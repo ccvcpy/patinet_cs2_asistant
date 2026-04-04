@@ -77,11 +77,11 @@ class MarketService:
         }
 
         market_hash_names = list(states.keys())
-        if self.steamdt_client:
-            self._load_steamdt_prices(states, market_hash_names)
-
         if self.csqaq_client:
             self._load_csqaq_prices(states, market_hash_names)
+
+        if self.steamdt_client:
+            self._load_steamdt_prices(states, market_hash_names)
 
         if self.c5_client:
             for batch in chunked(market_hash_names, 100):
@@ -170,12 +170,15 @@ class MarketService:
                     state.c5_price_source = _pick("steamdt", state.c5_price_source)
             elif "steam" in platform:
                 sell_price = _safe_positive_float(record.get("sellPrice"))
-                state.steam_sell_price = _pick(sell_price, state.steam_sell_price)
-                state.steam_sell_count = _pick(safe_int(record.get("sellCount")), state.steam_sell_count)
-                state.steam_bid_price = _pick(_safe_positive_float(record.get("biddingPrice")), state.steam_bid_price)
-                state.steam_bid_count = _pick(safe_int(record.get("biddingCount")), state.steam_bid_count)
-                if sell_price is not None:
-                    state.steam_price_source = _pick("steamdt", state.steam_price_source)
+                if state.steam_sell_price is None and sell_price is not None:
+                    state.steam_sell_price = sell_price
+                    state.steam_price_source = "steamdt"
+                if state.steam_sell_count is None:
+                    state.steam_sell_count = _pick(safe_int(record.get("sellCount")), state.steam_sell_count)
+                if state.steam_bid_price is None:
+                    state.steam_bid_price = _pick(_safe_positive_float(record.get("biddingPrice")), state.steam_bid_price)
+                if state.steam_bid_count is None:
+                    state.steam_bid_count = _pick(safe_int(record.get("biddingCount")), state.steam_bid_count)
 
     def _apply_csqaq_batch(
         self,

@@ -154,6 +154,25 @@ class MarketServiceTestCase(unittest.TestCase):
         self.assertEqual(9, state.steam_sell_count)
         self.assertEqual("csqaq_batch", state.steam_price_source)
 
+    def test_csqaq_is_preferred_when_both_sources_return_steam_price(self) -> None:
+        service = MarketService(
+            steamdt_client=FakeSteamDTClient(),
+            csqaq_client=FakeCSQAQClient(),
+            c5_client=FakeC5Client(),
+        )
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Rezan The Ready | Sabre",
+                    "name_cn": "准备就绪的列赞 | 军刀",
+                    "c5_item_id": "553486492",
+                }
+            ]
+        )
+        state = states[0]
+        self.assertEqual(222.0, state.steam_sell_price)
+        self.assertEqual("csqaq_batch", state.steam_price_source)
+
 
 if __name__ == "__main__":
     unittest.main()

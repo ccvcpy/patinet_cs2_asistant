@@ -11,6 +11,7 @@ from cs2_assistant.catalog import load_steamdt_catalog
 from cs2_assistant.clients import C5GameClient, CSQAQClient, ServerChanClient, SteamDTClient
 from cs2_assistant.config import Settings, load_settings
 from cs2_assistant.db import Database
+from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
 from cs2_assistant.services.market import (
     DEFAULT_C5_SETTLEMENT_FACTOR,
@@ -19,6 +20,18 @@ from cs2_assistant.services.market import (
     calculate_t_yield_rate,
 )
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
+from cs2_assistant.services.t_yield_scan import (
+    INVENTORY_FILTER_ALL,
+    INVENTORY_FILTER_ALL_COOLDOWN,
+    INVENTORY_FILTER_COOLDOWN_ONLY,
+    INVENTORY_FILTER_HAS_TRADABLE,
+    INVENTORY_FILTER_MIXED_ONLY,
+    INVENTORY_FILTER_TRADABLE_ONLY,
+    inventory_filter_label,
+    load_missing_steam_report,
+    normalize_inventory_filter,
+    scan_t_yield,
+)
 from cs2_assistant.utils import ensure_parent_dir, safe_float, utc_now_iso
 
 
@@ -26,8 +39,6 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     settings = load_settings()
     if getattr(args, "db_path", None):
         settings.db_path = Path(args.db_path)
-    if getattr(args, "steamdt_base_path", None):
-        settings.steamdt_base_path = Path(args.steamdt_base_path)
     return settings
 
 
@@ -66,7 +77,7 @@ def _resolve_c5_steam_id(client: C5GameClient, provided_steam_id: str | None) ->
             if steam_id:
                 return steam_id
 
-    raise RuntimeError("未能从 C5 账号信息里解析到 Steam ID，请手动传入 --steam-id")
+    raise RuntimeError("鏈兘浠?C5 璐﹀彿淇℃伅閲岃В鏋愬埌 Steam ID锛岃鎵嬪姩浼犲叆 --steam-id")
 
 
 def _list_c5_steam_accounts(client: C5GameClient) -> list[dict[str, Any]]:
@@ -169,7 +180,7 @@ def _fetch_all_c5_inventories(
             cached_payload = _load_inventory_cache(settings)
             if cached_payload is not None:
                 return cached_payload
-        raise RuntimeError("未找到绑定的 Steam 账号")
+        raise RuntimeError("鏈壘鍒扮粦瀹氱殑 Steam 璐﹀彿")
 
     inventories: list[dict[str, Any]] = []
     merged_items: list[dict[str, Any]] = []
@@ -518,8 +529,8 @@ def _warn_missing_t_yield_steam_prices(report: dict[str, Any]) -> None:
         return
     print(
         (
-            f"提示: 有 {len(missing_items)} 个库存饰品存在 C5 价格但缺少 Steam 价格，"
-            f"已写入 {report['missingSteamPricePath']}，"
+            f"提示: 有 {len(missing_items)} 个库存饰品存在 C5 价格但缺少 Steam 价格；"
+            f"已写入 {report['missingSteamPricePath']}；"
             "可运行 `python .\\main.py c5-t-yield-missing-steam` 查看。"
         ),
         file=sys.stderr,
@@ -528,7 +539,7 @@ def _warn_missing_t_yield_steam_prices(report: dict[str, Any]) -> None:
 
 def _require_item(db: Database, market_hash_name: str) -> None:
     if db.get_item(market_hash_name) is None:
-        raise ValueError(f"Item not found in catalog: {market_hash_name}. 请先 import-catalog 再操作。")
+        raise ValueError(f"Item not found in catalog: {market_hash_name}. Please run import-catalog first.")
 
 
 def cmd_init_db(args: argparse.Namespace) -> int:
@@ -709,13 +720,13 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
 def cmd_check_market(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     if not settings.steamdt_api_key and not settings.c5_api_key and not settings.csqaq_api_token:
-        raise RuntimeError("至少需要配置 STEAMDT_API_KEY 或 C5GAME_API_KEY。")
+        raise RuntimeError("至少需要配置 STEAMDT_API_KEY、C5GAME_API_KEY、CSQAQ_API_KEY 中的一项。")
 
     with _open_db(settings) as db:
         watch_rows = db.list_watch_items(enabled_only=True)
         required_names = db.list_required_market_hash_names()
         if not required_names:
-            print("当前没有监控项或篮子成分，先添加 watch-item 或 basket-item。")
+            print("当前没有监控项或篮子成分，请先添加 watch-item 或 basket-item。")
             return 0
         item_rows = [dict(db.get_item(name)) for name in required_names if db.get_item(name) is not None]
 
@@ -735,23 +746,26 @@ def cmd_check_market(args: argparse.Namespace) -> int:
     )
     if missing_steam_prices:
         print(
-            f"提示: {len(missing_steam_prices)} 个监控标的有 C5 价格但缺少 Steam 价格，比例相关规则可能被跳过。",
+            f"提示: {len(missing_steam_prices)} 个监控标的有 C5 价格但缺少 Steam 价格，比值相关规则可能被跳过。",
             file=sys.stderr,
         )
     for alert in alerts:
         print(f"- {alert.message}")
 
-    if alerts and not args.no_notify and settings.serverchan_sendkey:
-        notifier = ServerChanClient(
-            settings.serverchan_sendkey,
-            base_url=settings.serverchan_base_url,
+    if args.notify and not settings.serverchan_sendkey:
+        raise RuntimeError("缺少 SERVERCHAN_SENDKEY / SCTKEY 环境变量。")
+
+    if alerts and args.notify:
+        notification_service = NotificationService(
+            ServerChanClient(
+                settings.serverchan_sendkey,
+                base_url=settings.serverchan_base_url,
+            )
         )
-        title = f"CS2 理财助手提醒 {len(alerts)} 条"
-        body = AlertService.render_serverchan_markdown(alerts)
-        notifier.send(title, body)
+        notification_service.send(NotificationService.build_rule_alert_message(alerts))
         print("已发送 ServerChan 提醒。")
-    elif alerts and not args.no_notify:
-        print("检测到提醒，但未发送消息，因为缺少 ServerChan SendKey。")
+    elif alerts:
+        print("当前为仅生成提醒模式；如需推送，请追加 --notify。")
 
     if args.dump_json:
         payload = {
@@ -810,7 +824,7 @@ def cmd_c5_quick_buy(args: argparse.Namespace) -> int:
     _print_json(payload)
 
     if not args.yes:
-        confirm = input("输入 YES 确认下单，其它任意键取消: ")
+        confirm = input("杈撳叆 YES 纭涓嬪崟锛屽叾瀹冧换鎰忛敭鍙栨秷: ")
         if confirm != "YES":
             print("已取消。")
             return 0
@@ -876,6 +890,95 @@ def cmd_c5_inventory_all(args: argparse.Namespace) -> int:
     payload = _fetch_all_c5_inventories(client, settings, allow_cached_fallback=True)
     _print_json(payload)
     return 0
+
+
+def cmd_t_yield_scan(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    report = scan_t_yield(
+        settings,
+        min_price=args.min_price,
+        steam_discount=args.steam_discount,
+        allow_cached_fallback=not args.no_cache_fallback,
+        cache_max_age_minutes=args.cache_max_age_minutes,
+        inventory_filter=args.inventory_filter,
+    )
+    output_mode = "bottom" if args.bottom is not None else "top"
+    output_count = args.bottom if args.bottom is not None else args.top
+
+    if report.inventory_filter == INVENTORY_FILTER_ALL:
+        inventory_summary = f"已扫描 {report.inventory_type_count} 个库存饰品类型，"
+    else:
+        inventory_summary = (
+            f"已扫描 {report.inventory_type_total_count} 个库存饰品类型，"
+            f"筛选后 {report.inventory_type_count} 个（{report.inventory_filter_label}），"
+        )
+    print(
+        inventory_summary
+        + f"命中 {len(report.candidates)} 个做T候选，"
+        + f"缺少 Steam 价格 {len(report.missing_steam_prices)} 个。"
+    )
+
+    top_candidates = report.candidates[: args.top]
+    if not top_candidates:
+        print("当前没有符合条件的做T候选。")
+    else:
+        for index, candidate in enumerate(top_candidates, start=1):
+            accounts = ", ".join(
+                account.nickname or account.steam_id
+                for account in candidate.steam_accounts
+            ) or "-"
+            marker = "★" if candidate.t_yield_pct >= args.star_threshold else "-"
+            print(
+                f"{marker} {index}. {candidate.name} | 收益率 {candidate.t_yield_pct:.2f}% | "
+                f"{candidate.inventory_status_summary} | 挂刀比例 {candidate.ratio:.4f} | "
+                f"C5 {candidate.c5_lowest_sell_price:.2f} | "
+                f"Steam {candidate.steam_lowest_sell_price:.2f} | 账号 {accounts}"
+            )
+
+    if report.missing_steam_prices:
+        print(f"缺少 Steam 价格的饰品: {len(report.missing_steam_prices)} 个")
+        for issue in report.missing_steam_prices[:10]:
+            print(
+                f"- {issue.name} | {issue.inventory_status_summary} | C5 {issue.c5_sell_price:.2f} | "
+                f"HashName={issue.market_hash_name}"
+            )
+        print(f"详情文件: {report.missing_steam_price_path}")
+
+    if args.dump_json:
+        _print_json(
+            {
+                "generatedAt": report.generated_at,
+                "inventorySource": report.inventory_source,
+                "inventoryCachedAt": report.inventory_cached_at,
+                "inventoryFilter": report.inventory_filter,
+                "inventoryFilterLabel": report.inventory_filter_label,
+                "inventoryTypeTotalCount": report.inventory_type_total_count,
+                "inventoryTypeCount": report.inventory_type_count,
+                "rows": report.top_rows(args.top),
+                "missingSteamPrices": [issue.to_dict() for issue in report.missing_steam_prices],
+                "missingSteamPricePath": report.missing_steam_price_path,
+            }
+        )
+    return 0
+
+
+def cmd_t_yield_missing_steam_v2(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    _print_json(load_missing_steam_report(settings))
+    return 0
+
+
+def cmd_notify_t_yield(args: argparse.Namespace) -> int:
+    reminder_argv: list[str] = []
+    if args.configure:
+        reminder_argv.append("--configure")
+    if args.once:
+        reminder_argv.append("--once")
+    if args.show_config:
+        reminder_argv.append("--show-config")
+    if args.show_missing_steam:
+        reminder_argv.append("--show-missing-steam")
+    return int(t_yield_reminder_main(reminder_argv))
 
 
 def cmd_c5_t_yield_top(args: argparse.Namespace) -> int:
@@ -957,7 +1060,7 @@ def cmd_c5_t_yield_top_v2(args: argparse.Namespace) -> int:
     if not settings.c5_api_key:
         raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。")
     if not settings.steamdt_api_key and not settings.csqaq_api_token:
-        raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN。")
+        raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN 环境变量。")
 
     report = _build_t_yield_report(
         settings,
@@ -985,8 +1088,8 @@ def cmd_c5_t_yield_alert(args: argparse.Namespace) -> int:
     if not settings.c5_api_key:
         raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。")
     if not settings.steamdt_api_key and not settings.csqaq_api_token:
-        raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN。")
-    if not args.no_notify and not settings.serverchan_sendkey:
+        raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN 环境变量。")
+    if args.notify and not settings.serverchan_sendkey:
         raise RuntimeError("缺少 SERVERCHAN_SENDKEY / SCTKEY 环境变量。")
 
     report = _build_t_yield_report(
@@ -1009,7 +1112,7 @@ def cmd_c5_t_yield_alert(args: argparse.Namespace) -> int:
         f"缺少 Steam 价格 {len(report['missingSteamPrices'])} 个。"
     )
 
-    if not args.no_notify:
+    if args.notify:
         notification_service = NotificationService(
             ServerChanClient(
                 settings.serverchan_sendkey,
@@ -1018,6 +1121,8 @@ def cmd_c5_t_yield_alert(args: argparse.Namespace) -> int:
         )
         notification_service.send(notification)
         print("已发送 ServerChan 做T提醒。")
+    else:
+        print("当前为仅生成提醒模式；如需推送，请追加 --notify。")
 
     if args.dump_json:
         _print_json(
@@ -1035,9 +1140,11 @@ def cmd_c5_t_yield_alert(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CS2 理财助手第一版 CLI")
+    parser = argparse.ArgumentParser(
+        description="CS2 理财助手 CLI",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument("--db-path", help="自定义 SQLite 数据库路径")
-    parser.add_argument("--steamdt-base-path", help="自定义 SteamDT 基础数据 JSON 路径")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_db = subparsers.add_parser("init-db", help="初始化数据库")
@@ -1047,8 +1154,8 @@ def build_parser() -> argparse.ArgumentParser:
     import_catalog.add_argument("--file", help="SteamDT 基础数据 JSON 文件路径")
     import_catalog.set_defaults(handler=cmd_import_catalog)
 
-    search_item = subparsers.add_parser("search-item", help="按关键字搜索饰品")
-    search_item.add_argument("--keyword", required=True, help="中文名或 HashName 关键字")
+    search_item = subparsers.add_parser("search-item", help="按关键词搜索饰品")
+    search_item.add_argument("--keyword", required=True, help="中文名或 HashName 关键词")
     search_item.add_argument("--limit", type=int, default=20, help="返回条数")
     search_item.set_defaults(handler=cmd_search_item)
 
@@ -1124,7 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
     notify_test.set_defaults(handler=cmd_notify_test)
 
     check_market = subparsers.add_parser("check-market", help="采集价格并触发规则判断")
-    check_market.add_argument("--no-notify", action="store_true", help="只打印，不发 ServerChan")
+    check_market.add_argument("--notify", action="store_true", help="命中规则后通过 ServerChan 推送")
     check_market.add_argument("--dump-json", action="store_true", help="额外输出 JSON 结果")
     check_market.set_defaults(handler=cmd_check_market)
 
@@ -1156,28 +1263,404 @@ def build_parser() -> argparse.ArgumentParser:
     c5_inventory_all = subparsers.add_parser("c5-inventory-all", help="汇总所有绑定 Steam 账号的 C5 库存")
     c5_inventory_all.set_defaults(handler=cmd_c5_inventory_all)
 
-    c5_t_yield_top = subparsers.add_parser("c5-t-yield-top", help="基于全部库存按做 T 收益率输出饰品类型 Top")
-    c5_t_yield_top.add_argument("--top", type=int, default=10, help="返回前 N 个饰品类型")
-    c5_t_yield_top.add_argument("--min-price", type=float, default=0.0, help="只保留 C5 最低售价不低于该值的饰品")
-    c5_t_yield_top.add_argument("--steam-discount", type=float, default=DEFAULT_STEAM_BALANCE_DISCOUNT)
-    c5_t_yield_top.set_defaults(handler=cmd_c5_t_yield_top_v2)
-
-    c5_t_yield_missing_steam = subparsers.add_parser(
-        "c5-t-yield-missing-steam",
-        help="查看最近一次做T扫描中缺少 Steam 价格的饰品",
+    t_yield = subparsers.add_parser(
+        "t-yield",
+        help="做T扫描与结果输出",
+        description=(
+            "做T扫描相关命令。\n\n"
+            "常用：\n"
+            "  python .\\main.py t-yield scan -h\n"
+            "  python .\\main.py t-yield scan --top 10 --min-price 10 --inventory-filter all\n"
+            "  python .\\main.py t-yield scan --inventory-filter tradable_only\n"
+            "  python .\\main.py t-yield scan --inventory-filter cooldown_only\n"
+            "  python .\\main.py t-yield scan --inventory-filter mixed_only\n"
+            "  python .\\main.py t-yield missing-steam"
+        ),
+        epilog="提示：要看 scan 的完整参数，请执行 `python .\\main.py t-yield scan -h`。",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    c5_t_yield_missing_steam.set_defaults(handler=cmd_c5_t_yield_missing_steam)
+    t_yield_subparsers = t_yield.add_subparsers(dest="t_yield_command", required=True)
 
-    c5_t_yield_alert = subparsers.add_parser(
-        "c5-t-yield-alert",
-        help="扫描全部 C5 库存并按条件发送做T提醒",
+    t_yield_scan = t_yield_subparsers.add_parser(
+        "scan",
+        help="扫描全部库存并输出做T结果",
+        description=(
+            "扫描全部绑定 Steam 账号的 C5 库存，计算做T候选，并支持按库存状态筛选。\n\n"
+            "inventory-filter 说明：\n"
+            "  all: 全部库存状态\n"
+            "  tradable_only: 仅不冷却\n"
+            "  cooldown_only: 仅冷却\n"
+            "  mixed_only: 同一个饰品类型里同时存在冷却和不冷却"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    c5_t_yield_alert.add_argument("--top", type=int, default=10, help="提醒中保留前 N 个候选")
-    c5_t_yield_alert.add_argument("--min-price", type=float, default=0.0, help="只提醒 C5 最低售价不低于该值的饰品")
-    c5_t_yield_alert.add_argument("--steam-discount", type=float, default=DEFAULT_STEAM_BALANCE_DISCOUNT)
-    c5_t_yield_alert.add_argument("--no-notify", action="store_true", help="只生成提醒内容，不发 ServerChan")
-    c5_t_yield_alert.add_argument("--dump-json", action="store_true", help="输出提醒内容和价格缺失详情 JSON")
-    c5_t_yield_alert.set_defaults(handler=cmd_c5_t_yield_alert)
+    t_yield_scan.add_argument("--top", type=int, default=10, help="输出前 N 个候选")
+    t_yield_scan.add_argument("--min-price", type=float, default=10.0, help="只保留 C5 最低售价不低于该值的饰品")
+    t_yield_scan.add_argument("--steam-discount", type=float, default=DEFAULT_STEAM_BALANCE_DISCOUNT)
+    t_yield_scan.add_argument(
+        "--inventory-filter",
+        choices=[
+            INVENTORY_FILTER_ALL,
+            INVENTORY_FILTER_TRADABLE_ONLY,
+            INVENTORY_FILTER_COOLDOWN_ONLY,
+            INVENTORY_FILTER_MIXED_ONLY,
+        ],
+        default=INVENTORY_FILTER_ALL,
+        help=(
+            "库存筛选: "
+            f"{INVENTORY_FILTER_ALL}={inventory_filter_label(INVENTORY_FILTER_ALL)}, "
+            f"{INVENTORY_FILTER_TRADABLE_ONLY}={inventory_filter_label(INVENTORY_FILTER_TRADABLE_ONLY)}, "
+            f"{INVENTORY_FILTER_COOLDOWN_ONLY}={inventory_filter_label(INVENTORY_FILTER_COOLDOWN_ONLY)}, "
+            f"{INVENTORY_FILTER_MIXED_ONLY}={inventory_filter_label(INVENTORY_FILTER_MIXED_ONLY)}"
+        ),
+    )
+    t_yield_scan.add_argument("--star-threshold", type=float, default=10.0, help="达到该收益率时在本地输出中标星")
+    t_yield_scan.add_argument("--cache-max-age-minutes", type=int, default=180, help="允许使用的库存缓存最大时长")
+    t_yield_scan.add_argument("--no-cache-fallback", action="store_true", help="库存拉取失败时不回退到缓存")
+    t_yield_scan.add_argument("--dump-json", action="store_true", help="额外输出 JSON 结果")
+    t_yield_scan.set_defaults(handler=cmd_t_yield_scan)
+
+    t_yield_missing = t_yield_subparsers.add_parser("missing-steam", help="查看最近一次缺失 Steam 价格的明细")
+    t_yield_missing.set_defaults(handler=cmd_t_yield_missing_steam_v2)
+
+    notify = subparsers.add_parser(
+        "notify",
+        help="提醒模块入口",
+        description=(
+            "提醒模块入口。\n\n"
+            "常用：\n"
+            "  python .\\main.py notify t-yield -h\n"
+            "  python .\\main.py notify t-yield --configure\n"
+            "  python .\\main.py notify t-yield --show-config\n"
+            "  python .\\main.py notify t-yield --once"
+        ),
+        epilog="提示：要看做T提醒的完整参数，请执行 `python .\\main.py notify t-yield -h`。",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    notify_subparsers = notify.add_subparsers(dest="notify_command", required=True)
+
+    notify_t_yield = notify_subparsers.add_parser(
+        "t-yield",
+        help="做T提醒",
+        description=(
+            "做T提醒命令。\n\n"
+            "说明：\n"
+            "  --configure      重新配置提醒参数\n"
+            "  --show-config    查看当前提醒配置\n"
+            "  --show-missing-steam  查看最近一次 Steam 缺价明细\n"
+            "  --once           仅执行一次扫描和提醒判断"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    notify_t_yield.add_argument("--configure", action="store_true", help="重新配置做T提醒参数")
+    notify_t_yield.add_argument("--once", action="store_true", help="只执行一次提醒判断")
+    notify_t_yield.add_argument("--show-config", action="store_true", help="输出当前提醒配置")
+    notify_t_yield.add_argument("--show-missing-steam", action="store_true", help="输出最近一次缺失 Steam 价格的明细")
+    notify_t_yield.set_defaults(handler=cmd_notify_t_yield)
+
+    return parser
+
+
+def cmd_t_profit_scan(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    report = scan_t_yield(
+        settings,
+        min_price=args.min_price,
+        steam_discount=args.steam_discount,
+        allow_cached_fallback=not args.no_cache_fallback,
+        cache_max_age_minutes=args.cache_max_age_minutes,
+        inventory_filter=args.inventory_filter,
+    )
+    output_mode = "bottom" if args.bottom is not None else "top"
+    output_count = args.bottom if args.bottom is not None else args.top
+    selected_candidates = (
+        sorted(report.candidates, key=lambda candidate: candidate.t_yield_rate)[:output_count]
+        if output_mode == "bottom"
+        else report.candidates[:output_count]
+    )
+
+    if report.inventory_filter == INVENTORY_FILTER_ALL:
+        inventory_summary = f"已扫描 {report.inventory_type_count} 个库存饰品类型，"
+    else:
+        inventory_summary = (
+            f"已扫描 {report.inventory_type_total_count} 个库存饰品类型，"
+            f"筛选后 {report.inventory_type_count} 个（{report.inventory_filter_label}），"
+        )
+    print(
+        inventory_summary
+        + f"命中 {len(report.candidates)} 个做T候选，"
+        + f"缺少 Steam 价格 {len(report.missing_steam_prices)} 个。"
+    )
+
+    if not selected_candidates:
+        print("当前没有符合条件的做T候选。")
+    else:
+        print(f"输出模式: {'低收益优先' if output_mode == 'bottom' else '高收益优先'}，数量 {output_count}")
+        for index, candidate in enumerate(selected_candidates, start=1):
+            accounts = ", ".join(
+                account.nickname or account.steam_id
+                for account in candidate.steam_accounts
+            ) or "-"
+            marker = "★" if candidate.t_yield_pct >= args.star_threshold else "-"
+            print(
+                f"{marker} {index}. {candidate.name} | 收益率 {candidate.t_yield_pct:.2f}% | "
+                f"{candidate.inventory_status_summary} | 折算比 {candidate.ratio:.4f} | "
+                f"C5 {candidate.c5_lowest_sell_price:.2f} | "
+                f"Steam {candidate.steam_lowest_sell_price:.2f} | 账号 {accounts}"
+            )
+
+    if report.missing_steam_prices:
+        print(f"缺少 Steam 价格的饰品: {len(report.missing_steam_prices)} 个")
+        for issue in report.missing_steam_prices[:10]:
+            print(
+                f"- {issue.name} | {issue.inventory_status_summary} | C5 {issue.c5_sell_price:.2f} | "
+                f"HashName={issue.market_hash_name}"
+            )
+        print(f"详情文件: {report.missing_steam_price_path}")
+
+    if args.dump_json:
+        _print_json(
+            {
+                "generatedAt": report.generated_at,
+                "inventorySource": report.inventory_source,
+                "inventoryCachedAt": report.inventory_cached_at,
+                "inventoryFilter": report.inventory_filter,
+                "inventoryFilterLabel": report.inventory_filter_label,
+                "inventoryTypeTotalCount": report.inventory_type_total_count,
+                "inventoryTypeCount": report.inventory_type_count,
+                "sortMode": output_mode,
+                "rows": report.bottom_rows(output_count) if output_mode == "bottom" else report.top_rows(output_count),
+                "missingSteamPrices": [issue.to_dict() for issue in report.missing_steam_prices],
+                "missingSteamPricePath": report.missing_steam_price_path,
+            }
+        )
+    return 0
+
+
+def cmd_notify_t_profit(args: argparse.Namespace) -> int:
+    return cmd_notify_t_yield(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="CS2 理财助手 CLI",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("--db-path", help="自定义 SQLite 数据库路径")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_db = subparsers.add_parser("init-db", help="初始化数据库")
+    init_db.set_defaults(handler=cmd_init_db)
+
+    import_catalog = subparsers.add_parser("import-catalog", help="导入本地 SteamDT 基础数据")
+    import_catalog.add_argument("--file", help="SteamDT 基础数据 JSON 文件路径")
+    import_catalog.set_defaults(handler=cmd_import_catalog)
+
+    search_item = subparsers.add_parser("search-item", help="按关键词搜索饰品")
+    search_item.add_argument("--keyword", required=True, help="中文名或 HashName 关键词")
+    search_item.add_argument("--limit", type=int, default=20, help="返回条数")
+    search_item.set_defaults(handler=cmd_search_item)
+
+    watch_add = subparsers.add_parser("watch-add", help="加入单品监控")
+    watch_add.add_argument("--market-hash-name", required=True)
+    watch_add.add_argument("--display-name")
+    watch_add.add_argument("--note")
+    watch_add.set_defaults(handler=cmd_watch_add)
+
+    watch_list = subparsers.add_parser("watch-list", help="查看监控列表")
+    watch_list.add_argument("--all", action="store_true", help="包含禁用项")
+    watch_list.set_defaults(handler=cmd_watch_list)
+
+    basket_add = subparsers.add_parser("basket-add", help="创建篮子")
+    basket_add.add_argument("--name", required=True)
+    basket_add.add_argument("--note")
+    basket_add.set_defaults(handler=cmd_basket_add)
+
+    basket_add_item = subparsers.add_parser("basket-add-item", help="向篮子加入饰品")
+    basket_add_item.add_argument("--basket-name", required=True)
+    basket_add_item.add_argument("--market-hash-name", required=True)
+    basket_add_item.add_argument("--quantity", type=float, default=1.0)
+    basket_add_item.set_defaults(handler=cmd_basket_add_item)
+
+    basket_list = subparsers.add_parser("basket-list", help="查看篮子")
+    basket_list.add_argument("--basket-name")
+    basket_list.set_defaults(handler=cmd_basket_list)
+
+    position_add = subparsers.add_parser("position-add", help="新增人工仓位记录")
+    position_add.add_argument("--market-hash-name", required=True)
+    position_add.add_argument("--status", required=True)
+    position_add.add_argument("--quantity", type=float, default=0)
+    position_add.add_argument("--manual-cost", type=float)
+    position_add.add_argument("--target-buy-price", type=float)
+    position_add.add_argument("--target-sell-price", type=float)
+    position_add.add_argument("--note")
+    position_add.set_defaults(handler=cmd_position_add)
+
+    position_list = subparsers.add_parser("position-list", help="查看仓位记录")
+    position_list.set_defaults(handler=cmd_position_list)
+
+    rule_add = subparsers.add_parser("rule-add", help="新增提醒规则")
+    rule_add.add_argument("--target-type", choices=["item", "basket"], required=True)
+    rule_add.add_argument("--target-key", required=True, help="item 用 HashName，basket 用篮子名")
+    rule_add.add_argument(
+        "--metric",
+        choices=[
+            "c5_price",
+            "steam_price",
+            "c5_bid_price",
+            "ratio",
+            "basket_total",
+            "c5_change_pct",
+            "steam_change_pct",
+            "basket_change_pct",
+        ],
+        required=True,
+    )
+    rule_add.add_argument("--operator", choices=["lte", "gte"], required=True)
+    rule_add.add_argument("--threshold", type=float, required=True)
+    rule_add.add_argument("--anchor-value", type=float)
+    rule_add.add_argument("--cooldown-minutes", type=int, default=60)
+    rule_add.add_argument("--note")
+    rule_add.set_defaults(handler=cmd_rule_add)
+
+    rule_list = subparsers.add_parser("rule-list", help="查看提醒规则")
+    rule_list.add_argument("--all", action="store_true")
+    rule_list.set_defaults(handler=cmd_rule_list)
+
+    notify_test = subparsers.add_parser("notify-test", help="发送一条 ServerChan 测试消息")
+    notify_test.add_argument("--title", default="CS2 理财助手测试提醒")
+    notify_test.add_argument("--message", default="如果你看到这条消息，说明 ServerChan 已经打通。")
+    notify_test.set_defaults(handler=cmd_notify_test)
+
+    check_market = subparsers.add_parser("check-market", help="采集价格并触发规则判断")
+    check_market.add_argument("--notify", action="store_true", help="命中规则后通过 ServerChan 推送")
+    check_market.add_argument("--dump-json", action="store_true", help="额外输出 JSON 结果")
+    check_market.set_defaults(handler=cmd_check_market)
+
+    c5_quick_buy = subparsers.add_parser("c5-quick-buy", help="C5 快速购买，需要用户确认")
+    group = c5_quick_buy.add_mutually_exclusive_group(required=True)
+    group.add_argument("--market-hash-name")
+    group.add_argument("--item-id")
+    c5_quick_buy.add_argument("--max-price", type=float)
+    c5_quick_buy.add_argument("--delivery", type=int)
+    c5_quick_buy.add_argument("--low-price", type=float)
+    c5_quick_buy.add_argument("--out-trade-no")
+    c5_quick_buy.add_argument("--yes", action="store_true", help="跳过二次确认")
+    c5_quick_buy.set_defaults(handler=cmd_c5_quick_buy)
+
+    c5_sales = subparsers.add_parser("c5-sales", help="查询当前 C5 在售列表")
+    c5_sales.add_argument("--steam-id")
+    c5_sales.add_argument("--delivery", type=int)
+    c5_sales.add_argument("--page", type=int, default=1)
+    c5_sales.add_argument("--limit", type=int, default=20)
+    c5_sales.set_defaults(handler=cmd_c5_sales)
+
+    c5_steam_list = subparsers.add_parser("c5-steam-list", help="列出 C5 绑定的 Steam 账号")
+    c5_steam_list.set_defaults(handler=cmd_c5_steam_list_safe)
+
+    c5_inventory = subparsers.add_parser("c5-inventory", help="查询单个 Steam 账号的 C5 库存")
+    c5_inventory.add_argument("--steam-id")
+    c5_inventory.set_defaults(handler=cmd_c5_inventory)
+
+    c5_inventory_all = subparsers.add_parser("c5-inventory-all", help="汇总所有绑定 Steam 账号的 C5 库存")
+    c5_inventory_all.set_defaults(handler=cmd_c5_inventory_all)
+
+    def add_t_profit_parser(name: str, *, hidden: bool = False) -> None:
+        t_profit = subparsers.add_parser(
+            name,
+            help="兼容旧命令（不推荐）" if hidden else "做T扫描与结果输出",
+            description=(
+                "做T扫描相关命令。\n\n"
+                "常用：\n"
+                "  python .\\main.py t-profit scan -h\n"
+                "  python .\\main.py t-profit scan --top 10 --min-price 10 --inventory-filter all\n"
+                "  python .\\main.py t-profit scan --bottom 10 --min-price 10\n"
+                "  python .\\main.py t-profit missing-steam"
+            ),
+            epilog="提示：要看 scan 的完整参数，请执行 `python .\\main.py t-profit scan -h`。",
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        t_profit_subparsers = t_profit.add_subparsers(dest=f"{name.replace('-', '_')}_command", required=True)
+
+        t_profit_scan = t_profit_subparsers.add_parser(
+            "scan",
+            help="扫描全部库存并输出做T结果",
+            description=(
+                "扫描全部绑定 Steam 账号的 C5 库存，计算做T候选，并支持按库存状态筛选。\n\n"
+                "inventory-filter 说明：\n"
+                "  all: 全部库存\n"
+                "  all_cooldown: 这个饰品类型全部为冷却中\n"
+                "  has_tradable: 这个饰品类型只要存在不冷却就算命中"
+            ),
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        mode_group = t_profit_scan.add_mutually_exclusive_group()
+        mode_group.add_argument("--top", type=int, help="按收益率从高到低输出前 N 个候选，默认 10")
+        mode_group.add_argument("--bottom", type=int, help="按收益率从低到高输出前 N 个候选")
+        t_profit_scan.add_argument("--min-price", type=float, default=10.0, help="只保留 C5 最低售价不低于该值的饰品")
+        t_profit_scan.add_argument("--steam-discount", type=float, default=DEFAULT_STEAM_BALANCE_DISCOUNT)
+        t_profit_scan.add_argument(
+            "--inventory-filter",
+            type=normalize_inventory_filter,
+            metavar="{all,all_cooldown,has_tradable}",
+            default=INVENTORY_FILTER_ALL,
+            help=(
+                "库存筛选: "
+                f"{INVENTORY_FILTER_ALL}={inventory_filter_label(INVENTORY_FILTER_ALL)}, "
+                f"{INVENTORY_FILTER_ALL_COOLDOWN}={inventory_filter_label(INVENTORY_FILTER_ALL_COOLDOWN)}, "
+                f"{INVENTORY_FILTER_HAS_TRADABLE}={inventory_filter_label(INVENTORY_FILTER_HAS_TRADABLE)}"
+            ),
+        )
+        t_profit_scan.add_argument("--star-threshold", type=float, default=10.0, help="达到该收益率时在本地输出中标星")
+        t_profit_scan.add_argument("--cache-max-age-minutes", type=int, default=180, help="允许使用的库存缓存最大时长")
+        t_profit_scan.add_argument("--no-cache-fallback", action="store_true", help="库存拉取失败时不回退到缓存")
+        t_profit_scan.add_argument("--dump-json", action="store_true", help="额外输出 JSON 结果")
+        t_profit_scan.set_defaults(handler=cmd_t_profit_scan, top=10, bottom=None)
+
+        t_profit_missing = t_profit_subparsers.add_parser("missing-steam", help="查看最近一次缺失 Steam 价格的明细")
+        t_profit_missing.set_defaults(handler=cmd_t_yield_missing_steam_v2)
+
+    add_t_profit_parser("t-profit")
+    add_t_profit_parser("t-yield", hidden=True)
+
+    notify = subparsers.add_parser(
+        "notify",
+        help="提醒模块入口",
+        description=(
+            "提醒模块入口。\n\n"
+            "常用：\n"
+            "  python .\\main.py notify t-profit -h\n"
+            "  python .\\main.py notify t-profit --configure\n"
+            "  python .\\main.py notify t-profit --show-config\n"
+            "  python .\\main.py notify t-profit --once"
+        ),
+        epilog="提示：要看做T提醒的完整参数，请执行 `python .\\main.py notify t-profit -h`。",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    notify_subparsers = notify.add_subparsers(dest="notify_command", required=True)
+
+    def add_notify_t_profit_parser(name: str, *, hidden: bool = False) -> None:
+        notify_t_profit = notify_subparsers.add_parser(
+            name,
+            help="兼容旧命令（不推荐）" if hidden else "做T提醒",
+            description=(
+                "做T提醒命令。\n\n"
+                "说明：\n"
+                "  --configure      重新配置提醒参数\n"
+                "  --show-config    查看当前提醒配置\n"
+                "  --show-missing-steam  查看最近一次 Steam 缺价明细\n"
+                "  --once           仅执行一次扫描和提醒判断"
+            ),
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        notify_t_profit.add_argument("--configure", action="store_true", help="重新配置做T提醒参数")
+        notify_t_profit.add_argument("--once", action="store_true", help="只执行一次提醒判断")
+        notify_t_profit.add_argument("--show-config", action="store_true", help="输出当前提醒配置")
+        notify_t_profit.add_argument("--show-missing-steam", action="store_true", help="输出最近一次缺失 Steam 价格的明细")
+        notify_t_profit.set_defaults(handler=cmd_notify_t_profit)
+
+    add_notify_t_profit_parser("t-profit")
+    add_notify_t_profit_parser("t-yield", hidden=True)
 
     return parser
 
@@ -1193,3 +1676,4 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
+

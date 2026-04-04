@@ -15,9 +15,34 @@ DEFAULT_CSQAQ_BASE_URL = "https://api.csqaq.com"
 DEFAULT_CSGO_APP_ID = 730
 
 
+def _read_windows_registry_env(name: str) -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    locations = [
+        (winreg.HKEY_CURRENT_USER, r"Environment"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    ]
+    for hive, subkey in locations:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+        except OSError:
+            continue
+        if value:
+            return str(value)
+    return None
+
+
 def _first_env(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
+        if not value:
+            value = _read_windows_registry_env(name)
         if value:
             return value
     return None

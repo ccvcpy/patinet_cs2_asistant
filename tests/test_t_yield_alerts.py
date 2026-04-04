@@ -19,7 +19,8 @@ class TYieldAlertsTestCase(unittest.TestCase):
             [
                 {
                     "rank": 1,
-                    "name": "准备就绪的列赞 | 军刀",
+                    "name": "Rezan The Ready | Sabre",
+                    "inventoryStatusSummary": "同时有冷却和不冷却 (1 冷却 / 1 不冷却)",
                     "tYieldPct": "9.08%",
                     "ratio": "0.9446",
                     "c5LowestSellPrice": 136.9,
@@ -31,16 +32,19 @@ class TYieldAlertsTestCase(unittest.TestCase):
             min_price=50,
             missing_steam_prices=[
                 {
-                    "name": "热潮武器箱",
+                    "name": "Fever Case",
+                    "inventoryStatusSummary": "仅冷却 (1 冷却 / 0 不冷却)",
                     "marketHashName": "Fever Case",
                     "c5SellPrice": 4.64,
                 }
             ],
         )
         self.assertIn("做T收益率提醒", message.body)
-        self.assertIn("准备就绪的列赞 | 军刀", message.body)
-        self.assertIn("价格缺失", message.body)
+        self.assertIn("Rezan The Ready | Sabre", message.body)
+        self.assertIn("同时有冷却和不冷却", message.body)
+        self.assertIn("缺少 Steam 价格", message.body)
         self.assertIn("Fever Case", message.body)
+        self.assertIn("账号 115", message.body)
 
 
 if __name__ == "__main__":

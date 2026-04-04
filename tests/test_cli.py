@@ -11,6 +11,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cs2_assistant.cli import (
+    build_parser,
     _build_market_price_gap_rows,
     _list_c5_steam_accounts,
     _resolve_c5_steam_id,
@@ -78,7 +79,7 @@ class SummarizeInventoryTypesTestCase(unittest.TestCase):
             [
                 {
                     "marketHashName": "Revolution Case",
-                    "name": "变革武器箱",
+                    "name": "Revolution Case",
                     "steamId": "steam-a",
                     "ifTradable": True,
                     "itemId": "c5-item",
@@ -86,7 +87,7 @@ class SummarizeInventoryTypesTestCase(unittest.TestCase):
                 },
                 {
                     "marketHashName": "Revolution Case",
-                    "name": "变革武器箱",
+                    "name": "Revolution Case",
                     "steamId": "steam-b",
                     "ifTradable": False,
                     "itemId": "c5-item",
@@ -94,7 +95,7 @@ class SummarizeInventoryTypesTestCase(unittest.TestCase):
                 },
                 {
                     "marketHashName": "Sticker | MOUZ | Budapest 2025",
-                    "name": "印花 | MOUZ | 2025年布达佩斯锦标赛",
+                    "name": "Sticker | MOUZ | Budapest 2025",
                     "steamId": "steam-a",
                     "ifTradable": True,
                     "price": 0.02,
@@ -117,14 +118,14 @@ class BuildMarketPriceGapRowsTestCase(unittest.TestCase):
             [
                 MarketState(
                     market_hash_name="Rezan The Ready | Sabre",
-                    name_cn="准备就绪的列赞 | 军刀",
+                    name_cn="Rezan The Ready | Sabre",
                     c5_sell_price=136.9,
                     steam_sell_price=None,
                     c5_price_source="inventory_price",
                 ),
                 MarketState(
                     market_hash_name="Kilowatt Case",
-                    name_cn="千瓦武器箱",
+                    name_cn="Kilowatt Case",
                     c5_sell_price=1.62,
                     steam_sell_price=1.66,
                     c5_price_source="c5_batch",
@@ -136,6 +137,22 @@ class BuildMarketPriceGapRowsTestCase(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual("Rezan The Ready | Sabre", rows[0]["marketHashName"])
         self.assertEqual(["steamdt", "csqaq"], rows[0]["steamSourcesAttempted"])
+
+
+class ParserTestCase(unittest.TestCase):
+    def test_t_profit_scan_supports_bottom(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["t-profit", "scan", "--bottom", "10", "--inventory-filter", "has_tradable"])
+        self.assertEqual(10, args.bottom)
+        self.assertEqual("t-profit", args.command)
+        self.assertEqual("has_tradable", args.inventory_filter)
+
+    def test_notify_t_profit_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["notify", "t-profit", "--once"])
+        self.assertEqual("notify", args.command)
+        self.assertEqual("t-profit", args.notify_command)
+        self.assertTrue(args.once)
 
 
 if __name__ == "__main__":

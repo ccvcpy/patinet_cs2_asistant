@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import requests
@@ -11,10 +12,19 @@ class CSQAQError(RuntimeError):
 
 
 class CSQAQClient:
-    def __init__(self, api_token: str, base_url: str = "https://api.csqaq.com", timeout: int = 30):
+    def __init__(
+        self,
+        api_token: str,
+        base_url: str = "https://api.csqaq.com",
+        timeout: int = 30,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
+    ):
         self.api_token = api_token
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def _request(
         self,
@@ -31,20 +41,33 @@ class CSQAQClient:
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
-        try:
-            response = requests.request(
-                method=method,
-                url=f"{self.base_url}{path}",
-                params=params,
-                json=json_body,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise CSQAQError(f"CSQAQ request failed: {exc}") from exc
+        response: requests.Response | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=f"{self.base_url}{path}",
+                    params=params,
+                    json=json_body,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_seconds * (2**attempt))
+                    continue
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_seconds * (2**attempt))
+                    continue
+                raise CSQAQError(f"CSQAQ request failed: {exc}") from exc
+        else:
+            raise CSQAQError("CSQAQ request failed after retries.")
 
         try:
+            assert response is not None
             payload = response.json()
         except ValueError as exc:
             raise CSQAQError(f"CSQAQ returned invalid JSON: {response.text}") from exc
