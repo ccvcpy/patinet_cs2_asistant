@@ -136,6 +136,60 @@ class Database:
                 notified_at TEXT NOT NULL,
                 FOREIGN KEY (rule_id) REFERENCES alert_rules(id)
             );
+
+            -- ===== Strategy / inventory-pool tables =====
+
+            CREATE TABLE IF NOT EXISTS inventory_pool (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_hash_name TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'holding',
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_pool_mhn
+            ON inventory_pool(market_hash_name);
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_pool_status
+            ON inventory_pool(status);
+
+            CREATE TABLE IF NOT EXISTS strategy_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_hash_name TEXT NOT NULL,
+                evaluated_at TEXT NOT NULL,
+                rebuy_price REAL,
+                steam_sell_price REAL,
+                steam_after_tax_price REAL,
+                listing_ratio REAL,
+                transfer_real_ratio REAL,
+                recommended_strategy TEXT,
+                inventory_count INTEGER,
+                tradable_count INTEGER,
+                config_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_strategy_eval_mhn
+            ON strategy_evaluations(market_hash_name, evaluated_at);
+
+            CREATE TABLE IF NOT EXISTS pool_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_hash_name TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                operation_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                quantity INTEGER NOT NULL DEFAULT 1,
+                expected_price REAL,
+                actual_price REAL,
+                asset_id TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pool_ops_status
+            ON pool_operations(status);
             """
         )
         self.conn.commit()
@@ -529,6 +583,219 @@ class Database:
             ),
         )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Inventory pool
+    # ------------------------------------------------------------------
+
+    def upsert_pool_item(
+        self,
+        market_hash_name: str,
+        quantity: int,
+        *,
+        status: str = "holding",
+        note: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        existing = self.conn.execute(
+            "SELECT id FROM inventory_pool WHERE market_hash_name = ?",
+            (market_hash_name,),
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                """
+                UPDATE inventory_pool
+                SET quantity = ?, status = ?, note = ?, updated_at = ?
+                WHERE market_hash_name = ?
+                """,
+                (quantity, status, note, now, market_hash_name),
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO inventory_pool (market_hash_name, quantity, status, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (market_hash_name, quantity, status, note, now, now),
+            )
+        self.conn.commit()
+
+    def sync_pool_from_inventory(self, inventory_summaries: list[dict[str, Any]]) -> int:
+        """Sync inventory pool from C5 inventory scan results.
+
+        Upserts each item type with its total inventory_count.
+        Returns the number of item types synced.
+        """
+        now = utc_now_iso()
+        count = 0
+        for summary in inventory_summaries:
+            mhn = str(summary.get("market_hash_name") or "").strip()
+            if not mhn:
+                continue
+            qty = int(summary.get("inventory_count", 0))
+            if qty <= 0:
+                continue
+            existing = self.conn.execute(
+                "SELECT id, status FROM inventory_pool WHERE market_hash_name = ?",
+                (mhn,),
+            ).fetchone()
+            if existing:
+                self.conn.execute(
+                    "UPDATE inventory_pool SET quantity = ?, updated_at = ? WHERE market_hash_name = ?",
+                    (qty, now, mhn),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO inventory_pool (market_hash_name, quantity, status, note, created_at, updated_at)
+                    VALUES (?, ?, 'holding', NULL, ?, ?)
+                    """,
+                    (mhn, qty, now, now),
+                )
+            count += 1
+        self.conn.commit()
+        return count
+
+    def list_pool_items(self, status: str | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT id, market_hash_name, quantity, status, note, created_at, updated_at FROM inventory_pool"
+        params: tuple[Any, ...] = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY market_hash_name ASC"
+        return self.conn.execute(sql, params).fetchall()
+
+    def get_pool_market_hash_names(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT market_hash_name FROM inventory_pool WHERE quantity > 0 ORDER BY market_hash_name"
+        ).fetchall()
+        return [row["market_hash_name"] for row in rows]
+
+    def remove_pool_item(self, market_hash_name: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM inventory_pool WHERE market_hash_name = ?",
+            (market_hash_name,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Strategy evaluations
+    # ------------------------------------------------------------------
+
+    def save_strategy_evaluation(
+        self,
+        *,
+        market_hash_name: str,
+        rebuy_price: float | None,
+        steam_sell_price: float | None,
+        steam_after_tax_price: float | None,
+        listing_ratio: float | None,
+        transfer_real_ratio: float | None,
+        recommended_strategy: str | None,
+        inventory_count: int | None,
+        tradable_count: int | None,
+        config_json: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO strategy_evaluations (
+                market_hash_name, evaluated_at,
+                rebuy_price, steam_sell_price, steam_after_tax_price,
+                listing_ratio, transfer_real_ratio, recommended_strategy,
+                inventory_count, tradable_count, config_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market_hash_name,
+                utc_now_iso(),
+                rebuy_price,
+                steam_sell_price,
+                steam_after_tax_price,
+                listing_ratio,
+                transfer_real_ratio,
+                recommended_strategy,
+                inventory_count,
+                tradable_count,
+                config_json,
+            ),
+        )
+        self.conn.commit()
+
+    def list_latest_evaluations(self, limit: int = 100) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT * FROM strategy_evaluations
+            ORDER BY evaluated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Pool operations
+    # ------------------------------------------------------------------
+
+    def add_pool_operation(
+        self,
+        *,
+        market_hash_name: str,
+        strategy: str,
+        operation_type: str,
+        quantity: int = 1,
+        expected_price: float | None = None,
+        asset_id: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        cursor = self.conn.execute(
+            """
+            INSERT INTO pool_operations (
+                market_hash_name, strategy, operation_type, status,
+                quantity, expected_price, asset_id, note, created_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+            """,
+            (market_hash_name, strategy, operation_type, quantity, expected_price, asset_id, note, now),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def update_pool_operation(
+        self,
+        op_id: int,
+        *,
+        status: str | None = None,
+        actual_price: float | None = None,
+    ) -> None:
+        parts: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            parts.append("status = ?")
+            params.append(status)
+            if status in ("completed", "failed"):
+                parts.append("completed_at = ?")
+                params.append(utc_now_iso())
+        if actual_price is not None:
+            parts.append("actual_price = ?")
+            params.append(actual_price)
+        if not parts:
+            return
+        params.append(op_id)
+        self.conn.execute(
+            f"UPDATE pool_operations SET {', '.join(parts)} WHERE id = ?",
+            tuple(params),
+        )
+        self.conn.commit()
+
+    def list_pool_operations(self, status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM pool_operations"
+        params: tuple[Any, ...] = ()
+        if status:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params = (*params, limit)
+        return self.conn.execute(sql, params).fetchall()
 
     def list_required_market_hash_names(self) -> list[str]:
         cursor = self.conn.execute(

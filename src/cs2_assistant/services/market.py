@@ -8,6 +8,7 @@ from cs2_assistant.utils import chunked, safe_float, safe_int
 
 DEFAULT_C5_SETTLEMENT_FACTOR = 0.869
 DEFAULT_STEAM_BALANCE_DISCOUNT = 0.73
+DEFAULT_STEAM_NET_FACTOR = 0.85  # CS2: seller receives ~85% after Steam 15% fee (5% Steam + 10% game)
 
 
 def _normalize_platform_name(name: str) -> str:
@@ -48,6 +49,55 @@ def calculate_t_yield_rate(
     if ratio is None:
         return None
     return ratio * c5_settlement_factor - steam_balance_discount
+
+
+# ---------------------------------------------------------------------------
+# Strategy formulas (inventory-pool based T-tool)
+# ---------------------------------------------------------------------------
+
+
+def calculate_steam_after_tax(
+    steam_sell_price: float | None,
+    *,
+    steam_net_factor: float = DEFAULT_STEAM_NET_FACTOR,
+) -> float | None:
+    """Steam 卖出后实际到手余额 = steam_sell_price × steam_net_factor"""
+    if steam_sell_price is None or steam_sell_price <= 0:
+        return None
+    return steam_sell_price * steam_net_factor
+
+
+def calculate_listing_ratio(
+    rebuy_price: float | None,
+    steam_sell_price: float | None,
+    *,
+    steam_net_factor: float = DEFAULT_STEAM_NET_FACTOR,
+) -> float | None:
+    """listing_ratio = rebuy_price / steam_after_tax_price
+
+    LOW → 挂刀做T 有利（Steam 卖出后，外部平台低价补仓）
+    """
+    if rebuy_price is None or steam_sell_price is None:
+        return None
+    steam_after_tax = steam_sell_price * steam_net_factor
+    if steam_after_tax <= 0:
+        return None
+    return rebuy_price / steam_after_tax
+
+
+def calculate_transfer_real_ratio(
+    listing_ratio: float | None,
+    *,
+    c5_settlement_factor: float = DEFAULT_C5_SETTLEMENT_FACTOR,
+    balance_discount: float = DEFAULT_STEAM_BALANCE_DISCOUNT,
+) -> float | None:
+    """transfer_real_ratio = listing_ratio × c5_settlement_factor - balance_discount
+
+    HIGH → 导余额做T 有利（利用低价余额赚钱）
+    """
+    if listing_ratio is None:
+        return None
+    return listing_ratio * c5_settlement_factor - balance_discount
 
 
 class MarketService:

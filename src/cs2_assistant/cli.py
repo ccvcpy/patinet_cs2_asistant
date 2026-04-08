@@ -13,11 +13,23 @@ from cs2_assistant.config import Settings, load_settings
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
+from cs2_assistant.models import (
+    STRATEGY_GUADAO,
+    STRATEGY_HOLD,
+    STRATEGY_LABELS,
+    STRATEGY_TRANSFER,
+    StrategyConfig,
+)
 from cs2_assistant.services.market import (
     DEFAULT_C5_SETTLEMENT_FACTOR,
     DEFAULT_STEAM_BALANCE_DISCOUNT,
     calculate_ratio,
     calculate_t_yield_rate,
+)
+from cs2_assistant.services.strategy import (
+    load_strategy_config,
+    save_strategy_config,
+    scan_strategies,
 )
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
@@ -1441,6 +1453,318 @@ def cmd_notify_t_profit(args: argparse.Namespace) -> int:
     return cmd_notify_t_yield(args)
 
 
+# ---------------------------------------------------------------------------
+# Pool / strategy commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_pool_scan(args: argparse.Namespace) -> int:
+    """Scan inventory pool and evaluate strategies for each item type."""
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+
+    # Override config from CLI args
+    if args.min_price is not None:
+        config.min_price = args.min_price
+    if args.guadao_max_ratio is not None:
+        config.guadao_max_listing_ratio = args.guadao_max_ratio
+    if args.transfer_min_ratio is not None:
+        config.transfer_min_real_ratio = args.transfer_min_ratio
+    if args.steam_net_factor is not None:
+        config.steam_net_factor = args.steam_net_factor
+    if args.top_n is not None:
+        config.top_n = args.top_n
+
+    report = scan_strategies(
+        settings,
+        config,
+        allow_cached_fallback=not args.no_cache_fallback,
+        cache_max_age_minutes=args.cache_max_age_minutes,
+    )
+
+    print(
+        f"扫描完成: {report.total_pool_types} 个饰品类型 | "
+        f"已评估 {len(report.all_evaluated)} 个 | "
+        f"缺价 {report.missing_price_count} 个"
+    )
+    print(
+        f"策略分布: 挂刀做T {report.guadao_count} 个 | "
+        f"导余额做T {report.transfer_count} 个 | "
+        f"持有 {report.hold_count} 个"
+    )
+    print(f"配置: listing_ratio ≤ {config.guadao_max_listing_ratio} → 挂刀 | "
+          f"transfer_real_ratio ≥ {config.transfer_min_real_ratio} → 导余额")
+    print()
+
+    # Show guadao candidates
+    top_n = config.top_n
+    if report.guadao_candidates:
+        print(f"=== 挂刀做T 候选 (listing_ratio 低优先, Top {top_n}) ===")
+        for i, c in enumerate(report.guadao_candidates[:top_n], 1):
+            strategies_str = "+".join(STRATEGY_LABELS.get(s, s) for s in c.recommended_strategies)
+            star = "★" if c.listing_ratio <= args.star_threshold else " "
+            print(
+                f"{star}{i:>3}. {c.name} | "
+                f"listing_ratio {c.listing_ratio:.4f} | "
+                f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
+                f"补仓 ¥{c.rebuy_price:.2f} | "
+                f"Steam ¥{c.steam_sell_price:.2f} → ¥{c.steam_after_tax_price:.2f} | "
+                f"余额差 ¥{c.guadao_profit_per_unit:.2f} | "
+                f"库存 {c.inventory_count} ({c.tradable_count}可交易) | "
+                f"策略 [{strategies_str}]"
+            )
+        print()
+
+    # Show transfer candidates
+    if report.transfer_candidates:
+        print(f"=== 导余额做T 候选 (transfer_real_ratio 高优先, Top {top_n}) ===")
+        for i, c in enumerate(report.transfer_candidates[:top_n], 1):
+            strategies_str = "+".join(STRATEGY_LABELS.get(s, s) for s in c.recommended_strategies)
+            star = "★" if c.transfer_real_ratio >= 0.10 else " "
+            print(
+                f"{star}{i:>3}. {c.name} | "
+                f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
+                f"listing_ratio {c.listing_ratio:.4f} | "
+                f"C5 ¥{c.rebuy_price:.2f} | "
+                f"Steam ¥{c.steam_sell_price:.2f} | "
+                f"导余额利润 ¥{c.transfer_profit_per_unit:.2f} | "
+                f"库存 {c.inventory_count} ({c.tradable_count}可交易) | "
+                f"策略 [{strategies_str}]"
+            )
+        print()
+
+    # Show hold items (no strategy fits)
+    if report.hold_items and args.show_hold:
+        print(f"=== 持有 (不满足任何策略, 共 {report.hold_count} 个) ===")
+        for i, c in enumerate(report.hold_items[:top_n], 1):
+            print(
+                f"  {i:>3}. {c.name} | "
+                f"listing_ratio {c.listing_ratio:.4f} | "
+                f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
+                f"C5 ¥{c.rebuy_price:.2f} | Steam ¥{c.steam_sell_price:.2f}"
+            )
+        print()
+
+    if args.dump_json:
+        _print_json({
+            "generatedAt": report.generated_at,
+            "inventorySource": report.inventory_source,
+            "config": config.to_dict(),
+            "totalPoolTypes": report.total_pool_types,
+            "missingPriceCount": report.missing_price_count,
+            "guadaoCandidates": [c.to_dict(rank=i) for i, c in enumerate(report.guadao_candidates[:top_n], 1)],
+            "transferCandidates": [c.to_dict(rank=i) for i, c in enumerate(report.transfer_candidates[:top_n], 1)],
+            "holdItems": [c.to_dict(rank=i) for i, c in enumerate(report.hold_items[:top_n], 1)],
+        })
+
+    # Save evaluations to DB
+    if args.save_eval:
+        db = _open_db(settings)
+        config_json = json.dumps(config.to_dict(), ensure_ascii=False)
+        for c in report.all_evaluated:
+            db.save_strategy_evaluation(
+                market_hash_name=c.market_hash_name,
+                rebuy_price=c.rebuy_price,
+                steam_sell_price=c.steam_sell_price,
+                steam_after_tax_price=c.steam_after_tax_price,
+                listing_ratio=c.listing_ratio,
+                transfer_real_ratio=c.transfer_real_ratio,
+                recommended_strategy=c.primary_strategy,
+                inventory_count=c.inventory_count,
+                tradable_count=c.tradable_count,
+                config_json=config_json,
+            )
+        db.close()
+        print(f"已保存 {len(report.all_evaluated)} 条策略评估记录到数据库。")
+
+    return 0
+
+
+def cmd_pool_sync(args: argparse.Namespace) -> int:
+    """Sync inventory pool from C5 inventory."""
+    settings = _settings_from_args(args)
+    if not settings.c5_api_key:
+        print("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。", file=sys.stderr)
+        return 1
+
+    from cs2_assistant.clients import C5GameClient
+    from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories, summarize_inventory_types
+
+    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+    inventory_payload = fetch_all_c5_inventories(
+        c5_client,
+        settings,
+        allow_cached_fallback=False,
+        cache_max_age_minutes=None,
+    )
+    all_types = summarize_inventory_types(list(inventory_payload.get("list") or []))
+    db = _open_db(settings)
+    count = db.sync_pool_from_inventory(all_types)
+    db.close()
+    print(f"底仓同步完成: {count} 个饰品类型已更新到 inventory_pool 表。")
+    return 0
+
+
+def cmd_pool_status(args: argparse.Namespace) -> int:
+    """Show current inventory pool status."""
+    settings = _settings_from_args(args)
+    db = _open_db(settings)
+    pool_items = db.list_pool_items(status=args.status_filter)
+    db.close()
+
+    if not pool_items:
+        print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
+        return 0
+
+    total_qty = 0
+    status_counts: dict[str, int] = {}
+    print(f"{'饰品名':<50} {'数量':>6} {'状态':<12} {'备注'}")
+    print("-" * 90)
+    for item in pool_items:
+        mhn = item["market_hash_name"]
+        qty = item["quantity"]
+        status = item["status"]
+        note = item["note"] or ""
+        total_qty += qty
+        status_counts[status] = status_counts.get(status, 0) + qty
+        from cs2_assistant.models import POOL_STATUS_LABELS
+        status_label = POOL_STATUS_LABELS.get(status, status)
+        print(f"{mhn:<50} {qty:>6} {status_label:<12} {note}")
+
+    print("-" * 90)
+    print(f"合计: {len(pool_items)} 个类型, {total_qty} 件")
+    for status, count in sorted(status_counts.items()):
+        from cs2_assistant.models import POOL_STATUS_LABELS
+        print(f"  {POOL_STATUS_LABELS.get(status, status)}: {count} 件")
+    return 0
+
+
+def cmd_pool_config(args: argparse.Namespace) -> int:
+    """Show or edit strategy config."""
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+
+    if args.edit:
+        print("配置策略参数（直接回车保留当前值）：")
+
+        def _prompt_float(label: str, current: float) -> float:
+            raw = input(f"  {label} [{current}]: ").strip()
+            if not raw:
+                return current
+            return float(raw)
+
+        def _prompt_int(label: str, current: int) -> int:
+            raw = input(f"  {label} [{current}]: ").strip()
+            if not raw:
+                return current
+            return int(raw)
+
+        config.steam_net_factor = _prompt_float("Steam 税后系数 (steam_net_factor)", config.steam_net_factor)
+        config.c5_settlement_factor = _prompt_float("C5 结算系数 (c5_settlement_factor)", config.c5_settlement_factor)
+        config.balance_discount = _prompt_float("余额折扣率 (balance_discount)", config.balance_discount)
+        config.guadao_max_listing_ratio = _prompt_float("挂刀阈值 listing_ratio ≤ (guadao_max_listing_ratio)", config.guadao_max_listing_ratio)
+        config.transfer_min_real_ratio = _prompt_float("导余额阈值 transfer_real_ratio ≥ (transfer_min_real_ratio)", config.transfer_min_real_ratio)
+        config.min_price = _prompt_float("最低价格过滤 (min_price)", config.min_price)
+        config.poll_interval_minutes = _prompt_int("轮询间隔分钟 (poll_interval_minutes)", config.poll_interval_minutes)
+        config.top_n = _prompt_int("每种策略输出前 N 个 (top_n)", config.top_n)
+
+        path = save_strategy_config(settings, config)
+        print(f"策略配置已保存到: {path}")
+    else:
+        print("当前策略配置:")
+        print(f"  Steam 税后系数 (steam_net_factor):       {config.steam_net_factor}")
+        print(f"  C5 结算系数 (c5_settlement_factor):      {config.c5_settlement_factor}")
+        print(f"  余额折扣率 (balance_discount):           {config.balance_discount}")
+        print(f"  挂刀阈值 (guadao_max_listing_ratio):     ≤ {config.guadao_max_listing_ratio}")
+        print(f"  导余额阈值 (transfer_min_real_ratio):    ≥ {config.transfer_min_real_ratio}")
+        print(f"  最低价格 (min_price):                    {config.min_price}")
+        print(f"  轮询间隔 (poll_interval_minutes):        {config.poll_interval_minutes}")
+        print(f"  输出数量 (top_n):                        {config.top_n}")
+        print()
+        print("公式说明:")
+        print("  listing_ratio = rebuy_price / (steam_sell_price × steam_net_factor)")
+        print("  transfer_real_ratio = listing_ratio × c5_settlement_factor - balance_discount")
+        print()
+        print("  listing_ratio 低 → 挂刀做T（卖 Steam，低价补仓，获得低价余额）")
+        print("  transfer_real_ratio 高 → 导余额做T（利用低价余额赚钱）")
+        print()
+        print(f"配置文件: {settings.db_path.parent / 'strategy_config.json'}")
+    return 0
+
+
+def cmd_pool_monitor(args: argparse.Namespace) -> int:
+    """Run continuous strategy monitoring."""
+    import time
+
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    interval = config.poll_interval_minutes * 60
+
+    print(f"底仓策略监控启动 | 轮询间隔 {config.poll_interval_minutes} 分钟")
+    print(f"挂刀阈值: listing_ratio ≤ {config.guadao_max_listing_ratio}")
+    print(f"导余额阈值: transfer_real_ratio ≥ {config.transfer_min_real_ratio}")
+    print()
+
+    serverchan_client = None
+    if settings.serverchan_sendkey:
+        from cs2_assistant.clients import ServerChanClient
+        serverchan_client = ServerChanClient(settings.serverchan_sendkey, settings.serverchan_base_url)
+
+    cycle = 0
+    while True:
+        cycle += 1
+        now_str = utc_now_iso()
+        print(f"[{now_str}] 第 {cycle} 轮扫描...")
+
+        try:
+            report = scan_strategies(settings, config)
+        except Exception as exc:
+            print(f"扫描失败: {exc}", file=sys.stderr)
+            time.sleep(interval)
+            continue
+
+        print(
+            f"  评估 {len(report.all_evaluated)} 个 | "
+            f"挂刀 {report.guadao_count} | 导余额 {report.transfer_count} | "
+            f"持有 {report.hold_count}"
+        )
+
+        # Alert on noteworthy candidates
+        alert_lines: list[str] = []
+        for c in report.guadao_candidates[:5]:
+            alert_lines.append(
+                f"挂刀 | {c.name} | ratio={c.listing_ratio:.4f} | "
+                f"补仓¥{c.rebuy_price:.2f} | Steam¥{c.steam_after_tax_price:.2f} | "
+                f"差额¥{c.guadao_profit_per_unit:.2f}"
+            )
+        for c in report.transfer_candidates[:5]:
+            alert_lines.append(
+                f"导余额 | {c.name} | ratio={c.transfer_real_ratio_pct:+.2f}% | "
+                f"C5¥{c.rebuy_price:.2f} | Steam¥{c.steam_sell_price:.2f} | "
+                f"利润¥{c.transfer_profit_per_unit:.2f}"
+            )
+
+        if alert_lines:
+            for line in alert_lines:
+                print(f"  {line}")
+
+            # Push notification
+            if serverchan_client and (report.guadao_count > 0 or report.transfer_count > 0):
+                title = f"底仓策略: 挂刀{report.guadao_count}个 导余额{report.transfer_count}个"
+                body = "\n".join(alert_lines)
+                try:
+                    serverchan_client.send(title, body)
+                    print("  ServerChan 推送成功")
+                except Exception as exc:
+                    print(f"  ServerChan 推送失败: {exc}", file=sys.stderr)
+
+        if args.once:
+            return 0
+
+        print(f"  下次扫描: {config.poll_interval_minutes} 分钟后")
+        time.sleep(interval)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CS2 理财助手 CLI",
@@ -1622,6 +1946,74 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_t_profit_parser("t-profit")
     add_t_profit_parser("t-yield", hidden=True)
+
+    # ---- pool (底仓策略) ----
+    pool = subparsers.add_parser(
+        "pool",
+        help="底仓策略系统（挂刀做T / 导余额做T）",
+        description=(
+            "基于固定库存池的自动化 T 工具。\n\n"
+            "两种策略共用同一批底仓:\n"
+            "  挂刀做T: listing_ratio 低 → 卖 Steam，低价补仓\n"
+            "  导余额做T: transfer_real_ratio 高 → 利用低价余额赚钱\n\n"
+            "常用:\n"
+            "  python .\\main.py pool scan\n"
+            "  python .\\main.py pool scan --top-n 20 --min-price 10\n"
+            "  python .\\main.py pool sync\n"
+            "  python .\\main.py pool status\n"
+            "  python .\\main.py pool config\n"
+            "  python .\\main.py pool config --edit\n"
+            "  python .\\main.py pool monitor\n"
+            "  python .\\main.py pool monitor --once"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    pool_subparsers = pool.add_subparsers(dest="pool_command", required=True)
+
+    pool_scan = pool_subparsers.add_parser(
+        "scan",
+        help="扫描底仓，评估挂刀/导余额策略",
+        description=(
+            "扫描所有绑定 Steam 账号的库存，计算 listing_ratio 和 transfer_real_ratio，\n"
+            "将每个饰品分类到挂刀做T / 导余额做T / 持有。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    pool_scan.add_argument("--min-price", type=float, default=None, help="最低价格过滤（覆盖配置文件）")
+    pool_scan.add_argument("--guadao-max-ratio", type=float, default=None, help="挂刀 listing_ratio 阈值（覆盖配置文件）")
+    pool_scan.add_argument("--transfer-min-ratio", type=float, default=None, help="导余额 transfer_real_ratio 阈值（覆盖配置文件）")
+    pool_scan.add_argument("--steam-net-factor", type=float, default=None, help="Steam 税后系数（覆盖配置文件）")
+    pool_scan.add_argument("--top-n", type=int, default=None, help="每种策略输出前 N 个")
+    pool_scan.add_argument("--star-threshold", type=float, default=0.90, help="listing_ratio 低于该值时标星")
+    pool_scan.add_argument("--show-hold", action="store_true", help="显示持有（不满足任何策略）的饰品")
+    pool_scan.add_argument("--cache-max-age-minutes", type=int, default=180, help="库存缓存最大时长")
+    pool_scan.add_argument("--no-cache-fallback", action="store_true", help="不回退到缓存")
+    pool_scan.add_argument("--save-eval", action="store_true", help="保存评估记录到数据库")
+    pool_scan.add_argument("--dump-json", action="store_true", help="输出 JSON 结果")
+    pool_scan.set_defaults(handler=cmd_pool_scan)
+
+    pool_sync = pool_subparsers.add_parser("sync", help="从 C5 库存同步底仓")
+    pool_sync.set_defaults(handler=cmd_pool_sync)
+
+    pool_status = pool_subparsers.add_parser("status", help="查看底仓状态")
+    pool_status.add_argument("--status-filter", default=None, help="按状态过滤: holding, listed, sold, pending_rebuy")
+    pool_status.set_defaults(handler=cmd_pool_status)
+
+    pool_config = pool_subparsers.add_parser(
+        "config",
+        help="查看或编辑策略配置",
+        description="查看或交互式编辑策略参数（阈值、系数等）。",
+    )
+    pool_config.add_argument("--edit", action="store_true", help="交互式编辑配置")
+    pool_config.set_defaults(handler=cmd_pool_config)
+
+    pool_monitor = pool_subparsers.add_parser(
+        "monitor",
+        help="持续监控底仓策略",
+        description="按配置的轮询间隔持续扫描底仓策略，发现机会时通过 ServerChan 推送。",
+    )
+    pool_monitor.add_argument("--once", action="store_true", help="仅执行一次后退出")
+    pool_monitor.set_defaults(handler=cmd_pool_monitor)
 
     notify = subparsers.add_parser(
         "notify",
