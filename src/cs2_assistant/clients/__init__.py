@@ -1,6 +1,7 @@
 from cs2_assistant.clients.c5game import C5GameClient, C5GameError
 from cs2_assistant.clients.csqaq import CSQAQClient, CSQAQError
 from cs2_assistant.clients.serverchan import ServerChanClient, ServerChanError
+from cs2_assistant.clients.steam_market import SteamMarketClient, SteamMarketError
 from cs2_assistant.clients.steamdt import SteamDTClient, SteamDTError
 
 __all__ = [
@@ -10,6 +11,8 @@ __all__ = [
     "CSQAQError",
     "ServerChanClient",
     "ServerChanError",
+    "SteamMarketClient",
+    "SteamMarketError",
     "SteamDTClient",
     "SteamDTError",
 ]

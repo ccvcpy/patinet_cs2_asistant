@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from cs2_assistant.catalog import load_steamdt_catalog
-from cs2_assistant.clients import C5GameClient, CSQAQClient, ServerChanClient, SteamDTClient
+from cs2_assistant.clients import (
+    C5GameClient,
+    CSQAQClient,
+    ServerChanClient,
+    SteamDTClient,
+    SteamMarketClient,
+)
 from cs2_assistant.config import Settings, load_settings
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
@@ -31,6 +37,7 @@ from cs2_assistant.services.strategy import (
     save_strategy_config,
     scan_strategies,
 )
+from cs2_assistant.services.executor_engine import ExecutionEngine
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
     INVENTORY_FILTER_ALL,
@@ -58,6 +65,18 @@ def _open_db(settings: Settings) -> Database:
     db = Database(settings.db_path)
     db.initialize()
     return db
+
+
+def _build_steam_client(settings: Settings) -> SteamMarketClient:
+    if not settings.steam_cookies or not settings.steam_id64:
+        raise RuntimeError("missing STEAM_COOKIES / STEAM_ID64")
+    return SteamMarketClient(
+        cookies=settings.steam_cookies,
+        steam_id64=settings.steam_id64,
+        identity_secret=settings.steam_identity_secret,
+        device_id=settings.steam_device_id,
+        base_url=settings.steam_market_base_url,
+    )
 
 
 def _print_json(payload: Any) -> None:
@@ -1461,6 +1480,12 @@ def cmd_notify_t_profit(args: argparse.Namespace) -> int:
 def cmd_pool_scan(args: argparse.Namespace) -> int:
     """Scan inventory pool and evaluate strategies for each item type."""
     settings = _settings_from_args(args)
+    db = _open_db(settings)
+    pool_names = db.get_pool_market_hash_names()
+    db.close()
+    if not pool_names:
+        print("Pool is empty. Run `pool sync` first.")
+        return 0
     config = load_strategy_config(settings)
 
     # Override config from CLI args
@@ -1480,6 +1505,7 @@ def cmd_pool_scan(args: argparse.Namespace) -> int:
         config,
         allow_cached_fallback=not args.no_cache_fallback,
         cache_max_age_minutes=args.cache_max_age_minutes,
+        pool_market_hash_names=pool_names,
     )
 
     print(
@@ -1600,8 +1626,12 @@ def cmd_pool_sync(args: argparse.Namespace) -> int:
     all_types = summarize_inventory_types(list(inventory_payload.get("list") or []))
     db = _open_db(settings)
     count = db.sync_pool_from_inventory(all_types)
+    asset_count = db.upsert_inventory_assets(list(inventory_payload.get("list") or []))
     db.close()
-    print(f"底仓同步完成: {count} 个饰品类型已更新到 inventory_pool 表。")
+    print(
+        f"Pool sync completed: {count} item types updated; "
+        f"{asset_count} assets cached."
+    )
     return 0
 
 
@@ -1697,6 +1727,12 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
     import time
 
     settings = _settings_from_args(args)
+    db = _open_db(settings)
+    pool_names = db.get_pool_market_hash_names()
+    db.close()
+    if not pool_names:
+        print("Pool is empty. Run `pool sync` first.")
+        return 0
     config = load_strategy_config(settings)
     interval = config.poll_interval_minutes * 60
 
@@ -1717,7 +1753,7 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
         print(f"[{now_str}] 第 {cycle} 轮扫描...")
 
         try:
-            report = scan_strategies(settings, config)
+            report = scan_strategies(settings, config, pool_market_hash_names=pool_names)
         except Exception as exc:
             print(f"扫描失败: {exc}", file=sys.stderr)
             time.sleep(interval)
@@ -1763,6 +1799,62 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
 
         print(f"  下次扫描: {config.poll_interval_minutes} 分钟后")
         time.sleep(interval)
+
+
+def cmd_executor_start(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    if args.enable:
+        config.execution_enabled = True
+    if args.disable:
+        config.execution_enabled = False
+    if args.dry_run:
+        config.dry_run = True
+    if args.no_dry_run:
+        config.dry_run = False
+    if args.max_list is not None:
+        config.max_list_per_cycle = args.max_list
+    if args.max_buy is not None:
+        config.max_buy_per_cycle = args.max_buy
+
+    engine = ExecutionEngine(settings, config, dry_run_override=None)
+    try:
+        engine.run(once=args.once)
+    finally:
+        engine.close()
+    return 0
+
+
+def cmd_steam_auth_check(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    client = _build_steam_client(settings)
+    payload = client.my_listings(count=1)
+    if not payload or payload.get("success") not in (1, True):
+        print("Steam auth failed.")
+        return 1
+    print("Steam auth OK.")
+    return 0
+
+
+def cmd_steam_listings(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    client = _build_steam_client(settings)
+    listings = client.list_active_listings(count=args.count)
+    print(f"Active listings: {len(listings)}")
+    for listing in listings[: args.count]:
+        print(
+            f"- {listing.market_hash_name or '-'} | listing={listing.listing_id} | "
+            f"asset={listing.asset_id or '-'} | price={listing.price or '-'}"
+        )
+    return 0
+
+
+def cmd_steam_confirm(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    client = _build_steam_client(settings)
+    count = client.confirm_all()
+    print(f"Confirmed {count} listings.")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2014,6 +2106,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pool_monitor.add_argument("--once", action="store_true", help="仅执行一次后退出")
     pool_monitor.set_defaults(handler=cmd_pool_monitor)
+
+    # ---- executor ----
+    executor = subparsers.add_parser(
+        "executor",
+        help="Auto execution runner",
+        description="Run automated execution (Steam sell + C5 rebuy).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    executor_subparsers = executor.add_subparsers(dest="executor_command", required=True)
+
+    executor_start = executor_subparsers.add_parser(
+        "start",
+        help="Start execution loop",
+        description="Run scan + execute loop.",
+    )
+    executor_start.add_argument("--once", action="store_true", help="Run once and exit")
+    executor_start.add_argument("--dry-run", action="store_true", help="Force dry run")
+    executor_start.add_argument("--no-dry-run", action="store_true", help="Force real execution")
+    executor_start.add_argument("--enable", action="store_true", help="Enable execution for this run")
+    executor_start.add_argument("--disable", action="store_true", help="Disable execution for this run")
+    executor_start.add_argument("--max-list", type=int, help="Max listings per cycle")
+    executor_start.add_argument("--max-buy", type=int, help="Max rebuy per cycle")
+    executor_start.set_defaults(handler=cmd_executor_start)
+
+    # ---- steam tools ----
+    steam = subparsers.add_parser(
+        "steam",
+        help="Steam tools",
+        description="Steam market auth/listings/confirm helpers.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    steam_subparsers = steam.add_subparsers(dest="steam_command", required=True)
+
+    steam_auth = steam_subparsers.add_parser("auth-check", help="Check Steam auth")
+    steam_auth.set_defaults(handler=cmd_steam_auth_check)
+
+    steam_listings = steam_subparsers.add_parser("listings", help="List Steam listings")
+    steam_listings.add_argument("--count", type=int, default=20)
+    steam_listings.set_defaults(handler=cmd_steam_listings)
+
+    steam_confirm = steam_subparsers.add_parser("confirm", help="Confirm pending listings")
+    steam_confirm.set_defaults(handler=cmd_steam_confirm)
 
     notify = subparsers.add_parser(
         "notify",

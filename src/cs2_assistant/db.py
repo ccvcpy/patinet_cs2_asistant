@@ -155,6 +155,26 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_inventory_pool_status
             ON inventory_pool(status);
 
+            CREATE TABLE IF NOT EXISTS inventory_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id TEXT NOT NULL UNIQUE,
+                market_hash_name TEXT NOT NULL,
+                steam_id TEXT,
+                tradable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'available',
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_assets_mhn
+            ON inventory_assets(market_hash_name);
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_assets_status
+            ON inventory_assets(status);
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_assets_steam
+            ON inventory_assets(steam_id);
+
             CREATE TABLE IF NOT EXISTS strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_hash_name TEXT NOT NULL,
@@ -679,6 +699,79 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_pool_status(self, market_hash_name: str, status: str) -> None:
+        now = utc_now_iso()
+        self.conn.execute(
+            "UPDATE inventory_pool SET status = ?, updated_at = ? WHERE market_hash_name = ?",
+            (status, now, market_hash_name),
+        )
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Inventory assets (per-asset tracking for execution)
+    # ------------------------------------------------------------------
+
+    def upsert_inventory_assets(self, items: list[dict[str, Any]]) -> int:
+        now = utc_now_iso()
+        rows: list[tuple[Any, ...]] = []
+        for item in items:
+            asset_id = str(item.get("assetId") or "").strip()
+            market_hash_name = str(item.get("marketHashName") or "").strip()
+            if not asset_id or not market_hash_name:
+                continue
+            steam_id = str(item.get("steamId") or "").strip() or None
+            tradable = 1 if item.get("ifTradable") is True else 0
+            status = "available" if tradable else "locked"
+            rows.append((asset_id, market_hash_name, steam_id, tradable, status, now, now))
+        if not rows:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO inventory_assets (
+                asset_id, market_hash_name, steam_id, tradable, status, last_seen_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset_id) DO UPDATE SET
+                market_hash_name = excluded.market_hash_name,
+                steam_id = excluded.steam_id,
+                tradable = excluded.tradable,
+                status = CASE
+                    WHEN inventory_assets.status IN ('listed', 'sold') THEN inventory_assets.status
+                    ELSE excluded.status
+                END,
+                last_seen_at = excluded.last_seen_at
+            """,
+            rows,
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def pick_tradable_asset(
+        self,
+        market_hash_name: str,
+        *,
+        steam_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        sql = """
+            SELECT asset_id, market_hash_name, steam_id
+            FROM inventory_assets
+            WHERE market_hash_name = ?
+              AND tradable = 1
+              AND status = 'available'
+        """
+        params: list[Any] = [market_hash_name]
+        if steam_id:
+            sql += " AND steam_id = ?"
+            params.append(steam_id)
+        sql += " ORDER BY asset_id ASC LIMIT 1"
+        return self.conn.execute(sql, tuple(params)).fetchone()
+
+    def set_asset_status(self, asset_id: str, status: str) -> None:
+        self.conn.execute(
+            "UPDATE inventory_assets SET status = ?, last_seen_at = ? WHERE asset_id = ?",
+            (status, utc_now_iso(), asset_id),
+        )
+        self.conn.commit()
+
     # ------------------------------------------------------------------
     # Strategy evaluations
     # ------------------------------------------------------------------
@@ -796,6 +889,22 @@ class Database:
         sql += " ORDER BY created_at DESC LIMIT ?"
         params = (*params, limit)
         return self.conn.execute(sql, params).fetchall()
+
+    def list_pool_operations_by_type(
+        self,
+        operation_type: str,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM pool_operations WHERE operation_type = ?"
+        params: list[Any] = [operation_type]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return self.conn.execute(sql, tuple(params)).fetchall()
 
     def list_required_market_hash_names(self) -> list[str]:
         cursor = self.conn.execute(

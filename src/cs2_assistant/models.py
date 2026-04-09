@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,37 +61,41 @@ class NotificationMessage:
 # Strategy models (inventory-pool based T-tool)
 # ---------------------------------------------------------------------------
 
-STRATEGY_GUADAO = "guadao"        # 挂刀做T
-STRATEGY_TRANSFER = "transfer"    # 导余额做T
-STRATEGY_HOLD = "hold"            # 持有不动（不满足任何策略）
+STRATEGY_GUADAO = "guadao"        # 鎸傚垁鍋歍
+STRATEGY_TRANSFER = "transfer"    # 瀵间綑棰濆仛T
+STRATEGY_HOLD = "hold"            # 鎸佹湁涓嶅姩锛堜笉婊¤冻浠讳綍绛栫暐锛?
 
 STRATEGY_LABELS: dict[str, str] = {
-    STRATEGY_GUADAO: "挂刀做T",
-    STRATEGY_TRANSFER: "导余额做T",
-    STRATEGY_HOLD: "持有",
+    STRATEGY_GUADAO: "鎸傚垁鍋歍",
+    STRATEGY_TRANSFER: "瀵间綑棰濆仛T",
+    STRATEGY_HOLD: "鎸佹湁",
 }
 
-POOL_STATUS_HOLDING = "holding"           # 持有中
-POOL_STATUS_LISTED = "listed"             # 已挂卖 Steam
-POOL_STATUS_SOLD = "sold"                 # 已卖出
-POOL_STATUS_PENDING_REBUY = "pending_rebuy"  # 待补仓
+POOL_STATUS_HOLDING = "holding"           # 鎸佹湁涓?
+POOL_STATUS_LISTING_PENDING = "listing_pending"  # 挂卖待确认
+POOL_STATUS_LISTED = "listed"             # 宸叉寕鍗?Steam
+POOL_STATUS_SOLD = "sold"                 # 宸插崠鍑?
+POOL_STATUS_PENDING_REBUY = "pending_rebuy"  # 寰呰ˉ浠?
+POOL_STATUS_REBUY_FAILED = "rebuy_failed"     # 补仓失败
 
 POOL_STATUS_LABELS: dict[str, str] = {
-    POOL_STATUS_HOLDING: "持有中",
-    POOL_STATUS_LISTED: "已挂卖",
-    POOL_STATUS_SOLD: "已卖出",
-    POOL_STATUS_PENDING_REBUY: "待补仓",
+    POOL_STATUS_LISTING_PENDING: "listing_pending",
+    POOL_STATUS_REBUY_FAILED: "rebuy_failed",
+    POOL_STATUS_HOLDING: "holding",
+    POOL_STATUS_LISTED: "listed",
+    POOL_STATUS_SOLD: "sold",
+    POOL_STATUS_PENDING_REBUY: "pending_rebuy",
 }
 
-OP_SELL_STEAM = "sell_on_steam"       # 在 Steam 挂卖
-OP_REBUY_C5 = "rebuy_on_c5"          # 在 C5 补仓
-OP_TRANSFER_BUY = "transfer_buy"     # 导余额：用余额在 Steam 买入
-OP_TRANSFER_SELL = "transfer_sell"   # 导余额：在 C5 卖出
+OP_SELL_STEAM = "sell_on_steam"       # 鍦?Steam 鎸傚崠
+OP_REBUY_C5 = "rebuy_on_c5"          # 鍦?C5 琛ヤ粨
+OP_TRANSFER_BUY = "transfer_buy"     # 瀵间綑棰濓細鐢ㄤ綑棰濆湪 Steam 涔板叆
+OP_TRANSFER_SELL = "transfer_sell"   # 瀵间綑棰濓細鍦?C5 鍗栧嚭
 
 
 @dataclass(slots=True)
 class StrategyConfig:
-    """策略配置"""
+    #
     steam_net_factor: float = 0.85
     c5_settlement_factor: float = 0.869
     balance_discount: float = 0.73
@@ -100,6 +104,21 @@ class StrategyConfig:
     min_price: float = 10.0
     poll_interval_minutes: int = 30
     top_n: int = 20
+    execution_enabled: bool = False
+    auto_list_enabled: bool = True
+    auto_rebuy_enabled: bool = True
+    price_tolerance_pct: float = 2.0
+    max_list_per_cycle: int = 5
+    max_buy_per_cycle: int = 3
+    cycle_interval_minutes: int = 15
+    listing_check_interval_minutes: int = 5
+    dry_run: bool = True
+    steam_context_id: str = "2"
+    steam_currency: int = 23
+    steam_country: str = "CN"
+    steam_language: str = "schinese"
+    listing_wall_min_count: int = 20
+    listing_price_offset: float = 0.01
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,10 +130,34 @@ class StrategyConfig:
             "minPrice": self.min_price,
             "pollIntervalMinutes": self.poll_interval_minutes,
             "topN": self.top_n,
+            "executionEnabled": self.execution_enabled,
+            "autoListEnabled": self.auto_list_enabled,
+            "autoRebuyEnabled": self.auto_rebuy_enabled,
+            "priceTolerancePct": self.price_tolerance_pct,
+            "maxListPerCycle": self.max_list_per_cycle,
+            "maxBuyPerCycle": self.max_buy_per_cycle,
+            "cycleIntervalMinutes": self.cycle_interval_minutes,
+            "listingCheckIntervalMinutes": self.listing_check_interval_minutes,
+            "dryRun": self.dry_run,
+            "steamContextId": self.steam_context_id,
+            "steamCurrency": self.steam_currency,
+            "steamCountry": self.steam_country,
+            "steamLanguage": self.steam_language,
+            "listingWallMinCount": self.listing_wall_min_count,
+            "listingPriceOffset": self.listing_price_offset,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StrategyConfig":
+        def _as_bool(value: Any, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return default
+
         return cls(
             steam_net_factor=float(data.get("steamNetFactor", 0.85)),
             c5_settlement_factor=float(data.get("c5SettlementFactor", 0.869)),
@@ -124,12 +167,27 @@ class StrategyConfig:
             min_price=float(data.get("minPrice", 10.0)),
             poll_interval_minutes=int(data.get("pollIntervalMinutes", 30)),
             top_n=int(data.get("topN", 20)),
+            execution_enabled=_as_bool(data.get("executionEnabled"), False),
+            auto_list_enabled=_as_bool(data.get("autoListEnabled"), True),
+            auto_rebuy_enabled=_as_bool(data.get("autoRebuyEnabled"), True),
+            price_tolerance_pct=float(data.get("priceTolerancePct", 2.0)),
+            max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
+            max_buy_per_cycle=int(data.get("maxBuyPerCycle", 3)),
+            cycle_interval_minutes=int(data.get("cycleIntervalMinutes", 15)),
+            listing_check_interval_minutes=int(data.get("listingCheckIntervalMinutes", 5)),
+            dry_run=_as_bool(data.get("dryRun"), True),
+            steam_context_id=str(data.get("steamContextId", "2")),
+            steam_currency=int(data.get("steamCurrency", 23)),
+            steam_country=str(data.get("steamCountry", "CN")),
+            steam_language=str(data.get("steamLanguage", "schinese")),
+            listing_wall_min_count=int(data.get("listingWallMinCount", 20)),
+            listing_price_offset=float(data.get("listingPriceOffset", 0.01)),
         )
 
 
 @dataclass(slots=True)
 class StrategyCandidate:
-    """单个饰品的策略评估结果"""
+    #
     name: str
     market_hash_name: str
     inventory_count: int
@@ -196,7 +254,7 @@ class StrategyCandidate:
 
 @dataclass(slots=True)
 class StrategyScanReport:
-    """策略扫描报告"""
+    # Strategy scan report
     generated_at: str
     inventory_source: str
     config: StrategyConfig

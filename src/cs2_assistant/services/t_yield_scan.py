@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient
+from cs2_assistant.clients import C5GameClient, C5GameError, CSQAQClient, SteamDTClient
 from cs2_assistant.config import Settings
 from cs2_assistant.services.market import (
     DEFAULT_C5_SETTLEMENT_FACTOR,
@@ -431,7 +431,13 @@ def _fetch_single_inventory(
     account: dict[str, Any],
 ) -> dict[str, Any]:
     steam_id = str(account["steamId"])
-    inventory = client.inventory(steam_id, app_id=settings.app_id)
+    try:
+        inventory = client.inventory(steam_id, app_id=settings.app_id)
+    except C5GameError as exc:
+        if _is_empty_inventory_error(exc):
+            inventory = {"list": [], "total": 0}
+        else:
+            raise
     items = inventory.get("list") or []
     if not isinstance(items, list):
         items = []
@@ -443,6 +449,22 @@ def _fetch_single_inventory(
         "autoType": account.get("autoType"),
         "total": inventory_total if inventory_total is not None else len(items),
         "list": items,
+    }
+
+
+def _is_empty_inventory_error(exc: Exception) -> bool:
+    message = str(exc)
+    return ("库存为空" in message) or ("206003" in message)
+
+
+def _empty_inventory(account: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "steamId": str(account.get("steamId") or ""),
+        "nickname": account.get("nickname"),
+        "username": account.get("username"),
+        "autoType": account.get("autoType"),
+        "total": 0,
+        "list": [],
     }
 
 
@@ -474,10 +496,15 @@ def fetch_all_c5_inventories(
     try:
         max_workers = min(4, len(accounts))
         if max_workers <= 1:
-            fetched_inventories = [
-                _fetch_single_inventory(client, settings, account)
-                for account in accounts
-            ]
+            fetched_inventories = []
+            for account in accounts:
+                try:
+                    fetched_inventories.append(_fetch_single_inventory(client, settings, account))
+                except C5GameError as exc:
+                    if _is_empty_inventory_error(exc):
+                        fetched_inventories.append(_empty_inventory(account))
+                    else:
+                        raise
         else:
             inventory_by_steam_id: dict[str, dict[str, Any]] = {}
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -487,7 +514,17 @@ def fetch_all_c5_inventories(
                 }
                 for future in as_completed(future_map):
                     steam_id = future_map[future]
-                    inventory_by_steam_id[steam_id] = future.result()
+                    try:
+                        inventory_by_steam_id[steam_id] = future.result()
+                    except C5GameError as exc:
+                        if _is_empty_inventory_error(exc):
+                            account = next(
+                                (row for row in accounts if str(row.get("steamId")) == steam_id),
+                                None,
+                            )
+                            inventory_by_steam_id[steam_id] = _empty_inventory(account or {"steamId": steam_id})
+                        else:
+                            raise
             fetched_inventories = [
                 inventory_by_steam_id[str(account["steamId"])]
                 for account in accounts

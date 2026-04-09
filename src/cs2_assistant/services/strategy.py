@@ -121,6 +121,7 @@ def scan_strategies(
     *,
     allow_cached_fallback: bool = True,
     cache_max_age_minutes: int | None = 180,
+    pool_market_hash_names: list[str] | None = None,
 ) -> StrategyScanReport:
     """Scan the inventory pool and evaluate strategies for each item type.
 
@@ -147,6 +148,13 @@ def scan_strategies(
     all_inventory_types = summarize_inventory_types(
         list(inventory_payload.get("list") or [])
     )
+    if pool_market_hash_names is not None:
+        pool_set = {str(name).strip() for name in pool_market_hash_names if str(name).strip()}
+        all_inventory_types = [
+            row for row in all_inventory_types if row.get("market_hash_name") in pool_set
+        ]
+
+    pool_total = len(pool_market_hash_names) if pool_market_hash_names is not None else len(all_inventory_types)
 
     if not all_inventory_types:
         return StrategyScanReport(
@@ -157,7 +165,7 @@ def scan_strategies(
             transfer_candidates=[],
             hold_items=[],
             all_evaluated=[],
-            total_pool_types=0,
+            total_pool_types=pool_total,
             missing_price_count=0,
         )
 
@@ -275,6 +283,6 @@ def scan_strategies(
         transfer_candidates=transfer_candidates,
         hold_items=hold_items,
         all_evaluated=all_evaluated,
-        total_pool_types=len(all_inventory_types),
+        total_pool_types=pool_total,
         missing_price_count=missing_price_count,
     )

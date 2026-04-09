@@ -12,6 +12,7 @@ DEFAULT_SERVERCHAN_BASE_URL = "https://sctapi.ftqq.com"
 DEFAULT_C5_BASE_URL = "https://openapi.c5game.com"
 DEFAULT_STEAMDT_BASE_URL = "https://open.steamdt.com"
 DEFAULT_CSQAQ_BASE_URL = "https://api.csqaq.com"
+DEFAULT_STEAM_MARKET_BASE_URL = "https://steamcommunity.com"
 DEFAULT_CSGO_APP_ID = 730
 
 
@@ -60,7 +61,12 @@ class Settings:
     c5_base_url: str = DEFAULT_C5_BASE_URL
     steamdt_base_url: str = DEFAULT_STEAMDT_BASE_URL
     csqaq_base_url: str = DEFAULT_CSQAQ_BASE_URL
+    steam_market_base_url: str = DEFAULT_STEAM_MARKET_BASE_URL
     app_id: int = DEFAULT_CSGO_APP_ID
+    steam_cookies: str | None = None
+    steam_id64: str | None = None
+    steam_identity_secret: str | None = None
+    steam_device_id: str | None = None
 
 
 def load_settings() -> Settings:
@@ -83,4 +89,9 @@ def load_settings() -> Settings:
         c5_base_url=_first_env("C5GAME_BASE_URL") or DEFAULT_C5_BASE_URL,
         steamdt_base_url=_first_env("STEAMDT_BASE_URL") or DEFAULT_STEAMDT_BASE_URL,
         csqaq_base_url=_first_env("CSQAQ_BASE_URL") or DEFAULT_CSQAQ_BASE_URL,
+        steam_market_base_url=_first_env("STEAM_MARKET_BASE_URL") or DEFAULT_STEAM_MARKET_BASE_URL,
+        steam_cookies=_first_env("STEAM_COOKIES"),
+        steam_id64=_first_env("STEAM_ID64"),
+        steam_identity_secret=_first_env("STEAM_IDENTITY_SECRET"),
+        steam_device_id=_first_env("STEAM_DEVICE_ID"),
     )
