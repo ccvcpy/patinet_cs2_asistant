@@ -15,6 +15,7 @@ from cs2_assistant.clients import (
     SteamDTClient,
     SteamMarketClient,
 )
+from cs2_assistant.clients.steam_market import SteamMarketError
 from cs2_assistant.config import Settings, load_settings
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
@@ -38,6 +39,11 @@ from cs2_assistant.services.strategy import (
     scan_strategies,
 )
 from cs2_assistant.services.executor_engine import ExecutionEngine
+from cs2_assistant.services.pricing import (
+    clear_pricing_cache,
+    fetch_listing_price,
+    get_pricing_cache_snapshot,
+)
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
     INVENTORY_FILTER_ALL,
@@ -68,11 +74,11 @@ def _open_db(settings: Settings) -> Database:
 
 
 def _build_steam_client(settings: Settings) -> SteamMarketClient:
-    if not settings.steam_cookies or not settings.steam_id64:
-        raise RuntimeError("missing STEAM_COOKIES / STEAM_ID64")
+    if not settings.steam_cookies:
+        raise RuntimeError("missing STEAM_COOKIES")
     return SteamMarketClient(
         cookies=settings.steam_cookies,
-        steam_id64=settings.steam_id64,
+        steam_id64=None,
         identity_secret=settings.steam_identity_secret,
         device_id=settings.steam_device_id,
         base_url=settings.steam_market_base_url,
@@ -108,7 +114,7 @@ def _resolve_c5_steam_id(client: C5GameClient, provided_steam_id: str | None) ->
             if steam_id:
                 return steam_id
 
-    raise RuntimeError("鏈兘浠?C5 璐﹀彿淇℃伅閲岃В鏋愬埌 Steam ID锛岃鎵嬪姩浼犲叆 --steam-id")
+    raise RuntimeError("未能从 C5 账号信息里解析到 Steam ID，请手动传入 --steam-id")
 
 
 def _list_c5_steam_accounts(client: C5GameClient) -> list[dict[str, Any]]:
@@ -211,7 +217,7 @@ def _fetch_all_c5_inventories(
             cached_payload = _load_inventory_cache(settings)
             if cached_payload is not None:
                 return cached_payload
-        raise RuntimeError("鏈壘鍒扮粦瀹氱殑 Steam 璐﹀彿")
+        raise RuntimeError("未找到绑定的 Steam 账号。")
 
     inventories: list[dict[str, Any]] = []
     merged_items: list[dict[str, Any]] = []
@@ -855,7 +861,7 @@ def cmd_c5_quick_buy(args: argparse.Namespace) -> int:
     _print_json(payload)
 
     if not args.yes:
-        confirm = input("杈撳叆 YES 纭涓嬪崟锛屽叾瀹冧换鎰忛敭鍙栨秷: ")
+        confirm = input("输入 YES 确认下单，其它任意键取消: ")
         if confirm != "YES":
             print("已取消。")
             return 0
@@ -1525,51 +1531,54 @@ def cmd_pool_scan(args: argparse.Namespace) -> int:
     # Show guadao candidates
     top_n = config.top_n
     if report.guadao_candidates:
-        print(f"=== 挂刀做T 候选 (listing_ratio 低优先, Top {top_n}) ===")
+        lines = [f"=== 挂刀做T 候选 (listing_ratio 低优先, Top {top_n}) ==="]
         for i, c in enumerate(report.guadao_candidates[:top_n], 1):
             strategies_str = "+".join(STRATEGY_LABELS.get(s, s) for s in c.recommended_strategies)
+            account_summary = "、".join(c.steam_accounts) if c.steam_accounts else "未知"
             star = "★" if c.listing_ratio <= args.star_threshold else " "
-            print(
+            lines.append(
                 f"{star}{i:>3}. {c.name} | "
                 f"listing_ratio {c.listing_ratio:.4f} | "
                 f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
                 f"补仓 ¥{c.rebuy_price:.2f} | "
                 f"Steam ¥{c.steam_sell_price:.2f} → ¥{c.steam_after_tax_price:.2f} | "
-                f"余额差 ¥{c.guadao_profit_per_unit:.2f} | "
                 f"库存 {c.inventory_count} ({c.tradable_count}可交易) | "
-                f"策略 [{strategies_str}]"
+                f"账号 {account_summary}"
             )
-        print()
+        lines.append("")
+        sys.stdout.write("\n".join(lines) + "\n")
 
     # Show transfer candidates
     if report.transfer_candidates:
-        print(f"=== 导余额做T 候选 (transfer_real_ratio 高优先, Top {top_n}) ===")
+        lines = [f"=== 导余额做T 候选 (transfer_real_ratio 高优先, Top {top_n}) ==="]
         for i, c in enumerate(report.transfer_candidates[:top_n], 1):
             strategies_str = "+".join(STRATEGY_LABELS.get(s, s) for s in c.recommended_strategies)
+            account_summary = "、".join(c.steam_accounts) if c.steam_accounts else "未知"
             star = "★" if c.transfer_real_ratio >= 0.10 else " "
-            print(
+            lines.append(
                 f"{star}{i:>3}. {c.name} | "
                 f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
                 f"listing_ratio {c.listing_ratio:.4f} | "
                 f"C5 ¥{c.rebuy_price:.2f} | "
                 f"Steam ¥{c.steam_sell_price:.2f} | "
-                f"导余额利润 ¥{c.transfer_profit_per_unit:.2f} | "
                 f"库存 {c.inventory_count} ({c.tradable_count}可交易) | "
-                f"策略 [{strategies_str}]"
+                f"账号 {account_summary}"
             )
-        print()
+        lines.append("")
+        sys.stdout.write("\n".join(lines) + "\n")
 
     # Show hold items (no strategy fits)
     if report.hold_items and args.show_hold:
-        print(f"=== 持有 (不满足任何策略, 共 {report.hold_count} 个) ===")
+        lines = [f"=== 持有 (不满足任何策略, 共 {report.hold_count} 个) ==="]
         for i, c in enumerate(report.hold_items[:top_n], 1):
-            print(
+            lines.append(
                 f"  {i:>3}. {c.name} | "
                 f"listing_ratio {c.listing_ratio:.4f} | "
                 f"transfer_ratio {c.transfer_real_ratio_pct:+.2f}% | "
                 f"C5 ¥{c.rebuy_price:.2f} | Steam ¥{c.steam_sell_price:.2f}"
             )
-        print()
+        lines.append("")
+        sys.stdout.write("\n".join(lines) + "\n")
 
     if args.dump_json:
         _print_json({
@@ -1667,6 +1676,10 @@ def cmd_pool_status(args: argparse.Namespace) -> int:
         from cs2_assistant.models import POOL_STATUS_LABELS
         print(f"  {POOL_STATUS_LABELS.get(status, status)}: {count} 件")
     return 0
+
+
+def cmd_executor_status(args: argparse.Namespace) -> int:
+    return cmd_pool_status(args)
 
 
 def cmd_pool_config(args: argparse.Namespace) -> int:
@@ -1768,16 +1781,18 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
         # Alert on noteworthy candidates
         alert_lines: list[str] = []
         for c in report.guadao_candidates[:5]:
+            account_summary = "、".join(c.steam_accounts) if c.steam_accounts else "未知"
             alert_lines.append(
                 f"挂刀 | {c.name} | ratio={c.listing_ratio:.4f} | "
                 f"补仓¥{c.rebuy_price:.2f} | Steam¥{c.steam_after_tax_price:.2f} | "
-                f"差额¥{c.guadao_profit_per_unit:.2f}"
+                f"账号 {account_summary}"
             )
         for c in report.transfer_candidates[:5]:
+            account_summary = "、".join(c.steam_accounts) if c.steam_accounts else "未知"
             alert_lines.append(
                 f"导余额 | {c.name} | ratio={c.transfer_real_ratio_pct:+.2f}% | "
                 f"C5¥{c.rebuy_price:.2f} | Steam¥{c.steam_sell_price:.2f} | "
-                f"利润¥{c.transfer_profit_per_unit:.2f}"
+                f"账号 {account_summary}"
             )
 
         if alert_lines:
@@ -1816,8 +1831,20 @@ def cmd_executor_start(args: argparse.Namespace) -> int:
         config.max_list_per_cycle = args.max_list
     if args.max_buy is not None:
         config.max_buy_per_cycle = args.max_buy
+    force_refresh_override = None
+    if args.force_refresh:
+        force_refresh_override = True
+    if args.no_force_refresh:
+        force_refresh_override = False
+    if args.rebuy_first or args.no_rebuy_first:
+        print("提示: `rebuyBeforeListing` / `--rebuy-first` / `--no-rebuy-first` 已废弃；当前执行顺序已固定。")
 
-    engine = ExecutionEngine(settings, config, dry_run_override=None)
+    engine = ExecutionEngine(
+        settings,
+        config,
+        dry_run_override=None,
+        force_refresh_override=force_refresh_override,
+    )
     try:
         engine.run(once=args.once)
     finally:
@@ -1854,6 +1881,54 @@ def cmd_steam_confirm(args: argparse.Namespace) -> int:
     client = _build_steam_client(settings)
     count = client.confirm_all()
     print(f"Confirmed {count} listings.")
+    return 0
+
+
+def cmd_steam_price_cache_show(args: argparse.Namespace) -> int:
+    snapshot = get_pricing_cache_snapshot()
+    print(f"Price cache entries: {len(snapshot)}")
+    for row in snapshot:
+        print(
+            f"- {row['market_hash_name']} | age={row['age_sec']:.0f}s | "
+            f"list={row['list_price']:.2f} | wall={row['wall_price']}"
+        )
+    return 0
+
+
+def cmd_steam_price_cache_clear(args: argparse.Namespace) -> int:
+    clear_pricing_cache(args.name)
+    print("Price cache cleared.")
+    return 0
+
+
+def cmd_steam_price_check(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    client = _build_steam_client(settings)
+    try:
+        decision = fetch_listing_price(
+            client,
+            app_id=settings.app_id,
+            market_hash_name=args.market_hash_name,
+            wall_min_count=config.listing_wall_min_count,
+            price_offset=config.listing_price_offset,
+            min_price=0.01,
+            country=config.steam_country,
+            language=config.steam_language,
+            currency=config.steam_currency,
+            force_refresh=True,
+            cache_ttl=config.steam_price_cache_ttl,
+            debug=True,
+        )
+    except SteamMarketError as exc:
+        print(f"Steam price check failed: {exc}")
+        return 1
+    if decision is None:
+        print("Steam price unavailable.")
+        return 1
+    print(
+        f"Steam list price: {decision.list_price:.2f} | wall={decision.wall_price} | reason={decision.reason}"
+    )
     return 0
 
 
@@ -2088,7 +2163,14 @@ def build_parser() -> argparse.ArgumentParser:
     pool_sync.set_defaults(handler=cmd_pool_sync)
 
     pool_status = pool_subparsers.add_parser("status", help="查看底仓状态")
-    pool_status.add_argument("--status-filter", default=None, help="按状态过滤: holding, listed, sold, pending_rebuy")
+    pool_status.add_argument(
+        "--status-filter",
+        default=None,
+        help=(
+            "按状态过滤: holding, listed, sold, pending_rebuy, listing_pending, "
+            "transfer_buying, transfer_holding, transfer_listed_c5, transfer_sold"
+        ),
+    )
     pool_status.set_defaults(handler=cmd_pool_status)
 
     pool_config = pool_subparsers.add_parser(
@@ -2111,7 +2193,7 @@ def build_parser() -> argparse.ArgumentParser:
     executor = subparsers.add_parser(
         "executor",
         help="Auto execution runner",
-        description="Run automated execution (Steam sell + C5 rebuy).",
+        description="Run automated execution (list/guadao + transfer).",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     executor_subparsers = executor.add_subparsers(dest="executor_command", required=True)
@@ -2119,7 +2201,7 @@ def build_parser() -> argparse.ArgumentParser:
     executor_start = executor_subparsers.add_parser(
         "start",
         help="Start execution loop",
-        description="Run scan + execute loop.",
+        description="Run scan + execute loop for list/guadao and transfer paths.",
     )
     executor_start.add_argument("--once", action="store_true", help="Run once and exit")
     executor_start.add_argument("--dry-run", action="store_true", help="Force dry run")
@@ -2128,7 +2210,34 @@ def build_parser() -> argparse.ArgumentParser:
     executor_start.add_argument("--disable", action="store_true", help="Disable execution for this run")
     executor_start.add_argument("--max-list", type=int, help="Max listings per cycle")
     executor_start.add_argument("--max-buy", type=int, help="Max rebuy per cycle")
+    executor_start.add_argument("--force-refresh", action="store_true", help="Force steam refresh")
+    executor_start.add_argument("--no-force-refresh", action="store_true", help="Disable steam refresh")
+    executor_start.add_argument(
+        "--rebuy-first",
+        action="store_true",
+        help="Deprecated: execution order is fixed now",
+    )
+    executor_start.add_argument(
+        "--no-rebuy-first",
+        action="store_true",
+        help="Deprecated: execution order is fixed now",
+    )
     executor_start.set_defaults(handler=cmd_executor_start)
+
+    executor_status = executor_subparsers.add_parser(
+        "status",
+        help="Show executor pool status",
+        description="Show current pool states including transfer execution states.",
+    )
+    executor_status.add_argument(
+        "--status-filter",
+        default=None,
+        help=(
+            "Filter by status: holding, listed, sold, pending_rebuy, listing_pending, "
+            "transfer_buying, transfer_holding, transfer_listed_c5, transfer_sold"
+        ),
+    )
+    executor_status.set_defaults(handler=cmd_executor_status)
 
     # ---- steam tools ----
     steam = subparsers.add_parser(
@@ -2148,6 +2257,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     steam_confirm = steam_subparsers.add_parser("confirm", help="Confirm pending listings")
     steam_confirm.set_defaults(handler=cmd_steam_confirm)
+
+    steam_price_cache = steam_subparsers.add_parser("price-cache", help="Manage steam price cache")
+    steam_price_cache_sub = steam_price_cache.add_subparsers(dest="price_cache_command", required=True)
+
+    steam_price_cache_show = steam_price_cache_sub.add_parser("show", help="Show price cache")
+    steam_price_cache_show.set_defaults(handler=cmd_steam_price_cache_show)
+
+    steam_price_cache_clear = steam_price_cache_sub.add_parser("clear", help="Clear price cache")
+    steam_price_cache_clear.add_argument("--name", help="Market hash name")
+    steam_price_cache_clear.set_defaults(handler=cmd_steam_price_cache_clear)
+
+    steam_price_check = steam_subparsers.add_parser("price-check", help="Check steam price by name")
+    steam_price_check.add_argument("market_hash_name")
+    steam_price_check.set_defaults(handler=cmd_steam_price_check)
 
     notify = subparsers.add_parser(
         "notify",

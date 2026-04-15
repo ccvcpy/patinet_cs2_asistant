@@ -685,6 +685,12 @@ class Database:
         sql += " ORDER BY market_hash_name ASC"
         return self.conn.execute(sql, params).fetchall()
 
+    def get_pool_status_map(self) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT market_hash_name, status FROM inventory_pool ORDER BY market_hash_name ASC"
+        ).fetchall()
+        return {row["market_hash_name"]: row["status"] for row in rows}
+
     def get_pool_market_hash_names(self) -> list[str]:
         rows = self.conn.execute(
             "SELECT DISTINCT market_hash_name FROM inventory_pool WHERE quantity > 0 ORDER BY market_hash_name"
@@ -750,6 +756,7 @@ class Database:
         market_hash_name: str,
         *,
         steam_id: str | None = None,
+        exclude_asset_ids: set[str] | None = None,
     ) -> sqlite3.Row | None:
         sql = """
             SELECT asset_id, market_hash_name, steam_id
@@ -762,6 +769,10 @@ class Database:
         if steam_id:
             sql += " AND steam_id = ?"
             params.append(steam_id)
+        if exclude_asset_ids:
+            placeholders = ", ".join("?" for _ in exclude_asset_ids)
+            sql += f" AND asset_id NOT IN ({placeholders})"
+            params.extend(sorted(exclude_asset_ids))
         sql += " ORDER BY asset_id ASC LIMIT 1"
         return self.conn.execute(sql, tuple(params)).fetchone()
 
@@ -771,6 +782,54 @@ class Database:
             (status, utc_now_iso(), asset_id),
         )
         self.conn.commit()
+
+    def get_asset(self, asset_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT asset_id, market_hash_name, steam_id, tradable, status, last_seen_at, created_at
+            FROM inventory_assets
+            WHERE asset_id = ?
+            """,
+            (asset_id,),
+        ).fetchone()
+
+    def list_assets(
+        self,
+        *,
+        market_hash_name: str | None = None,
+        steam_id: str | None = None,
+        tradable: bool | None = None,
+        status: str | None = None,
+    ) -> list[sqlite3.Row]:
+        sql = """
+            SELECT asset_id, market_hash_name, steam_id, tradable, status, last_seen_at, created_at
+            FROM inventory_assets
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if market_hash_name is not None:
+            sql += " AND market_hash_name = ?"
+            params.append(market_hash_name)
+        if steam_id is not None:
+            sql += " AND steam_id = ?"
+            params.append(steam_id)
+        if tradable is not None:
+            sql += " AND tradable = ?"
+            params.append(1 if tradable else 0)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY asset_id ASC"
+        return self.conn.execute(sql, tuple(params)).fetchall()
+
+    def list_asset_ids(
+        self,
+        market_hash_name: str,
+        *,
+        steam_id: str | None = None,
+    ) -> list[str]:
+        rows = self.list_assets(market_hash_name=market_hash_name, steam_id=steam_id)
+        return [str(row["asset_id"]) for row in rows]
 
     # ------------------------------------------------------------------
     # Strategy evaluations
@@ -859,18 +918,26 @@ class Database:
         *,
         status: str | None = None,
         actual_price: float | None = None,
+        asset_id: str | None = None,
+        note: str | None = None,
     ) -> None:
         parts: list[str] = []
         params: list[Any] = []
         if status is not None:
             parts.append("status = ?")
             params.append(status)
-            if status in ("completed", "failed"):
+            if status in ("completed", "failed", "skipped", "dry_run", "sold"):
                 parts.append("completed_at = ?")
                 params.append(utc_now_iso())
         if actual_price is not None:
             parts.append("actual_price = ?")
             params.append(actual_price)
+        if asset_id is not None:
+            parts.append("asset_id = ?")
+            params.append(asset_id)
+        if note is not None:
+            parts.append("note = ?")
+            params.append(note)
         if not parts:
             return
         params.append(op_id)
@@ -904,6 +971,23 @@ class Database:
             params.append(status)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
+        return self.conn.execute(sql, tuple(params)).fetchall()
+
+    def list_pool_operations_by_type_and_statuses(
+        self,
+        operation_type: str,
+        *,
+        statuses: list[str],
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        params: list[Any] = [operation_type, *statuses, limit]
+        sql = (
+            "SELECT * FROM pool_operations WHERE operation_type = ? "
+            f"AND status IN ({placeholders}) ORDER BY created_at DESC LIMIT ?"
+        )
         return self.conn.execute(sql, tuple(params)).fetchall()
 
     def list_required_market_hash_names(self) -> list[str]:

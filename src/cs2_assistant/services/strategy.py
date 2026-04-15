@@ -88,31 +88,6 @@ def classify_strategies(
     return strategies
 
 
-def calculate_guadao_profit(
-    rebuy_price: float,
-    steam_after_tax_price: float,
-) -> float:
-    """挂刀做T 单件利润 = Steam 到手余额 - 外部平台补仓成本
-
-    正值表示获得 Steam 余额的折扣（非现金利润）。
-    """
-    return steam_after_tax_price - rebuy_price
-
-
-def calculate_transfer_profit(
-    rebuy_price: float,
-    steam_sell_price: float,
-    *,
-    c5_settlement_factor: float,
-    balance_discount: float,
-) -> float:
-    """导余额做T 单件利润 = C5 卖出到手 - Steam 余额成本
-
-    假设用 balance_discount 价格获得 Steam 余额。
-    """
-    c5_proceeds = rebuy_price * c5_settlement_factor
-    balance_cost = steam_sell_price * balance_discount
-    return c5_proceeds - balance_cost
 
 
 def scan_strategies(
@@ -145,6 +120,11 @@ def scan_strategies(
         allow_cached_fallback=allow_cached_fallback,
         cache_max_age_minutes=cache_max_age_minutes,
     )
+    account_lookup = {
+        str(account.get("steamId") or "").strip(): (account.get("nickname") or str(account.get("steamId") or "").strip())
+        for account in list(inventory_payload.get("accounts") or [])
+        if str(account.get("steamId") or "").strip()
+    }
     all_inventory_types = summarize_inventory_types(
         list(inventory_payload.get("list") or [])
     )
@@ -231,17 +211,15 @@ def scan_strategies(
         if transfer_real_ratio is None:
             continue
 
-        # Calculate per-unit profits
-        guadao_profit = calculate_guadao_profit(rebuy_price, steam_after_tax)
-        transfer_profit = calculate_transfer_profit(
-            rebuy_price,
-            steam_sell_price,
-            c5_settlement_factor=config.c5_settlement_factor,
-            balance_discount=config.balance_discount,
-        )
-
         # Classify strategies
         strategies = classify_strategies(listing_ratio, transfer_real_ratio, config)
+
+        steam_ids = item_type.get("steam_ids") or []
+        steam_accounts = [
+            str(account_lookup.get(str(steam_id).strip()) or str(steam_id).strip())
+            for steam_id in steam_ids
+            if str(steam_id).strip()
+        ]
 
         candidate = StrategyCandidate(
             name=state.name_cn or item_type["name_cn"],
@@ -256,8 +234,7 @@ def scan_strategies(
             listing_ratio=float(listing_ratio),
             transfer_real_ratio=float(transfer_real_ratio),
             recommended_strategies=strategies,
-            guadao_profit_per_unit=float(guadao_profit),
-            transfer_profit_per_unit=float(transfer_profit),
+            steam_accounts=steam_accounts,
         )
 
         all_evaluated.append(candidate)

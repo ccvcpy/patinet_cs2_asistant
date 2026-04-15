@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient
@@ -8,7 +9,7 @@ from cs2_assistant.utils import chunked, safe_float, safe_int
 
 DEFAULT_C5_SETTLEMENT_FACTOR = 0.869
 DEFAULT_STEAM_BALANCE_DISCOUNT = 0.73
-DEFAULT_STEAM_NET_FACTOR = 0.85  # CS2: seller receives ~85% after Steam 15% fee (5% Steam + 10% game)
+DEFAULT_STEAM_NET_FACTOR = 0.869  # Steam 到手系数（可在配置中覆盖）
 
 
 def _normalize_platform_name(name: str) -> str:
@@ -109,12 +110,14 @@ class MarketService:
         c5_client: C5GameClient | None = None,
         app_id: int = 730,
         include_c5_purchase_prices: bool = True,
+        fallback_max_workers: int = 4,
     ):
         self.steamdt_client = steamdt_client
         self.csqaq_client = csqaq_client
         self.c5_client = c5_client
         self.app_id = app_id
         self.include_c5_purchase_prices = include_c5_purchase_prices
+        self.fallback_max_workers = max(1, int(fallback_max_workers))
 
     def refresh_items(self, items: list[dict[str, Any]]) -> list[MarketState]:
         states = {
@@ -167,12 +170,28 @@ class MarketService:
         except Exception:
             pass
 
-        for market_hash_name in market_hash_names:
-            try:
-                data_list = self.steamdt_client.price_single(market_hash_name)
-            except Exception:
-                continue
-            self._apply_steamdt_single(states[market_hash_name], data_list)
+        max_workers = min(self.fallback_max_workers, len(market_hash_names))
+        if max_workers <= 1:
+            for market_hash_name in market_hash_names:
+                try:
+                    data_list = self.steamdt_client.price_single(market_hash_name)
+                except Exception:
+                    continue
+                self._apply_steamdt_single(states[market_hash_name], data_list)
+            return
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(self.steamdt_client.price_single, market_hash_name): market_hash_name
+                for market_hash_name in market_hash_names
+            }
+            for future in as_completed(future_map):
+                market_hash_name = future_map[future]
+                try:
+                    data_list = future.result()
+                except Exception:
+                    continue
+                self._apply_steamdt_single(states[market_hash_name], data_list)
 
     def _load_csqaq_prices(
         self,
@@ -187,12 +206,27 @@ class MarketService:
             except Exception:
                 pass
 
-            for market_hash_name in batch:
-                try:
-                    data = self.csqaq_client.price_by_market_hash_names([market_hash_name])
-                except Exception:
-                    continue
-                self._apply_csqaq_batch(states, data)
+            max_workers = min(self.fallback_max_workers, len(batch))
+            if max_workers <= 1:
+                for market_hash_name in batch:
+                    try:
+                        data = self.csqaq_client.price_by_market_hash_names([market_hash_name])
+                    except Exception:
+                        continue
+                    self._apply_csqaq_batch(states, data)
+                continue
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(self.csqaq_client.price_by_market_hash_names, [market_hash_name]): market_hash_name
+                    for market_hash_name in batch
+                }
+                for future in as_completed(future_map):
+                    try:
+                        data = future.result()
+                    except Exception:
+                        continue
+                    self._apply_csqaq_batch(states, data)
 
     def _apply_steamdt_batch(
         self,
