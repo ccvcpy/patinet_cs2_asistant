@@ -61,22 +61,26 @@ class NotificationMessage:
 # Strategy models (inventory-pool based T-tool)
 # ---------------------------------------------------------------------------
 
-STRATEGY_GUADAO = "guadao"        # 鎸傚垁鍋歍
-STRATEGY_TRANSFER = "transfer"    # 瀵间綑棰濆仛T
-STRATEGY_HOLD = "hold"            # 鎸佹湁涓嶅姩锛堜笉婊¤冻浠讳綍绛栫暐锛?
+STRATEGY_GUADAO = "guadao"        # 挂刀做T
+STRATEGY_TRANSFER = "transfer"    # 导余额做T
+STRATEGY_HOLD = "hold"            # 持有不动（不满足任何策略）
 
 STRATEGY_LABELS: dict[str, str] = {
-    STRATEGY_GUADAO: "鎸傚垁鍋歍",
-    STRATEGY_TRANSFER: "瀵间綑棰濆仛T",
-    STRATEGY_HOLD: "鎸佹湁",
+    STRATEGY_GUADAO: "挂刀做T",
+    STRATEGY_TRANSFER: "导余额做T",
+    STRATEGY_HOLD: "持有",
 }
 
-POOL_STATUS_HOLDING = "holding"           # 鎸佹湁涓?
+POOL_STATUS_HOLDING = "holding"           # 持有中
 POOL_STATUS_LISTING_PENDING = "listing_pending"  # 挂卖待确认
-POOL_STATUS_LISTED = "listed"             # 宸叉寕鍗?Steam
-POOL_STATUS_SOLD = "sold"                 # 宸插崠鍑?
-POOL_STATUS_PENDING_REBUY = "pending_rebuy"  # 寰呰ˉ浠?
+POOL_STATUS_LISTED = "listed"             # 已挂单 Steam
+POOL_STATUS_SOLD = "sold"                 # 已卖出
+POOL_STATUS_PENDING_REBUY = "pending_rebuy"  # 待补仓
 POOL_STATUS_REBUY_FAILED = "rebuy_failed"     # 补仓失败
+POOL_STATUS_TRANSFER_BUYING = "transfer_buying"      # transfer: Steam 已买，等待卖出旧底仓
+POOL_STATUS_TRANSFER_HOLDING = "transfer_holding"    # transfer: 旧底仓已卖，replacement 冷却中
+POOL_STATUS_TRANSFER_LISTED_C5 = "transfer_listed_c5"  # transfer: 旧底仓已挂 C5
+POOL_STATUS_TRANSFER_SOLD = "transfer_sold"          # transfer: 旧底仓已卖，等待 replacement 对齐
 
 POOL_STATUS_LABELS: dict[str, str] = {
     POOL_STATUS_LISTING_PENDING: "listing_pending",
@@ -85,18 +89,22 @@ POOL_STATUS_LABELS: dict[str, str] = {
     POOL_STATUS_LISTED: "listed",
     POOL_STATUS_SOLD: "sold",
     POOL_STATUS_PENDING_REBUY: "pending_rebuy",
+    POOL_STATUS_TRANSFER_BUYING: "transfer_buying",
+    POOL_STATUS_TRANSFER_HOLDING: "transfer_holding",
+    POOL_STATUS_TRANSFER_LISTED_C5: "transfer_listed_c5",
+    POOL_STATUS_TRANSFER_SOLD: "transfer_sold",
 }
 
-OP_SELL_STEAM = "sell_on_steam"       # 鍦?Steam 鎸傚崠
-OP_REBUY_C5 = "rebuy_on_c5"          # 鍦?C5 琛ヤ粨
-OP_TRANSFER_BUY = "transfer_buy"     # 瀵间綑棰濓細鐢ㄤ綑棰濆湪 Steam 涔板叆
-OP_TRANSFER_SELL = "transfer_sell"   # 瀵间綑棰濓細鍦?C5 鍗栧嚭
+OP_SELL_STEAM = "sell_on_steam"       # 在 Steam 挂卖
+OP_REBUY_C5 = "rebuy_on_c5"          # 在 C5 补仓
+OP_TRANSFER_BUY = "transfer_buy"     # 导余额：用余额在 Steam 买入
+OP_TRANSFER_SELL = "transfer_sell"   # 导余额：在 C5 卖出
 
 
 @dataclass(slots=True)
 class StrategyConfig:
     #
-    steam_net_factor: float = 0.85
+    steam_net_factor: float = 0.869
     c5_settlement_factor: float = 0.869
     balance_discount: float = 0.73
     guadao_max_listing_ratio: float = 0.95
@@ -119,6 +127,11 @@ class StrategyConfig:
     steam_language: str = "schinese"
     listing_wall_min_count: int = 20
     listing_price_offset: float = 0.01
+    force_refresh_before_execution: bool = True
+    steam_price_cache_ttl: float = 60.0
+    verify_steam_before_rebuy: bool = True
+    rebuy_steam_drop_tolerance_pct: float = 5.0
+    rebuy_before_listing: bool = True  # Deprecated: kept only for config compatibility; execution order is fixed.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +158,11 @@ class StrategyConfig:
             "steamLanguage": self.steam_language,
             "listingWallMinCount": self.listing_wall_min_count,
             "listingPriceOffset": self.listing_price_offset,
+            "forceRefreshBeforeExecution": self.force_refresh_before_execution,
+            "steamPriceCacheTtl": self.steam_price_cache_ttl,
+            "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
+            "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
+            "rebuyBeforeListing": self.rebuy_before_listing,
         }
 
     @classmethod
@@ -159,7 +177,7 @@ class StrategyConfig:
             return default
 
         return cls(
-            steam_net_factor=float(data.get("steamNetFactor", 0.85)),
+            steam_net_factor=float(data.get("steamNetFactor", 0.869)),
             c5_settlement_factor=float(data.get("c5SettlementFactor", 0.869)),
             balance_discount=float(data.get("balanceDiscount", 0.73)),
             guadao_max_listing_ratio=float(data.get("guadaoMaxListingRatio", 0.95)),
@@ -182,6 +200,11 @@ class StrategyConfig:
             steam_language=str(data.get("steamLanguage", "schinese")),
             listing_wall_min_count=int(data.get("listingWallMinCount", 20)),
             listing_price_offset=float(data.get("listingPriceOffset", 0.01)),
+            force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
+            steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
+            verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),
+            rebuy_steam_drop_tolerance_pct=float(data.get("rebuySteamDropTolerancePct", 5.0)),
+            rebuy_before_listing=_as_bool(data.get("rebuyBeforeListing"), True),
         )
 
 
@@ -200,8 +223,7 @@ class StrategyCandidate:
     listing_ratio: float
     transfer_real_ratio: float
     recommended_strategies: list[str]
-    guadao_profit_per_unit: float
-    transfer_profit_per_unit: float
+    steam_accounts: list[str]
 
     @property
     def cooldown_count(self) -> int:
@@ -244,8 +266,7 @@ class StrategyCandidate:
             "recommendedStrategies": self.recommended_strategies,
             "primaryStrategy": self.primary_strategy,
             "primaryStrategyLabel": self.primary_strategy_label,
-            "guadaoProfitPerUnit": round(self.guadao_profit_per_unit, 2),
-            "transferProfitPerUnit": round(self.transfer_profit_per_unit, 2),
+            "steamAccounts": list(self.steam_accounts),
         }
         if rank is not None:
             payload["rank"] = rank

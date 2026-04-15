@@ -64,7 +64,6 @@ class Settings:
     steam_market_base_url: str = DEFAULT_STEAM_MARKET_BASE_URL
     app_id: int = DEFAULT_CSGO_APP_ID
     steam_cookies: str | None = None
-    steam_id64: str | None = None
     steam_identity_secret: str | None = None
     steam_device_id: str | None = None
 
@@ -79,7 +78,7 @@ def load_settings() -> Settings:
         steamdt_base_path=steamdt_base_path,
         steamdt_api_key=_first_env("STEAMDT_API_KEY"),
         c5_api_key=_first_env("C5GAME_API_KEY", "C5_API_KEY"),
-        csqaq_api_token=_first_env("CSQAQ_API_TOKEN", "CSQAQ_API_KEY"),
+        csqaq_api_token=_first_env("CSQAQ_API_KEY", "CSQAQ_API_TOKEN"),
         serverchan_sendkey=_first_env(
             "SERVERCHAN_SENDKEY",
             "SCTKEY",
@@ -91,7 +90,6 @@ def load_settings() -> Settings:
         csqaq_base_url=_first_env("CSQAQ_BASE_URL") or DEFAULT_CSQAQ_BASE_URL,
         steam_market_base_url=_first_env("STEAM_MARKET_BASE_URL") or DEFAULT_STEAM_MARKET_BASE_URL,
         steam_cookies=_first_env("STEAM_COOKIES"),
-        steam_id64=_first_env("STEAM_ID64"),
         steam_identity_secret=_first_env("STEAM_IDENTITY_SECRET"),
         steam_device_id=_first_env("STEAM_DEVICE_ID"),
     )

@@ -103,6 +103,42 @@ class C5GameClient:
         )
         return dict(data or {})
 
+    def sale_create(self, *, app_id: int, items: list[dict[str, Any]]) -> dict[str, Any]:
+        if not items:
+            raise C5GameError("items is required")
+
+        data_list: list[dict[str, Any]] = []
+        for item in items:
+            asset_id = str(item.get("assetId") or "").strip()
+            market_hash_name = str(item.get("marketHashName") or "").strip()
+            token = str(item.get("token") or "").strip()
+            style_token = str(item.get("styleToken") or item.get("style_token") or "").strip()
+            price = item.get("price")
+            if not asset_id:
+                raise C5GameError("sale_create requires assetId for each item")
+            if not market_hash_name:
+                raise C5GameError("sale_create requires marketHashName for each item")
+            if not token:
+                raise C5GameError("sale_create requires token for each item")
+            if not style_token:
+                raise C5GameError("sale_create requires styleToken for each item")
+            if price is None:
+                raise C5GameError("sale_create requires price for each item")
+            data_list.append(
+                {
+                    "price": float(price),
+                    "token": token,
+                    "styleToken": style_token,
+                }
+            )
+
+        data = self._request(
+            "POST",
+            "/merchant/sale/v2/create",
+            json_body={"appId": app_id, "dataList": data_list},
+        )
+        return dict(data or {})
+
     def sale_cancel(self, *, app_id: int, product_ids: list[int]) -> dict[str, Any]:
         data = self._request(
             "POST",
