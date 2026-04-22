@@ -4,5 +4,6 @@ __pycache__/
 *.db
 data/
 .venv/
+*.egg-info/
 
 .claude/
