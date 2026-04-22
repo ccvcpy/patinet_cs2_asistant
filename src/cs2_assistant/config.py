@@ -66,6 +66,7 @@ class Settings:
     steam_cookies: str | None = None
     steam_identity_secret: str | None = None
     steam_device_id: str | None = None
+    steam_trade_url: str | None = None
 
 
 def load_settings() -> Settings:
@@ -92,4 +93,5 @@ def load_settings() -> Settings:
         steam_cookies=_first_env("STEAM_COOKIES"),
         steam_identity_secret=_first_env("STEAM_IDENTITY_SECRET"),
         steam_device_id=_first_env("STEAM_DEVICE_ID"),
+        steam_trade_url=_first_env("STEAM_TRADE_URL"),
     )

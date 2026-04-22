@@ -34,6 +34,7 @@ from cs2_assistant.models import (
     StrategyCandidate,
     StrategyConfig,
 )
+from cs2_assistant.services.executor_buy import execute_rebuy
 from cs2_assistant.services.market import calculate_listing_ratio, calculate_transfer_real_ratio
 from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price
 from cs2_assistant.services.strategy import load_strategy_config, scan_strategies
@@ -145,12 +146,12 @@ class ExecutionEngine:
 
     def run(self, *, once: bool = False) -> None:
         while True:
-            self.run_once()
+            self.run_once(wait_for_cycle=True)
             if once:
                 return
             time.sleep(self.config.cycle_interval_minutes * 60)
 
-    def run_once(self) -> None:
+    def run_once(self, *, wait_for_cycle: bool = True) -> None:
         self._pending_confirmation_count = 0
         pool_names = self.db.get_pool_market_hash_names()
         if not pool_names:
@@ -166,24 +167,208 @@ class ExecutionEngine:
             cache_max_age_minutes=180,
             pool_market_hash_names=pool_names,
         )
+        self._print_scan_summary(report)
 
-        listed = self._execute_guadao_listings(report, self.db.get_pool_status_map())
-        sold = self._refresh_listings()
-        rebought = self._execute_rebuys()
-        transfer_bought = self._execute_transfer_buys(report, self.db.get_pool_status_map())
-        transfer_listed = self._execute_transfer_sells()
-        transfer_sold = self._refresh_transfer_sales()
+        listed, sold, rebought = self._run_guadao_cycle(report, wait_for_cycle=wait_for_cycle)
+        if self._has_open_guadao_cycle():
+            print("[等待] 挂刀循环尚未闭环，先跳过本轮导余额执行。")
+            transfer_bought = 0
+            transfer_listed = 0
+            transfer_sold = 0
+        else:
+            transfer_bought = self._execute_transfer_buys(report, self.db.get_pool_status_map())
+            transfer_listed = self._execute_transfer_sells()
+            transfer_sold = self._refresh_transfer_sales()
 
         print(
             f"[{utc_now_iso()}] 执行完成 | 挂刀上架 {listed} | Steam卖出 {sold} | "
             f"C5补仓 {rebought} | 导余额买入 {transfer_bought} | "
             f"导余额上架C5 {transfer_listed} | 导余额卖出 {transfer_sold}"
         )
+        self._print_run_result(
+            report,
+            pool_names=pool_names,
+            listed=listed,
+            sold=sold,
+            rebought=rebought,
+            transfer_bought=transfer_bought,
+            transfer_listed=transfer_listed,
+            transfer_sold=transfer_sold,
+        )
         if self._pending_confirmation_count > 0:
             print(
                 f"[提醒] {self._pending_confirmation_count} 件物品待 Steam Guard 确认，"
                 "请运行: python main.py steam confirm"
             )
+
+    def _print_scan_summary(self, report: Any) -> None:
+        evaluated_count = len(getattr(report, "all_evaluated", []) or [])
+        print(
+            f"[扫描] 底仓池 {getattr(report, 'total_pool_types', 0)} 个品种 | "
+            f"进入评估 {evaluated_count} 个 | "
+            f"缺价 {getattr(report, 'missing_price_count', 0)} 个 | "
+            f"挂刀候选 {getattr(report, 'guadao_count', 0)} 个 | "
+            f"导余额候选 {getattr(report, 'transfer_count', 0)} 个"
+        )
+
+    def _print_run_result(
+        self,
+        report: Any,
+        *,
+        pool_names: list[str],
+        listed: int,
+        sold: int,
+        rebought: int,
+        transfer_bought: int,
+        transfer_listed: int,
+        transfer_sold: int,
+    ) -> None:
+        total_actions = listed + sold + rebought + transfer_bought + transfer_listed + transfer_sold
+        if total_actions > 0:
+            print(f"[结果] 本轮已执行 {total_actions} 个实际动作。")
+            return
+
+        print("[结果] 本轮只完成了扫描/状态检查，没有实际上架、买入或卖出。")
+        reasons = self._describe_no_action_reasons(report, pool_names=pool_names)
+        if not reasons:
+            reasons = ["未命中可执行条件。"]
+        for reason in reasons:
+            print(f"[原因] {reason}")
+
+    def _describe_no_action_reasons(self, report: Any, *, pool_names: list[str]) -> list[str]:
+        reasons: list[str] = []
+        open_statuses = self._get_open_guadao_statuses()
+        if open_statuses:
+            summary = ", ".join(
+                f"{status}={count}" for status, count in sorted(open_statuses.items())
+            )
+            reasons.append(f"上一轮挂刀循环未闭环（{summary}），本轮仅做等待和状态检查。")
+
+        inventory_type_names = self._current_inventory_type_names()
+        missing_inventory_names = sorted(
+            [
+            name for name in pool_names
+            if name not in inventory_type_names
+            ]
+        )
+        if missing_inventory_names:
+            sample = "、".join(missing_inventory_names[:3])
+            suffix = " 等" if len(missing_inventory_names) > 3 else ""
+            reasons.append(
+                f"底仓池中 {len(missing_inventory_names)} 个品种当前真实库存里不存在，"
+                f"未进入执行：{sample}{suffix}"
+            )
+
+        missing_price_count = int(getattr(report, "missing_price_count", 0) or 0)
+        if missing_price_count > 0:
+            reasons.append(f"{missing_price_count} 个品种缺少价格，无法完成策略评估。")
+
+        evaluated = list(getattr(report, "all_evaluated", []) or [])
+        guadao_candidates = list(getattr(report, "guadao_candidates", []) or [])
+        transfer_candidates = list(getattr(report, "transfer_candidates", []) or [])
+        if evaluated and not guadao_candidates and not transfer_candidates:
+            reasons.append(f"已评估 {len(evaluated)} 个品种，但都未满足 list/transfer 阈值。")
+
+        if guadao_candidates and all(int(candidate.tradable_count) <= 0 for candidate in guadao_candidates):
+            reasons.append("存在挂刀候选，但当前没有可交易库存，无法上架。")
+
+        if guadao_candidates and self.config.max_list_per_cycle <= 0:
+            reasons.append("本轮 `max-list=0`，已禁用新的 Steam 上架。")
+
+        if transfer_candidates and self.config.max_buy_per_cycle <= 0:
+            reasons.append("本轮 `max-buy=0`，已禁用买入动作。")
+
+        return reasons
+
+    def _current_inventory_type_names(self) -> set[str]:
+        names: set[str] = set()
+        for item in list(self._last_inventory_payload.get("list") or []):
+            if not isinstance(item, dict):
+                continue
+            market_hash_name = str(item.get("marketHashName") or "").strip()
+            if market_hash_name:
+                names.add(market_hash_name)
+        return names
+
+    def _run_guadao_cycle(self, report: Any, *, wait_for_cycle: bool) -> tuple[int, int, int]:
+        status_map = self.db.get_pool_status_map()
+        listed = 0
+        sold = 0
+        rebought = 0
+
+        if self._has_open_guadao_cycle(status_map):
+            print("[等待] 检测到上一轮挂刀循环未闭环，本轮先等待卖出/补仓完成。")
+        else:
+            listed = self._execute_guadao_listings(report, status_map)
+
+        self._backfill_listing_ids()
+        sold_delta, rebought_delta = self._advance_guadao_cycle()
+        sold += sold_delta
+        rebought += rebought_delta
+
+        if wait_for_cycle and self._has_open_guadao_cycle():
+            waited_sold, waited_rebought = self._wait_for_guadao_cycle_close()
+            sold += waited_sold
+            rebought += waited_rebought
+
+        return listed, sold, rebought
+
+    def _advance_guadao_cycle(self) -> tuple[int, int]:
+        self._refresh_pending_listing_confirmations()
+        sold = self._refresh_listings()
+        rebought = self._execute_rebuys()
+        return sold, rebought
+
+    def _wait_for_guadao_cycle_close(self) -> tuple[int, int]:
+        sold = 0
+        rebought = 0
+        while self._has_open_guadao_cycle():
+            wait_seconds = self._guadao_wait_seconds()
+            open_statuses = self._get_open_guadao_statuses()
+            if open_statuses and set(open_statuses) == {POOL_STATUS_REBUY_FAILED}:
+                print("[停止] 挂刀循环卡在补仓失败状态，需人工处理后才能开启下一轮。")
+                return sold, rebought
+            status_summary = ", ".join(
+                f"{status}={count}" for status, count in sorted(open_statuses.items())
+            ) or "unknown"
+            print(
+                f"[等待] 挂刀循环未完成（{status_summary}），"
+                f"{int(wait_seconds)} 秒后继续检查。"
+            )
+            time.sleep(wait_seconds)
+            self._sync_assets()
+            self._backfill_listing_ids()
+            sold_delta, rebought_delta = self._advance_guadao_cycle()
+            sold += sold_delta
+            rebought += rebought_delta
+        return sold, rebought
+
+    def _guadao_wait_seconds(self) -> float:
+        return max(1.0, float(self.config.listing_check_interval_minutes) * 60.0)
+
+    def _get_open_guadao_statuses(self) -> dict[str, int]:
+        open_statuses = {
+            POOL_STATUS_LISTING_PENDING,
+            POOL_STATUS_LISTED,
+            POOL_STATUS_PENDING_REBUY,
+            POOL_STATUS_REBUY_FAILED,
+        }
+        counts: dict[str, int] = {}
+        for status in self.db.get_pool_status_map().values():
+            if status not in open_statuses:
+                continue
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    def _has_open_guadao_cycle(self, status_map: dict[str, str] | None = None) -> bool:
+        open_statuses = {
+            POOL_STATUS_LISTING_PENDING,
+            POOL_STATUS_LISTED,
+            POOL_STATUS_PENDING_REBUY,
+            POOL_STATUS_REBUY_FAILED,
+        }
+        current_status_map = status_map or self.db.get_pool_status_map()
+        return any(status in open_statuses for status in current_status_map.values())
 
     def _sync_assets(self) -> None:
         inventory_payload = fetch_all_c5_inventories(
@@ -276,6 +461,8 @@ class ExecutionEngine:
     def _execute_guadao_listings(self, report: Any, status_map: dict[str, str]) -> int:
         if not self.config.auto_list_enabled or not self.steam_client:
             return 0
+        if self._has_open_guadao_cycle(status_map):
+            return 0
 
         list_count = 0
         picked_asset_ids: set[str] = set()
@@ -313,15 +500,6 @@ class ExecutionEngine:
                 if final_pricing is None:
                     self._notify_skip(candidate.market_hash_name, "steam_price_unavailable", {})
                     continue
-                if decision.list_price > 0:
-                    drift_pct = (decision.list_price - final_pricing.list_price) / decision.list_price * 100.0
-                    if drift_pct > self.config.price_tolerance_pct:
-                        self._notify_skip(
-                            candidate.market_hash_name,
-                            "steam_price_dropped",
-                            {"drift_pct": round(drift_pct, 2)},
-                        )
-                        continue
                 decision = self._decision_from_list_price(
                     candidate,
                     final_pricing.list_price,
@@ -359,19 +537,17 @@ class ExecutionEngine:
                     price=decision.list_price,
                     quantity=1,
                 )
-                needs_conf = bool(payload.get("needs_confirmation"))
                 listing_id = str(payload.get("listingid") or "")
                 confirmation_note: dict[str, Any] = {
-                    "needsConfirmation": needs_conf,
-                    "confirmationStatus": "not_required",
+                    "needsConfirmation": True,
+                    "confirmationStatus": "pending",
                 }
                 status_after = POOL_STATUS_LISTED
-                if needs_conf:
-                    confirmation_note, status_after = self._handle_listing_confirmation(
-                        market_hash_name=candidate.market_hash_name,
-                        asset_id=asset_id,
-                        listing_id=listing_id,
-                    )
+                confirmation_note, status_after = self._handle_listing_confirmation(
+                    market_hash_name=candidate.market_hash_name,
+                    asset_id=asset_id,
+                    listing_id=listing_id,
+                )
 
                 self.db.set_pool_status(candidate.market_hash_name, status_after)
                 self.db.set_asset_status(asset_id, "listed")
@@ -395,9 +571,80 @@ class ExecutionEngine:
                     note=note,
                 )
                 self.db.update_pool_operation(op_id, status="listed")
+                print(
+                    f"[上架] {candidate.market_hash_name} | "
+                    f"asset={asset_id} | "
+                    f"Steam挂价 ¥{decision.list_price:.2f} | "
+                    f"预计到手 ¥{decision.list_price * 0.869:.2f}"
+                )
                 list_count += 1
 
         return list_count
+
+    def _refresh_pending_listing_confirmations(self) -> int:
+        if not self.steam_client:
+            return 0
+        try:
+            active = self.steam_client.list_active_listings()
+        except Exception as exc:
+            print(f"[警告] 获取 Steam 挂单列表失败: {exc}")
+            return 0
+        active_listing_ids = {lst.listing_id for lst in active if lst.listing_id}
+        updated = 0
+        for pool_row in self.db.list_pool_items(status=POOL_STATUS_LISTING_PENDING):
+            market_hash_name = pool_row["market_hash_name"]
+            listed_ops = self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
+            target_op = None
+            for op in listed_ops:
+                if op["market_hash_name"] != market_hash_name:
+                    continue
+                note = _read_note(op["note"])
+                listing_id = str(note.get("listingId") or "").strip()
+                if listing_id and listing_id in active_listing_ids:
+                    target_op = op
+                    break
+            if target_op is None:
+                continue
+            note = _read_note(target_op["note"])
+            note["confirmationStatus"] = "confirmed_late"
+            note["confirmationRecoveredAt"] = utc_now_iso()
+            self.db.update_pool_operation(target_op["id"], note=_build_note(note))
+            self.db.set_pool_status(market_hash_name, POOL_STATUS_LISTED)
+            updated += 1
+        return updated
+
+    def _backfill_listing_ids(self) -> int:
+        """上架确认后，Steam 才分配 listing_id。
+        此方法查询当前活跃挂单，按 asset_id 匹配，把真实 listing_id 回填到 DB。
+        """
+        if not self.steam_client:
+            return 0
+        ops = self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
+        empty_ops = [
+            op for op in ops
+            if not _read_note(op["note"]).get("listingId") and op["asset_id"]
+        ]
+        if not empty_ops:
+            return 0
+        try:
+            active_listings = self.steam_client.list_active_listings()
+        except Exception:
+            return 0
+        asset_to_lid = {
+            lst.asset_id: lst.listing_id
+            for lst in active_listings
+            if lst.asset_id and lst.listing_id
+        }
+        updated = 0
+        for op in empty_ops:
+            lid = asset_to_lid.get(op["asset_id"])
+            if not lid:
+                continue
+            note = _read_note(op["note"])
+            note["listingId"] = lid
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            updated += 1
+        return updated
 
     def _handle_listing_confirmation(
         self,
@@ -437,6 +684,18 @@ class ExecutionEngine:
                 asset_id=asset_id,
                 listing_id=listing_id,
                 reason=f"confirm_failed: {exc}",
+            )
+            return note, POOL_STATUS_LISTING_PENDING
+
+        if confirmed_count <= 0:
+            note["confirmationStatus"] = "not_found"
+            note["confirmationMessage"] = "no pending Steam Guard confirmation found"
+            self._pending_confirmation_count += 1
+            self._notify_listing_confirmation_required(
+                market_hash_name,
+                asset_id=asset_id,
+                listing_id=listing_id,
+                reason="confirm_not_found",
             )
             return note, POOL_STATUS_LISTING_PENDING
 
@@ -872,10 +1131,16 @@ class ExecutionEngine:
     def _refresh_listings(self) -> int:
         if not self.steam_client:
             return 0
-        active = self.steam_client.list_active_listings()
-        active_ids = {listing.listing_id for listing in active}
+        try:
+            active = self.steam_client.list_active_listings()
+        except Exception as exc:
+            print(f"[警告] 获取 Steam 挂单列表失败（可能 Cookie 过期）: {exc}")
+            return 0
+        active_listing_ids = {lst.listing_id for lst in active if lst.listing_id}
+        active_asset_ids = {lst.asset_id for lst in active if lst.asset_id}
         now = _now_utc()
         sold_count = 0
+        pool_status_map = self.db.get_pool_status_map()
         pending_rebuys = {
             row["market_hash_name"]
             for row in self.db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=500)
@@ -883,20 +1148,34 @@ class ExecutionEngine:
 
         listed_ops = self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
         for op in listed_ops:
+            pool_status = pool_status_map.get(op["market_hash_name"], POOL_STATUS_HOLDING)
+            if pool_status == POOL_STATUS_LISTING_PENDING:
+                continue
             note = _read_note(op["note"])
             listing_id = str(note.get("listingId") or "")
-            if not listing_id:
+            asset_id = str(op["asset_id"] or "")
+
+            # 判断是否仍在活跃挂单中（listing_id 优先，没有则用 asset_id 兜底）
+            if listing_id and listing_id in active_listing_ids:
                 continue
-            if listing_id in active_ids:
+            if not listing_id and asset_id and asset_id in active_asset_ids:
                 continue
+
             created_at = _parse_iso(op["created_at"])
             if created_at and (now - created_at).total_seconds() < self.config.listing_check_interval_minutes * 60:
                 continue
 
             self.db.update_pool_operation(op["id"], status="sold")
             self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
-            if op["asset_id"]:
-                self.db.set_asset_status(op["asset_id"], "sold")
+            if asset_id:
+                self.db.set_asset_status(asset_id, "sold")
+
+            steam_list_price = note.get("steamListPrice")
+            print(
+                f"[卖出] {op['market_hash_name']} | "
+                f"asset={asset_id} | "
+                f"Steam售价 ¥{steam_list_price or '?'}"
+            )
 
             rebuy_price = note.get("rebuyPrice")
             if isinstance(rebuy_price, (int, float)) and rebuy_price > 0:
@@ -909,10 +1188,11 @@ class ExecutionEngine:
                         note=_build_note(
                             {
                                 "sourceListing": listing_id,
-                                "steamListPrice": note.get("steamListPrice"),
+                                "steamListPrice": steam_list_price,
                             }
                         ),
                     )
+                    pending_rebuys.add(op["market_hash_name"])
             sold_count += 1
         return sold_count
 
@@ -968,9 +1248,26 @@ class ExecutionEngine:
             page += 1
         return active_ids
 
+    def _resolve_trade_url(self) -> str | None:
+        """优先用环境变量，没有则自动从 Steam 页面获取。"""
+        if self.settings.steam_trade_url:
+            return self.settings.steam_trade_url
+        if not self.steam_client:
+            return None
+        try:
+            url = self.steam_client.get_trade_url()
+            self.settings.steam_trade_url = url  # 缓存，避免重复请求
+            return url
+        except Exception as exc:
+            print(f"[警告] 自动获取交易链接失败: {exc}")
+            return None
+
     def _execute_rebuys(self) -> int:
         if not self.config.auto_rebuy_enabled:
             return 0
+        trade_url = self._resolve_trade_url()
+        if not trade_url:
+            print("[提示] 未配置 STEAM_TRADE_URL，将尝试不带 tradeUrl 直接补仓（C5 使用账号预设链接）")
         pending = self.db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=200)
         rebuy_count = 0
         for op in pending:
@@ -991,7 +1288,6 @@ class ExecutionEngine:
                 tolerance_pct=self.config.price_tolerance_pct,
                 dry_run=self.config.dry_run,
                 verify_steam=self.config.verify_steam_before_rebuy,
-                steam_drop_tolerance_pct=self.config.rebuy_steam_drop_tolerance_pct,
                 force_refresh=self.config.force_refresh_before_execution,
                 pricing_kwargs={
                     "wall_min_count": self.config.listing_wall_min_count,
@@ -1003,13 +1299,38 @@ class ExecutionEngine:
                 },
                 steam_net_factor=self.config.steam_net_factor,
                 guadao_max_listing_ratio=self.config.guadao_max_listing_ratio,
+                trade_url=trade_url,
             )
             if result.reason in (
-                "price_too_high",
                 "steam_crashed",
                 "ratio_no_longer_profitable",
                 "steam_price_unavailable",
+                "no_matching_listing",
             ):
+                # 临时性跳过：保持 pending，下次循环重试；只更新 note 记录原因
+                self.db.update_pool_operation(
+                    op["id"],
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": result.reason,
+                            "steamPriceNow": result.steam_price_now,
+                            "listingRatioNow": result.listing_ratio_now,
+                        }
+                    ),
+                )
+                print(
+                    f"[补仓等待] {op['market_hash_name']} | "
+                    f"原因: {result.reason} | "
+                    f"Steam现价: {result.steam_price_now} | "
+                    f"ratio: {result.listing_ratio_now:.4f}"
+                    if result.listing_ratio_now else
+                    f"[补仓等待] {op['market_hash_name']} | 原因: {result.reason}"
+                )
+                self._notify_skip(op["market_hash_name"], result.reason, result)
+                continue
+            if result.reason == "price_too_high":
+                # C5 当前价格超出预算上限 → 永久跳过本次补仓
                 self.db.update_pool_operation(
                     op["id"],
                     status="skipped",
@@ -1017,22 +1338,37 @@ class ExecutionEngine:
                         {
                             **note,
                             "skipReason": result.reason,
-                            "steamPriceNow": result.steam_price_now,
-                            "listingRatioNow": result.listing_ratio_now,
+                            "actualPrice": result.actual_price,
                         }
                     ),
                 )
+                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+                print(f"[补仓跳过] {op['market_hash_name']} | C5价格过高: ¥{result.actual_price}")
                 self._notify_skip(op["market_hash_name"], result.reason, result)
                 continue
             if result.success and not result.skipped:
                 self.db.update_pool_operation(op["id"], status="completed", actual_price=result.actual_price)
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+                print(
+                    f"[补仓] {op['market_hash_name']} | "
+                    f"C5买入 ¥{result.actual_price:.2f}"
+                )
                 rebuy_count += 1
             elif result.skipped:
                 self.db.update_pool_operation(op["id"], status="dry_run")
             else:
                 self.db.update_pool_operation(op["id"], status="failed")
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_REBUY_FAILED)
+                print(f"[补仓失败] {op['market_hash_name']} | 原因: {result.reason}")
+                if self.serverchan:
+                    try:
+                        self.serverchan.send(
+                            f"[补仓失败] {op['market_hash_name']}",
+                            f"原因: {result.reason}\nC5价格: {result.actual_price}\n"
+                            f"Steam价格: {result.steam_price_now}",
+                        )
+                    except Exception:
+                        pass
         return rebuy_count
 
     def _notify_skip(self, market_hash_name: str, reason: str, details: Any) -> None:
@@ -1042,6 +1378,7 @@ class ExecutionEngine:
             "steam_crashed": "[rebuy] steam dropped",
             "ratio_no_longer_profitable": "[rebuy] ratio not profitable",
             "steam_price_unavailable": "[rebuy] steam price unavailable",
+            "no_matching_listing": "[rebuy] no matching listing",
             "price_too_high": "[rebuy] c5 price too high",
             "steam_price_dropped": "[list] steam price dropped",
             "no_tradable_asset": "[transfer] no tradable base asset",

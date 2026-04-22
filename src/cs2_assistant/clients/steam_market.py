@@ -145,6 +145,31 @@ class SteamMarketClient:
         response.raise_for_status()
         return response
 
+    def get_trade_url(self) -> str:
+        """从 Steam 交易隐私页面自动获取当前账号的交易链接。"""
+        response = self._request("GET", f"/profiles/{self.steam_id64}/tradeoffers/privacy")
+        match = re.search(
+            r"https://steamcommunity\.com/tradeoffer/new/\?partner=\d+&token=[A-Za-z0-9_-]+",
+            response.text,
+        )
+        if match:
+            return match.group(0)
+        raise SteamMarketError("无法从页面提取交易链接，请确认账号已登录且交易链接已启用")
+
+    def remove_listing(self, listing_id: str) -> bool:
+        """Cancel a Steam market listing by listing ID."""
+        response = self._request(
+            "POST",
+            f"/market/removelisting/{listing_id}",
+            data={"sessionid": self.sessionid},
+            headers={"Referer": f"{self.base_url}/market"},
+        )
+        try:
+            payload = response.json()
+            return bool(payload.get("success", True))
+        except ValueError:
+            return response.status_code == 200
+
     def sell_item(
         self,
         *,
@@ -153,20 +178,31 @@ class SteamMarketClient:
         asset_id: str,
         price: float,
         quantity: int = 1,
+        steam_net_factor: float = 0.869,
     ) -> dict[str, Any]:
+        """List an item on the Steam market.
+
+        Args:
+            price: The buyer's listing price (what appears on the market page).
+                   Steam's API internally expects the seller's net amount;
+                   this method converts automatically using steam_net_factor.
+            steam_net_factor: Seller's take rate (default 0.869 = 86.9% for CS2).
+        """
         if price <= 0:
             raise SteamMarketError("price must be positive")
         if quantity <= 0:
             raise SteamMarketError("quantity must be positive")
 
-        price_cents = int(round(price * 100))
+        # Steam's sellitem API 'price' field = seller's net amount in cents.
+        # Caller passes buyer's listing price, so we convert here.
+        seller_net_cents = int(round(price * steam_net_factor * 100))
         data = {
             "sessionid": self.sessionid,
             "appid": app_id,
             "contextid": context_id,
             "assetid": asset_id,
             "amount": quantity,
-            "price": price_cents,
+            "price": seller_net_cents,
         }
         response = self._request(
             "POST",

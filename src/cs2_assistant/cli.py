@@ -1836,9 +1836,6 @@ def cmd_executor_start(args: argparse.Namespace) -> int:
         force_refresh_override = True
     if args.no_force_refresh:
         force_refresh_override = False
-    if args.rebuy_first or args.no_rebuy_first:
-        print("提示: `rebuyBeforeListing` / `--rebuy-first` / `--no-rebuy-first` 已废弃；当前执行顺序已固定。")
-
     engine = ExecutionEngine(
         settings,
         config,
@@ -2212,16 +2209,6 @@ def build_parser() -> argparse.ArgumentParser:
     executor_start.add_argument("--max-buy", type=int, help="Max rebuy per cycle")
     executor_start.add_argument("--force-refresh", action="store_true", help="Force steam refresh")
     executor_start.add_argument("--no-force-refresh", action="store_true", help="Disable steam refresh")
-    executor_start.add_argument(
-        "--rebuy-first",
-        action="store_true",
-        help="Deprecated: execution order is fixed now",
-    )
-    executor_start.add_argument(
-        "--no-rebuy-first",
-        action="store_true",
-        help="Deprecated: execution order is fixed now",
-    )
     executor_start.set_defaults(handler=cmd_executor_start)
 
     executor_status = executor_subparsers.add_parser(

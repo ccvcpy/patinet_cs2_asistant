@@ -115,7 +115,7 @@ class StrategyConfig:
     execution_enabled: bool = False
     auto_list_enabled: bool = True
     auto_rebuy_enabled: bool = True
-    price_tolerance_pct: float = 2.0
+    price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
     max_buy_per_cycle: int = 3
     cycle_interval_minutes: int = 15
@@ -131,7 +131,6 @@ class StrategyConfig:
     steam_price_cache_ttl: float = 60.0
     verify_steam_before_rebuy: bool = True
     rebuy_steam_drop_tolerance_pct: float = 5.0
-    rebuy_before_listing: bool = True  # Deprecated: kept only for config compatibility; execution order is fixed.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,7 +161,6 @@ class StrategyConfig:
             "steamPriceCacheTtl": self.steam_price_cache_ttl,
             "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
             "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
-            "rebuyBeforeListing": self.rebuy_before_listing,
         }
 
     @classmethod
@@ -188,7 +186,7 @@ class StrategyConfig:
             execution_enabled=_as_bool(data.get("executionEnabled"), False),
             auto_list_enabled=_as_bool(data.get("autoListEnabled"), True),
             auto_rebuy_enabled=_as_bool(data.get("autoRebuyEnabled"), True),
-            price_tolerance_pct=float(data.get("priceTolerancePct", 2.0)),
+            price_tolerance_pct=float(data.get("priceTolerancePct", 1.0)),
             max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
             max_buy_per_cycle=int(data.get("maxBuyPerCycle", 3)),
             cycle_interval_minutes=int(data.get("cycleIntervalMinutes", 15)),
@@ -204,7 +202,6 @@ class StrategyConfig:
             steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
             verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),
             rebuy_steam_drop_tolerance_pct=float(data.get("rebuySteamDropTolerancePct", 5.0)),
-            rebuy_before_listing=_as_bool(data.get("rebuyBeforeListing"), True),
         )
 
 
