@@ -4,7 +4,14 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 克隆仓库
+
+```powershell
+git clone https://github.com/ccvcpy/patinet_cs2_asistant.git
+cd patinet_cs2_asistant
+```
+
+### 2. 安装依赖
 
 ```powershell
 pip install -e .
@@ -12,7 +19,7 @@ pip install -e .
 
 如果你不想用可编辑安装，也可以先安装项目依赖后直接运行 `python .\main.py ...`。
 
-### 2. 配置环境变量
+### 3. 配置环境变量
 
 至少准备这些变量中的一部分：
 
@@ -30,7 +37,7 @@ $env:SERVERCHAN_SENDKEY="..."
 3. `STEAMDT_API_KEY` 用于 Steam 价格兜底。
 4. `SERVERCHAN_SENDKEY` 只有在你要推送提醒时才需要。
 
-### 3. 初始化本地数据
+### 4. 初始化本地数据
 
 第一次使用建议先跑这两步：
 
@@ -44,7 +51,7 @@ python .\main.py import-catalog
 1. `init-db` 会创建本地 SQLite 数据库。
 2. `import-catalog` 会把本地 SteamDT 基础数据导入数据库，方便后续搜索和辅助映射。
 
-### 4. 直接开始扫描
+### 5. 直接开始扫描
 
 ```powershell
 python .\main.py t-profit scan --top 10 --min-price 10
@@ -52,7 +59,7 @@ python .\main.py t-profit scan --bottom 10 --min-price 10
 python .\main.py t-profit missing-steam
 ```
 
-### 5. 配置并运行提醒
+### 6. 配置并运行提醒
 
 ```powershell
 python .\main.py notify t-profit --configure
