@@ -1,12 +1,19 @@
 ﻿from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
+from cs2_assistant.accounts.browser import relogin_with_browser
+from cs2_assistant.accounts import AccountStore
+from cs2_assistant.accounts.steam_auth import (
+    _verify_steam_cookies_valid,
+    try_steam_auto_relogin,
+)
 from cs2_assistant.catalog import load_steamdt_catalog
 from cs2_assistant.clients import (
     C5GameClient,
@@ -16,7 +23,7 @@ from cs2_assistant.clients import (
     SteamMarketClient,
 )
 from cs2_assistant.clients.steam_market import SteamMarketError
-from cs2_assistant.config import Settings, load_settings
+from cs2_assistant.config import PROJECT_ROOT, Settings, load_settings
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
@@ -73,14 +80,25 @@ def _open_db(settings: Settings) -> Database:
     return db
 
 
+def _account_store(_: Settings | None = None) -> AccountStore:
+    return AccountStore(PROJECT_ROOT / "config")
+
+
 def _build_steam_client(settings: Settings) -> SteamMarketClient:
-    if not settings.steam_cookies:
+    store = _account_store(settings)
+    current = store.get_current()
+    cookies = (current.cookies if current else None) or settings.steam_cookies
+    identity_secret = (current.identity_secret if current else None) or settings.steam_identity_secret
+    device_id = (current.device_id if current else None) or settings.steam_device_id
+    steam_id64 = (current.steam_id64 if current else None) or None
+    if not cookies:
         raise RuntimeError("missing STEAM_COOKIES")
     return SteamMarketClient(
-        cookies=settings.steam_cookies,
-        steam_id64=None,
-        identity_secret=settings.steam_identity_secret,
-        device_id=settings.steam_device_id,
+        cookies=cookies,
+        steam_id64=steam_id64,
+        identity_secret=identity_secret,
+        device_id=device_id,
+        account_id=current.id if current else None,
         base_url=settings.steam_market_base_url,
     )
 
@@ -1648,11 +1666,18 @@ def cmd_pool_status(args: argparse.Namespace) -> int:
     """Show current inventory pool status."""
     settings = _settings_from_args(args)
     db = _open_db(settings)
+    all_pool_items = db.list_pool_items()
     pool_items = db.list_pool_items(status=args.status_filter)
     db.close()
 
     if not pool_items:
-        print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
+        if args.status_filter:
+            if all_pool_items:
+                print(f"未找到状态为 `{args.status_filter}` 的底仓项。")
+            else:
+                print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
+        else:
+            print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
         return 0
 
     total_qty = 0
@@ -1929,6 +1954,172 @@ def cmd_steam_price_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_account_status(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    accounts = store.list_accounts()
+    current = store.get_current()
+    print(f"账户数: {len(accounts)}")
+    print(f"存储文件: {store.file_path}")
+    if not accounts:
+        print("当前没有已保存账户。")
+        return 0
+
+    for account in accounts:
+        marker = "*" if current and account.id == current.id else "-"
+        cookie_status = "未配置"
+        listing_summary = "-"
+        if account.cookies and account.steam_id64:
+            try:
+                client = SteamMarketClient(
+                    cookies=account.cookies,
+                    steam_id64=account.steam_id64,
+                    identity_secret=account.identity_secret,
+                    device_id=account.device_id,
+                    base_url=settings.steam_market_base_url,
+                )
+                payload = client.my_listings(count=1)
+                if payload and payload.get("success") in (1, True):
+                    cookie_status = "有效"
+                    listing_summary = str(len(client.list_active_listings(count=100)))
+                else:
+                    cookie_status = "无效"
+            except Exception as exc:
+                cookie_status = f"无效 ({exc})"
+        print(
+            f"{marker} {account.name} | id={account.id} | steam={account.steam_id64 or '-'} | "
+            f"cookie={cookie_status} | 挂单数={listing_summary}"
+        )
+    return 0
+
+
+def _generate_steam_device_id(steam_id64: str) -> str | None:
+    steam_id = str(steam_id64 or "").strip()
+    if not steam_id:
+        return None
+    digest = hashlib.sha1(steam_id.encode("utf-8")).hexdigest()
+    return f"android:{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+
+def cmd_account_import_mafile(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    path = Path(args.path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("maFile 内容不是 JSON 对象")
+
+    name = str(payload.get("account_name") or payload.get("name") or path.stem).strip()
+    steam_id64 = str(payload.get("steamid") or payload.get("steam_id") or "").strip()
+    device_id = str(payload.get("device_id") or "").strip() or _generate_steam_device_id(steam_id64)
+    update_fields = {
+        "name": str(args.name or name).strip(),
+        "username": args.username,
+        "password": args.password,
+        "steam_id64": steam_id64 or None,
+        "shared_secret": payload.get("shared_secret"),
+        "identity_secret": payload.get("identity_secret"),
+        "device_id": device_id,
+    }
+
+    existing = store.get_account(name)
+    if existing is None and steam_id64:
+        existing = next(
+            (account for account in store.list_accounts() if account.steam_id64 == steam_id64),
+            None,
+        )
+
+    if existing:
+        account = store.update_account(existing.id, **update_fields)
+        action = "updated"
+    else:
+        account = store.add_account(**update_fields)
+        action = "imported"
+    print(f"Account {action}: {account.name} | id={account.id} | steam={account.steam_id64 or '-'}")
+    return 0
+
+
+def cmd_account_list(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    accounts = store.list_accounts()
+    current = store.get_current()
+    if not accounts:
+        print("当前没有已保存账户。")
+        return 0
+    for account in accounts:
+        marker = "*" if current and account.id == current.id else "-"
+        print(f"{marker} {account.name} | id={account.id} | steam={account.steam_id64 or '-'}")
+    return 0
+
+
+def cmd_account_use(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    if not store.set_current(args.name):
+        raise RuntimeError(f"account not found: {args.name}")
+    account = store.get_current()
+    print(f"当前账户: {account.name} | id={account.id}")
+    return 0
+
+
+def cmd_account_remove(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    if not store.delete_account(args.name):
+        raise RuntimeError(f"account not found: {args.name}")
+    print(f"已删除账户: {args.name}")
+    return 0
+
+
+def cmd_account_set_credentials(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    account = store.update_account(
+        args.name,
+        username=args.username,
+        password=args.password,
+    )
+    if account is None:
+        raise RuntimeError(f"account not found: {args.name}")
+    print(f"已更新凭据: {account.name}")
+    return 0
+
+
+def cmd_steam_login(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    account = store.get_account(args.account)
+    if account is None:
+        raise RuntimeError(f"account not found: {args.account}")
+    store.set_current(account.id)
+
+    if args.browser:
+        ok, status, updated = relogin_with_browser(store, account_id=account.id)
+    else:
+        ok, status, updated = try_steam_auto_relogin(store, account_id=account.id, force_login=True)
+    if not ok or updated is None:
+        raise RuntimeError(f"steam login failed: {status}")
+    print(f"Steam 登录成功: {updated.name} | steam={updated.steam_id64 or '-'} | mode={'browser' if args.browser else 'steampy'}")
+    return 0
+
+
+def cmd_steam_cookie_refresh(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    account = store.get_current()
+    if account is None:
+        raise RuntimeError("no current account")
+    if account.cookies and _verify_steam_cookies_valid(account.cookies, account.steam_id64 or ""):
+        print(f"Cookie 仍有效，无需刷新: {account.name}")
+        return 0
+    ok, status, updated = try_steam_auto_relogin(store, account_id=account.id, force_login=True)
+    if not ok or updated is None:
+        raise RuntimeError(f"cookie refresh failed: {status}")
+    print(f"Cookie 已刷新: {updated.name} | steam={updated.steam_id64 or '-'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CS2 理财助手 CLI",
@@ -2052,6 +2243,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     c5_inventory_all = subparsers.add_parser("c5-inventory-all", help="汇总所有绑定 Steam 账号的 C5 库存")
     c5_inventory_all.set_defaults(handler=cmd_c5_inventory_all)
+
+    account = subparsers.add_parser(
+        "account",
+        help="账户管理",
+        description="管理本地保存的 Steam 账户信息。",
+    )
+    account_subparsers = account.add_subparsers(dest="account_command", required=True)
+    account_import = account_subparsers.add_parser(
+        "import-mafile",
+        help="导入 SDA maFile，可同时保存账号密码",
+    )
+    account_import.add_argument("path")
+    account_import.add_argument("--name", help="账户显示名，默认取 maFile 里的账户名或文件名")
+    account_import.add_argument("--username", help="Steam 登录账号")
+    account_import.add_argument("--password", help="Steam 登录密码")
+    account_import.set_defaults(handler=cmd_account_import_mafile)
+    account_list = account_subparsers.add_parser("list", help="列出账户")
+    account_list.set_defaults(handler=cmd_account_list)
+    account_use = account_subparsers.add_parser("use", help="切换当前账户")
+    account_use.add_argument("name")
+    account_use.set_defaults(handler=cmd_account_use)
+    account_set_credentials = account_subparsers.add_parser(
+        "set-credentials",
+        help="更新账户的 Steam 账号密码",
+    )
+    account_set_credentials.add_argument("name")
+    account_set_credentials.add_argument("--username", required=True)
+    account_set_credentials.add_argument("--password", required=True)
+    account_set_credentials.set_defaults(handler=cmd_account_set_credentials)
+    account_remove = account_subparsers.add_parser("remove", help="删除账户")
+    account_remove.add_argument("name")
+    account_remove.set_defaults(handler=cmd_account_remove)
+    account_status = account_subparsers.add_parser("status", help="查看账户状态")
+    account_status.set_defaults(handler=cmd_account_status)
 
     def add_t_profit_parser(name: str, *, hidden: bool = False) -> None:
         t_profit = subparsers.add_parser(
@@ -2238,12 +2463,20 @@ def build_parser() -> argparse.ArgumentParser:
     steam_auth = steam_subparsers.add_parser("auth-check", help="Check Steam auth")
     steam_auth.set_defaults(handler=cmd_steam_auth_check)
 
+    steam_login = steam_subparsers.add_parser("login", help="登录 Steam 并保存 Cookie")
+    steam_login.add_argument("--account", required=True, help="账户名")
+    steam_login.add_argument("--browser", action="store_true", help="使用 Playwright 浏览器登录")
+    steam_login.set_defaults(handler=cmd_steam_login)
+
     steam_listings = steam_subparsers.add_parser("listings", help="List Steam listings")
     steam_listings.add_argument("--count", type=int, default=20)
     steam_listings.set_defaults(handler=cmd_steam_listings)
 
     steam_confirm = steam_subparsers.add_parser("confirm", help="Confirm pending listings")
     steam_confirm.set_defaults(handler=cmd_steam_confirm)
+
+    steam_cookie_refresh = steam_subparsers.add_parser("cookie-refresh", help="验证并自动刷新当前账户 Cookie")
+    steam_cookie_refresh.set_defaults(handler=cmd_steam_cookie_refresh)
 
     steam_price_cache = steam_subparsers.add_parser("price-cache", help="Manage steam price cache")
     steam_price_cache_sub = steam_price_cache.add_subparsers(dest="price_cache_command", required=True)

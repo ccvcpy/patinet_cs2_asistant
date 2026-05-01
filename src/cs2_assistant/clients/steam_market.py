@@ -13,6 +13,10 @@ from urllib.parse import quote, unquote
 
 import requests
 
+from cs2_assistant.accounts import AccountStore
+from cs2_assistant.accounts.steam_auth import try_steam_auto_relogin
+from cs2_assistant.config import PROJECT_ROOT
+
 
 class SteamMarketError(RuntimeError):
     pass
@@ -87,30 +91,50 @@ class SteamMarketClient:
     def __init__(
         self,
         *,
-        cookies: str,
+        cookies: str | None,
         steam_id64: str | None = None,
         identity_secret: str | None = None,
         device_id: str | None = None,
+        account_id: str | None = None,
         base_url: str = "https://steamcommunity.com",
         timeout: int = 30,
     ) -> None:
-        if not cookies:
-            raise SteamMarketError("missing Steam cookies")
-
         self.base_url = base_url.rstrip("/")
         self.identity_secret = _normalize_identity_secret(identity_secret) if identity_secret else identity_secret
         self.device_id = device_id
         self.timeout = timeout
+        self.account_id = str(account_id or "").strip() or None
+        self._account_store = AccountStore(PROJECT_ROOT / "config") if self.account_id else None
 
         self._session = requests.Session()
-        cookie_map = _parse_cookie_string(cookies)
-        self._session.cookies.update(cookie_map)
         self._session.headers.update(
             {
                 "Accept": "application/json, text/plain, */*",
                 "User-Agent": "Steam Mobile/10372190 CFNetwork/3860.100.1 Darwin/25.0.0",
             }
         )
+        cookie_source = cookies
+        if not cookie_source and self._account_store and self.account_id:
+            account = self._account_store.get_account(self.account_id)
+            if account:
+                cookie_source = account.cookies
+                steam_id64 = steam_id64 or account.steam_id64
+                if not self.identity_secret:
+                    self.identity_secret = account.identity_secret
+                if not self.device_id:
+                    self.device_id = account.device_id
+        if not cookie_source:
+            raise SteamMarketError("missing Steam cookies")
+        self._apply_cookie_string(cookie_source, steam_id64=steam_id64)
+
+    @property
+    def sessionid(self) -> str:
+        return self._sessionid
+
+    def _apply_cookie_string(self, cookies: str, *, steam_id64: str | None = None) -> None:
+        cookie_map = _parse_cookie_string(cookies)
+        self._session.cookies.clear()
+        self._session.cookies.update(cookie_map)
         self._sessionid = _extract_sessionid(cookie_map)
         if not self._sessionid:
             raise SteamMarketError("Steam cookies missing sessionid")
@@ -119,9 +143,22 @@ class SteamMarketClient:
             raise SteamMarketError("missing Steam ID64 in cookies")
         self.steam_id64 = resolved_id64
 
-    @property
-    def sessionid(self) -> str:
-        return self._sessionid
+    def _try_account_relogin(self) -> bool:
+        if not self._account_store or not self.account_id:
+            return False
+        ok, _, account = try_steam_auto_relogin(
+            self._account_store,
+            account_id=self.account_id,
+            force_login=True,
+        )
+        if not ok or account is None or not account.cookies:
+            return False
+        self._apply_cookie_string(account.cookies, steam_id64=account.steam_id64)
+        if account.identity_secret and not self.identity_secret:
+            self.identity_secret = account.identity_secret
+        if account.device_id and not self.device_id:
+            self.device_id = account.device_id
+        return True
 
     def _request(
         self,
@@ -131,6 +168,7 @@ class SteamMarketClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        _allow_retry: bool = True,
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
         merged_headers = dict(headers or {})
@@ -142,6 +180,15 @@ class SteamMarketClient:
             headers=merged_headers,
             timeout=self.timeout,
         )
+        if response.status_code in (400, 401) and _allow_retry and self._try_account_relogin():
+            response = self._session.request(
+                method=method,
+                url=url,
+                params=params,
+                data=data,
+                headers=merged_headers,
+                timeout=self.timeout,
+            )
         response.raise_for_status()
         return response
 

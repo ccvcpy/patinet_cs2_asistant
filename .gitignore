@@ -6,3 +6,7 @@ data/
 .venv/
 
 .claude/
+config/accounts.json
+config/*.bak*
+config/playwright_steam/
+maFiles/

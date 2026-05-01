@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from cs2_assistant.accounts import Account, AccountStore
 from cs2_assistant.clients import (
     C5GameClient,
     C5GameError,
@@ -13,7 +14,7 @@ from cs2_assistant.clients import (
     SteamMarketClient,
     SteamMarketError,
 )
-from cs2_assistant.config import Settings
+from cs2_assistant.config import PROJECT_ROOT, Settings
 from cs2_assistant.db import Database
 from cs2_assistant.models import (
     OP_REBUY_C5,
@@ -55,6 +56,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+REBUY_NO_MATCHING_TIMEOUT_SECONDS = 3 * 60 * 60
+
+
 def _build_note(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
@@ -91,6 +95,7 @@ class ExecutionEngine:
         settings: Settings,
         config: StrategyConfig | None = None,
         *,
+        account: Account | str | None = None,
         dry_run_override: bool | None = None,
         force_refresh_override: bool | None = None,
     ) -> None:
@@ -103,11 +108,31 @@ class ExecutionEngine:
         if not self.config.execution_enabled:
             self.config.dry_run = True
 
+        self.account_store = AccountStore(PROJECT_ROOT / "config")
+        if isinstance(account, Account):
+            self.account = account
+        elif account is not None:
+            self.account = self.account_store.get_account(str(account))
+        else:
+            self.account = self.account_store.get_current()
+
+        self._c5_api_key = (self.account.c5_api_key if self.account else None) or settings.c5_api_key
+        self._steam_cookies = (self.account.cookies if self.account else None) or settings.steam_cookies
+        self._steam_identity_secret = (
+            self.account.identity_secret if self.account else None
+        ) or settings.steam_identity_secret
+        self._steam_device_id = (
+            self.account.device_id if self.account else None
+        ) or settings.steam_device_id
+        self._steam_trade_url = (
+            self.account.trade_url if self.account else None
+        ) or settings.steam_trade_url
+
         self.db = Database(settings.db_path)
         self.db.initialize()
-        if not settings.c5_api_key:
+        if not self._c5_api_key:
             raise RuntimeError("missing C5GAME_API_KEY / C5_API_KEY")
-        self.c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+        self.c5_client = C5GameClient(self._c5_api_key, settings.c5_base_url)
         self.serverchan = (
             ServerChanClient(settings.serverchan_sendkey, settings.serverchan_base_url)
             if settings.serverchan_sendkey
@@ -116,25 +141,28 @@ class ExecutionEngine:
 
         self.steam_client = None
         if self.config.execution_enabled or self.config.auto_list_enabled:
-            if not settings.steam_cookies:
+            if not self._steam_cookies:
                 raise RuntimeError("missing STEAM_COOKIES for auto execution")
             self.steam_client = SteamMarketClient(
-                cookies=settings.steam_cookies,
+                cookies=self._steam_cookies,
                 steam_id64=None,
-                identity_secret=settings.steam_identity_secret,
-                device_id=settings.steam_device_id,
+                identity_secret=self._steam_identity_secret,
+                device_id=self._steam_device_id,
+                account_id=self.account.id if self.account else None,
                 base_url=settings.steam_market_base_url,
             )
 
         self._last_inventory_payload: dict[str, Any] = {}
         self._inventory_items_by_asset_id: dict[str, dict[str, Any]] = {}
         self._pending_confirmation_count = 0
+        self._stop_requested = False
+        self._stop_reason: str | None = None
 
         if (
             self.config.execution_enabled
             and not self.config.dry_run
             and self.config.auto_list_enabled
-            and (not settings.steam_identity_secret or not settings.steam_device_id)
+            and (not self._steam_identity_secret or not self._steam_device_id)
         ):
             print(
                 "[提醒] 未配置 `STEAM_IDENTITY_SECRET` 或 `STEAM_DEVICE_ID`，"
@@ -147,6 +175,10 @@ class ExecutionEngine:
     def run(self, *, once: bool = False) -> None:
         while True:
             self.run_once(wait_for_cycle=True)
+            if self._stop_requested:
+                if self._stop_reason:
+                    print(f"[停止] {self._stop_reason}")
+                return
             if once:
                 return
             time.sleep(self.config.cycle_interval_minutes * 60)
@@ -289,6 +321,15 @@ class ExecutionEngine:
             if market_hash_name:
                 names.add(market_hash_name)
         return names
+
+    def _effective_steam_identity_secret(self) -> str | None:
+        return getattr(self, "_steam_identity_secret", None) or self.settings.steam_identity_secret
+
+    def _effective_steam_device_id(self) -> str | None:
+        return getattr(self, "_steam_device_id", None) or self.settings.steam_device_id
+
+    def _effective_steam_trade_url(self) -> str | None:
+        return getattr(self, "_steam_trade_url", None) or self.settings.steam_trade_url
 
     def _run_guadao_cycle(self, report: Any, *, wait_for_cycle: bool) -> tuple[int, int, int]:
         status_map = self.db.get_pool_status_map()
@@ -574,8 +615,8 @@ class ExecutionEngine:
                 print(
                     f"[上架] {candidate.market_hash_name} | "
                     f"asset={asset_id} | "
-                    f"Steam挂价 ¥{decision.list_price:.2f} | "
-                    f"预计到手 ¥{decision.list_price * 0.869:.2f}"
+                    f"Steam挂价 CNY {decision.list_price:.2f} | "
+                    f"预计到手 CNY {decision.list_price * 0.869:.2f}"
                 )
                 list_count += 1
 
@@ -657,7 +698,7 @@ class ExecutionEngine:
             "needsConfirmation": True,
             "confirmationStatus": "pending",
         }
-        if not self.settings.steam_identity_secret or not self.settings.steam_device_id:
+        if not self._effective_steam_identity_secret() or not self._effective_steam_device_id():
             note["confirmationStatus"] = "manual_required"
             note["confirmationMessage"] = "missing STEAM_IDENTITY_SECRET or STEAM_DEVICE_ID"
             self._pending_confirmation_count += 1
@@ -1174,7 +1215,7 @@ class ExecutionEngine:
             print(
                 f"[卖出] {op['market_hash_name']} | "
                 f"asset={asset_id} | "
-                f"Steam售价 ¥{steam_list_price or '?'}"
+                f"Steam售价 CNY {steam_list_price or '?'}"
             )
 
             rebuy_price = note.get("rebuyPrice")
@@ -1250,13 +1291,17 @@ class ExecutionEngine:
 
     def _resolve_trade_url(self) -> str | None:
         """优先用环境变量，没有则自动从 Steam 页面获取。"""
-        if self.settings.steam_trade_url:
-            return self.settings.steam_trade_url
+        trade_url = self._effective_steam_trade_url()
+        if trade_url:
+            return trade_url
         if not self.steam_client:
             return None
         try:
             url = self.steam_client.get_trade_url()
-            self.settings.steam_trade_url = url  # 缓存，避免重复请求
+            self._steam_trade_url = url
+            self.settings.steam_trade_url = url  # fallback 缓存，避免重复请求
+            if self.account:
+                self.account_store.update_account(self.account.id, trade_url=url)
             return url
         except Exception as exc:
             print(f"[警告] 自动获取交易链接失败: {exc}")
@@ -1307,6 +1352,17 @@ class ExecutionEngine:
                 "steam_price_unavailable",
                 "no_matching_listing",
             ):
+                timeout_triggered = False
+                no_matching_since = note.get("noMatchingSince")
+                if result.reason == "no_matching_listing":
+                    timeout_triggered = self._handle_no_matching_rebuy_timeout(
+                        op=op,
+                        note=note,
+                        result=result,
+                    )
+                    if timeout_triggered:
+                        return rebuy_count
+                    no_matching_since = no_matching_since or utc_now_iso()
                 # 临时性跳过：保持 pending，下次循环重试；只更新 note 记录原因
                 self.db.update_pool_operation(
                     op["id"],
@@ -1316,6 +1372,7 @@ class ExecutionEngine:
                             "lastSkipReason": result.reason,
                             "steamPriceNow": result.steam_price_now,
                             "listingRatioNow": result.listing_ratio_now,
+                            "noMatchingSince": no_matching_since,
                         }
                     ),
                 )
@@ -1343,7 +1400,7 @@ class ExecutionEngine:
                     ),
                 )
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
-                print(f"[补仓跳过] {op['market_hash_name']} | C5价格过高: ¥{result.actual_price}")
+                print(f"[补仓跳过] {op['market_hash_name']} | C5价格过高: CNY {result.actual_price}")
                 self._notify_skip(op["market_hash_name"], result.reason, result)
                 continue
             if result.success and not result.skipped:
@@ -1351,7 +1408,7 @@ class ExecutionEngine:
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
                 print(
                     f"[补仓] {op['market_hash_name']} | "
-                    f"C5买入 ¥{result.actual_price:.2f}"
+                    f"C5买入 CNY {result.actual_price:.2f}"
                 )
                 rebuy_count += 1
             elif result.skipped:
@@ -1370,6 +1427,64 @@ class ExecutionEngine:
                     except Exception:
                         pass
         return rebuy_count
+
+    def _handle_no_matching_rebuy_timeout(
+        self,
+        *,
+        op: Any,
+        note: dict[str, Any],
+        result: Any,
+    ) -> bool:
+        started_at = _parse_iso(str(note.get("noMatchingSince") or "")) or _parse_iso(op["created_at"])
+        if started_at is None:
+            return False
+        elapsed_seconds = (_now_utc() - started_at).total_seconds()
+        if elapsed_seconds < REBUY_NO_MATCHING_TIMEOUT_SECONDS:
+            return False
+
+        timeout_hours = REBUY_NO_MATCHING_TIMEOUT_SECONDS / 3600
+        timeout_reason = "no_matching_listing_timeout"
+        updated_note = {
+            **note,
+            "lastSkipReason": result.reason,
+            "noMatchingSince": started_at.isoformat(),
+            "manualRequired": True,
+            "timeoutReason": timeout_reason,
+            "timeoutHours": timeout_hours,
+            "steamPriceNow": result.steam_price_now,
+            "listingRatioNow": result.listing_ratio_now,
+        }
+        self.db.update_pool_operation(
+            op["id"],
+            status="failed",
+            note=_build_note(updated_note),
+        )
+        self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_REBUY_FAILED)
+        self._stop_requested = True
+        self._stop_reason = (
+            f"{op['market_hash_name']} 补仓已连续等待超过 {timeout_hours:.0f} 小时"
+            "（无满足条件的在售饰品），已停止执行，需人工处理。"
+        )
+        print(
+            f"[补仓超时] {op['market_hash_name']} | "
+            f"原因: no_matching_listing 持续超过 {timeout_hours:.0f} 小时 | "
+            "已转人工处理"
+        )
+        if self.serverchan:
+            try:
+                self.serverchan.send(
+                    f"[补仓超时] {op['market_hash_name']}",
+                    (
+                        f"原因: no_matching_listing 持续超过 {timeout_hours:.0f} 小时\n"
+                        "状态: 已停止程序，等待人工处理\n"
+                        f"C5价格: {result.actual_price}\n"
+                        f"Steam价格: {result.steam_price_now}\n"
+                        f"ratio: {result.listing_ratio_now}"
+                    ),
+                )
+            except Exception:
+                pass
+        return True
 
     def _notify_skip(self, market_hash_name: str, reason: str, details: Any) -> None:
         if not self.serverchan:
