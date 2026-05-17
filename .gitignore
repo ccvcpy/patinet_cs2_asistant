@@ -3,6 +3,11 @@ __pycache__/
 *.pyo
 *.db
 data/
+logs/
 .venv/
 
 .claude/
+config/accounts.json
+config/*.bak*
+config/playwright_steam/
+maFiles/

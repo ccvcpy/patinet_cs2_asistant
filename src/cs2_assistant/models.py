@@ -115,7 +115,7 @@ class StrategyConfig:
     execution_enabled: bool = False
     auto_list_enabled: bool = True
     auto_rebuy_enabled: bool = True
-    price_tolerance_pct: float = 2.0
+    price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
     max_buy_per_cycle: int = 3
     cycle_interval_minutes: int = 15
@@ -127,11 +127,11 @@ class StrategyConfig:
     steam_language: str = "schinese"
     listing_wall_min_count: int = 20
     listing_price_offset: float = 0.01
+    case_listing_price_offset: float | None = -0.01
     force_refresh_before_execution: bool = True
     steam_price_cache_ttl: float = 60.0
     verify_steam_before_rebuy: bool = True
     rebuy_steam_drop_tolerance_pct: float = 5.0
-    rebuy_before_listing: bool = True  # Deprecated: kept only for config compatibility; execution order is fixed.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,11 +158,11 @@ class StrategyConfig:
             "steamLanguage": self.steam_language,
             "listingWallMinCount": self.listing_wall_min_count,
             "listingPriceOffset": self.listing_price_offset,
+            "caseListingPriceOffset": self.case_listing_price_offset,
             "forceRefreshBeforeExecution": self.force_refresh_before_execution,
             "steamPriceCacheTtl": self.steam_price_cache_ttl,
             "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
             "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
-            "rebuyBeforeListing": self.rebuy_before_listing,
         }
 
     @classmethod
@@ -188,7 +188,7 @@ class StrategyConfig:
             execution_enabled=_as_bool(data.get("executionEnabled"), False),
             auto_list_enabled=_as_bool(data.get("autoListEnabled"), True),
             auto_rebuy_enabled=_as_bool(data.get("autoRebuyEnabled"), True),
-            price_tolerance_pct=float(data.get("priceTolerancePct", 2.0)),
+            price_tolerance_pct=float(data.get("priceTolerancePct", 1.0)),
             max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
             max_buy_per_cycle=int(data.get("maxBuyPerCycle", 3)),
             cycle_interval_minutes=int(data.get("cycleIntervalMinutes", 15)),
@@ -200,11 +200,15 @@ class StrategyConfig:
             steam_language=str(data.get("steamLanguage", "schinese")),
             listing_wall_min_count=int(data.get("listingWallMinCount", 20)),
             listing_price_offset=float(data.get("listingPriceOffset", 0.01)),
+            case_listing_price_offset=(
+                float(data["caseListingPriceOffset"])
+                if data.get("caseListingPriceOffset") is not None
+                else None
+            ),
             force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
             steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
             verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),
             rebuy_steam_drop_tolerance_pct=float(data.get("rebuySteamDropTolerancePct", 5.0)),
-            rebuy_before_listing=_as_bool(data.get("rebuyBeforeListing"), True),
         )
 
 

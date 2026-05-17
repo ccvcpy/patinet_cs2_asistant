@@ -14,6 +14,7 @@ DEFAULT_STEAMDT_BASE_URL = "https://open.steamdt.com"
 DEFAULT_CSQAQ_BASE_URL = "https://api.csqaq.com"
 DEFAULT_STEAM_MARKET_BASE_URL = "https://steamcommunity.com"
 DEFAULT_CSGO_APP_ID = 730
+_TRUSTSTORE_INJECTED = False
 
 
 def _read_windows_registry_env(name: str) -> str | None:
@@ -49,6 +50,19 @@ def _first_env(*names: str) -> str | None:
     return None
 
 
+def ensure_system_cert_store() -> None:
+    """Prefer the OS certificate store for HTTPS requests when available."""
+    global _TRUSTSTORE_INJECTED
+    if _TRUSTSTORE_INJECTED:
+        return
+    try:
+        import truststore
+    except ImportError:
+        return
+    truststore.inject_into_ssl()
+    _TRUSTSTORE_INJECTED = True
+
+
 @dataclass(slots=True)
 class Settings:
     db_path: Path = DEFAULT_DB_PATH
@@ -69,6 +83,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    ensure_system_cert_store()
     db_path = Path(_first_env("CS2_ASSISTANT_DB_PATH") or DEFAULT_DB_PATH)
     steamdt_base_path = Path(
         _first_env("CS2_ASSISTANT_STEAMDT_BASE_PATH") or DEFAULT_STEAMDT_BASE_PATH

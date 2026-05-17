@@ -147,6 +147,47 @@ class C5GameClient:
         )
         return dict(data or {})
 
+    def goods_search(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        delivery: int = 1,
+        page: int = 1,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """搜索市场在售商品，返回 productId 和价格列表。delivery=1 只看自动发货。"""
+        params: dict[str, Any] = {
+            "appId": app_id,
+            "marketHashName": market_hash_name,
+            "delivery": delivery,
+            "page": page,
+            "limit": limit,
+        }
+        data = self._request("GET", "/merchant/goods/v1/search", params=params)
+        return dict(data or {})
+
+    def normal_buy(
+        self,
+        *,
+        app_id: int,
+        product_id: int,
+        buy_price: float,
+        trade_url: str,
+        out_trade_no: str | None = None,
+    ) -> dict[str, Any]:
+        """普通购买：按指定 productId 和价格购买。"""
+        import uuid
+        body: dict[str, Any] = {
+            "appId": app_id,
+            "productId": product_id,
+            "buyPrice": buy_price,
+            "tradeUrl": trade_url,
+            "outTradeNo": out_trade_no or uuid.uuid4().hex,
+        }
+        data = self._request("POST", "/merchant/trade/v2/normal-buy", json_body=body)
+        return dict(data or {})
+
     def quick_buy(
         self,
         *,
