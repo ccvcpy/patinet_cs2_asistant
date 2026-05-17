@@ -127,6 +127,7 @@ class StrategyConfig:
     steam_language: str = "schinese"
     listing_wall_min_count: int = 20
     listing_price_offset: float = 0.01
+    case_listing_price_offset: float | None = -0.01
     force_refresh_before_execution: bool = True
     steam_price_cache_ttl: float = 60.0
     verify_steam_before_rebuy: bool = True
@@ -157,6 +158,7 @@ class StrategyConfig:
             "steamLanguage": self.steam_language,
             "listingWallMinCount": self.listing_wall_min_count,
             "listingPriceOffset": self.listing_price_offset,
+            "caseListingPriceOffset": self.case_listing_price_offset,
             "forceRefreshBeforeExecution": self.force_refresh_before_execution,
             "steamPriceCacheTtl": self.steam_price_cache_ttl,
             "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
@@ -198,6 +200,11 @@ class StrategyConfig:
             steam_language=str(data.get("steamLanguage", "schinese")),
             listing_wall_min_count=int(data.get("listingWallMinCount", 20)),
             listing_price_offset=float(data.get("listingPriceOffset", 0.01)),
+            case_listing_price_offset=(
+                float(data["caseListingPriceOffset"])
+                if data.get("caseListingPriceOffset") is not None
+                else None
+            ),
             force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
             steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
             verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),

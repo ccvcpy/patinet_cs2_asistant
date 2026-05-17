@@ -12,9 +12,12 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cs2_assistant.accounts import Account
 from cs2_assistant.config import Settings
+from cs2_assistant.clients.steam_market import SteamMarketError
 from cs2_assistant.db import Database
 from cs2_assistant.models import (
+    CatalogItem,
     OP_REBUY_C5,
     OP_SELL_STEAM,
     OP_TRANSFER_BUY,
@@ -39,15 +42,29 @@ class FakeSteamClient:
         self.buy_calls: list[dict[str, object]] = []
         self.active_listing_ids: set[str] = set()
         self.sell_calls: list[dict[str, object]] = []
+        self.trade_url = "https://steamcommunity.com/tradeoffer/new/?partner=39734272&token=abc"
         self.confirm_calls = 0
         self.confirm_should_fail = False
         self.confirm_result = 1
+        self.orderbook_should_fail = False
+        self.price_overview_should_fail = False
 
-    def get_item_nameid(self, *, app_id: int, market_hash_name: str) -> str:
-        return "123456"
+    def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
+        if self.orderbook_should_fail:
+            raise SteamMarketError("steam ssl eof")
+        return {
+            "success": 1,
+            "data": {
+                "rgCompactSellOrders": [
+                    2500, 20,
+                ],
+            },
+        }
 
-    def item_orders_histogram(self, *, item_nameid: str, country: str, language: str, currency: int) -> dict:
-        return {"success": 1, "lowest_sell_order": 2500}
+    def price_overview(self, *, app_id: int, market_hash_name: str, country: str, currency: int) -> dict:
+        if self.price_overview_should_fail:
+            raise SteamMarketError("priceoverview boom")
+        return {"success": True, "lowest_price": "¥ 25.00"}
 
     def search_listings(self, *, app_id: int, market_hash_name: str, start: int = 0, count: int = 10) -> dict:
         return {
@@ -71,6 +88,9 @@ class FakeSteamClient:
     def buy_listing(self, **kwargs: object) -> dict:
         self.buy_calls.append(dict(kwargs))
         return {"wallet_info": {"success": 1}}
+
+    def get_trade_url(self) -> str:
+        return self.trade_url
 
     def sell_item(self, **kwargs: object) -> dict:
         self.sell_calls.append(dict(kwargs))
@@ -130,6 +150,14 @@ class FakeServerChan:
         self.messages.append({"title": title, "body": body})
 
 
+class FakeAccountStore:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, dict[str, object]]] = []
+
+    def update_account(self, account_id_or_name: str, **kwargs: object) -> None:
+        self.updates.append((account_id_or_name, dict(kwargs)))
+
+
 def build_candidate() -> StrategyCandidate:
     return StrategyCandidate(
         name="Revolution Case",
@@ -186,6 +214,9 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.engine.c5_client = FakeC5Client()
         self.engine.steam_client = FakeSteamClient()
         self.engine.serverchan = None
+        self.engine.account = None
+        self.engine.account_store = None
+        self.engine._steam_trade_url = None
         self.engine._last_inventory_payload = {}
         self.engine._inventory_items_by_asset_id = {}
         self.engine._pending_confirmation_count = 0
@@ -207,6 +238,131 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.temp_dir.cleanup()
+
+    def test_case_listing_uses_case_specific_price_offset(self) -> None:
+        self.engine.config.listing_price_offset = 0.01
+        self.engine.config.case_listing_price_offset = -0.01
+
+        candidate = build_guadao_candidate()
+
+        self.assertEqual(-0.01, self.engine._listing_price_offset_for_candidate(candidate))
+        self.assertEqual(20, self.engine._listing_wall_min_count_for_candidate(candidate))
+
+    def test_non_case_listing_uses_default_price_offset(self) -> None:
+        self.engine.config.listing_price_offset = 0.01
+        self.engine.config.case_listing_price_offset = -0.01
+        self.engine.config.listing_wall_min_count = 20
+        self.db.upsert_items(
+            [
+                CatalogItem(
+                    market_hash_name="AK-47 | Redline (Field-Tested)",
+                    name_cn="AK-47 | 红线 (久经沙场)",
+                    c5_item_id=None,
+                    steam_item_id=None,
+                    raw_json={
+                        "marketHashName": "AK-47 | Redline (Field-Tested)",
+                        "name": "AK-47 | 红线 (久经沙场)",
+                        "typeName": "步枪",
+                    },
+                )
+            ]
+        )
+        candidate = StrategyCandidate(
+            name="AK-47 | Redline (Field-Tested)",
+            market_hash_name="AK-47 | Redline (Field-Tested)",
+            inventory_count=1,
+            tradable_count=1,
+            rebuy_price=100.0,
+            rebuy_price_source="c5_batch",
+            steam_sell_price=150.0,
+            steam_price_source="steam_market",
+            steam_after_tax_price=130.35,
+            listing_ratio=0.77,
+            transfer_real_ratio=-0.06,
+            recommended_strategies=[STRATEGY_GUADAO],
+            steam_accounts=["main-steam"],
+        )
+
+        self.assertEqual(0.01, self.engine._listing_price_offset_for_candidate(candidate))
+        self.assertEqual(20, self.engine._listing_wall_min_count_for_candidate(candidate))
+
+    def test_dry_run_listing_decision_falls_back_to_scan_price_when_steam_wall_unavailable(self) -> None:
+        self.engine.config.dry_run = True
+        self.engine.steam_client.orderbook_should_fail = True
+        self.engine.steam_client.price_overview_should_fail = True
+        candidate = build_guadao_candidate()
+
+        with patch("builtins.print") as print_mock:
+            decision = self.engine._decide_listing(candidate)
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(25.0, decision.list_price)
+        self.assertIsNotNone(decision.pricing)
+        assert decision.pricing is not None
+        self.assertEqual("scan_price_fallback", decision.pricing.reason)
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("Steam 实时挂单墙取价失败", printed)
+
+    def test_real_listing_decision_requires_live_steam_price(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.steam_client.orderbook_should_fail = True
+        candidate = build_guadao_candidate()
+
+        with patch("builtins.print") as print_mock:
+            decision = self.engine._decide_listing(candidate)
+
+        self.assertIsNone(decision)
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("真实执行必须获取 Steam 实时挂单墙价格", printed)
+
+    def test_real_listing_decision_uses_steam_orderbook_wall(self) -> None:
+        self.engine.config.dry_run = False
+        candidate = build_guadao_candidate()
+
+        decision = self.engine._decide_listing(candidate)
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(25.01, round(decision.list_price, 2))
+        self.assertIsNotNone(decision.pricing)
+        assert decision.pricing is not None
+        self.assertEqual("orderbook_wall", decision.pricing.reason)
+
+    def test_settings_do_not_accept_global_trade_url(self) -> None:
+        self.assertFalse(hasattr(self.engine.settings, "steam_trade_url"))
+
+    def test_current_imported_account_trade_url_is_resolved_from_account_cookie(self) -> None:
+        self.engine.account = Account(
+            id="current",
+            name="current",
+            steam_id64=self.engine.steam_client.steam_id64,
+        )
+        self.engine.account_store = FakeAccountStore()
+
+        trade_url = self.engine._resolve_trade_url()
+
+        self.assertEqual(self.engine.steam_client.trade_url, trade_url)
+        self.assertEqual(
+            [("current", {"trade_url": self.engine.steam_client.trade_url})],
+            self.engine.account_store.updates,
+        )
+
+    def test_mismatched_account_trade_url_is_rejected(self) -> None:
+        self.engine._steam_trade_url = (
+            "https://steamcommunity.com/tradeoffer/new/?partner=319711777&token=old"
+        )
+        self.engine.account = Account(
+            id="current",
+            name="current",
+            steam_id64=self.engine.steam_client.steam_id64,
+        )
+        self.engine.account_store = FakeAccountStore()
+
+        with patch("builtins.print"):
+            trade_url = self.engine._resolve_trade_url()
+
+        self.assertEqual(self.engine.steam_client.trade_url, trade_url)
 
     def test_transfer_sells_existing_base_asset_instead_of_new_buy(self) -> None:
         candidate = build_candidate()
@@ -308,6 +464,26 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual(1, len(rebuy_ops))
         self.assertEqual("pending", rebuy_ops[0]["status"])
 
+    def test_guadao_refresh_listing_prints_net_amount(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 0
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        with patch("builtins.print") as print_mock:
+            sold = self.engine._refresh_listings()
+
+        self.assertEqual(1, sold)
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("Steam售价 CNY 25.0", printed)
+        self.assertIn("税后到手 CNY 21.73", printed)
+
     def test_guadao_does_not_continue_listing_when_cycle_is_open(self) -> None:
         self.engine.config.dry_run = True
         self.engine.config.force_refresh_before_execution = False
@@ -322,6 +498,36 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_PENDING_REBUY})
 
         self.assertEqual(0, listed)
+
+    def test_listed_sell_operation_blocks_new_listing_even_when_pool_status_holding(self) -> None:
+        self.engine.config.dry_run = True
+        self.engine.config.force_refresh_before_execution = False
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_HOLDING)
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        self.assertTrue(self.engine._has_open_guadao_cycle())
+
+    def test_pending_rebuy_operation_blocks_new_listing_even_when_pool_status_holding(self) -> None:
+        self.engine.config.dry_run = True
+        self.engine.config.force_refresh_before_execution = False
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_HOLDING)
+        self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=20.0,
+            note='{"sourceSellOperationId": 1, "steamListPrice": 25.0}',
+        )
+
+        self.assertTrue(self.engine._has_open_guadao_cycle())
 
     def test_listing_pending_confirmation_is_recorded_when_credentials_missing(self) -> None:
         self.engine.config.dry_run = False

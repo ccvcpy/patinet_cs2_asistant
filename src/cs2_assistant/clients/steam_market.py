@@ -101,7 +101,7 @@ class SteamMarketClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity_secret = _normalize_identity_secret(identity_secret) if identity_secret else identity_secret
-        self.device_id = device_id
+        self.device_id = unquote(device_id) if device_id else device_id
         self.timeout = timeout
         self.account_id = str(account_id or "").strip() or None
         self._account_store = AccountStore(PROJECT_ROOT / "config") if self.account_id else None
@@ -172,24 +172,40 @@ class SteamMarketClient:
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
         merged_headers = dict(headers or {})
-        response = self._session.request(
-            method=method,
-            url=url,
-            params=params,
-            data=data,
-            headers=merged_headers,
-            timeout=self.timeout,
-        )
-        if response.status_code in (400, 401) and _allow_retry and self._try_account_relogin():
-            response = self._session.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
-                headers=merged_headers,
-                timeout=self.timeout,
-            )
-        response.raise_for_status()
+        attempts = 3 if method.upper() == "GET" else 1
+        last_exc: requests.RequestException | None = None
+        try:
+            response = None
+            for attempt in range(attempts):
+                try:
+                    response = self._session.request(
+                        method=method,
+                        url=url,
+                        params=params,
+                        data=data,
+                        headers=merged_headers,
+                        timeout=self.timeout,
+                    )
+                    break
+                except (requests.Timeout, requests.ConnectionError) as exc:
+                    last_exc = exc
+                    if attempt >= attempts - 1:
+                        raise
+                    time.sleep(1.0 + attempt)
+            if response is None:
+                raise last_exc or SteamMarketError("Steam request failed without response")
+            if response.status_code in (400, 401) and _allow_retry and self._try_account_relogin():
+                response = self._session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    headers=merged_headers,
+                    timeout=self.timeout,
+                )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise SteamMarketError(f"Steam request failed: {method} {path}: {exc}") from exc
         return response
 
     def get_trade_url(self) -> str:
@@ -213,6 +229,8 @@ class SteamMarketClient:
         )
         try:
             payload = response.json()
+            if isinstance(payload, list):
+                return response.status_code == 200
             return bool(payload.get("success", True))
         except ValueError:
             return response.status_code == 200
@@ -335,6 +353,74 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload
 
+    def price_overview(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        country: str = "CN",
+        currency: int = 23,
+    ) -> dict[str, Any]:
+        params = {
+            "country": country,
+            "currency": currency,
+            "appid": app_id,
+            "market_hash_name": market_hash_name,
+        }
+        response = self._request(
+            "GET",
+            "/market/priceoverview/",
+            params=params,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SteamMarketError(f"Steam priceoverview invalid JSON: {response.text}") from exc
+        if payload.get("success") not in (1, True):
+            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
+        return payload
+
+    def order_book(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/market/orderbook",
+            params={
+                "q": "Load",
+                "qp": json.dumps([app_id, market_hash_name], separators=(",", ":")),
+            },
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": (
+                    f"{self.base_url}/market/listings/{app_id}/"
+                    f"{quote(market_hash_name, safe='')}"
+                ),
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SteamMarketError(f"Steam orderbook invalid JSON: {response.text}") from exc
+        if payload.get("success") not in (None, 1, True):
+            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
+        return payload
+
     def my_listings(self, *, start: int = 0, count: int = 100) -> dict[str, Any]:
         params = {"start": start, "count": count, "norender": 1}
         response = self._request("GET", "/market/mylistings", params=params)
@@ -402,43 +488,6 @@ class SteamMarketClient:
                 )
             )
         return parsed
-
-    def get_item_nameid(self, *, app_id: int, market_hash_name: str) -> str:
-        encoded_name = quote(market_hash_name)
-        response = self._request("GET", f"/market/listings/{app_id}/{encoded_name}")
-        match = re.search(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)", response.text)
-        if match:
-            return match.group(1)
-        match = re.search(r"Market_LoadOrderSpread\(\s*(\d+)\s*,", response.text)
-        if match:
-            return match.group(1)
-        match = re.search(r"item_nameid\s*[:=]\s*\"?(\d+)\"?", response.text)
-        if match:
-            return match.group(1)
-        raise SteamMarketError("cannot find item_nameid")
-
-    def item_orders_histogram(
-        self,
-        *,
-        item_nameid: str,
-        country: str = "CN",
-        language: str = "schinese",
-        currency: int = 23,
-    ) -> dict[str, Any]:
-        params = {
-            "country": country,
-            "language": language,
-            "currency": currency,
-            "item_nameid": item_nameid,
-        }
-        response = self._request("GET", "/market/itemordershistogram", params=params)
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise SteamMarketError(f"Steam histogram invalid JSON: {response.text}") from exc
-        if payload.get("success") != 1:
-            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
-        return payload
 
     def fetch_confirmations(self) -> list[dict[str, Any]]:
         if not self.identity_secret or not self.device_id:

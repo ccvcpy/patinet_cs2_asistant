@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: cs2-assistant
+Version: 0.1.0
+Summary: CS2 trading assistant for C5 and Steam
+Requires-Python: >=3.11
+Requires-Dist: cryptography>=42.0.0
+Requires-Dist: playwright>=1.54.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: steampy>=1.2.0
+Requires-Dist: truststore>=0.10.0

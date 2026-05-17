@@ -12,6 +12,7 @@ dependencies = [
   "playwright>=1.54.0",
   "requests>=2.31.0",
   "steampy>=1.2.0",
+  "truststore>=0.10.0",
 ]
 
 [project.scripts]

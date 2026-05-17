@@ -18,9 +18,7 @@ class PricingDecision:
 
 
 _STEAM_PRICE_TTL = 60.0
-_STEAM_NAMEID_TTL = 86400.0
 _price_cache: dict[tuple[Any, ...], tuple[float, PricingDecision]] = {}
-_nameid_cache: dict[tuple[Any, ...], tuple[float, str]] = {}
 _cache_lock = threading.Lock()
 
 
@@ -28,14 +26,10 @@ def clear_pricing_cache(market_hash_name: str | None = None) -> None:
     with _cache_lock:
         if market_hash_name is None:
             _price_cache.clear()
-            _nameid_cache.clear()
             return
         keys_to_remove = [key for key in _price_cache if key[0] == market_hash_name]
         for key in keys_to_remove:
             _price_cache.pop(key, None)
-        keys_to_remove = [key for key in _nameid_cache if key[0] == market_hash_name]
-        for key in keys_to_remove:
-            _nameid_cache.pop(key, None)
 
 
 def get_pricing_cache_snapshot() -> list[dict[str, Any]]:
@@ -64,48 +58,90 @@ def _parse_price_text(text: str) -> float | None:
     return safe_float(cleaned)
 
 
-def _extract_sell_order_graph(payload: dict[str, Any]) -> list[list[Any]]:
-    graph = payload.get("sell_order_graph")
-    if isinstance(graph, list):
-        return graph
+def _normalize_orderbook_rows(value: Any) -> list[list[Any]]:
+    if not isinstance(value, list):
+        return []
+    if not value:
+        return []
+    if all(isinstance(row, list) for row in value):
+        return value
+    rows: list[list[Any]] = []
+    index = 0
+    while index + 1 < len(value):
+        rows.append([value[index], value[index + 1]])
+        index += 2
+    return rows
+
+
+def _extract_orderbook_sell_rows(payload: dict[str, Any]) -> list[list[Any]]:
+    for key in (
+        "rgCompactSellOrders",
+        "sell_orderbook",
+        "sell_orders",
+        "sell",
+        "asks",
+        "ask",
+        "sell_order_graph",
+    ):
+        rows = _normalize_orderbook_rows(payload.get(key))
+        if rows:
+            return rows
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _extract_orderbook_sell_rows(data)
     return []
 
 
-def choose_list_price(
+def _parse_orderbook_price(value: Any) -> float | None:
+    price = _parse_price_text(str(value))
+    if price is None:
+        return None
+    # Steam's new orderbook preload uses integer micro-units:
+    # 237400 -> CNY 2.374. Keep already-decimal values intact for tests
+    # and for any future JSON shape that returns display prices.
+    if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+        if price >= 10000:
+            return price / 100000.0
+        if price >= 100:
+            return price / 100.0
+    return price
+
+
+def choose_orderbook_price(
     payload: dict[str, Any],
     *,
     wall_min_count: int = 20,
     price_offset: float = 0.01,
     min_price: float | None = None,
 ) -> PricingDecision | None:
-    graph = _extract_sell_order_graph(payload)
-    if not graph:
+    rows = _extract_orderbook_sell_rows(payload)
+    if not rows:
         return None
 
     wall_price: float | None = None
-    for row in graph:
+    cumulative = 0.0
+    for row in rows:
         if not isinstance(row, list) or len(row) < 2:
             continue
-        price = _parse_price_text(str(row[0]))
-        if price is None:
+        price = _parse_orderbook_price(row[0])
+        count = safe_float(row[1])
+        if price is None or count is None:
             continue
-        cumulative = None
-        if len(row) >= 3:
-            cumulative = safe_float(row[2])
-        if cumulative is None:
-            cumulative = safe_float(row[1])
-        if cumulative is None:
-            continue
+        cumulative += count
         if cumulative >= wall_min_count:
             wall_price = price
             break
 
     if wall_price is None:
-        last_row = graph[-1]
-        price = _parse_price_text(str(last_row[0])) if isinstance(last_row, list) else None
-        if price is None:
-            return None
-        wall_price = price
+        for row in rows:
+            if not isinstance(row, list) or not row:
+                continue
+            wall_price = _parse_orderbook_price(row[0])
+            if wall_price is not None:
+                break
+
+    if wall_price is None:
+        return None
 
     list_price = max(0.01, wall_price - price_offset)
     if min_price is not None and list_price < min_price:
@@ -114,7 +150,7 @@ def choose_list_price(
     return PricingDecision(
         list_price=list_price,
         wall_price=wall_price,
-        reason="wall",
+        reason="orderbook_wall",
     )
 
 
@@ -153,35 +189,22 @@ def fetch_listing_price(
                 return decision
 
     try:
-        name_key = (market_hash_name, app_id)
-        item_nameid = None
-        with _cache_lock:
-            cached_nameid = _nameid_cache.get(name_key)
-        if cached_nameid:
-            ts, value = cached_nameid
-            if now - ts <= _STEAM_NAMEID_TTL:
-                item_nameid = value
-        if not item_nameid:
-            item_nameid = client.get_item_nameid(app_id=app_id, market_hash_name=market_hash_name)
-            if item_nameid:
-                with _cache_lock:
-                    _nameid_cache[name_key] = (now, item_nameid)
-        payload = client.item_orders_histogram(
-            item_nameid=item_nameid,
-            country=country,
-            language=language,
-            currency=currency,
+        orderbook = client.order_book(
+            app_id=app_id,
+            market_hash_name=market_hash_name,
         )
     except SteamMarketError:
         if debug:
             raise
         return None
-    decision = choose_list_price(
-        payload,
+
+    decision = choose_orderbook_price(
+        orderbook,
         wall_min_count=wall_min_count,
         price_offset=price_offset,
         min_price=min_price,
     )
+
     if decision is None:
         return None
     with _cache_lock:
