@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,11 +14,13 @@ if str(SRC_DIR) not in sys.path:
 
 from cs2_assistant.cli import (
     build_parser,
+    _build_guadao_discount_report,
     _build_market_price_gap_rows,
     _list_c5_steam_accounts,
     _resolve_c5_steam_id,
     _summarize_inventory_types,
 )
+from cs2_assistant.db import Database
 from cs2_assistant.models import MarketState
 
 
@@ -153,6 +157,92 @@ class ParserTestCase(unittest.TestCase):
         self.assertEqual("notify", args.command)
         self.assertEqual("t-profit", args.notify_command)
         self.assertTrue(args.once)
+
+    def test_pool_guadao_report_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "pool",
+                "guadao-report",
+                "--from",
+                "2026-05-10",
+                "--to",
+                "2026-05-17",
+                "--detail",
+            ]
+        )
+        self.assertEqual("pool", args.command)
+        self.assertEqual("guadao-report", args.pool_command)
+        self.assertEqual("2026-05-10", args.date_from)
+        self.assertTrue(args.detail)
+
+    def test_pool_sync_command_is_removed(self) -> None:
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["pool", "sync"])
+
+
+class GuadaoDiscountReportTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "assistant.db"
+        self.db = Database(self.db_path)
+        self.db.initialize()
+
+    def tearDown(self) -> None:
+        self.db.close()
+        self.temp_dir.cleanup()
+
+    def _add_closed_cycle(self, market_hash_name: str, *, steam_price: float, cash: float) -> None:
+        sell_id = self.db.add_pool_operation(
+            market_hash_name=market_hash_name,
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=steam_price,
+            asset_id=f"asset-{market_hash_name}",
+            note=json.dumps(
+                {
+                    "listingId": f"listing-{market_hash_name}",
+                    "rebuyPrice": cash,
+                    "steamListPrice": steam_price,
+                    "strategy": "guadao",
+                }
+            ),
+        )
+        self.db.update_pool_operation(sell_id, status="sold")
+        rebuy_id = self.db.add_pool_operation(
+            market_hash_name=market_hash_name,
+            strategy="guadao",
+            operation_type="rebuy_on_c5",
+            expected_price=cash,
+            note=json.dumps(
+                {
+                    "sourceListing": f"listing-{market_hash_name}",
+                    "sourceSellOperationId": sell_id,
+                    "steamListPrice": steam_price,
+                }
+            ),
+        )
+        self.db.update_pool_operation(rebuy_id, status="completed", actual_price=cash)
+
+    def test_build_guadao_discount_report_summarizes_multiple_items(self) -> None:
+        self._add_closed_cycle("Kilowatt Case", steam_price=100.0, cash=60.0)
+        self._add_closed_cycle("Revolution Case", steam_price=200.0, cash=130.0)
+
+        report = _build_guadao_discount_report(
+            self.db,
+            start_utc="2000-01-01T00:00:00+00:00",
+            end_utc="2100-01-01T00:00:00+00:00",
+            steam_net_factor=0.869,
+        )
+
+        self.assertEqual(2, report["summary"]["count"])
+        self.assertEqual(300.0, report["summary"]["steamGross"])
+        self.assertEqual(260.7, report["summary"]["steamNet"])
+        self.assertEqual(190.0, report["summary"]["cash"])
+        self.assertAlmostEqual(190.0 / 260.7, report["summary"]["totalDiscountRatio"])
+        self.assertAlmostEqual(190.0 / 300.0, report["summary"]["faceDiscountRatio"])
+        self.assertEqual(["Kilowatt Case", "Revolution Case"], sorted(row["marketHashName"] for row in report["items"]))
 
 
 if __name__ == "__main__":

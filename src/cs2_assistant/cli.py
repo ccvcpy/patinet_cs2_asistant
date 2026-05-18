@@ -5,6 +5,7 @@ import hashlib
 import json
 import sys
 import uuid
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ from cs2_assistant.services.t_yield_scan import (
     normalize_inventory_filter,
     scan_t_yield,
 )
-from cs2_assistant.utils import ensure_parent_dir, safe_float, utc_now_iso
+from cs2_assistant.utils import ensure_parent_dir, safe_float, safe_int, utc_now_iso
 
 
 def _settings_from_args(args: argparse.Namespace) -> Settings:
@@ -1508,7 +1509,7 @@ def cmd_pool_scan(args: argparse.Namespace) -> int:
     pool_names = db.get_pool_market_hash_names()
     db.close()
     if not pool_names:
-        print("Pool is empty. Run `pool sync` first.")
+        print("底仓为空。运行 `python .\\main.py executor start` 会自动从 C5 库存初始化。")
         return 0
     config = load_strategy_config(settings)
 
@@ -1633,35 +1634,6 @@ def cmd_pool_scan(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pool_sync(args: argparse.Namespace) -> int:
-    """Sync inventory pool from C5 inventory."""
-    settings = _settings_from_args(args)
-    if not settings.c5_api_key:
-        print("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。", file=sys.stderr)
-        return 1
-
-    from cs2_assistant.clients import C5GameClient
-    from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories, summarize_inventory_types
-
-    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
-    inventory_payload = fetch_all_c5_inventories(
-        c5_client,
-        settings,
-        allow_cached_fallback=False,
-        cache_max_age_minutes=None,
-    )
-    all_types = summarize_inventory_types(list(inventory_payload.get("list") or []))
-    db = _open_db(settings)
-    count = db.sync_pool_from_inventory(all_types)
-    asset_count = db.upsert_inventory_assets(list(inventory_payload.get("list") or []))
-    db.close()
-    print(
-        f"Pool sync completed: {count} item types updated; "
-        f"{asset_count} assets cached."
-    )
-    return 0
-
-
 def cmd_pool_status(args: argparse.Namespace) -> int:
     """Show current inventory pool status."""
     settings = _settings_from_args(args)
@@ -1675,9 +1647,9 @@ def cmd_pool_status(args: argparse.Namespace) -> int:
             if all_pool_items:
                 print(f"未找到状态为 `{args.status_filter}` 的底仓项。")
             else:
-                print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
+                print("底仓为空。运行 `python .\\main.py executor start` 会自动从 C5 库存初始化。")
         else:
-            print("底仓为空。使用 `pool sync` 从 C5 库存同步。")
+            print("底仓为空。运行 `python .\\main.py executor start` 会自动从 C5 库存初始化。")
         return 0
 
     total_qty = 0
@@ -1700,6 +1672,293 @@ def cmd_pool_status(args: argparse.Namespace) -> int:
     for status, count in sorted(status_counts.items()):
         from cs2_assistant.models import POOL_STATUS_LABELS
         print(f"  {POOL_STATUS_LABELS.get(status, status)}: {count} 件")
+    return 0
+
+
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def _read_note_dict(note: str | None) -> dict[str, Any]:
+    if not note:
+        return {}
+    try:
+        data = json.loads(note)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_report_boundary(value: str, *, is_end: bool) -> datetime:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("日期不能为空")
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        day = datetime.strptime(raw, "%Y-%m-%d").date()
+        local_time = time(23, 59, 59) if is_end else time(0, 0, 0)
+        return datetime.combine(day, local_time, tzinfo=CN_TZ)
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=CN_TZ)
+    return parsed
+
+
+def _to_utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _to_local_display(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _empty_guadao_report_summary() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "steamGross": 0.0,
+        "steamNet": 0.0,
+        "cash": 0.0,
+        "totalDiscountRatio": None,
+        "faceDiscountRatio": None,
+    }
+
+
+def _add_guadao_report_row(summary: dict[str, Any], row: dict[str, Any]) -> None:
+    summary["count"] += 1
+    summary["steamGross"] += float(row["steamGross"] or 0.0)
+    summary["steamNet"] += float(row["steamNet"] or 0.0)
+    summary["cash"] += float(row["cash"] or 0.0)
+
+
+def _finalize_guadao_report_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    steam_net = float(summary["steamNet"] or 0.0)
+    steam_gross = float(summary["steamGross"] or 0.0)
+    cash = float(summary["cash"] or 0.0)
+    summary["steamGross"] = round(steam_gross, 2)
+    summary["steamNet"] = round(steam_net, 2)
+    summary["cash"] = round(cash, 2)
+    summary["totalDiscountRatio"] = cash / steam_net if steam_net > 0 else None
+    summary["faceDiscountRatio"] = cash / steam_gross if steam_gross > 0 else None
+    return summary
+
+
+def _build_guadao_discount_report(
+    db: Database,
+    *,
+    start_utc: str,
+    end_utc: str,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    params: list[Any] = [start_utc, end_utc]
+    market_filter = ""
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+    rebuy_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+          AND status = 'completed'
+          AND completed_at IS NOT NULL
+          AND completed_at >= ?
+          AND completed_at <= ?
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    source_ids: list[int] = []
+    for row in rebuy_rows:
+        source_id = safe_int(_read_note_dict(row["note"]).get("sourceSellOperationId"))
+        if source_id is not None:
+            source_ids.append(source_id)
+
+    sell_by_id: dict[int, Any] = {}
+    if source_ids:
+        placeholders = ", ".join("?" for _ in source_ids)
+        sell_rows = db.conn.execute(
+            f"SELECT * FROM pool_operations WHERE id IN ({placeholders})",
+            tuple(source_ids),
+        ).fetchall()
+        sell_by_id = {int(row["id"]): row for row in sell_rows}
+
+    detail_rows: list[dict[str, Any]] = []
+    item_summaries: dict[str, dict[str, Any]] = {}
+    summary = _empty_guadao_report_summary()
+
+    for rebuy in rebuy_rows:
+        rebuy_note = _read_note_dict(rebuy["note"])
+        source_id = safe_int(rebuy_note.get("sourceSellOperationId"))
+        sell = sell_by_id.get(source_id) if source_id is not None else None
+        sell_note = _read_note_dict(sell["note"]) if sell is not None else {}
+
+        item_name = str(rebuy["market_hash_name"] or (sell["market_hash_name"] if sell else "")).strip()
+        steam_gross = (
+            safe_float(rebuy_note.get("steamListPrice"))
+            or safe_float(sell_note.get("steamListPrice"))
+            or (safe_float(sell["expected_price"]) if sell is not None else None)
+        )
+        cash = safe_float(rebuy["actual_price"]) or safe_float(rebuy["expected_price"])
+        if steam_gross is None or steam_gross <= 0 or cash is None or cash <= 0:
+            continue
+
+        steam_net = steam_gross * steam_net_factor
+        detail = {
+            "completedAt": rebuy["completed_at"],
+            "completedAtLocal": _to_local_display(rebuy["completed_at"]),
+            "marketHashName": item_name,
+            "steamGross": steam_gross,
+            "steamNet": steam_net,
+            "cash": cash,
+            "totalDiscountRatio": cash / steam_net if steam_net > 0 else None,
+            "faceDiscountRatio": cash / steam_gross if steam_gross > 0 else None,
+            "sellOperationId": source_id,
+            "rebuyOperationId": int(rebuy["id"]),
+            "assetId": str(sell["asset_id"] or "") if sell is not None else "",
+            "listingId": str(rebuy_note.get("sourceListing") or sell_note.get("listingId") or ""),
+        }
+        detail_rows.append(detail)
+        _add_guadao_report_row(summary, detail)
+        item_summary = item_summaries.setdefault(item_name, _empty_guadao_report_summary())
+        _add_guadao_report_row(item_summary, detail)
+
+    finalized_items = [
+        {"marketHashName": market_hash_name, **_finalize_guadao_report_summary(item_summary)}
+        for market_hash_name, item_summary in item_summaries.items()
+    ]
+    finalized_items.sort(key=lambda row: (-int(row["count"]), row["marketHashName"]))
+
+    return {
+        "startUtc": start_utc,
+        "endUtc": end_utc,
+        "steamNetFactor": steam_net_factor,
+        "summary": _finalize_guadao_report_summary(summary),
+        "items": finalized_items,
+        "details": detail_rows,
+    }
+
+
+def _fmt_cny(value: float | None) -> str:
+    return "-" if value is None else f"CNY {value:.2f}"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "-" if value is None else f"{value * 100:.2f}%"
+
+
+def _print_guadao_discount_report(
+    report: dict[str, Any],
+    *,
+    start_local: datetime,
+    end_local: datetime,
+    show_detail: bool,
+) -> None:
+    summary = report["summary"]
+    print("挂刀余额折扣报表")
+    print(
+        "范围: "
+        f"{start_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} ~ "
+        f"{end_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} (北京时间)"
+    )
+    print(
+        "口径: 按 C5 补仓完成时间统计；"
+        "总折比 = C5补仓现金 / Steam税后到手；"
+        "面值折比 = C5补仓现金 / Steam税前售价。"
+    )
+    print(
+        f"总览: 闭环 {summary['count']} 笔 | "
+        f"Steam面值 {_fmt_cny(summary['steamGross'])} | "
+        f"Steam到手 {_fmt_cny(summary['steamNet'])} | "
+        f"C5现金 {_fmt_cny(summary['cash'])} | "
+        f"总折比 {_fmt_pct(summary['totalDiscountRatio'])} | "
+        f"面值折比 {_fmt_pct(summary['faceDiscountRatio'])}"
+    )
+    if not report["items"]:
+        print("本时间段没有已完成补仓的挂刀闭环。")
+        return
+
+    print("\n按饰品汇总:")
+    print(f"{'饰品':<42} {'笔数':>4} {'Steam到手':>12} {'C5现金':>10} {'总折比':>8} {'面值折比':>8}")
+    for row in report["items"]:
+        print(
+            f"{row['marketHashName']:<42} "
+            f"{int(row['count']):>4} "
+            f"{row['steamNet']:>12.2f} "
+            f"{row['cash']:>10.2f} "
+            f"{_fmt_pct(row['totalDiscountRatio']):>8} "
+            f"{_fmt_pct(row['faceDiscountRatio']):>8}"
+        )
+
+    if not show_detail:
+        return
+
+    print("\n明细:")
+    print(
+        f"{'完成时间':<19} {'饰品':<30} {'Steam面值':>9} {'Steam到手':>9} "
+        f"{'C5现金':>8} {'总折比':>8} {'asset':>12} {'listing':>18}"
+    )
+    for row in report["details"]:
+        print(
+            f"{row['completedAtLocal']:<19} "
+            f"{row['marketHashName']:<30} "
+            f"{row['steamGross']:>9.2f} "
+            f"{row['steamNet']:>9.2f} "
+            f"{row['cash']:>8.2f} "
+            f"{_fmt_pct(row['totalDiscountRatio']):>8} "
+            f"{(row['assetId'] or '-'):>12} "
+            f"{(row['listingId'] or '-'):>18}"
+        )
+
+
+def cmd_pool_guadao_report(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    start_local = _parse_report_boundary(args.date_from, is_end=False)
+    end_local = (
+        _parse_report_boundary(args.date_to, is_end=True)
+        if args.date_to
+        else datetime.now(CN_TZ)
+    )
+    if end_local < start_local:
+        raise ValueError("--to 不能早于 --from")
+
+    db = _open_db(settings)
+    try:
+        report = _build_guadao_discount_report(
+            db,
+            start_utc=_to_utc_iso(start_local),
+            end_utc=_to_utc_iso(end_local),
+            steam_net_factor=config.steam_net_factor,
+            market_hash_name=args.market_hash_name,
+        )
+    finally:
+        db.close()
+
+    if args.dump_json:
+        _print_json(
+            {
+                "startLocal": start_local.isoformat(timespec="seconds"),
+                "endLocal": end_local.isoformat(timespec="seconds"),
+                **report,
+            }
+        )
+        return 0
+
+    _print_guadao_discount_report(
+        report,
+        start_local=start_local,
+        end_local=end_local,
+        show_detail=args.detail,
+    )
     return 0
 
 
@@ -1727,10 +1986,15 @@ def cmd_pool_config(args: argparse.Namespace) -> int:
                 return current
             return int(raw)
 
+        def _prompt_str(label: str, current: str) -> str:
+            raw = input(f"  {label} [{current}]: ").strip()
+            return raw or current
+
         config.steam_net_factor = _prompt_float("Steam 税后系数 (steam_net_factor)", config.steam_net_factor)
         config.c5_settlement_factor = _prompt_float("C5 结算系数 (c5_settlement_factor)", config.c5_settlement_factor)
         config.balance_discount = _prompt_float("余额折扣率 (balance_discount)", config.balance_discount)
         config.guadao_max_listing_ratio = _prompt_float("挂刀阈值 listing_ratio ≤ (guadao_max_listing_ratio)", config.guadao_max_listing_ratio)
+        config.guadao_item_scope = _prompt_str("挂刀品类范围 case_only/non_case_only (guadao_item_scope)", config.guadao_item_scope)
         config.transfer_min_real_ratio = _prompt_float("导余额阈值 transfer_real_ratio ≥ (transfer_min_real_ratio)", config.transfer_min_real_ratio)
         config.min_price = _prompt_float("最低价格过滤 (min_price)", config.min_price)
         config.poll_interval_minutes = _prompt_int("轮询间隔分钟 (poll_interval_minutes)", config.poll_interval_minutes)
@@ -1744,6 +2008,7 @@ def cmd_pool_config(args: argparse.Namespace) -> int:
         print(f"  C5 结算系数 (c5_settlement_factor):      {config.c5_settlement_factor}")
         print(f"  余额折扣率 (balance_discount):           {config.balance_discount}")
         print(f"  挂刀阈值 (guadao_max_listing_ratio):     ≤ {config.guadao_max_listing_ratio}")
+        print(f"  挂刀品类范围 (guadao_item_scope):        {config.guadao_item_scope}")
         print(f"  导余额阈值 (transfer_min_real_ratio):    ≥ {config.transfer_min_real_ratio}")
         print(f"  最低价格 (min_price):                    {config.min_price}")
         print(f"  轮询间隔 (poll_interval_minutes):        {config.poll_interval_minutes}")
@@ -1769,7 +2034,7 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
     pool_names = db.get_pool_market_hash_names()
     db.close()
     if not pool_names:
-        print("Pool is empty. Run `pool sync` first.")
+        print("底仓为空。运行 `python .\\main.py executor start` 会自动从 C5 库存初始化。")
         return 0
     config = load_strategy_config(settings)
     interval = config.poll_interval_minutes * 60
@@ -2348,8 +2613,8 @@ def build_parser() -> argparse.ArgumentParser:
             "常用:\n"
             "  python .\\main.py pool scan\n"
             "  python .\\main.py pool scan --top-n 20 --min-price 10\n"
-            "  python .\\main.py pool sync\n"
             "  python .\\main.py pool status\n"
+            "  python .\\main.py pool guadao-report --from 2026-05-10 --to 2026-05-17\n"
             "  python .\\main.py pool config\n"
             "  python .\\main.py pool config --edit\n"
             "  python .\\main.py pool monitor\n"
@@ -2381,9 +2646,6 @@ def build_parser() -> argparse.ArgumentParser:
     pool_scan.add_argument("--dump-json", action="store_true", help="输出 JSON 结果")
     pool_scan.set_defaults(handler=cmd_pool_scan)
 
-    pool_sync = pool_subparsers.add_parser("sync", help="从 C5 库存同步底仓")
-    pool_sync.set_defaults(handler=cmd_pool_sync)
-
     pool_status = pool_subparsers.add_parser("status", help="查看底仓状态")
     pool_status.add_argument(
         "--status-filter",
@@ -2394,6 +2656,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     pool_status.set_defaults(handler=cmd_pool_status)
+
+    pool_guadao_report = pool_subparsers.add_parser(
+        "guadao-report",
+        help="查看挂刀余额折扣报表",
+        description=(
+            "按日期范围统计挂刀闭环流水。\n\n"
+            "总折比 = C5补仓现金 / Steam税后到手余额。\n"
+            "面值折比 = C5补仓现金 / Steam税前售价。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    pool_guadao_report.add_argument("--from", dest="date_from", required=True, help="开始日期/时间，例如 2026-05-10")
+    pool_guadao_report.add_argument("--to", dest="date_to", default=None, help="结束日期/时间，默认到现在")
+    pool_guadao_report.add_argument("--item", dest="market_hash_name", default=None, help="只统计某个 market_hash_name")
+    pool_guadao_report.add_argument("--detail", action="store_true", help="显示每笔闭环明细")
+    pool_guadao_report.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    pool_guadao_report.set_defaults(handler=cmd_pool_guadao_report)
 
     pool_config = pool_subparsers.add_parser(
         "config",

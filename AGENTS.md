@@ -117,7 +117,14 @@
 上一轮挂刀循环未闭环时：
 
 - 先推进旧状态
-- 不开新挂单
+- 默认不开新挂单
+
+箱子有一个明确例外：
+
+- 仅针对箱子，`sell_on_steam.listed` / `rebuy_on_c5.pending` 低于 `caseMaxOpenGuadaoCount` 时，可以继续开启下一轮挂刀
+- 默认上限是 `caseMaxOpenGuadaoCount = 100`
+- 达到上限后必须停止开启新一轮并提醒用户人工处理
+- 这个例外不适用于非箱子，也不适用于 `listing_pending`、`rebuy_failed` 等需要人工确认或失败处理的状态
 
 不要破坏这条链路：
 
@@ -171,12 +178,21 @@
 - `listingWallMinCount`
 - `listingPriceOffset`
 - `caseListingPriceOffset`
+- `caseMaxOpenGuadaoCount`
+- `guadaoItemScope`
 
 修改定价逻辑时，优先确认是：
 
 - 统一规则变更
 - 箱子专用规则变更
 - 仅某条执行路径的局部修正
+
+`guadaoItemScope` 控制挂刀品类范围：
+
+- `case_only`：只允许箱子进入挂刀候选
+- `non_case_only`：只允许非箱子进入挂刀候选
+
+当前不再支持 `all`。旧配置里如果仍写着 `all`，应按 `case_only` 处理。
 
 ### 4.3 箱子模式当前约定
 

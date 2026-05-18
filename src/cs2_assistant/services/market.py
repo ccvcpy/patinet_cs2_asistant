@@ -138,7 +138,14 @@ class MarketService:
 
         if self.c5_client:
             for batch in chunked(market_hash_names, 100):
-                data = self.c5_client.price_batch(batch, app_id=self.app_id)
+                try:
+                    data = self.c5_client.price_batch(batch, app_id=self.app_id)
+                except Exception as exc:
+                    for market_hash_name in batch:
+                        state = states.get(market_hash_name)
+                        if state is not None:
+                            state.raw_json["c5_batch_error"] = str(exc)
+                    continue
                 self._apply_c5_batch(states, data)
             if self.include_c5_purchase_prices:
                 self._apply_c5_purchase_prices(states)
