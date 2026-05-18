@@ -27,6 +27,8 @@ from cs2_assistant.models import (
     StrategyCandidate,
     StrategyConfig,
     StrategyScanReport,
+    guadao_scope_allows_item,
+    looks_like_weapon_case_name,
 )
 from cs2_assistant.services.market import (
     MarketService,
@@ -73,12 +75,17 @@ def classify_strategies(
     listing_ratio: float,
     transfer_real_ratio: float,
     config: StrategyConfig,
+    *,
+    is_weapon_case: bool = False,
 ) -> list[str]:
     """Classify which strategies apply to an item based on its ratios."""
     strategies: list[str] = []
 
     # 挂刀做T: listing_ratio 低 → 有利
-    if listing_ratio <= config.guadao_max_listing_ratio:
+    if listing_ratio <= config.guadao_max_listing_ratio and guadao_scope_allows_item(
+        config.guadao_item_scope,
+        is_weapon_case=is_weapon_case,
+    ):
         strategies.append(STRATEGY_GUADAO)
 
     # 导余额做T: transfer_real_ratio 高 → 有利
@@ -97,6 +104,7 @@ def scan_strategies(
     allow_cached_fallback: bool = True,
     cache_max_age_minutes: int | None = 180,
     pool_market_hash_names: list[str] | None = None,
+    inventory_payload: dict[str, Any] | None = None,
 ) -> StrategyScanReport:
     """Scan the inventory pool and evaluate strategies for each item type.
 
@@ -111,15 +119,16 @@ def scan_strategies(
     if not settings.steamdt_api_key and not settings.csqaq_api_token:
         raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN 环境变量。")
 
-    from cs2_assistant.clients import C5GameClient
+    if inventory_payload is None:
+        from cs2_assistant.clients import C5GameClient
 
-    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
-    inventory_payload = fetch_all_c5_inventories(
-        c5_client,
-        settings,
-        allow_cached_fallback=allow_cached_fallback,
-        cache_max_age_minutes=cache_max_age_minutes,
-    )
+        c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+        inventory_payload = fetch_all_c5_inventories(
+            c5_client,
+            settings,
+            allow_cached_fallback=allow_cached_fallback,
+            cache_max_age_minutes=cache_max_age_minutes,
+        )
     account_lookup = {
         str(account.get("steamId") or "").strip(): (account.get("nickname") or str(account.get("steamId") or "").strip())
         for account in list(inventory_payload.get("accounts") or [])
@@ -211,8 +220,19 @@ def scan_strategies(
         if transfer_real_ratio is None:
             continue
 
+        item_is_weapon_case = (
+            looks_like_weapon_case_name(mhn)
+            or looks_like_weapon_case_name(state.name_cn)
+            or looks_like_weapon_case_name(item_type.get("name_cn"))
+        )
+
         # Classify strategies
-        strategies = classify_strategies(listing_ratio, transfer_real_ratio, config)
+        strategies = classify_strategies(
+            listing_ratio,
+            transfer_real_ratio,
+            config,
+            is_weapon_case=item_is_weapon_case,
+        )
 
         steam_ids = item_type.get("steam_ids") or []
         steam_accounts = [

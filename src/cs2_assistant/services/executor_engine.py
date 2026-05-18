@@ -35,12 +35,13 @@ from cs2_assistant.models import (
     STRATEGY_TRANSFER,
     StrategyCandidate,
     StrategyConfig,
+    guadao_scope_allows_item,
 )
 from cs2_assistant.services.executor_buy import execute_rebuy
 from cs2_assistant.services.market import calculate_listing_ratio, calculate_transfer_real_ratio
 from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price
 from cs2_assistant.services.strategy import load_strategy_config, scan_strategies
-from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories
+from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories, summarize_inventory_types
 from cs2_assistant.utils import safe_float, safe_int, utc_now_iso
 
 
@@ -178,6 +179,7 @@ class ExecutionEngine:
         self._pending_confirmation_count = 0
         self._stop_requested = False
         self._stop_reason: str | None = None
+        self._case_open_guadao_limit_notified = False
 
         if (
             self.config.execution_enabled
@@ -206,19 +208,21 @@ class ExecutionEngine:
 
     def run_once(self, *, wait_for_cycle: bool = True) -> None:
         self._pending_confirmation_count = 0
+        self._sync_assets()
         pool_names = self.db.get_pool_market_hash_names()
         if not pool_names:
-            print("底仓为空，跳过执行。")
+            print("底仓为空，且当前 C5 库存未同步到可执行品种，跳过执行。")
             return
+        scan_pool_names = self._pool_names_for_strategy_scan(pool_names)
 
-        self._sync_assets()
         self._refresh_transfer_holdings()
         report = scan_strategies(
             self.settings,
             self.config,
             allow_cached_fallback=True,
             cache_max_age_minutes=180,
-            pool_market_hash_names=pool_names,
+            pool_market_hash_names=scan_pool_names,
+            inventory_payload=self._last_inventory_payload,
         )
         self._print_scan_summary(report)
         self._filter_guadao_candidates_by_account(report)
@@ -241,7 +245,7 @@ class ExecutionEngine:
         )
         self._print_run_result(
             report,
-            pool_names=pool_names,
+            pool_names=scan_pool_names,
             listed=listed,
             sold=sold,
             rebought=rebought,
@@ -254,6 +258,20 @@ class ExecutionEngine:
                 f"[提醒] {self._pending_confirmation_count} 件物品待 Steam Guard 确认，"
                 "请运行: python main.py steam confirm"
             )
+
+    def _pool_names_for_strategy_scan(self, pool_names: list[str]) -> list[str]:
+        if self._transfer_scan_enabled():
+            return pool_names
+        return [
+            market_hash_name
+            for market_hash_name in pool_names
+            if self._guadao_scope_allows_market_hash_name(market_hash_name)
+        ]
+
+    def _transfer_scan_enabled(self) -> bool:
+        if self.config.max_buy_per_cycle <= 0:
+            return False
+        return float(self.config.transfer_min_real_ratio) < 9999.0
 
     def _print_scan_summary(self, report: Any) -> None:
         evaluated_count = len(getattr(report, "all_evaluated", []) or [])
@@ -392,6 +410,9 @@ class ExecutionEngine:
         evaluated = list(getattr(report, "all_evaluated", []) or [])
         guadao_candidates = list(getattr(report, "guadao_candidates", []) or [])
         transfer_candidates = list(getattr(report, "transfer_candidates", []) or [])
+        lowest_listing_summary = self._lowest_listing_ratio_reason(report)
+        if lowest_listing_summary:
+            reasons.append(lowest_listing_summary)
         if evaluated and not guadao_candidates and not transfer_candidates:
             reasons.append(f"已评估 {len(evaluated)} 个品种，但都未满足 list/transfer 阈值。")
 
@@ -405,6 +426,42 @@ class ExecutionEngine:
             reasons.append("本轮 `max-buy=0`，已禁用买入动作。")
 
         return reasons
+
+    def _lowest_listing_ratio_reason(self, report: Any) -> str | None:
+        evaluated = [
+            candidate
+            for candidate in list(getattr(report, "all_evaluated", []) or [])
+            if getattr(candidate, "inventory_count", 0) > 0
+        ]
+        if not evaluated:
+            return None
+
+        best_candidate = min(evaluated, key=lambda candidate: float(candidate.listing_ratio))
+        best_ratio_pct = float(best_candidate.listing_ratio_pct)
+        threshold_pct = float(self.config.guadao_max_listing_ratio) * 100.0
+        skipped_market_names = {
+            str(market_hash_name)
+            for market_hash_name, _total_tradable, _local in (getattr(self, "_guadao_skipped_by_account", []) or [])
+        }
+
+        if best_candidate.market_hash_name in skipped_market_names:
+            return (
+                f"当前库内最低预计挂刀比例为 {best_ratio_pct:.2f}% "
+                f"（{best_candidate.market_hash_name}），配置挂刀阈值为 {threshold_pct:.2f}%："
+                "比例已满足，但当前 executor 账号无可交易资产。"
+            )
+
+        if best_candidate.listing_ratio <= self.config.guadao_max_listing_ratio:
+            return (
+                f"当前库内最低预计挂刀比例为 {best_ratio_pct:.2f}% "
+                f"（{best_candidate.market_hash_name}），配置挂刀阈值为 {threshold_pct:.2f}%。"
+            )
+
+        return (
+            f"当前库内最低预计挂刀比例为 {best_ratio_pct:.2f}% "
+            f"（{best_candidate.market_hash_name}），配置挂刀阈值为 {threshold_pct:.2f}%："
+            "最低比例仍高于阈值，暂不满足挂刀条件。"
+        )
 
     def _current_inventory_type_names(self) -> set[str]:
         names: set[str] = set()
@@ -448,6 +505,12 @@ class ExecutionEngine:
         if self._has_open_guadao_cycle(status_map):
             print("[等待] 检测到上一轮挂刀循环未闭环，本轮先等待卖出/补仓完成。")
         else:
+            case_open_count = self._open_case_guadao_count()
+            if case_open_count > 0:
+                print(
+                    f"[继续] 箱子未闭环挂刀 {case_open_count}/{self._case_max_open_guadao_count()}，"
+                    "未达上限，本轮继续开启新挂刀。"
+                )
             listed = self._execute_guadao_listings(report, status_map)
 
         self._backfill_listing_ids()
@@ -472,6 +535,10 @@ class ExecutionEngine:
         sold = 0
         rebought = 0
         while self._has_open_guadao_cycle():
+            case_open_count = self._open_case_guadao_count()
+            if self._case_open_guadao_limit_reached(case_open_count):
+                self._notify_case_open_guadao_limit(case_open_count)
+                return sold, rebought
             wait_seconds = self._guadao_wait_seconds()
             open_statuses = self._get_open_guadao_statuses()
             if open_statuses and set(open_statuses) == {POOL_STATUS_REBUY_FAILED}:
@@ -528,25 +595,95 @@ class ExecutionEngine:
             counts["rebuy_on_c5.pending"] = len(pending_rebuy_ops)
         if failed_rebuy_ops:
             counts["rebuy_on_c5.failed"] = len(failed_rebuy_ops)
+        case_open_count = self._open_case_guadao_count()
+        if case_open_count:
+            counts["case_open_guadao.unclosed"] = case_open_count
         return counts
 
     def _has_open_guadao_cycle(self, status_map: dict[str, str] | None = None) -> bool:
-        open_statuses = {
+        current_status_map = status_map or self.db.get_pool_status_map()
+        hard_block_statuses = {
             POOL_STATUS_LISTING_PENDING,
-            POOL_STATUS_LISTED,
-            POOL_STATUS_PENDING_REBUY,
             POOL_STATUS_REBUY_FAILED,
         }
-        current_status_map = status_map or self.db.get_pool_status_map()
-        if any(status in open_statuses for status in current_status_map.values()):
-            return True
-        if self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=1):
-            return True
-        if self.db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=1):
+        case_pool_open_count = 0
+        for market_hash_name, status in current_status_map.items():
+            if status in hard_block_statuses:
+                return True
+            if status not in {POOL_STATUS_LISTED, POOL_STATUS_PENDING_REBUY}:
+                continue
+            if not self._is_weapon_case(market_hash_name):
+                return True
+            case_pool_open_count += 1
+
+        if self._has_non_case_open_guadao_operation():
             return True
         if self.db.list_pool_operations_by_type(OP_REBUY_C5, status="failed", limit=1):
             return True
+
+        case_open_count = self._open_case_guadao_count()
+        if case_pool_open_count and case_open_count == 0:
+            return True
+        if self._case_open_guadao_limit_reached(case_open_count):
+            self._notify_case_open_guadao_limit(case_open_count)
+            return True
         return False
+
+    def _case_max_open_guadao_count(self) -> int:
+        return max(0, int(self.config.case_max_open_guadao_count))
+
+    def _open_case_guadao_count(self) -> int:
+        count = 0
+        limit = max(500, self._case_max_open_guadao_count() + 10)
+        for operation_type, status in (
+            (OP_SELL_STEAM, "listed"),
+            (OP_REBUY_C5, "pending"),
+        ):
+            for op in self.db.list_pool_operations_by_type(operation_type, status=status, limit=limit):
+                if not self._is_weapon_case(op["market_hash_name"]):
+                    continue
+                quantity = safe_int(op["quantity"]) or 1
+                count += max(1, quantity)
+        return count
+
+    def _has_non_case_open_guadao_operation(self) -> bool:
+        for operation_type, status in (
+            (OP_SELL_STEAM, "listed"),
+            (OP_REBUY_C5, "pending"),
+        ):
+            for op in self.db.list_pool_operations_by_type(operation_type, status=status, limit=500):
+                if not self._is_weapon_case(op["market_hash_name"]):
+                    return True
+        return False
+
+    def _case_open_guadao_limit_reached(self, count: int | None = None) -> bool:
+        count = self._open_case_guadao_count() if count is None else count
+        return count > 0 and count >= self._case_max_open_guadao_count()
+
+    def _notify_case_open_guadao_limit(self, count: int) -> None:
+        limit = self._case_max_open_guadao_count()
+        self._stop_requested = True
+        self._stop_reason = (
+            f"箱子未闭环挂刀已达到 {count}/{limit} 个，已停止开启新一轮，等待人工处理。"
+        )
+        if getattr(self, "_case_open_guadao_limit_notified", False):
+            return
+        self._case_open_guadao_limit_notified = True
+        print(f"[提醒] {self._stop_reason}")
+        serverchan = getattr(self, "serverchan", None)
+        if not serverchan:
+            return
+        try:
+            serverchan.send(
+                "[挂刀暂停] 箱子未闭环已达上限",
+                (
+                    f"箱子未闭环挂刀: {count}/{limit}\n"
+                    "状态: 已停止开启新一轮\n"
+                    "处理: 请手动检查 Steam 挂单和 C5 补仓状态"
+                ),
+            )
+        except Exception as exc:
+            print(f"  ServerChan 推送失败: {exc}")
 
     def _sync_assets(self) -> None:
         inventory_payload = fetch_all_c5_inventories(
@@ -563,6 +700,11 @@ class ExecutionEngine:
             if isinstance(item, dict) and str(item.get("assetId") or "").strip()
         }
         self.db.upsert_inventory_assets(items)
+        inventory_source = str(inventory_payload.get("source") or "").lower()
+        self.db.sync_pool_from_inventory(
+            summarize_inventory_types(items),
+            zero_missing_holding=inventory_source != "cache",
+        )
         self._reconcile_transfer_buys()
 
     def _decide_listing(self, candidate: StrategyCandidate) -> ListingDecision | None:
@@ -620,6 +762,12 @@ class ExecutionEngine:
                 return True
         return _looks_like_weapon_case_name(market_hash_name)
 
+    def _guadao_scope_allows_market_hash_name(self, market_hash_name: str) -> bool:
+        return guadao_scope_allows_item(
+            self.config.guadao_item_scope,
+            is_weapon_case=self._is_weapon_case(market_hash_name),
+        )
+
     def _listing_price_offset_for_candidate(self, candidate: StrategyCandidate) -> float:
         return self._listing_price_offset_for_market_hash_name(candidate.market_hash_name)
 
@@ -627,6 +775,8 @@ class ExecutionEngine:
         return self._listing_wall_min_count_for_market_hash_name(candidate.market_hash_name)
 
     def _listing_wall_min_count_for_market_hash_name(self, market_hash_name: str) -> int:
+        if not self._is_weapon_case(market_hash_name):
+            return 1
         return self.config.listing_wall_min_count
 
     def _listing_price_offset_for_market_hash_name(self, market_hash_name: str) -> float:
@@ -701,11 +851,19 @@ class ExecutionEngine:
             candidate
             for candidate in report.guadao_candidates
             if candidate.primary_strategy == STRATEGY_GUADAO
+            and self._guadao_scope_allows_market_hash_name(candidate.market_hash_name)
         ]
 
         for candidate in candidates:
+            if getattr(self, "_stop_requested", False):
+                break
             if list_count >= self.config.max_list_per_cycle:
                 break
+            if self._is_weapon_case(candidate.market_hash_name):
+                case_open_count = self._open_case_guadao_count()
+                if self._case_open_guadao_limit_reached(case_open_count):
+                    self._notify_case_open_guadao_limit(case_open_count)
+                    break
             if not self._can_execute_guadao(status_map.get(candidate.market_hash_name)):
                 continue
             if candidate.tradable_count <= 0:
@@ -757,6 +915,11 @@ class ExecutionEngine:
 
             steam_id = self.steam_client.steam_id64
             while list_count < self.config.max_list_per_cycle:
+                if self._is_weapon_case(candidate.market_hash_name):
+                    case_open_count = self._open_case_guadao_count()
+                    if self._case_open_guadao_limit_reached(case_open_count):
+                        self._notify_case_open_guadao_limit(case_open_count)
+                        break
                 asset_row = self.db.pick_tradable_asset(
                     candidate.market_hash_name,
                     steam_id=steam_id,
@@ -781,6 +944,7 @@ class ExecutionEngine:
                     asset_id=asset_id,
                     price=decision.list_price,
                     quantity=1,
+                    steam_net_factor=self.config.steam_net_factor,
                 )
                 listing_id = str(payload.get("listingid") or "")
                 confirmation_note: dict[str, Any] = {
@@ -819,6 +983,7 @@ class ExecutionEngine:
                 print(
                     f"[上架] {candidate.market_hash_name} | "
                     f"asset={asset_id} | "
+                    f"预计挂刀比例 {decision.listing_ratio * 100:.2f}% | "
                     f"Steam挂价 CNY {decision.list_price:.2f} | "
                     f"预计到手 CNY {decision.list_price * 0.869:.2f}"
                 )

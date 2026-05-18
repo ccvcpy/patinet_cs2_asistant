@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from cs2_assistant.models import CatalogItem, MarketState
+from cs2_assistant.models import CatalogItem, MarketState, POOL_STATUS_HOLDING
 from cs2_assistant.utils import ensure_parent_dir, utc_now_iso
 
 
@@ -640,14 +640,21 @@ class Database:
             )
         self.conn.commit()
 
-    def sync_pool_from_inventory(self, inventory_summaries: list[dict[str, Any]]) -> int:
+    def sync_pool_from_inventory(
+        self,
+        inventory_summaries: list[dict[str, Any]],
+        *,
+        zero_missing_holding: bool = False,
+    ) -> int:
         """Sync inventory pool from C5 inventory scan results.
 
         Upserts each item type with its total inventory_count.
+        Optionally zeroes idle holding types that are absent from the live scan.
         Returns the number of item types synced.
         """
         now = utc_now_iso()
         count = 0
+        seen_market_hash_names: set[str] = set()
         for summary in inventory_summaries:
             mhn = str(summary.get("market_hash_name") or "").strip()
             if not mhn:
@@ -655,6 +662,7 @@ class Database:
             qty = int(summary.get("inventory_count", 0))
             if qty <= 0:
                 continue
+            seen_market_hash_names.add(mhn)
             existing = self.conn.execute(
                 "SELECT id, status FROM inventory_pool WHERE market_hash_name = ?",
                 (mhn,),
@@ -673,6 +681,29 @@ class Database:
                     (mhn, qty, now, now),
                 )
             count += 1
+        if zero_missing_holding:
+            if seen_market_hash_names:
+                placeholders = ",".join("?" for _ in seen_market_hash_names)
+                self.conn.execute(
+                    f"""
+                    UPDATE inventory_pool
+                    SET quantity = 0, updated_at = ?
+                    WHERE status = ?
+                    AND quantity > 0
+                    AND market_hash_name NOT IN ({placeholders})
+                    """,
+                    (now, POOL_STATUS_HOLDING, *sorted(seen_market_hash_names)),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE inventory_pool
+                    SET quantity = 0, updated_at = ?
+                    WHERE status = ?
+                    AND quantity > 0
+                    """,
+                    (now, POOL_STATUS_HOLDING),
+                )
         self.conn.commit()
         return count
 

@@ -109,6 +109,14 @@ class FakeC5Client:
         }
 
 
+class FakeC5PriceBatchFailureClient:
+    def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict:
+        raise RuntimeError("c5 ssl eof")
+
+    def purchase_max_price(self, market_hash_name: str, app_id: int = 730) -> dict:
+        raise RuntimeError("c5 purchase unavailable")
+
+
 class MarketServiceTestCase(unittest.TestCase):
     def test_c5_bid_price_comes_from_c5_official_api(self) -> None:
         service = MarketService(
@@ -172,6 +180,29 @@ class MarketServiceTestCase(unittest.TestCase):
         state = states[0]
         self.assertEqual(222.0, state.steam_sell_price)
         self.assertEqual("csqaq_batch", state.steam_price_source)
+
+    def test_c5_price_batch_failure_does_not_abort_scan(self) -> None:
+        service = MarketService(
+            steamdt_client=FakeSteamDTClient(),
+            c5_client=FakeC5PriceBatchFailureClient(),
+            include_c5_purchase_prices=False,
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertEqual(200.0, state.steam_sell_price)
+        self.assertEqual(101.0, state.c5_sell_price)
+        self.assertEqual("steamdt", state.c5_price_source)
+        self.assertIn("c5_batch_error", state.raw_json)
 
 
 if __name__ == "__main__":

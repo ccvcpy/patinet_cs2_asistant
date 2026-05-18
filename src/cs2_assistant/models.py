@@ -100,6 +100,42 @@ OP_REBUY_C5 = "rebuy_on_c5"          # 在 C5 补仓
 OP_TRANSFER_BUY = "transfer_buy"     # 导余额：用余额在 Steam 买入
 OP_TRANSFER_SELL = "transfer_sell"   # 导余额：在 C5 卖出
 
+GUADAO_ITEM_SCOPE_CASE_ONLY = "case_only"
+GUADAO_ITEM_SCOPE_NON_CASE_ONLY = "non_case_only"
+GUADAO_ITEM_SCOPES = {
+    GUADAO_ITEM_SCOPE_CASE_ONLY,
+    GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
+}
+
+
+def normalize_guadao_item_scope(value: object) -> str:
+    raw = str(value or GUADAO_ITEM_SCOPE_CASE_ONLY).strip().lower().replace("-", "_")
+    aliases = {
+        "case": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "cases": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "case_only": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "box": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "boxes": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "non_case": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
+        "non_cases": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
+        "non_case_only": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
+    }
+    return aliases.get(raw, GUADAO_ITEM_SCOPE_CASE_ONLY)
+
+
+def looks_like_weapon_case_name(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    return normalized.endswith(" case") or "武器箱" in value
+
+
+def guadao_scope_allows_item(scope: object, *, is_weapon_case: bool) -> bool:
+    normalized = normalize_guadao_item_scope(scope)
+    if normalized == GUADAO_ITEM_SCOPE_CASE_ONLY:
+        return is_weapon_case
+    return not is_weapon_case
+
 
 @dataclass(slots=True)
 class StrategyConfig:
@@ -115,6 +151,7 @@ class StrategyConfig:
     execution_enabled: bool = False
     auto_list_enabled: bool = True
     auto_rebuy_enabled: bool = True
+    guadao_item_scope: str = GUADAO_ITEM_SCOPE_CASE_ONLY
     price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
     max_buy_per_cycle: int = 3
@@ -128,6 +165,7 @@ class StrategyConfig:
     listing_wall_min_count: int = 20
     listing_price_offset: float = 0.01
     case_listing_price_offset: float | None = -0.01
+    case_max_open_guadao_count: int = 100
     force_refresh_before_execution: bool = True
     steam_price_cache_ttl: float = 60.0
     verify_steam_before_rebuy: bool = True
@@ -146,6 +184,7 @@ class StrategyConfig:
             "executionEnabled": self.execution_enabled,
             "autoListEnabled": self.auto_list_enabled,
             "autoRebuyEnabled": self.auto_rebuy_enabled,
+            "guadaoItemScope": normalize_guadao_item_scope(self.guadao_item_scope),
             "priceTolerancePct": self.price_tolerance_pct,
             "maxListPerCycle": self.max_list_per_cycle,
             "maxBuyPerCycle": self.max_buy_per_cycle,
@@ -159,6 +198,7 @@ class StrategyConfig:
             "listingWallMinCount": self.listing_wall_min_count,
             "listingPriceOffset": self.listing_price_offset,
             "caseListingPriceOffset": self.case_listing_price_offset,
+            "caseMaxOpenGuadaoCount": self.case_max_open_guadao_count,
             "forceRefreshBeforeExecution": self.force_refresh_before_execution,
             "steamPriceCacheTtl": self.steam_price_cache_ttl,
             "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
@@ -188,6 +228,7 @@ class StrategyConfig:
             execution_enabled=_as_bool(data.get("executionEnabled"), False),
             auto_list_enabled=_as_bool(data.get("autoListEnabled"), True),
             auto_rebuy_enabled=_as_bool(data.get("autoRebuyEnabled"), True),
+            guadao_item_scope=normalize_guadao_item_scope(data.get("guadaoItemScope", GUADAO_ITEM_SCOPE_CASE_ONLY)),
             price_tolerance_pct=float(data.get("priceTolerancePct", 1.0)),
             max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
             max_buy_per_cycle=int(data.get("maxBuyPerCycle", 3)),
@@ -205,6 +246,7 @@ class StrategyConfig:
                 if data.get("caseListingPriceOffset") is not None
                 else None
             ),
+            case_max_open_guadao_count=int(data.get("caseMaxOpenGuadaoCount", 100)),
             force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
             steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
             verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),

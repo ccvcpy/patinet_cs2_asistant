@@ -47,11 +47,14 @@ class FakeSteamClient:
         self.confirm_should_fail = False
         self.confirm_result = 1
         self.orderbook_should_fail = False
+        self.orderbook_payload: dict | None = None
         self.price_overview_should_fail = False
 
     def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
         if self.orderbook_should_fail:
             raise SteamMarketError("steam ssl eof")
+        if self.orderbook_payload is not None:
+            return self.orderbook_payload
         return {
             "success": 1,
             "data": {
@@ -284,7 +287,57 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         )
 
         self.assertEqual(0.01, self.engine._listing_price_offset_for_candidate(candidate))
-        self.assertEqual(20, self.engine._listing_wall_min_count_for_candidate(candidate))
+        self.assertEqual(1, self.engine._listing_wall_min_count_for_candidate(candidate))
+
+    def test_guadao_scope_filters_case_and_non_case_candidates(self) -> None:
+        self.db.upsert_items(
+            [
+                CatalogItem(
+                    market_hash_name="AK-47 | Redline (Field-Tested)",
+                    name_cn="AK-47 | Redline (Field-Tested)",
+                    raw_json={"typeName": "Rifle"},
+                )
+            ]
+        )
+
+        self.engine.config.guadao_item_scope = "case_only"
+        self.assertTrue(self.engine._guadao_scope_allows_market_hash_name("Revolution Case"))
+        self.assertFalse(
+            self.engine._guadao_scope_allows_market_hash_name("AK-47 | Redline (Field-Tested)")
+        )
+
+        self.engine.config.guadao_item_scope = "non_case_only"
+        self.assertFalse(self.engine._guadao_scope_allows_market_hash_name("Revolution Case"))
+        self.assertTrue(
+            self.engine._guadao_scope_allows_market_hash_name("AK-47 | Redline (Field-Tested)")
+        )
+
+    def test_strategy_scan_pool_names_are_prefiltered_when_transfer_is_disabled(self) -> None:
+        market_hash_name = "AK-47 | Redline (Field-Tested)"
+        self.db.upsert_items(
+            [
+                CatalogItem(
+                    market_hash_name=market_hash_name,
+                    name_cn=market_hash_name,
+                    raw_json={"typeName": "Rifle"},
+                )
+            ]
+        )
+        self.engine.config.guadao_item_scope = "case_only"
+        self.engine.config.transfer_min_real_ratio = 9999
+
+        pool_names = self.engine._pool_names_for_strategy_scan(["Revolution Case", market_hash_name])
+
+        self.assertEqual(["Revolution Case"], pool_names)
+
+    def test_strategy_scan_pool_names_are_not_prefiltered_when_transfer_is_enabled(self) -> None:
+        market_hash_name = "AK-47 | Redline (Field-Tested)"
+        self.engine.config.guadao_item_scope = "case_only"
+        self.engine.config.transfer_min_real_ratio = 0.05
+
+        pool_names = self.engine._pool_names_for_strategy_scan(["Revolution Case", market_hash_name])
+
+        self.assertEqual(["Revolution Case", market_hash_name], pool_names)
 
     def test_dry_run_listing_decision_falls_back_to_scan_price_when_steam_wall_unavailable(self) -> None:
         self.engine.config.dry_run = True
@@ -301,8 +354,95 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIsNotNone(decision.pricing)
         assert decision.pricing is not None
         self.assertEqual("scan_price_fallback", decision.pricing.reason)
-        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
-        self.assertIn("Steam 实时挂单墙取价失败", printed)
+
+    def test_sync_assets_updates_pool_from_inventory(self) -> None:
+        self.db.remove_pool_item("Revolution Case")
+        payload = {
+            "list": [
+                {
+                    "assetId": "asset-auto",
+                    "marketHashName": "Kilowatt Case",
+                    "name": "Kilowatt Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "price": 1.35,
+                }
+            ]
+        }
+
+        with patch("cs2_assistant.services.executor_engine.fetch_all_c5_inventories", return_value=payload):
+            self.engine._sync_assets()
+
+        self.assertEqual(["Kilowatt Case"], self.db.get_pool_market_hash_names())
+        assets = self.db.list_assets(market_hash_name="Kilowatt Case")
+        self.assertEqual(1, len(assets))
+
+    def test_sync_assets_zeroes_holding_pool_item_absent_from_live_inventory(self) -> None:
+        payload = {
+            "list": [
+                {
+                    "assetId": "asset-auto",
+                    "marketHashName": "Kilowatt Case",
+                    "name": "Kilowatt Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "price": 1.35,
+                }
+            ]
+        }
+
+        with patch("cs2_assistant.services.executor_engine.fetch_all_c5_inventories", return_value=payload):
+            self.engine._sync_assets()
+
+        pool_rows = {row["market_hash_name"]: row for row in self.db.list_pool_items()}
+        self.assertEqual(0, pool_rows["Revolution Case"]["quantity"])
+        self.assertEqual(POOL_STATUS_HOLDING, pool_rows["Revolution Case"]["status"])
+        self.assertEqual(["Kilowatt Case"], self.db.get_pool_market_hash_names())
+
+    def test_sync_assets_keeps_open_pool_item_absent_from_live_inventory(self) -> None:
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        payload = {
+            "list": [
+                {
+                    "assetId": "asset-auto",
+                    "marketHashName": "Kilowatt Case",
+                    "name": "Kilowatt Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "price": 1.35,
+                }
+            ]
+        }
+
+        with patch("cs2_assistant.services.executor_engine.fetch_all_c5_inventories", return_value=payload):
+            self.engine._sync_assets()
+
+        pool_rows = {row["market_hash_name"]: row for row in self.db.list_pool_items()}
+        self.assertEqual(1, pool_rows["Revolution Case"]["quantity"])
+        self.assertEqual(POOL_STATUS_LISTED, pool_rows["Revolution Case"]["status"])
+        self.assertEqual(["Kilowatt Case", "Revolution Case"], self.db.get_pool_market_hash_names())
+
+    def test_sync_assets_does_not_zero_pool_from_cached_inventory(self) -> None:
+        payload = {
+            "source": "cache",
+            "list": [
+                {
+                    "assetId": "asset-auto",
+                    "marketHashName": "Kilowatt Case",
+                    "name": "Kilowatt Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "price": 1.35,
+                }
+            ],
+        }
+
+        with patch("cs2_assistant.services.executor_engine.fetch_all_c5_inventories", return_value=payload):
+            self.engine._sync_assets()
+
+        pool_rows = {row["market_hash_name"]: row for row in self.db.list_pool_items()}
+        self.assertEqual(1, pool_rows["Revolution Case"]["quantity"])
+        self.assertEqual(["Kilowatt Case", "Revolution Case"], self.db.get_pool_market_hash_names())
 
     def test_real_listing_decision_requires_live_steam_price(self) -> None:
         self.engine.config.dry_run = False
@@ -328,6 +468,56 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIsNotNone(decision.pricing)
         assert decision.pricing is not None
         self.assertEqual("orderbook_wall", decision.pricing.reason)
+
+    def test_non_case_listing_decision_uses_lowest_sell_order_minus_offset(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.listing_price_offset = 0.01
+        self.engine.config.listing_wall_min_count = 20
+        market_hash_name = "AK-47 | Redline (Field-Tested)"
+        self.db.upsert_items(
+            [
+                CatalogItem(
+                    market_hash_name=market_hash_name,
+                    name_cn=market_hash_name,
+                    raw_json={"typeName": "Rifle"},
+                )
+            ]
+        )
+        self.engine.steam_client.orderbook_payload = {
+            "success": 1,
+            "data": {
+                "rgCompactSellOrders": [
+                    2500,
+                    1,
+                    2600,
+                    19,
+                ],
+            },
+        }
+        candidate = StrategyCandidate(
+            name=market_hash_name,
+            market_hash_name=market_hash_name,
+            inventory_count=1,
+            tradable_count=1,
+            rebuy_price=10.0,
+            rebuy_price_source="c5_batch",
+            steam_sell_price=25.0,
+            steam_price_source="steam_market",
+            steam_after_tax_price=21.73,
+            listing_ratio=0.50,
+            transfer_real_ratio=-0.1,
+            recommended_strategies=[STRATEGY_GUADAO],
+            steam_accounts=["main-steam"],
+        )
+
+        decision = self.engine._decide_listing(candidate)
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(24.99, round(decision.list_price, 2))
+        self.assertIsNotNone(decision.pricing)
+        assert decision.pricing is not None
+        self.assertEqual(25.0, decision.pricing.wall_price)
 
     def test_settings_do_not_accept_global_trade_url(self) -> None:
         self.assertFalse(hasattr(self.engine.settings, "steam_trade_url"))
@@ -484,6 +674,24 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIn("Steam售价 CNY 25.0", printed)
         self.assertIn("税后到手 CNY 21.73", printed)
 
+    def test_listing_prints_expected_listing_ratio(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.6543,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        with patch("builtins.print") as print_mock:
+            listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
+
+        self.assertEqual(1, listed)
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("65.43%", printed)
+
     def test_guadao_does_not_continue_listing_when_cycle_is_open(self) -> None:
         self.engine.config.dry_run = True
         self.engine.config.force_refresh_before_execution = False
@@ -502,9 +710,10 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
     def test_listed_sell_operation_blocks_new_listing_even_when_pool_status_holding(self) -> None:
         self.engine.config.dry_run = True
         self.engine.config.force_refresh_before_execution = False
-        self.db.set_pool_status("Revolution Case", POOL_STATUS_HOLDING)
+        market_hash_name = "AK-47 | Redline (Field-Tested)"
+        self.db.upsert_pool_item(market_hash_name, 1, status=POOL_STATUS_HOLDING)
         op_id = self.db.add_pool_operation(
-            market_hash_name="Revolution Case",
+            market_hash_name=market_hash_name,
             strategy=STRATEGY_GUADAO,
             operation_type=OP_SELL_STEAM,
             expected_price=25.0,
@@ -518,7 +727,36 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
     def test_pending_rebuy_operation_blocks_new_listing_even_when_pool_status_holding(self) -> None:
         self.engine.config.dry_run = True
         self.engine.config.force_refresh_before_execution = False
-        self.db.set_pool_status("Revolution Case", POOL_STATUS_HOLDING)
+        market_hash_name = "AK-47 | Redline (Field-Tested)"
+        self.db.upsert_pool_item(market_hash_name, 1, status=POOL_STATUS_HOLDING)
+        self.db.add_pool_operation(
+            market_hash_name=market_hash_name,
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=20.0,
+            note='{"sourceSellOperationId": 1, "steamListPrice": 25.0}',
+        )
+
+        self.assertTrue(self.engine._has_open_guadao_cycle())
+
+    def test_case_listed_sell_operation_under_limit_does_not_block_new_listing(self) -> None:
+        self.engine.config.case_max_open_guadao_count = 100
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        self.assertFalse(self.engine._has_open_guadao_cycle())
+
+    def test_case_pending_rebuy_operation_under_limit_does_not_block_new_listing(self) -> None:
+        self.engine.config.case_max_open_guadao_count = 100
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_PENDING_REBUY)
         self.db.add_pool_operation(
             market_hash_name="Revolution Case",
             strategy=STRATEGY_GUADAO,
@@ -527,7 +765,29 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
             note='{"sourceSellOperationId": 1, "steamListPrice": 25.0}',
         )
 
-        self.assertTrue(self.engine._has_open_guadao_cycle())
+        self.assertFalse(self.engine._has_open_guadao_cycle())
+
+    def test_case_open_guadao_at_limit_blocks_and_notifies(self) -> None:
+        self.engine.config.case_max_open_guadao_count = 1
+        self.engine.serverchan = FakeServerChan()
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        with patch("builtins.print") as print_mock:
+            self.assertTrue(self.engine._has_open_guadao_cycle())
+
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("1/1", printed)
+        self.assertTrue(self.engine._stop_requested)
+        self.assertEqual(1, len(self.engine.serverchan.messages))
 
     def test_listing_pending_confirmation_is_recorded_when_credentials_missing(self) -> None:
         self.engine.config.dry_run = False
@@ -767,6 +1027,62 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIn("[等待] 检测到上一轮挂刀循环未闭环，本轮先等待卖出/补仓完成。", printed)
         self.assertIn("[结果] 本轮只完成了扫描/状态检查，没有实际上架、买入或卖出。", printed)
         self.assertIn("上一轮挂刀循环未闭环（pending_rebuy=1）", printed)
+
+    def test_no_action_reason_includes_lowest_listing_ratio_vs_threshold(self) -> None:
+        self.engine.config.guadao_max_listing_ratio = 0.67
+        report = type(
+            "Report",
+            (),
+            {
+                "all_evaluated": [
+                    StrategyCandidate(
+                        name="Dreams & Nightmares Case",
+                        market_hash_name="Dreams & Nightmares Case",
+                        inventory_count=2,
+                        tradable_count=2,
+                        rebuy_price=10.0,
+                        rebuy_price_source="c5_batch",
+                        steam_sell_price=14.0,
+                        steam_price_source="steam_market",
+                        steam_after_tax_price=12.17,
+                        listing_ratio=0.8211,
+                        transfer_real_ratio=-0.02,
+                        recommended_strategies=[],
+                        steam_accounts=["main-steam"],
+                    )
+                ],
+                "guadao_candidates": [],
+                "transfer_candidates": [],
+                "missing_price_count": 0,
+            },
+        )()
+
+        reasons = self.engine._describe_no_action_reasons(report, pool_names=["Dreams & Nightmares Case"])
+
+        joined = "\n".join(reasons)
+        self.assertIn("82.11%", joined)
+        self.assertIn("67.00%", joined)
+        self.assertIn("Dreams & Nightmares Case", joined)
+
+    def test_no_action_reason_reports_account_filtered_ratio_when_threshold_met(self) -> None:
+        self.engine.config.guadao_max_listing_ratio = 0.67
+        report = type(
+            "Report",
+            (),
+            {
+                "all_evaluated": [build_guadao_candidate()],
+                "guadao_candidates": [],
+                "transfer_candidates": [],
+                "missing_price_count": 0,
+            },
+        )()
+        self.engine._guadao_skipped_by_account = [("Revolution Case", 76, 0)]
+
+        reasons = self.engine._describe_no_action_reasons(report, pool_names=["Revolution Case"])
+
+        joined = "\n".join(reasons)
+        self.assertIn("67.00%", joined)
+        self.assertIn("Revolution Case", joined)
 
 
 if __name__ == "__main__":
