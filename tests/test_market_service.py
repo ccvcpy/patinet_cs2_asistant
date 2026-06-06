@@ -109,6 +109,19 @@ class FakeC5Client:
         }
 
 
+class FakeSteamMarketClient:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+
+    def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
+        if self.fail:
+            raise RuntimeError("steam account unavailable")
+        return {
+            "success": 1,
+            "rgCompactSellOrders": [[22200, 4]],
+        }
+
+
 class FakeC5PriceBatchFailureClient:
     def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict:
         raise RuntimeError("c5 ssl eof")
@@ -180,6 +193,53 @@ class MarketServiceTestCase(unittest.TestCase):
         state = states[0]
         self.assertEqual(222.0, state.steam_sell_price)
         self.assertEqual("csqaq_batch", state.steam_price_source)
+
+    def test_steam_orderbook_overrides_third_party_steam_price(self) -> None:
+        service = MarketService(
+            steamdt_client=FakeSteamDTClient(),
+            csqaq_client=FakeCSQAQClient(),
+            c5_client=FakeC5Client(),
+            steam_market_client=FakeSteamMarketClient(),
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertEqual(222.0, state.steam_sell_price)
+        self.assertEqual("steam_orderbook", state.steam_price_source)
+        self.assertEqual(99.0, state.c5_sell_price)
+        self.assertEqual("c5_batch", state.c5_price_source)
+
+    def test_steam_orderbook_tries_all_configured_clients(self) -> None:
+        service = MarketService(
+            c5_client=FakeC5Client(),
+            steam_market_clients=[
+                FakeSteamMarketClient(fail=True),
+                FakeSteamMarketClient(),
+            ],
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertEqual(222.0, state.steam_sell_price)
+        self.assertEqual("steam_orderbook", state.steam_price_source)
 
     def test_c5_price_batch_failure_does_not_abort_scan(self) -> None:
         service = MarketService(

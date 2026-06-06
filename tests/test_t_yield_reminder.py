@@ -58,6 +58,7 @@ def _candidate(
         steam_lowest_sell_price=166.78,
         steam_price_source="csqaq_batch",
         ratio=0.9446,
+        listing_ratio=0.9446 / 0.869,
         t_yield_rate=pct / 100,
     )
 
@@ -106,6 +107,22 @@ class TYieldReminderTestCase(unittest.TestCase):
         self.assertFalse(second.should_notify)
         self.assertEqual("hot_duplicate", second.reason)
 
+    def test_startup_force_notifies_even_when_hot_is_duplicate(self) -> None:
+        config = TYieldReminderConfig()
+        state = TYieldReminderState()
+        report = _report(_candidate(name="Tradable Knife", pct=10.5, status=INVENTORY_FILTER_TRADABLE_ONLY))
+        first = evaluate_reminder(report, config, state, now=datetime(2026, 4, 1, 14, 0))
+        second = evaluate_reminder(
+            report,
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 15),
+            force_startup_notify=True,
+        )
+        self.assertTrue(first.should_notify)
+        self.assertTrue(second.should_notify)
+        self.assertEqual("startup", second.reason)
+
     def test_exists_tradable_scope_excludes_all_cooldown(self) -> None:
         config = TYieldReminderConfig(inventory_scope=INVENTORY_SCOPE_NOT_ALL_COOLDOWN)
         state = TYieldReminderState()
@@ -121,7 +138,7 @@ class TYieldReminderTestCase(unittest.TestCase):
         cooldown = evaluate_reminder(
             _report(_candidate(name="Cooldown Knife", pct=10.5, status=INVENTORY_FILTER_COOLDOWN_ONLY)),
             TYieldReminderConfig(inventory_scope=INVENTORY_SCOPE_NOT_ALL_COOLDOWN),
-            TYieldReminderState(),
+            TYieldReminderState(last_no_hot_summary_at="2026-04-01T13:30:00"),
             now=datetime(2026, 4, 1, 14, 0),
         )
         self.assertFalse(cooldown.should_notify)
@@ -138,10 +155,10 @@ class TYieldReminderTestCase(unittest.TestCase):
         self.assertTrue(decision.should_notify)
         self.assertEqual("hot", decision.reason)
 
-    def test_daily_summary_after_1530_uses_same_inventory_scope(self) -> None:
+    def test_fixed_summary_uses_same_inventory_scope(self) -> None:
         config = TYieldReminderConfig(
             inventory_scope=INVENTORY_SCOPE_ALL,
-            daily_summary_time="15:30",
+            fixed_summary_times=["15:30"],
         )
         state = TYieldReminderState()
         decision = evaluate_reminder(
@@ -154,15 +171,15 @@ class TYieldReminderTestCase(unittest.TestCase):
             now=datetime(2026, 4, 1, 15, 30),
         )
         self.assertTrue(decision.should_notify)
-        self.assertEqual("daily", decision.reason)
+        self.assertEqual("fixed:15:30", decision.reason)
         self.assertIsNotNone(decision.notification)
         assert decision.notification is not None
         self.assertIn("Mixed Candidate", decision.notification.body)
         self.assertIn("Tradable Hot Candidate", decision.notification.body)
         self.assertIn("范围: 全部", decision.notification.body)
 
-    def test_daily_summary_triggers_after_target_time_if_not_yet_sent(self) -> None:
-        config = TYieldReminderConfig(daily_summary_time="15:30")
+    def test_fixed_summary_triggers_after_target_time_within_scan_window(self) -> None:
+        config = TYieldReminderConfig(fixed_summary_times=["15:30"])
         state = TYieldReminderState()
         decision = evaluate_reminder(
             _report(_candidate(name="Mixed Candidate", pct=9.5, status=INVENTORY_FILTER_MIXED_ONLY)),
@@ -171,11 +188,14 @@ class TYieldReminderTestCase(unittest.TestCase):
             now=datetime(2026, 4, 1, 15, 47),
         )
         self.assertTrue(decision.should_notify)
-        self.assertEqual("daily", decision.reason)
+        self.assertEqual("fixed:15:30", decision.reason)
 
-    def test_daily_summary_only_sends_once_per_day_after_target_time(self) -> None:
-        config = TYieldReminderConfig(daily_summary_time="15:30")
-        state = TYieldReminderState(last_daily_summary_date="2026-04-01")
+    def test_fixed_summary_only_sends_once_per_day_after_target_time(self) -> None:
+        config = TYieldReminderConfig(fixed_summary_times=["15:30"])
+        state = TYieldReminderState(
+            last_fixed_summary_sent={"15:30": "2026-04-01"},
+            last_no_hot_summary_at="2026-04-01T14:00:00",
+        )
         decision = evaluate_reminder(
             _report(_candidate(name="Mixed Candidate", pct=9.5, status=INVENTORY_FILTER_MIXED_ONLY)),
             config,
@@ -185,9 +205,24 @@ class TYieldReminderTestCase(unittest.TestCase):
         self.assertFalse(decision.should_notify)
         self.assertEqual("local_only", decision.reason)
 
+    def test_no_hot_summary_sends_after_configured_interval(self) -> None:
+        config = TYieldReminderConfig(
+            fixed_summary_times=["15:30"],
+            no_hot_summary_interval_hours=4,
+        )
+        state = TYieldReminderState(last_no_hot_summary_at="2026-04-01T09:00:00")
+        decision = evaluate_reminder(
+            _report(_candidate(name="Tradable Candidate", pct=9.5, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        self.assertTrue(decision.should_notify)
+        self.assertEqual("no_hot_summary", decision.reason)
+
     def test_local_only_when_no_hot_and_not_summary_time(self) -> None:
-        config = TYieldReminderConfig(daily_summary_time="15:30")
-        state = TYieldReminderState()
+        config = TYieldReminderConfig(fixed_summary_times=["15:30"])
+        state = TYieldReminderState(last_no_hot_summary_at="2026-04-01T12:30:00")
         decision = evaluate_reminder(
             _report(_candidate(name="Tradable Candidate", pct=9.5, status=INVENTORY_FILTER_TRADABLE_ONLY)),
             config,

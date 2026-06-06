@@ -214,7 +214,7 @@ class Database:
         )
         self.conn.commit()
 
-    def upsert_items(self, items: Iterable[CatalogItem]) -> int:
+    def upsert_items(self, items: Iterable[CatalogItem], *, preserve_existing_ids: bool = False) -> int:
         now = utc_now_iso()
         rows = [
             (
@@ -228,8 +228,14 @@ class Database:
             )
             for item in items
         ]
+        c5_update = "COALESCE(excluded.c5_item_id, items.c5_item_id)" if preserve_existing_ids else "excluded.c5_item_id"
+        steam_update = (
+            "COALESCE(excluded.steam_item_id, items.steam_item_id)"
+            if preserve_existing_ids
+            else "excluded.steam_item_id"
+        )
         self.conn.executemany(
-            """
+            f"""
             INSERT INTO items (
                 market_hash_name,
                 name_cn,
@@ -241,8 +247,8 @@ class Database:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(market_hash_name) DO UPDATE SET
                 name_cn = excluded.name_cn,
-                c5_item_id = excluded.c5_item_id,
-                steam_item_id = excluded.steam_item_id,
+                c5_item_id = {c5_update},
+                steam_item_id = {steam_update},
                 raw_json = excluded.raw_json,
                 updated_at = excluded.updated_at
             """,
@@ -772,7 +778,7 @@ class Database:
                 steam_id = excluded.steam_id,
                 tradable = excluded.tradable,
                 status = CASE
-                    WHEN inventory_assets.status IN ('listed', 'sold') THEN inventory_assets.status
+                    WHEN inventory_assets.status IN ('listed', 'sold', 'listing_failed') THEN inventory_assets.status
                     ELSE excluded.status
                 END,
                 last_seen_at = excluded.last_seen_at
@@ -781,6 +787,31 @@ class Database:
         )
         self.conn.commit()
         return len(rows)
+
+    def delete_assets_absent_from_live_inventory(self, seen_asset_ids: set[str]) -> int:
+        self.conn.execute("DROP TABLE IF EXISTS temp_seen_inventory_assets")
+        self.conn.execute(
+            "CREATE TEMP TABLE temp_seen_inventory_assets (asset_id TEXT PRIMARY KEY)"
+        )
+        if seen_asset_ids:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO temp_seen_inventory_assets (asset_id) VALUES (?)",
+                [(asset_id,) for asset_id in sorted(seen_asset_ids)],
+            )
+        cursor = self.conn.execute(
+            """
+            DELETE FROM inventory_assets
+            WHERE status IN ('available', 'locked')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM temp_seen_inventory_assets seen
+                  WHERE seen.asset_id = inventory_assets.asset_id
+              )
+            """,
+        )
+        self.conn.execute("DROP TABLE IF EXISTS temp_seen_inventory_assets")
+        self.conn.commit()
+        return cursor.rowcount
 
     def pick_tradable_asset(
         self,

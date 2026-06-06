@@ -34,9 +34,9 @@ class FakeMarketService:
                 market_hash_name=item["market_hash_name"],
                 name_cn=item["name_cn"],
                 c5_sell_price=item["reference_price"],
-                c5_price_source="inventory_price",
+                c5_price_source="c5_batch",
                 steam_sell_price=15.0,
-                steam_price_source="csqaq_batch",
+                steam_price_source="steam_orderbook",
             )
             for item in items
         ]
@@ -65,6 +65,7 @@ class TYieldScanTestCase(unittest.TestCase):
                     steam_lowest_sell_price=12.0,
                     steam_price_source="csqaq_batch",
                     ratio=0.95,
+                    listing_ratio=0.95 / 0.869,
                     t_yield_rate=0.12,
                 ),
                 TYieldCandidate(
@@ -79,6 +80,7 @@ class TYieldScanTestCase(unittest.TestCase):
                     steam_lowest_sell_price=12.0,
                     steam_price_source="csqaq_batch",
                     ratio=0.82,
+                    listing_ratio=0.82 / 0.869,
                     t_yield_rate=0.01,
                 ),
                 TYieldCandidate(
@@ -93,6 +95,7 @@ class TYieldScanTestCase(unittest.TestCase):
                     steam_lowest_sell_price=12.0,
                     steam_price_source="csqaq_batch",
                     ratio=0.88,
+                    listing_ratio=0.88 / 0.869,
                     t_yield_rate=0.05,
                 ),
             ],
@@ -201,6 +204,10 @@ class TYieldScanTestCase(unittest.TestCase):
         self.assertEqual(3, report.inventory_type_total_count)
         self.assertEqual(1, report.inventory_type_count)
         self.assertEqual(["Mixed Item"], [candidate.market_hash_name for candidate in report.candidates])
+        candidate = report.candidates[0]
+        self.assertAlmostEqual(12.0 / 15.0, candidate.ratio)
+        self.assertAlmostEqual(12.0 / 15.0 - 0.73, candidate.t_yield_rate)
+        self.assertAlmostEqual((12.0 / 15.0) / 0.869, candidate.listing_ratio)
         self.assertEqual(
             ["Mixed Item"],
             [

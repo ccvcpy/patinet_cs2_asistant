@@ -96,12 +96,10 @@ def _parse_orderbook_price(value: Any) -> float | None:
     price = _parse_price_text(str(value))
     if price is None:
         return None
-    # Steam's new orderbook preload uses integer micro-units:
-    # 237400 -> CNY 2.374. Keep already-decimal values intact for tests
-    # and for any future JSON shape that returns display prices.
+    # Steam orderbook uses the selected currency's minor unit for compact
+    # prices. For CNY currency=23 this means fen: 210 -> CNY 2.10,
+    # 14199 -> CNY 141.99. Keep already-decimal display prices intact.
     if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
-        if price >= 10000:
-            return price / 100000.0
         if price >= 100:
             return price / 100.0
     return price

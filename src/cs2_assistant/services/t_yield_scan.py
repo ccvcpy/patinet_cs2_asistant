@@ -7,14 +7,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from cs2_assistant.clients import C5GameClient, C5GameError, CSQAQClient, SteamDTClient
-from cs2_assistant.config import Settings
+from cs2_assistant.accounts import AccountStore
+from cs2_assistant.accounts.steam_auth import try_steam_auto_relogin
+from cs2_assistant.clients import C5GameClient, C5GameError, CSQAQClient, SteamDTClient, SteamMarketClient
+from cs2_assistant.config import PROJECT_ROOT, Settings
 from cs2_assistant.services.market import (
     DEFAULT_C5_SETTLEMENT_FACTOR,
     DEFAULT_STEAM_BALANCE_DISCOUNT,
     MarketService,
-    calculate_ratio,
-    calculate_t_yield_rate,
 )
 from cs2_assistant.utils import ensure_parent_dir, safe_float, utc_now_iso
 
@@ -152,6 +152,7 @@ class TYieldCandidate:
     steam_lowest_sell_price: float
     steam_price_source: str
     ratio: float
+    listing_ratio: float
     t_yield_rate: float
 
     @property
@@ -186,6 +187,8 @@ class TYieldCandidate:
             "steamLowestSellPrice": self.steam_lowest_sell_price,
             "steamPriceSource": self.steam_price_source,
             "ratio": self.ratio,
+            "listingRatio": self.listing_ratio,
+            "listingRatioPct": self.listing_ratio * 100,
             "tYieldRate": self.t_yield_rate,
             "tYieldPct": self.t_yield_pct,
         }
@@ -614,6 +617,14 @@ def summarize_inventory_types(items: list[dict[str, Any]]) -> list[dict[str, Any
 
 def configured_steam_sources(settings: Settings) -> list[str]:
     sources: list[str] = []
+    store = AccountStore(PROJECT_ROOT / "config")
+    accounts = [
+        account
+        for account in store.list_accounts()
+        if account.cookies or (account.username and account.password)
+    ]
+    if accounts or settings.steam_cookies:
+        sources.append("steam_orderbook")
     if settings.steamdt_api_key:
         sources.append("steamdt")
     if settings.csqaq_api_token:
@@ -626,6 +637,42 @@ def build_market_service(
     *,
     include_c5_purchase_prices: bool,
 ) -> MarketService:
+    store = AccountStore(PROJECT_ROOT / "config")
+    usable_accounts = []
+    for account in store.list_accounts():
+        if account.username and account.password:
+            ok, _, refreshed_account = try_steam_auto_relogin(store, account_id=account.id)
+            if ok and refreshed_account is not None:
+                account = refreshed_account
+        if account.cookies:
+            usable_accounts.append(account)
+
+    steam_market_client: SteamMarketClient | None = None
+    for account in usable_accounts:
+        try:
+            candidate_client = SteamMarketClient(
+                cookies=account.cookies,
+                steam_id64=account.steam_id64,
+                identity_secret=account.identity_secret,
+                device_id=account.device_id,
+                account_id=account.id,
+                base_url=settings.steam_market_base_url,
+            )
+            candidate_client.my_listings(start=0, count=1)
+            steam_market_client = candidate_client
+            break
+        except Exception:
+            continue
+    if steam_market_client is None and settings.steam_cookies:
+        try:
+            steam_market_client = SteamMarketClient(
+                cookies=settings.steam_cookies,
+                identity_secret=settings.steam_identity_secret,
+                device_id=settings.steam_device_id,
+                base_url=settings.steam_market_base_url,
+            )
+        except Exception:
+            pass
     return MarketService(
         steamdt_client=SteamDTClient(settings.steamdt_api_key, settings.steamdt_base_url)
         if settings.steamdt_api_key
@@ -636,6 +683,7 @@ def build_market_service(
         c5_client=C5GameClient(settings.c5_api_key, settings.c5_base_url)
         if settings.c5_api_key
         else None,
+        steam_market_client=steam_market_client,
         app_id=settings.app_id,
         include_c5_purchase_prices=include_c5_purchase_prices,
     )
@@ -654,8 +702,6 @@ def scan_t_yield(
 
     if not settings.c5_api_key:
         raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。")
-    if not settings.steamdt_api_key and not settings.csqaq_api_token:
-        raise RuntimeError("缺少 STEAMDT_API_KEY 或 CSQAQ_API_KEY / CSQAQ_API_TOKEN 环境变量。")
     if min_price < 0:
         raise ValueError("--min-price 不能小于 0。")
 
@@ -705,13 +751,10 @@ def scan_t_yield(
         if state is None:
             continue
 
-        c5_sell_price = item_type["reference_price"]
-        c5_price_source = "inventory_price" if c5_sell_price is not None else None
-        if c5_sell_price is None:
-            c5_sell_price = state.c5_sell_price
-            c5_price_source = state.c5_price_source
+        c5_sell_price = state.c5_sell_price
+        c5_price_source = state.c5_price_source
 
-        if c5_sell_price is None:
+        if c5_sell_price is None or c5_price_source != "c5_batch":
             continue
 
         steam_accounts = [
@@ -719,7 +762,7 @@ def scan_t_yield(
             for steam_id in item_type["steam_ids"]
         ]
 
-        if state.steam_sell_price is None:
+        if state.steam_sell_price is None or state.steam_price_source != "steam_orderbook":
             missing_steam_prices.append(
                 MissingSteamPriceIssue(
                     name=state.name_cn or item_type["name_cn"],
@@ -736,17 +779,13 @@ def scan_t_yield(
             )
             continue
 
-        ratio = calculate_ratio(
-            c5_sell_price,
-            state.steam_sell_price,
-            c5_settlement_factor=DEFAULT_C5_SETTLEMENT_FACTOR,
-        )
-        t_yield_rate = calculate_t_yield_rate(
-            ratio,
-            steam_balance_discount=steam_discount,
-            c5_settlement_factor=DEFAULT_C5_SETTLEMENT_FACTOR,
-        )
-        if t_yield_rate is None or c5_sell_price < min_price:
+        steam_sell_price = float(state.steam_sell_price)
+        if steam_sell_price <= 0:
+            continue
+        ratio = float(c5_sell_price) / steam_sell_price
+        listing_ratio = ratio / DEFAULT_C5_SETTLEMENT_FACTOR
+        t_yield_rate = ratio - steam_discount
+        if c5_sell_price < min_price:
             continue
 
         candidates.append(
@@ -759,15 +798,18 @@ def scan_t_yield(
                 steam_accounts=steam_accounts,
                 c5_lowest_sell_price=float(c5_sell_price),
                 c5_price_source=c5_price_source or "unknown",
-                steam_lowest_sell_price=float(state.steam_sell_price),
+                steam_lowest_sell_price=steam_sell_price,
                 steam_price_source=state.steam_price_source or "unknown",
                 ratio=float(ratio),
+                listing_ratio=float(listing_ratio),
                 t_yield_rate=float(t_yield_rate),
             )
         )
 
-    candidates.sort(key=lambda item: item.t_yield_rate, reverse=True)
-    missing_steam_prices.sort(key=lambda item: item.market_hash_name)
+    candidates.sort(
+        key=lambda item: (-item.t_yield_rate, -item.c5_lowest_sell_price, item.market_hash_name),
+    )
+    missing_steam_prices.sort(key=lambda item: (-item.c5_sell_price, item.market_hash_name))
     missing_path = _save_missing_steam_report(settings, missing_steam_prices)
 
     return TYieldScanReport(

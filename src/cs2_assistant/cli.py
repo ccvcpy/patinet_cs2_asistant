@@ -3,9 +3,11 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 import uuid
 from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,14 @@ from cs2_assistant.accounts.steam_auth import (
     _verify_steam_cookies_valid,
     try_steam_auto_relogin,
 )
-from cs2_assistant.catalog import load_steamdt_catalog
+from cs2_assistant.catalog import (
+    CSGO_API_BASE_URL,
+    CSGO_API_DEFAULT_CATEGORIES,
+    CSGO_API_DEFAULT_LANGUAGE,
+    is_csgo_api_weapon_case,
+    load_csgo_api_catalog,
+    load_steamdt_catalog,
+)
 from cs2_assistant.clients import (
     C5GameClient,
     CSQAQClient,
@@ -24,7 +33,15 @@ from cs2_assistant.clients import (
     SteamMarketClient,
 )
 from cs2_assistant.clients.steam_market import SteamMarketError
-from cs2_assistant.config import PROJECT_ROOT, Settings, load_settings
+from cs2_assistant.config import (
+    NETWORK_CONFIG_PATH,
+    PROJECT_ROOT,
+    Settings,
+    apply_proxy_mode,
+    load_network_proxy_mode,
+    load_settings,
+    save_network_proxy_mode,
+)
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
@@ -34,6 +51,9 @@ from cs2_assistant.models import (
     STRATEGY_LABELS,
     STRATEGY_TRANSFER,
     StrategyConfig,
+    guadao_scope_allows_item,
+    looks_like_weapon_case_name,
+    normalize_guadao_item_scope,
 )
 from cs2_assistant.services.market import (
     DEFAULT_C5_SETTLEMENT_FACTOR,
@@ -54,6 +74,7 @@ from cs2_assistant.services.pricing import (
 )
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
+    fetch_all_c5_inventories,
     INVENTORY_FILTER_ALL,
     INVENTORY_FILTER_ALL_COOLDOWN,
     INVENTORY_FILTER_COOLDOWN_ONLY,
@@ -386,6 +407,7 @@ def _format_t_yield_top_rows(
                 ],
                 "tYieldPct": f"{row['tYieldPct']:.2f}%",
                 "ratio": f"{row['ratio']:.4f}",
+                "listingRatio": f"{row['listingRatio']:.4f}" if row.get("listingRatio") is not None else "-",
                 "c5LowestSellPrice": row["c5SellPrice"],
                 "steamLowestSellPrice": row["steamSellPrice"],
                 "c5PriceSource": row["c5PriceSource"],
@@ -612,6 +634,27 @@ def cmd_import_catalog(args: argparse.Namespace) -> int:
     with _open_db(settings) as db:
         count = db.upsert_items(items)
     print(f"已导入 {count} 条饰品基础数据: {source_path}")
+    return 0
+
+
+def cmd_catalog_sync_csgo_api(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = load_csgo_api_catalog(
+        language=args.language,
+        categories=args.categories,
+        base_url=args.base_url,
+        timeout=args.timeout,
+    )
+    with _open_db(settings) as db:
+        count = db.upsert_items(result.items, preserve_existing_ids=True)
+
+    categories_text = ", ".join(
+        f"{category}={item_count}" for category, item_count in result.category_counts.items()
+    )
+    print(f"已从 CSGO-API 同步 {count} 条饰品资料，语言={result.language}")
+    print(f"分类明细: {categories_text}")
+    print(f"箱子识别资料: CSGO-API crates 分类共 {result.weapon_case_count} 个")
+    print("已保留本地已有 c5_item_id / steam_item_id，不会覆盖成空。")
     return 0
 
 
@@ -1210,6 +1253,28 @@ def build_parser() -> argparse.ArgumentParser:
     import_catalog.add_argument("--file", help="SteamDT 基础数据 JSON 文件路径")
     import_catalog.set_defaults(handler=cmd_import_catalog)
 
+    catalog = subparsers.add_parser("catalog", help="饰品资料库")
+    catalog_subparsers = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_sync_csgo_api = catalog_subparsers.add_parser(
+        "sync-csgo-api",
+        help="从 ByMykel/CSGO-API 同步饰品资料",
+        description=(
+            "从 ByMykel/CSGO-API 同步饰品资料到本地 items 表。\n"
+            "默认同步常用可交易品类，并保留本地已有 c5_item_id / steam_item_id。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    catalog_sync_csgo_api.add_argument("--language", default=CSGO_API_DEFAULT_LANGUAGE, help="CSGO-API 语言目录")
+    catalog_sync_csgo_api.add_argument("--base-url", default=CSGO_API_BASE_URL, help=argparse.SUPPRESS)
+    catalog_sync_csgo_api.add_argument("--timeout", type=float, default=30.0, help="单个分类请求超时秒数")
+    catalog_sync_csgo_api.add_argument(
+        "--category",
+        dest="categories",
+        action="append",
+        help="只同步指定分类；可重复传入。默认同步常用品类。",
+    )
+    catalog_sync_csgo_api.set_defaults(handler=cmd_catalog_sync_csgo_api)
+
     search_item = subparsers.add_parser("search-item", help="按关键词搜索饰品")
     search_item.add_argument("--keyword", required=True, help="中文名或 HashName 关键词")
     search_item.add_argument("--limit", type=int, default=20, help="返回条数")
@@ -1447,6 +1512,7 @@ def cmd_t_profit_scan(args: argparse.Namespace) -> int:
         + f"命中 {len(report.candidates)} 个做T候选，"
         + f"缺少 Steam 价格 {len(report.missing_steam_prices)} 个。"
     )
+    print(f"价格源: C5官方API / Steam官方orderbook | 库存账号 {len(report.accounts)} 个")
 
     if not selected_candidates:
         print("当前没有符合条件的做T候选。")
@@ -1458,20 +1524,21 @@ def cmd_t_profit_scan(args: argparse.Namespace) -> int:
                 for account in candidate.steam_accounts
             ) or "-"
             marker = "★" if candidate.t_yield_pct >= args.star_threshold else "-"
+            print(f"\n{marker} {index}. {candidate.name}")
             print(
-                f"{marker} {index}. {candidate.name} | 收益率 {candidate.t_yield_pct:.2f}% | "
-                f"{candidate.inventory_status_summary} | 折算比 {candidate.ratio:.4f} | "
-                f"C5 {candidate.c5_lowest_sell_price:.2f} | "
-                f"Steam {candidate.steam_lowest_sell_price:.2f} | 账号 {accounts}"
+                f"   利润 {candidate.t_yield_pct:.2f}% | "
+                f"折算比 {candidate.ratio:.4f} | 挂刀比 {candidate.listing_ratio:.4f}"
             )
+            print(f"   C5 {candidate.c5_lowest_sell_price:.2f} | Steam {candidate.steam_lowest_sell_price:.2f}")
+            print(f"   库存 {candidate.inventory_status_summary}")
+            print(f"   账号 {accounts}")
 
     if report.missing_steam_prices:
-        print(f"缺少 Steam 价格的饰品: {len(report.missing_steam_prices)} 个")
+        print(f"\n缺少 Steam 价格: {len(report.missing_steam_prices)} 个")
         for issue in report.missing_steam_prices[:10]:
-            print(
-                f"- {issue.name} | {issue.inventory_status_summary} | C5 {issue.c5_sell_price:.2f} | "
-                f"HashName={issue.market_hash_name}"
-            )
+            print(f"- {issue.name}")
+            print(f"  C5 {issue.c5_sell_price:.2f} | {issue.inventory_status_summary}")
+            print(f"  HashName={issue.market_hash_name}")
         print(f"详情文件: {report.missing_steam_price_path}")
 
     if args.dump_json:
@@ -1498,8 +1565,327 @@ def cmd_notify_t_profit(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Global config commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_config_proxy(args: argparse.Namespace) -> int:
+    if args.mode:
+        mode = apply_proxy_mode(args.mode)
+        save_network_proxy_mode(mode)
+        print(f"网络代理模式已保存: {mode}")
+    else:
+        mode = apply_proxy_mode(load_network_proxy_mode())
+        print(f"当前网络代理模式: {mode}")
+    if mode == "none":
+        print("含义: 不使用系统/环境代理，C5 和 Steam 请求直接连接。")
+    else:
+        print("含义: 使用系统/环境代理，例如 HTTP_PROXY / HTTPS_PROXY。")
+    print(f"配置文件: {NETWORK_CONFIG_PATH}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Pool / strategy commands
 # ---------------------------------------------------------------------------
+
+
+POOL_REPORT_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_c5_tradable_time(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        raw_number = float(value)
+        if raw_number <= 0:
+            return None
+        if raw_number > 10_000_000_000:
+            raw_number /= 1000
+        return datetime.fromtimestamp(raw_number, tz=timezone.utc)
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", raw):
+        raw_number = float(raw)
+        if raw_number <= 0:
+            return None
+        if raw_number > 10_000_000_000:
+            raw_number /= 1000
+        return datetime.fromtimestamp(raw_number, tz=timezone.utc)
+
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_broad_weapon_case_name(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    if looks_like_weapon_case_name(value):
+        return True
+    return (
+        normalized.endswith(" capsule")
+        or normalized.endswith(" package")
+        or normalized.endswith(" container")
+        or "胶囊" in value
+        or "收藏包" in value
+    )
+
+
+def _is_pool_scope_weapon_case(db: Database, item: dict[str, Any]) -> bool:
+    market_hash_name = str(item.get("marketHashName") or "").strip()
+    name = str(item.get("name") or item.get("shortName") or "").strip()
+    catalog_item = db.get_item(market_hash_name) if market_hash_name else None
+    if catalog_item is not None:
+        raw_json = _read_note_dict(catalog_item["raw_json"])
+        if isinstance(raw_json.get("csgoApi"), dict) and is_csgo_api_weapon_case(raw_json):
+            return True
+        if _is_broad_weapon_case_name(str(catalog_item["market_hash_name"] or "")):
+            return True
+        if _is_broad_weapon_case_name(str(catalog_item["name_cn"] or "")):
+            return True
+        if _is_broad_weapon_case_name(str(raw_json.get("marketHashName") or "")):
+            return True
+        if _is_broad_weapon_case_name(str(raw_json.get("name") or "")):
+            return True
+        type_name = str(raw_json.get("typeName") or raw_json.get("type") or "")
+        if _is_broad_weapon_case_name(type_name) or "weaponcase" in type_name.lower():
+            return True
+    return _is_broad_weapon_case_name(market_hash_name) or _is_broad_weapon_case_name(name)
+
+
+def _format_account_counts(counts: dict[str, int], account_lookup: dict[str, str]) -> str:
+    if not counts:
+        return "-"
+    parts: list[str] = []
+    for steam_id, count in sorted(counts.items(), key=lambda row: (-row[1], account_lookup.get(row[0], row[0]))):
+        label = account_lookup.get(steam_id) or steam_id or "未知账号"
+        parts.append(f"{label} {count}")
+    return "、".join(parts)
+
+
+def _format_status_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "-"
+    return "、".join(
+        f"status={status} {count}"
+        for status, count in sorted(counts.items(), key=lambda row: (str(row[0]), -int(row[1])))
+    )
+
+
+def _build_pool_inventory_report(
+    inventory_payload: dict[str, Any],
+    *,
+    db: Database,
+    scope: str,
+    days: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    normalized_scope = normalize_guadao_item_scope(scope)
+    now_utc = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
+    today = now_utc.astimezone(POOL_REPORT_TZ).date()
+    day_keys = [today + timedelta(days=offset) for offset in range(max(1, days))]
+    day_set = set(day_keys)
+
+    account_lookup = {
+        str(account.get("steamId") or "").strip(): str(
+            account.get("nickname") or account.get("username") or account.get("steamId") or ""
+        ).strip()
+        for account in list(inventory_payload.get("accounts") or [])
+        if str(account.get("steamId") or "").strip()
+    }
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in list(inventory_payload.get("list") or []):
+        if not isinstance(item, dict):
+            continue
+        if not guadao_scope_allows_item(
+            normalized_scope,
+            is_weapon_case=_is_pool_scope_weapon_case(db, item),
+        ):
+            continue
+        market_hash_name = str(item.get("marketHashName") or "").strip()
+        if not market_hash_name:
+            continue
+        row = grouped.setdefault(
+            market_hash_name,
+            {
+                "marketHashName": market_hash_name,
+                "name": item.get("name") or item.get("shortName") or market_hash_name,
+                "totalCount": 0,
+                "tradableCount": 0,
+                "cooldownCount": 0,
+                "tradableAccounts": {},
+                "cooldownAccounts": {},
+                "cooldownStatuses": {},
+                "cooldownByDate": {day.isoformat(): {} for day in day_keys},
+                "futureCooldownCount": 0,
+                "unknownCooldownCount": 0,
+                "outOfRangeCooldownCount": 0,
+            },
+        )
+        row["totalCount"] += 1
+        steam_id = str(item.get("steamId") or "").strip()
+        if item.get("ifTradable") is True:
+            row["tradableCount"] += 1
+            row["tradableAccounts"][steam_id] = int(row["tradableAccounts"].get(steam_id, 0)) + 1
+            continue
+
+        row["cooldownCount"] += 1
+        row["cooldownAccounts"][steam_id] = int(row["cooldownAccounts"].get(steam_id, 0)) + 1
+        status_key = str(item.get("status") if item.get("status") is not None else "unknown")
+        row["cooldownStatuses"][status_key] = int(row["cooldownStatuses"].get(status_key, 0)) + 1
+        tradable_time = _parse_c5_tradable_time(item.get("tradableTime"))
+        if tradable_time is None:
+            row["unknownCooldownCount"] += 1
+            continue
+        local_day = tradable_time.astimezone(POOL_REPORT_TZ).date()
+        if local_day in day_set:
+            day_bucket = row["cooldownByDate"][local_day.isoformat()]
+            day_bucket[steam_id] = int(day_bucket.get(steam_id, 0)) + 1
+            row["futureCooldownCount"] += 1
+        else:
+            row["outOfRangeCooldownCount"] += 1
+
+    rows = list(grouped.values())
+    for row in rows:
+        row["tradableAccountSummary"] = _format_account_counts(row["tradableAccounts"], account_lookup)
+        row["cooldownAccountSummary"] = _format_account_counts(row["cooldownAccounts"], account_lookup)
+        row["cooldownStatusSummary"] = _format_status_counts(row["cooldownStatuses"])
+    rows.sort(key=lambda row: (-int(row["tradableCount"]), -int(row["totalCount"]), str(row["marketHashName"])))
+
+    daily_rows: list[dict[str, Any]] = []
+    for day in day_keys:
+        item_rows: list[dict[str, Any]] = []
+        day_key = day.isoformat()
+        for row in rows:
+            counts = dict(row["cooldownByDate"].get(day_key) or {})
+            count = sum(int(value) for value in counts.values())
+            if count <= 0:
+                continue
+            item_rows.append(
+                {
+                    "marketHashName": row["marketHashName"],
+                    "name": row["name"],
+                    "count": count,
+                    "accountSummary": _format_account_counts(counts, account_lookup),
+                }
+            )
+        item_rows.sort(key=lambda item: (-int(item["count"]), str(item["marketHashName"])))
+        daily_rows.append({"date": day_key, "items": item_rows, "count": sum(int(item["count"]) for item in item_rows)})
+
+    return {
+        "generatedAt": utc_now_iso(),
+        "source": inventory_payload.get("source") or "live",
+        "cachedAt": inventory_payload.get("cachedAt"),
+        "accountCount": int(inventory_payload.get("accountCount") or len(account_lookup)),
+        "scope": normalized_scope,
+        "days": len(day_keys),
+        "totalTypes": len(rows),
+        "totalCount": sum(int(row["totalCount"]) for row in rows),
+        "tradableCount": sum(int(row["tradableCount"]) for row in rows),
+        "cooldownCount": sum(int(row["cooldownCount"]) for row in rows),
+        "futureCooldownCount": sum(int(row["futureCooldownCount"]) for row in rows),
+        "unknownCooldownCount": sum(int(row["unknownCooldownCount"]) for row in rows),
+        "outOfRangeCooldownCount": sum(int(row["outOfRangeCooldownCount"]) for row in rows),
+        "rows": rows,
+        "daily": daily_rows,
+    }
+
+
+def _print_pool_inventory_report(report: dict[str, Any]) -> None:
+    scope_label = "广义武器箱" if report["scope"] == "case_only" else "非广义武器箱"
+    print("C5 库存冷却查询")
+    print(
+        f"库存源: {report['source']} | C5账号 {report['accountCount']} 个 | "
+        f"itemScope={report['scope']} ({scope_label})"
+    )
+    print(
+        f"汇总: 类型 {report['totalTypes']} 个 | 总件 {report['totalCount']} | "
+        f"当前可交易 {report['tradableCount']} | 冷却中 {report['cooldownCount']}"
+    )
+    print(
+        f"未来 {report['days']} 天解冷却 {report['futureCooldownCount']} 件 | "
+        f"C5未返回到期时间 {report['unknownCooldownCount']} 件 | "
+        f"超过范围 {report['outOfRangeCooldownCount']} 件"
+    )
+
+    print("\n当前已经可以交易:")
+    tradable_rows = [row for row in report["rows"] if int(row["tradableCount"]) > 0]
+    if not tradable_rows:
+        print("- 无")
+    for index, row in enumerate(tradable_rows, start=1):
+        print(
+            f"{index}. {row['marketHashName']} | "
+            f"可交易 {row['tradableCount']}/{row['totalCount']} | "
+            f"账号 {row['tradableAccountSummary']}"
+        )
+
+    print(f"\n未来 {report['days']} 天每天解冷却:")
+    if int(report["futureCooldownCount"]) <= 0:
+        if int(report["unknownCooldownCount"]) > 0:
+            print("C5 inventory/v2 本次没有返回可解析的到期时间，无法按日拆分。")
+        else:
+            print("- 无")
+    else:
+        for day in report["daily"]:
+            print(f"{day['date']} | 合计 {day['count']} 件")
+            if not day["items"]:
+                print("  - 无")
+                continue
+            for item in day["items"]:
+                print(
+                    f"  - {item['marketHashName']} | +{item['count']} | "
+                    f"账号 {item['accountSummary']}"
+                )
+
+    undated_rows = [row for row in report["rows"] if int(row["unknownCooldownCount"]) > 0]
+    if undated_rows:
+        undated_rows.sort(key=lambda row: (-int(row["unknownCooldownCount"]), str(row["marketHashName"])))
+        print("\nC5未返回到期时间的不可交易库存:")
+        for index, row in enumerate(undated_rows, start=1):
+            print(
+                f"{index}. {row['marketHashName']} | "
+                f"未给时间 {row['unknownCooldownCount']}/{row['cooldownCount']} | "
+                f"{row['cooldownStatusSummary']} | 账号 {row['cooldownAccountSummary']}"
+            )
+
+
+def cmd_pool_inventory(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    if not settings.c5_api_key:
+        raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。")
+    config = load_strategy_config(settings)
+    scope = normalize_guadao_item_scope(getattr(args, "scope", None) or config.guadao_item_scope)
+    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+    inventory_payload = fetch_all_c5_inventories(
+        c5_client,
+        settings,
+        allow_cached_fallback=bool(getattr(args, "cache_fallback", False)),
+        cache_max_age_minutes=getattr(args, "cache_max_age_minutes", 180),
+    )
+    db = _open_db(settings)
+    try:
+        report = _build_pool_inventory_report(
+            inventory_payload,
+            db=db,
+            scope=scope,
+            days=int(getattr(args, "days", 7) or 7),
+        )
+    finally:
+        db.close()
+
+    _print_pool_inventory_report(report)
+    if getattr(args, "dump_json", False):
+        _print_json(report)
+    return 0
 
 
 def cmd_pool_scan(args: argparse.Namespace) -> int:
@@ -1696,6 +2082,14 @@ def _parse_report_boundary(value: str, *, is_end: bool) -> datetime:
         day = datetime.strptime(raw, "%Y-%m-%d").date()
         local_time = time(23, 59, 59) if is_end else time(0, 0, 0)
         return datetime.combine(day, local_time, tzinfo=CN_TZ)
+    hour_only_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[T\s](\d{2})", raw)
+    if hour_only_match:
+        day = datetime.strptime(hour_only_match.group(1), "%Y-%m-%d").date()
+        hour = int(hour_only_match.group(2))
+        if hour < 0 or hour > 23:
+            raise ValueError(f"无效小时: {hour_only_match.group(2)}")
+        local_time = time(hour, 59, 59) if is_end else time(hour, 0, 0)
+        return datetime.combine(day, local_time, tzinfo=CN_TZ)
     parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=CN_TZ)
@@ -1748,6 +2142,220 @@ def _finalize_guadao_report_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _steam_seller_net_from_notes(
+    *,
+    steam_gross: float | None,
+    steam_net_factor: float,
+    rebuy_note: dict[str, Any] | None = None,
+    sell_note: dict[str, Any] | None = None,
+) -> float | None:
+    for note in (rebuy_note or {}, sell_note or {}):
+        for key in ("steamSellerNetPrice", "steamNetPrice", "steamSoldNetPrice"):
+            value = safe_float(note.get(key))
+            if value is not None and value > 0:
+                return value
+    if steam_gross is None or steam_gross <= 0:
+        return None
+    # Fallback for historical rows before we stored Steam's seller-net amount.
+    cents = (
+        Decimal(str(float(steam_gross)))
+        * Decimal(str(float(steam_net_factor)))
+        * Decimal("100")
+    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(cents / Decimal("100"))
+
+
+def _is_balance_insufficient_rebuy_note(note: dict[str, Any]) -> bool:
+    skip_reason = str(note.get("skipReason") or "")
+    if skip_reason == "c5_balance_insufficient":
+        return True
+    failed_reason = str(note.get("failedReason") or "")
+    c5_error_payload = note.get("c5ErrorPayload")
+    if isinstance(c5_error_payload, dict):
+        error_code = safe_int(c5_error_payload.get("errorCode"))
+        error_message = str(c5_error_payload.get("errorMsg") or c5_error_payload.get("message") or "")
+        if error_code == 70001 or "余额不足" in error_message:
+            return True
+    return "70001" in failed_reason or "余额不足" in failed_reason or "insufficient balance" in failed_reason.lower()
+
+
+def _build_unclosed_sold_steam_summary(
+    db: Database,
+    *,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    market_filter = ""
+    params: list[Any] = []
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+
+    sold_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'sell_on_steam'
+          AND status = 'sold'
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    successful_rebuy_rows = db.conn.execute(
+        """
+        SELECT note
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+          AND status = 'completed'
+        """
+    ).fetchall()
+    closed_sell_ids: set[int] = set()
+    for row in successful_rebuy_rows:
+        note = _read_note_dict(row["note"])
+        c5_order_id = str(note.get("c5OrderId") or "").strip()
+        c5_final_status = str(note.get("c5FinalStatus") or "").strip()
+        if c5_order_id and c5_final_status != "c5_success":
+            continue
+        source_id = safe_int(note.get("sourceSellOperationId"))
+        if source_id is not None:
+            closed_sell_ids.add(source_id)
+
+    ignored_sell_ids: set[int] = set()
+    rebuy_note_rows = db.conn.execute(
+        """
+        SELECT note
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+        """
+    ).fetchall()
+    for row in rebuy_note_rows:
+        note = _read_note_dict(row["note"])
+        if not _is_balance_insufficient_rebuy_note(note):
+            continue
+        source_id = safe_int(note.get("sourceSellOperationId"))
+        if source_id is not None:
+            ignored_sell_ids.add(source_id)
+
+    summary = _empty_guadao_report_summary()
+    item_summaries: dict[str, dict[str, Any]] = {}
+    for sell in sold_rows:
+        sell_id = int(sell["id"])
+        if sell_id in closed_sell_ids or sell_id in ignored_sell_ids:
+            continue
+        sell_note = _read_note_dict(sell["note"])
+        steam_gross = (
+            safe_float(sell_note.get("steamListPrice"))
+            or safe_float(sell["actual_price"])
+            or safe_float(sell["expected_price"])
+        )
+        if steam_gross is None or steam_gross <= 0:
+            continue
+        steam_net = _steam_seller_net_from_notes(
+            steam_gross=steam_gross,
+            steam_net_factor=steam_net_factor,
+            sell_note=sell_note,
+        )
+        if steam_net is None or steam_net <= 0:
+            continue
+        row = {
+            "marketHashName": str(sell["market_hash_name"] or "").strip(),
+            "steamGross": steam_gross,
+            "steamNet": steam_net,
+            "cash": 0.0,
+        }
+        _add_guadao_report_row(summary, row)
+        item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
+        _add_guadao_report_row(item_summary, row)
+
+    finalized_items = [
+        {"marketHashName": name, **_finalize_guadao_report_summary(item_summary)}
+        for name, item_summary in item_summaries.items()
+    ]
+    finalized_items.sort(key=lambda row: (-int(row["count"]), row["marketHashName"]))
+    return {
+        "summary": _finalize_guadao_report_summary(summary),
+        "items": finalized_items,
+    }
+
+
+def _build_sold_steam_time_summary(
+    db: Database,
+    *,
+    start_utc: str,
+    end_utc: str,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    params: list[Any] = [start_utc, end_utc]
+    market_filter = ""
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+
+    sold_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'sell_on_steam'
+          AND status = 'sold'
+          AND completed_at IS NOT NULL
+          AND completed_at >= ?
+          AND completed_at <= ?
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    summary = _empty_guadao_report_summary()
+    item_summaries: dict[str, dict[str, Any]] = {}
+    detail_rows: list[dict[str, Any]] = []
+    for sell in sold_rows:
+        sell_note = _read_note_dict(sell["note"])
+        steam_gross = (
+            safe_float(sell_note.get("steamListPrice"))
+            or safe_float(sell["actual_price"])
+            or safe_float(sell["expected_price"])
+        )
+        if steam_gross is None or steam_gross <= 0:
+            continue
+        steam_net = _steam_seller_net_from_notes(
+            steam_gross=steam_gross,
+            steam_net_factor=steam_net_factor,
+            sell_note=sell_note,
+        )
+        if steam_net is None or steam_net <= 0:
+            continue
+        row = {
+            "completedAt": sell["completed_at"],
+            "completedAtLocal": _to_local_display(sell["completed_at"]),
+            "marketHashName": str(sell["market_hash_name"] or "").strip(),
+            "steamGross": steam_gross,
+            "steamNet": steam_net,
+            "cash": 0.0,
+            "sellOperationId": int(sell["id"]),
+            "assetId": str(sell["asset_id"] or ""),
+            "listingId": str(sell_note.get("listingId") or ""),
+        }
+        detail_rows.append(row)
+        _add_guadao_report_row(summary, row)
+        item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
+        _add_guadao_report_row(item_summary, row)
+
+    finalized_items = [
+        {"marketHashName": name, **_finalize_guadao_report_summary(item_summary)}
+        for name, item_summary in item_summaries.items()
+    ]
+    finalized_items.sort(key=lambda row: (-int(row["count"]), row["marketHashName"]))
+    return {
+        "summary": _finalize_guadao_report_summary(summary),
+        "items": finalized_items,
+        "details": detail_rows,
+    }
+
+
 def _build_guadao_discount_report(
     db: Database,
     *,
@@ -1794,9 +2402,15 @@ def _build_guadao_discount_report(
     detail_rows: list[dict[str, Any]] = []
     item_summaries: dict[str, dict[str, Any]] = {}
     summary = _empty_guadao_report_summary()
+    closed_from_sell_outside_range = _empty_guadao_report_summary()
 
     for rebuy in rebuy_rows:
         rebuy_note = _read_note_dict(rebuy["note"])
+        c5_order_id = str(rebuy_note.get("c5OrderId") or "").strip()
+        c5_final_status = str(rebuy_note.get("c5FinalStatus") or "").strip()
+        if c5_order_id and c5_final_status != "c5_success":
+            continue
+
         source_id = safe_int(rebuy_note.get("sourceSellOperationId"))
         sell = sell_by_id.get(source_id) if source_id is not None else None
         sell_note = _read_note_dict(sell["note"]) if sell is not None else {}
@@ -1811,7 +2425,14 @@ def _build_guadao_discount_report(
         if steam_gross is None or steam_gross <= 0 or cash is None or cash <= 0:
             continue
 
-        steam_net = steam_gross * steam_net_factor
+        steam_net = _steam_seller_net_from_notes(
+            steam_gross=steam_gross,
+            steam_net_factor=steam_net_factor,
+            rebuy_note=rebuy_note,
+            sell_note=sell_note,
+        )
+        if steam_net is None or steam_net <= 0:
+            continue
         detail = {
             "completedAt": rebuy["completed_at"],
             "completedAtLocal": _to_local_display(rebuy["completed_at"]),
@@ -1830,6 +2451,9 @@ def _build_guadao_discount_report(
         _add_guadao_report_row(summary, detail)
         item_summary = item_summaries.setdefault(item_name, _empty_guadao_report_summary())
         _add_guadao_report_row(item_summary, detail)
+        sell_completed_at = str(sell["completed_at"] or "") if sell is not None else ""
+        if sell_completed_at and (sell_completed_at < start_utc or sell_completed_at > end_utc):
+            _add_guadao_report_row(closed_from_sell_outside_range, detail)
 
     finalized_items = [
         {"marketHashName": market_hash_name, **_finalize_guadao_report_summary(item_summary)}
@@ -1844,6 +2468,19 @@ def _build_guadao_discount_report(
         "summary": _finalize_guadao_report_summary(summary),
         "items": finalized_items,
         "details": detail_rows,
+        "steamSoldInRange": _build_sold_steam_time_summary(
+            db,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            steam_net_factor=steam_net_factor,
+            market_hash_name=market_hash_name,
+        ),
+        "closedFromSellOutsideRange": _finalize_guadao_report_summary(closed_from_sell_outside_range),
+        "unclosedSoldSteam": _build_unclosed_sold_steam_summary(
+            db,
+            steam_net_factor=steam_net_factor,
+            market_hash_name=market_hash_name,
+        ),
     }
 
 
@@ -1871,8 +2508,10 @@ def _print_guadao_discount_report(
     )
     print(
         "口径: 按 C5 补仓完成时间统计；"
+        "新补仓订单仅统计 C5 最终成功记录；"
         "总折比 = C5补仓现金 / Steam税后到手；"
-        "面值折比 = C5补仓现金 / Steam税前售价。"
+        "面值折比 = C5补仓现金 / Steam税前售价；"
+        "未闭环已卖出 Steam 余额为当前仍未成功补仓闭环的卖出流水，不按日期过滤。"
     )
     print(
         f"总览: 闭环 {summary['count']} 笔 | "
@@ -1881,6 +2520,24 @@ def _print_guadao_discount_report(
         f"C5现金 {_fmt_cny(summary['cash'])} | "
         f"总折比 {_fmt_pct(summary['totalDiscountRatio'])} | "
         f"面值折比 {_fmt_pct(summary['faceDiscountRatio'])}"
+    )
+    steam_sold = report.get("steamSoldInRange", {}).get("summary", _empty_guadao_report_summary())
+    print(
+        f"Steam入账口径(按卖出时间): 卖出 {steam_sold['count']} 笔 | "
+        f"Steam面值 {_fmt_cny(steam_sold['steamGross'])} | "
+        f"Steam到手 {_fmt_cny(steam_sold['steamNet'])}"
+    )
+    outside = report.get("closedFromSellOutsideRange", _empty_guadao_report_summary())
+    if outside["count"]:
+        print(
+            f"对账提示: 总览含历史卖出本期补仓 {outside['count']} 笔 | "
+            f"Steam到手 {_fmt_cny(outside['steamNet'])}，这部分不应计入本时间段 Steam 钱包入账。"
+        )
+    unclosed_sold = report.get("unclosedSoldSteam", {}).get("summary", _empty_guadao_report_summary())
+    print(
+        f"当前未闭环已卖出: {unclosed_sold['count']} 笔 | "
+        f"Steam面值 {_fmt_cny(unclosed_sold['steamGross'])} | "
+        f"Steam到手 {_fmt_cny(unclosed_sold['steamNet'])}"
     )
     if not report["items"]:
         print("本时间段没有已完成补仓的挂刀闭环。")
@@ -2119,8 +2776,8 @@ def cmd_executor_start(args: argparse.Namespace) -> int:
         config.dry_run = False
     if args.max_list is not None:
         config.max_list_per_cycle = args.max_list
-    if args.max_buy is not None:
-        config.max_buy_per_cycle = args.max_buy
+    if args.max_transfer_buy is not None:
+        config.max_transfer_buy_per_cycle = args.max_transfer_buy
     force_refresh_override = None
     if args.force_refresh:
         force_refresh_override = True
@@ -2168,6 +2825,53 @@ def cmd_steam_confirm(args: argparse.Namespace) -> int:
     client = _build_steam_client(settings)
     count = client.confirm_all()
     print(f"Confirmed {count} listings.")
+    return 0
+
+
+def cmd_steam_test_list(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    client = _build_steam_client(settings)
+    try:
+        payload = client.sell_item(
+            app_id=settings.app_id,
+            context_id=args.context_id or config.steam_context_id,
+            asset_id=args.asset_id,
+            price=args.price,
+            quantity=1,
+            steam_net_factor=config.steam_net_factor,
+        )
+    except SteamMarketError as exc:
+        print(f"[测试上架失败] asset={args.asset_id} | Steam挂价 CNY {args.price:.2f} | 原因: {exc}")
+        return 1
+
+    listing_id = str(payload.get("listingid") or "").strip()
+    print(f"[测试上架成功] asset={args.asset_id} | listing={listing_id or '-'} | Steam挂价 CNY {args.price:.2f}")
+
+    if not args.no_confirm:
+        try:
+            count = client.confirm_all()
+            print(f"[测试确认] 已确认 {count} 个挂单")
+        except SteamMarketError as exc:
+            print(f"[测试确认失败] {exc}")
+
+    if not listing_id and not args.no_cancel:
+        try:
+            for listing in client.list_active_listings(count=200):
+                if str(listing.asset_id or "") == str(args.asset_id):
+                    listing_id = str(listing.listing_id or "").strip()
+                    break
+        except SteamMarketError as exc:
+            print(f"[测试查找挂单失败] {exc}")
+
+    if listing_id and not args.no_cancel:
+        try:
+            removed = client.remove_listing(listing_id)
+            print(f"[测试撤单] listing={listing_id} | removed={removed}")
+        except SteamMarketError as exc:
+            print(f"[测试撤单失败] listing={listing_id} | 原因: {exc}")
+    elif not listing_id:
+        print("[测试撤单跳过] Steam 未返回 listingid，请到 Steam 待确认/挂单页检查。")
     return 0
 
 
@@ -2241,6 +2945,7 @@ def cmd_account_status(args: argparse.Namespace) -> int:
                     steam_id64=account.steam_id64,
                     identity_secret=account.identity_secret,
                     device_id=account.device_id,
+                    account_id=account.id,
                     base_url=settings.steam_market_base_url,
                 )
                 payload = client.my_listings(count=1)
@@ -2399,6 +3104,43 @@ def build_parser() -> argparse.ArgumentParser:
     import_catalog = subparsers.add_parser("import-catalog", help="导入本地 SteamDT 基础数据")
     import_catalog.add_argument("--file", help="SteamDT 基础数据 JSON 文件路径")
     import_catalog.set_defaults(handler=cmd_import_catalog)
+
+    config = subparsers.add_parser("config", help="全局运行配置")
+    config_subparsers = config.add_subparsers(dest="config_command", required=True)
+    config_proxy = config_subparsers.add_parser(
+        "proxy",
+        help="查看或设置网络代理模式",
+        description=(
+            "网络代理模式。\n\n"
+            "  system  使用系统/环境代理，例如 HTTP_PROXY / HTTPS_PROXY\n"
+            "  none    不使用代理，C5 和 Steam 请求直接连接"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    config_proxy.add_argument("mode", nargs="?", choices=["system", "none"])
+    config_proxy.set_defaults(handler=cmd_config_proxy)
+
+    catalog = subparsers.add_parser("catalog", help="饰品资料库")
+    catalog_subparsers = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_sync_csgo_api = catalog_subparsers.add_parser(
+        "sync-csgo-api",
+        help="从 ByMykel/CSGO-API 同步饰品资料",
+        description=(
+            "从 ByMykel/CSGO-API 同步饰品资料到本地 items 表。\n"
+            "默认同步常用可交易品类，并保留本地已有 c5_item_id / steam_item_id。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    catalog_sync_csgo_api.add_argument("--language", default=CSGO_API_DEFAULT_LANGUAGE, help="CSGO-API 语言目录")
+    catalog_sync_csgo_api.add_argument("--base-url", default=CSGO_API_BASE_URL, help=argparse.SUPPRESS)
+    catalog_sync_csgo_api.add_argument("--timeout", type=float, default=30.0, help="单个分类请求超时秒数")
+    catalog_sync_csgo_api.add_argument(
+        "--category",
+        dest="categories",
+        action="append",
+        help="只同步指定分类；可重复传入。默认同步常用品类。",
+    )
+    catalog_sync_csgo_api.set_defaults(handler=cmd_catalog_sync_csgo_api)
 
     search_item = subparsers.add_parser("search-item", help="按关键词搜索饰品")
     search_item.add_argument("--keyword", required=True, help="中文名或 HashName 关键词")
@@ -2601,94 +3343,63 @@ def build_parser() -> argparse.ArgumentParser:
     add_t_profit_parser("t-profit")
     add_t_profit_parser("t-yield", hidden=True)
 
-    # ---- pool (底仓策略) ----
+    # ---- pool (C5 inventory cooldown lookup) ----
     pool = subparsers.add_parser(
         "pool",
-        help="底仓策略系统（挂刀做T / 导余额做T）",
+        help="C5库存查询 / 执行器挂刀报表",
         description=(
-            "基于固定库存池的自动化 T 工具。\n\n"
-            "两种策略共用同一批底仓:\n"
-            "  挂刀做T: listing_ratio 低 → 卖 Steam，低价补仓\n"
-            "  导余额做T: transfer_real_ratio 高 → 利用低价余额赚钱\n\n"
-            "常用:\n"
-            "  python .\\main.py pool scan\n"
-            "  python .\\main.py pool scan --top-n 20 --min-price 10\n"
-            "  python .\\main.py pool status\n"
-            "  python .\\main.py pool guadao-report --from 2026-05-10 --to 2026-05-17\n"
-            "  python .\\main.py pool config\n"
-            "  python .\\main.py pool config --edit\n"
-            "  python .\\main.py pool monitor\n"
-            "  python .\\main.py pool monitor --once"
+            "常用：\n"
+            "  python .\\main.py pool item\n"
+            "  python .\\main.py pool guadao-report --from 2026-06-01T02 --to 2026-06-01T23"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
     pool_subparsers = pool.add_subparsers(dest="pool_command", required=True)
 
-    pool_scan = pool_subparsers.add_parser(
-        "scan",
-        help="扫描底仓，评估挂刀/导余额策略",
+    pool_item = pool_subparsers.add_parser(
+        "item",
+        help="查询 C5 API 全库存中符合 guadaoItemScope 的广义箱子可交易/冷却状态",
         description=(
-            "扫描所有绑定 Steam 账号的库存，计算 listing_ratio 和 transfer_real_ratio，\n"
-            "将每个饰品分类到挂刀做T / 导余额做T / 持有。"
+            "直接读取 C5 API 的全部绑定 Steam 库存，按当前 guadaoItemScope 过滤。\n"
+            "case_only 会识别 CSGO-API crates，以及 Case/Capsule/Package/Container 等广义箱子。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    pool_scan.add_argument("--min-price", type=float, default=None, help="最低价格过滤（覆盖配置文件）")
-    pool_scan.add_argument("--guadao-max-ratio", type=float, default=None, help="挂刀 listing_ratio 阈值（覆盖配置文件）")
-    pool_scan.add_argument("--transfer-min-ratio", type=float, default=None, help="导余额 transfer_real_ratio 阈值（覆盖配置文件）")
-    pool_scan.add_argument("--steam-net-factor", type=float, default=None, help="Steam 税后系数（覆盖配置文件）")
-    pool_scan.add_argument("--top-n", type=int, default=None, help="每种策略输出前 N 个")
-    pool_scan.add_argument("--star-threshold", type=float, default=0.90, help="listing_ratio 低于该值时标星")
-    pool_scan.add_argument("--show-hold", action="store_true", help="显示持有（不满足任何策略）的饰品")
-    pool_scan.add_argument("--cache-max-age-minutes", type=int, default=180, help="库存缓存最大时长")
-    pool_scan.add_argument("--no-cache-fallback", action="store_true", help="不回退到缓存")
-    pool_scan.add_argument("--save-eval", action="store_true", help="保存评估记录到数据库")
-    pool_scan.add_argument("--dump-json", action="store_true", help="输出 JSON 结果")
-    pool_scan.set_defaults(handler=cmd_pool_scan)
-
-    pool_status = pool_subparsers.add_parser("status", help="查看底仓状态")
-    pool_status.add_argument(
-        "--status-filter",
-        default=None,
-        help=(
-            "按状态过滤: holding, listed, sold, pending_rebuy, listing_pending, "
-            "transfer_buying, transfer_holding, transfer_listed_c5, transfer_sold"
-        ),
+    pool_item.set_defaults(
+        handler=cmd_pool_inventory,
+        scope=None,
+        days=7,
+        cache_fallback=False,
+        cache_max_age_minutes=180,
+        dump_json=False,
     )
-    pool_status.set_defaults(handler=cmd_pool_status)
 
     pool_guadao_report = pool_subparsers.add_parser(
         "guadao-report",
-        help="查看挂刀余额折扣报表",
+        help="查看执行器挂刀余额折扣报表",
         description=(
-            "按日期范围统计挂刀闭环流水。\n\n"
+            "按日期范围统计执行器挂刀闭环流水。\n\n"
             "总折比 = C5补仓现金 / Steam税后到手余额。\n"
             "面值折比 = C5补仓现金 / Steam税前售价。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    pool_guadao_report.add_argument("--from", dest="date_from", required=True, help="开始日期/时间，例如 2026-05-10")
-    pool_guadao_report.add_argument("--to", dest="date_to", default=None, help="结束日期/时间，默认到现在")
+    pool_guadao_report.add_argument(
+        "--from",
+        dest="date_from",
+        required=True,
+        help="开始日期/时间，例如 2026-05-10 或 2026-05-10T08",
+    )
+    pool_guadao_report.add_argument(
+        "--to",
+        dest="date_to",
+        default=None,
+        help="结束日期/时间，默认到现在；支持精确到小时，例如 2026-05-10T17",
+    )
     pool_guadao_report.add_argument("--item", dest="market_hash_name", default=None, help="只统计某个 market_hash_name")
     pool_guadao_report.add_argument("--detail", action="store_true", help="显示每笔闭环明细")
     pool_guadao_report.add_argument("--dump-json", action="store_true", help="输出 JSON")
     pool_guadao_report.set_defaults(handler=cmd_pool_guadao_report)
-
-    pool_config = pool_subparsers.add_parser(
-        "config",
-        help="查看或编辑策略配置",
-        description="查看或交互式编辑策略参数（阈值、系数等）。",
-    )
-    pool_config.add_argument("--edit", action="store_true", help="交互式编辑配置")
-    pool_config.set_defaults(handler=cmd_pool_config)
-
-    pool_monitor = pool_subparsers.add_parser(
-        "monitor",
-        help="持续监控底仓策略",
-        description="按配置的轮询间隔持续扫描底仓策略，发现机会时通过 ServerChan 推送。",
-    )
-    pool_monitor.add_argument("--once", action="store_true", help="仅执行一次后退出")
-    pool_monitor.set_defaults(handler=cmd_pool_monitor)
 
     # ---- executor ----
     executor = subparsers.add_parser(
@@ -2710,7 +3421,13 @@ def build_parser() -> argparse.ArgumentParser:
     executor_start.add_argument("--enable", action="store_true", help="Enable execution for this run")
     executor_start.add_argument("--disable", action="store_true", help="Disable execution for this run")
     executor_start.add_argument("--max-list", type=int, help="Max listings per cycle")
-    executor_start.add_argument("--max-buy", type=int, help="Max rebuy per cycle")
+    executor_start.add_argument(
+        "--max-transfer-buy",
+        "--max-buy",
+        dest="max_transfer_buy",
+        type=int,
+        help="Max transfer buys per cycle",
+    )
     executor_start.add_argument("--force-refresh", action="store_true", help="Force steam refresh")
     executor_start.add_argument("--no-force-refresh", action="store_true", help="Disable steam refresh")
     executor_start.set_defaults(handler=cmd_executor_start)
@@ -2753,6 +3470,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     steam_confirm = steam_subparsers.add_parser("confirm", help="Confirm pending listings")
     steam_confirm.set_defaults(handler=cmd_steam_confirm)
+
+    steam_test_list = steam_subparsers.add_parser(
+        "test-list",
+        help="测试单个 asset 是否能被 Steam sellitem 接受，默认高价上架后撤单",
+    )
+    steam_test_list.add_argument("--asset-id", required=True)
+    steam_test_list.add_argument("--price", type=float, default=999.0, help="测试挂价，默认 999 CNY")
+    steam_test_list.add_argument("--context-id", default=None)
+    steam_test_list.add_argument("--no-confirm", action="store_true", help="不自动确认测试挂单")
+    steam_test_list.add_argument("--no-cancel", action="store_true", help="成功后不自动撤单")
+    steam_test_list.set_defaults(handler=cmd_steam_test_list)
 
     steam_cookie_refresh = steam_subparsers.add_parser("cookie-refresh", help="验证并自动刷新当前账户 Cookie")
     steam_cookie_refresh.set_defaults(handler=cmd_steam_cookie_refresh)

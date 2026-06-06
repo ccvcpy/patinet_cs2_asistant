@@ -25,7 +25,7 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
             continue
         key, _, value = segment.partition("=")
         cookie_dict[key.strip()] = value.strip()
-    if not cookie_dict.get("steamLoginSecure"):
+    if not cookie_dict.get("steamLoginSecure") or not cookie_dict.get("sessionid"):
         return False
 
     session = requests.Session()
@@ -40,6 +40,35 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
     )
+    # Market access is the strictest useful definition of a "good" Steam
+    # session for this project. A cookie that still opens profile/store pages
+    # but gets 400/401 on /market/mylistings is not healthy enough for listing
+    # or listing-status checks.
+    try:
+        response = session.get(
+            "https://steamcommunity.com/market/mylistings",
+            params={"start": 0, "count": 1, "norender": 1},
+            timeout=12,
+            allow_redirects=True,
+        )
+        final_url = (response.url or "").lower()
+        if "login" in final_url:
+            return False
+        if response.status_code in (400, 401, 403):
+            return False
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("success") in (1, True):
+                return True
+    except Exception:
+        pass
+
+    # Fall back to broader storefront/profile checks only when the market
+    # probe failed due to ambiguous transport issues. This avoids treating
+    # temporary SSLEOF/timeout bursts as definite cookie invalidation.
     try:
         response = session.get(
             "https://store.steampowered.com/pointssummary/ajaxgetasyncconfig",

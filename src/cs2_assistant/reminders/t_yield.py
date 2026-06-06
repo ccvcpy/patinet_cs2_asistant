@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -71,7 +71,8 @@ class TYieldReminderConfig:
     steam_discount: float = 0.73
     hot_threshold_pct: float = 10.0
     poll_interval_minutes: int = 30
-    daily_summary_time: str = "15:30"
+    fixed_summary_times: list[str] = field(default_factory=lambda: ["08:30", "18:00"])
+    no_hot_summary_interval_hours: float = 4.0
     inventory_scope: str = INVENTORY_SCOPE_NOT_ALL_COOLDOWN
     allow_cached_fallback: bool = True
     cache_max_age_minutes: int = 180
@@ -85,9 +86,13 @@ class TYieldReminderConfig:
             raise ValueError("hot_threshold_pct must be positive")
         if self.poll_interval_minutes <= 0:
             raise ValueError("poll_interval_minutes must be positive")
+        if self.no_hot_summary_interval_hours <= 0:
+            raise ValueError("no_hot_summary_interval_hours must be positive")
         if self.cache_max_age_minutes <= 0:
             raise ValueError("cache_max_age_minutes must be positive")
-        _parse_summary_time(self.daily_summary_time)
+        if not self.fixed_summary_times:
+            raise ValueError("fixed_summary_times must not be empty")
+        self.fixed_summary_times = _normalize_summary_times(self.fixed_summary_times)
         self.inventory_scope = normalize_inventory_scope(self.inventory_scope)
 
 
@@ -95,7 +100,8 @@ class TYieldReminderConfig:
 class TYieldReminderState:
     last_hot_signature: str | None = None
     last_hot_sent_at: str | None = None
-    last_daily_summary_date: str | None = None
+    last_fixed_summary_sent: dict[str, str] = field(default_factory=dict)
+    last_no_hot_summary_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -135,6 +141,31 @@ def _parse_summary_time(value: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _format_summary_time(value: str) -> str:
+    hour, minute = _parse_summary_time(value)
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _normalize_summary_times(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        summary_time = _format_summary_time(str(value))
+        if summary_time in seen:
+            continue
+        seen.add(summary_time)
+        normalized.append(summary_time)
+    normalized.sort(key=_parse_summary_time)
+    return normalized
+
+
+def _parse_summary_times(value: str) -> list[str]:
+    raw_times = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+    if not raw_times:
+        raise ValueError("summary times must not be empty")
+    return _normalize_summary_times(raw_times)
+
+
 def _load_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -164,13 +195,23 @@ def load_config() -> TYieldReminderConfig | None:
     payload = _load_json_file(config_path())
     if payload is None:
         return None
+    raw_fixed_summary_times = payload.get("fixed_summary_times")
+    if isinstance(raw_fixed_summary_times, list):
+        fixed_summary_times = [str(value) for value in raw_fixed_summary_times]
+    elif raw_fixed_summary_times:
+        fixed_summary_times = _parse_summary_times(str(raw_fixed_summary_times))
+    elif payload.get("daily_summary_time"):
+        fixed_summary_times = [str(payload["daily_summary_time"])]
+    else:
+        fixed_summary_times = ["08:30", "18:00"]
     config = TYieldReminderConfig(
         top_n=int(payload.get("top_n") or 10),
         min_price=float(payload.get("min_price") or 10.0),
         steam_discount=float(payload.get("steam_discount") or 0.73),
         hot_threshold_pct=float(payload.get("hot_threshold_pct") or 10.0),
         poll_interval_minutes=int(payload.get("poll_interval_minutes") or 30),
-        daily_summary_time=str(payload.get("daily_summary_time") or "15:30"),
+        fixed_summary_times=fixed_summary_times,
+        no_hot_summary_interval_hours=float(payload.get("no_hot_summary_interval_hours") or 4.0),
         inventory_scope=_migrate_inventory_scope(payload),
         allow_cached_fallback=bool(payload.get("allow_cached_fallback", True)),
         cache_max_age_minutes=int(payload.get("cache_max_age_minutes") or 180),
@@ -191,10 +232,23 @@ def save_config(config: TYieldReminderConfig) -> Path:
 
 def load_state() -> TYieldReminderState:
     payload = _load_json_file(state_path()) or {}
+    raw_fixed_summary_sent = payload.get("last_fixed_summary_sent")
+    fixed_summary_sent: dict[str, str] = {}
+    if isinstance(raw_fixed_summary_sent, dict):
+        fixed_summary_sent = {
+            _format_summary_time(str(key)): str(value)
+            for key, value in raw_fixed_summary_sent.items()
+            if value
+        }
+    elif payload.get("last_daily_summary_date") and payload.get("daily_summary_time"):
+        fixed_summary_sent[_format_summary_time(str(payload["daily_summary_time"]))] = str(
+            payload["last_daily_summary_date"]
+        )
     return TYieldReminderState(
         last_hot_signature=payload.get("last_hot_signature"),
         last_hot_sent_at=payload.get("last_hot_sent_at"),
-        last_daily_summary_date=payload.get("last_daily_summary_date"),
+        last_fixed_summary_sent=fixed_summary_sent,
+        last_no_hot_summary_at=payload.get("last_no_hot_summary_at"),
     )
 
 
@@ -251,7 +305,7 @@ def _prompt_inventory_scope(default_scope: str) -> str:
 
 def prompt_for_config(existing: TYieldReminderConfig | None = None) -> TYieldReminderConfig:
     current = existing or TYieldReminderConfig()
-    print("提醒规则固定为：高收益快报 + 15:30 固定提醒")
+    print("提醒规则固定为：定时扫描 + 高收益快报 + 固定摘要 + 无高收益摘要")
     inventory_scope = _prompt_inventory_scope(current.inventory_scope)
 
     config = TYieldReminderConfig(
@@ -260,7 +314,16 @@ def prompt_for_config(existing: TYieldReminderConfig | None = None) -> TYieldRem
         steam_discount=_prompt("Steam 余额折扣", f"{current.steam_discount:g}", float),
         hot_threshold_pct=_prompt("高收益提醒阈值(%)", f"{current.hot_threshold_pct:g}", float),
         poll_interval_minutes=_prompt("轮询间隔(分钟)", str(current.poll_interval_minutes), int),
-        daily_summary_time=_prompt("固定提醒时间(HH:MM)", current.daily_summary_time, str),
+        fixed_summary_times=_prompt(
+            "固定提醒时间(HH:MM, 多个用逗号分隔)",
+            ",".join(current.fixed_summary_times),
+            _parse_summary_times,
+        ),
+        no_hot_summary_interval_hours=_prompt(
+            "无高收益摘要间隔(小时)",
+            f"{current.no_hot_summary_interval_hours:g}",
+            float,
+        ),
         inventory_scope=inventory_scope,
         allow_cached_fallback=_prompt_bool(
             "C5 库存拉取失败时是否允许回退到缓存",
@@ -367,6 +430,17 @@ def build_notification_message(
     candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
     missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
     scope_label = inventory_scope_label(config.inventory_scope)
+    shown_count = min(len(candidates), config.top_n)
+    title_count = f"Top{shown_count}/{config.top_n}"
+    count_lines = [
+        f"展示: {shown_count}/{config.top_n}",
+        f"当前范围候选: {len(candidates)} | 全部候选: {len(report.candidates)}",
+    ]
+    shown_count = min(len(candidates), config.top_n)
+    count_lines = [
+        f"展示: {shown_count}/{config.top_n}",
+        f"当前范围候选: {len(candidates)} | 全部候选: {len(report.candidates)}",
+    ]
 
     if reason == "hot":
         hot_count = sum(
@@ -381,9 +455,9 @@ def build_notification_message(
             "",
         ]
     else:
-        title = f"CS2 做T 15:30 固定提醒 Top{min(len(candidates), config.top_n)}"
+        title = f"CS2 做T固定提醒 Top{min(len(candidates), config.top_n)}"
         header = [
-            "做T 15:30 固定提醒",
+            "做T固定提醒",
             f"范围: {scope_label}",
             f"C5 >= {config.min_price:.2f}",
             f"来源: {report.inventory_source}",
@@ -408,7 +482,7 @@ def build_local_message(
     missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
     lines = [
         f"[{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}] 做T提醒扫描",
-        "- 提醒规则: 高收益快报 + 15:30 固定提醒",
+        "- 提醒规则: 高收益快报 + 固定提醒",
         f"- 触发原因: {reason}",
         f"- 饰品范围: {inventory_scope_label(config.inventory_scope)}",
         f"- 库存来源: {report.inventory_source}",
@@ -425,6 +499,267 @@ def build_local_message(
     return "\n".join(lines)
 
 
+def _candidate_line(candidate: TYieldCandidate, *, starred: bool) -> list[str]:
+    prefix = "★" if starred else "-"
+    return [
+        f"{prefix} {candidate.name}",
+        f"收益 {candidate.t_yield_pct:.2f}% | 折算比 {candidate.ratio:.4f}",
+        f"C5 {candidate.c5_lowest_sell_price:.2f} | Steam {candidate.steam_lowest_sell_price:.2f}",
+        f"库存 {candidate.inventory_status_summary}",
+        f"账号 {_account_summary(candidate.steam_accounts)}",
+        "",
+    ]
+
+
+def _top_lines(candidates: list[TYieldCandidate], config: TYieldReminderConfig) -> list[str]:
+    lines: list[str] = []
+    for candidate in candidates[: config.top_n]:
+        lines.extend(
+            _candidate_line(
+                candidate,
+                starred=candidate.t_yield_pct >= config.hot_threshold_pct,
+            )
+        )
+    if not lines:
+        lines.append("- 当前没有符合条件的做T候选。")
+    return lines
+
+
+def _missing_lines(missing_issues: list[MissingSteamPriceIssue], path: str) -> list[str]:
+    if not missing_issues:
+        return []
+    lines = ["", f"缺少 Steam 价格: {len(missing_issues)} 个"]
+    for issue in missing_issues[:5]:
+        lines.append(f"- {issue.name}")
+        lines.append(f"  C5 {issue.c5_sell_price:.2f} | {issue.inventory_status_summary}")
+        lines.append(f"  账号 {_account_summary(issue.steam_accounts)}")
+    lines.append(f"- 明细: {path}")
+    return lines
+
+
+def build_notification_message(
+    report: TYieldScanReport,
+    config: TYieldReminderConfig,
+    *,
+    reason: str,
+) -> NotificationMessage:
+    candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
+    missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
+    scope_label = inventory_scope_label(config.inventory_scope)
+    shown_count = min(len(candidates), config.top_n)
+    title_count = f"Top{shown_count}/{config.top_n}"
+    count_lines = [
+        f"展示: {shown_count}/{config.top_n}",
+        f"当前范围候选: {len(candidates)} | 全部候选: {len(report.candidates)}",
+    ]
+
+    if reason == "hot":
+        hot_count = sum(
+            1 for candidate in candidates if candidate.t_yield_pct >= config.hot_threshold_pct
+        )
+        title = f"CS2 做T高收益提醒 {hot_count}个"
+        header = [
+            "做T高收益提醒",
+            f"范围: {scope_label}",
+            f"条件: 收益 >= {config.hot_threshold_pct:.2f}% | C5 >= {config.min_price:.2f}",
+            f"库存源: {report.inventory_source}",
+            "价格源: C5官方API / Steam官方orderbook",
+            "",
+        ]
+    else:
+        title = f"CS2 做T固定提醒 Top{min(len(candidates), config.top_n)}"
+        header = [
+            "做T固定提醒",
+            f"范围: {scope_label}",
+            f"C5 >= {config.min_price:.2f}",
+            f"库存源: {report.inventory_source}",
+            "价格源: C5官方API / Steam官方orderbook",
+            "",
+        ]
+
+    body_lines = header + _top_lines(candidates, config) + _missing_lines(
+        missing_issues,
+        report.missing_steam_price_path,
+    )
+    return NotificationMessage(title=title, body="\n".join(body_lines).strip())
+
+
+def build_local_message(
+    report: TYieldScanReport,
+    config: TYieldReminderConfig,
+    *,
+    reason: str,
+    note: str | None = None,
+) -> str:
+    shown_candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
+    missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
+    lines = [
+        f"[{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}] 做T提醒扫描",
+        "- 提醒规则: 高收益快报 + 固定提醒",
+        f"- 触发原因: {reason}",
+        f"- 范围: {inventory_scope_label(config.inventory_scope)}",
+        f"- 库存源: {report.inventory_source}",
+        "- 价格源: C5官方API / Steam官方orderbook",
+        f"- 类型: {report.inventory_type_count}/{report.inventory_type_total_count}",
+        f"- 候选: {len(report.candidates)}",
+        f"- 当前范围候选: {len(shown_candidates)}",
+        f"- 缺少 Steam 价格: {len(missing_issues)}",
+    ]
+    if report.inventory_source == "cache" and report.inventory_cached_at:
+        lines.append(f"- 缓存时间: {report.inventory_cached_at}")
+    if note:
+        lines.append(f"- 备注: {note}")
+    lines.extend(["", *_top_lines(shown_candidates, config), *_missing_lines(missing_issues, report.missing_steam_price_path)])
+    return "\n".join(lines).strip()
+
+
+def _candidate_line(candidate: TYieldCandidate, *, starred: bool) -> list[str]:
+    prefix = "★" if starred else "-"
+    return [
+        f"{prefix} {candidate.name}",
+        (
+            f"利润 {candidate.t_yield_pct:.2f}% | "
+            f"折算比 {candidate.ratio:.4f} | 挂刀比 {candidate.listing_ratio:.4f}"
+        ),
+        f"C5 {candidate.c5_lowest_sell_price:.2f} | Steam {candidate.steam_lowest_sell_price:.2f}",
+        f"库存 {candidate.inventory_status_summary}",
+        f"账号 {_account_summary(candidate.steam_accounts)}",
+        "",
+    ]
+
+
+def _top_lines(candidates: list[TYieldCandidate], config: TYieldReminderConfig) -> list[str]:
+    lines: list[str] = []
+    for candidate in candidates[: config.top_n]:
+        lines.extend(
+            _candidate_line(
+                candidate,
+                starred=candidate.t_yield_pct >= config.hot_threshold_pct,
+            )
+        )
+    if not lines:
+        lines.append("- 当前没有符合条件的做T候选。")
+    return lines
+
+
+def _missing_lines(missing_issues: list[MissingSteamPriceIssue], path: str) -> list[str]:
+    if not missing_issues:
+        return []
+    lines = ["", f"缺少 Steam 价格: {len(missing_issues)} 个"]
+    for issue in missing_issues[:5]:
+        lines.append(f"- {issue.name}")
+        lines.append(f"  C5 {issue.c5_sell_price:.2f} | {issue.inventory_status_summary}")
+        lines.append(f"  账号 {_account_summary(issue.steam_accounts)}")
+    lines.append(f"- 明细: {path}")
+    return lines
+
+
+def build_notification_message(
+    report: TYieldScanReport,
+    config: TYieldReminderConfig,
+    *,
+    reason: str,
+) -> NotificationMessage:
+    candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
+    missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
+    scope_label = inventory_scope_label(config.inventory_scope)
+    shown_count = min(len(candidates), config.top_n)
+    title_count = f"Top{shown_count}/{config.top_n}"
+    count_lines = [
+        f"展示: {shown_count}/{config.top_n}",
+        f"当前范围候选: {len(candidates)} | 全部候选: {len(report.candidates)}",
+    ]
+
+    if reason == "hot":
+        hot_count = sum(
+            1 for candidate in candidates if candidate.t_yield_pct >= config.hot_threshold_pct
+        )
+        title = f"CS2 做T高收益提醒 {hot_count}个"
+        header = [
+            "做T高收益提醒",
+            f"范围: {scope_label}",
+            f"条件: 利润 >= {config.hot_threshold_pct:.2f}% | C5 >= {config.min_price:.2f}",
+            "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+            f"库存源: {report.inventory_source}",
+            "",
+        ]
+    elif reason == "startup":
+        title = f"CS2 做T启动提醒 {title_count}"
+        header = [
+            "做T启动提醒",
+            f"范围: {scope_label}",
+            f"C5 >= {config.min_price:.2f}",
+            "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+            f"库存源: {report.inventory_source}",
+            "",
+        ]
+    elif reason == "no_hot_summary":
+        title = f"CS2 做T无高收益摘要 {title_count}"
+        header = [
+            "做T无高收益摘要",
+            f"范围: {scope_label}",
+            f"条件: 当前无利润 >= {config.hot_threshold_pct:.2f}% 的候选",
+            f"摘要间隔: {config.no_hot_summary_interval_hours:g} 小时",
+            "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+            f"库存源: {report.inventory_source}",
+            "",
+        ]
+    else:
+        fixed_time = reason.split(":", 1)[1] if reason.startswith("fixed:") else ""
+        fixed_label = f"{fixed_time} 固定提醒" if fixed_time else "固定提醒"
+        title = f"CS2 做T{fixed_label} {title_count}"
+        header = [
+            f"做T{fixed_label}",
+            f"范围: {scope_label}",
+            f"C5 >= {config.min_price:.2f}",
+            "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+            f"库存源: {report.inventory_source}",
+            "",
+        ]
+
+    body_lines = header[:-1] + count_lines + [""] + _top_lines(candidates, config) + _missing_lines(
+        missing_issues,
+        report.missing_steam_price_path,
+    )
+    return NotificationMessage(title=title, body="\n".join(body_lines).strip())
+
+
+def build_local_message(
+    report: TYieldScanReport,
+    config: TYieldReminderConfig,
+    *,
+    reason: str,
+    note: str | None = None,
+) -> str:
+    shown_candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
+    missing_issues = _filter_missing_for_scope(report.missing_steam_prices, config.inventory_scope)
+    lines = [
+        f"[{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}] 做T提醒扫描",
+        (
+            "- 提醒规则: "
+            f"每 {config.poll_interval_minutes} 分钟扫描 | "
+            f"高收益去重推送 | 无高收益 {config.no_hot_summary_interval_hours:g} 小时摘要 | "
+            f"固定 {', '.join(config.fixed_summary_times)}"
+        ),
+        f"- 触发原因: {reason}",
+        f"- 范围: {inventory_scope_label(config.inventory_scope)}",
+        f"- 库存源: {report.inventory_source}",
+        "- 公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+        f"- 类型: {report.inventory_type_count}/{report.inventory_type_total_count}",
+        f"- 候选: {len(report.candidates)}",
+        f"- 当前范围候选: {len(shown_candidates)}",
+        f"- 配置展示上限: {config.top_n}",
+        f"- 实际展示: {min(len(shown_candidates), config.top_n)}",
+        f"- 缺少 Steam 价格: {len(missing_issues)}",
+    ]
+    if report.inventory_source == "cache" and report.inventory_cached_at:
+        lines.append(f"- 缓存时间: {report.inventory_cached_at}")
+    if note:
+        lines.append(f"- 备注: {note}")
+    lines.extend(["", *_top_lines(shown_candidates, config), *_missing_lines(missing_issues, report.missing_steam_price_path)])
+    return "\n".join(lines).strip()
+
+
 def _hot_signature(candidates: list[TYieldCandidate], threshold_pct: float) -> str | None:
     hot_rows = [
         {
@@ -439,16 +774,67 @@ def _hot_signature(candidates: list[TYieldCandidate], threshold_pct: float) -> s
     return json.dumps(hot_rows, ensure_ascii=False, sort_keys=True)
 
 
-def _is_daily_summary_due(
+def _latest_due_fixed_summary_time(
+    now: datetime,
+    config: TYieldReminderConfig,
+    state: TYieldReminderState,
+) -> str | None:
+    today = now.date().isoformat()
+    due_times: list[str] = []
+    window = timedelta(minutes=max(1, config.poll_interval_minutes))
+    for summary_time in config.fixed_summary_times:
+        hour, minute = _parse_summary_time(summary_time)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now <= target + window:
+            due_times.append(summary_time)
+    if not due_times:
+        return None
+    latest_due = due_times[-1]
+    if state.last_fixed_summary_sent.get(latest_due) == today:
+        return None
+    return latest_due
+
+
+def _mark_latest_due_fixed_summary_sent(
+    now: datetime,
+    config: TYieldReminderConfig,
+    state: TYieldReminderState,
+) -> None:
+    today = now.date().isoformat()
+    due_times: list[str] = []
+    window = timedelta(minutes=max(1, config.poll_interval_minutes))
+    for summary_time in config.fixed_summary_times:
+        hour, minute = _parse_summary_time(summary_time)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now <= target + window:
+            due_times.append(summary_time)
+    if due_times:
+        state.last_fixed_summary_sent[due_times[-1]] = today
+
+
+def _parse_state_datetime(value: str | None, now: datetime) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or now.tzinfo is None:
+        return parsed.replace(tzinfo=None)
+    return parsed.astimezone(now.tzinfo)
+
+
+def _is_no_hot_summary_due(
     now: datetime,
     config: TYieldReminderConfig,
     state: TYieldReminderState,
 ) -> bool:
-    hour, minute = _parse_summary_time(config.daily_summary_time)
-    summary_time_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if now < summary_time_today:
-        return False
-    return state.last_daily_summary_date != now.date().isoformat()
+    last_sent_at = _parse_state_datetime(state.last_no_hot_summary_at, now)
+    if last_sent_at is None:
+        return True
+    comparable_now = now if last_sent_at.tzinfo is not None else now.replace(tzinfo=None)
+    interval = timedelta(hours=config.no_hot_summary_interval_hours)
+    return comparable_now - last_sent_at >= interval
 
 
 def evaluate_reminder(
@@ -457,6 +843,7 @@ def evaluate_reminder(
     state: TYieldReminderState,
     *,
     now: datetime | None = None,
+    force_startup_notify: bool = False,
 ) -> TYieldReminderDecision:
     current_time = now or datetime.now().astimezone()
     scoped_candidates = _filter_candidates_for_scope(report.candidates, config.inventory_scope)
@@ -465,13 +852,36 @@ def evaluate_reminder(
     if hot_signature is None:
         state.last_hot_signature = None
 
-    if _is_daily_summary_due(current_time, config, state):
-        state.last_daily_summary_date = current_time.date().isoformat()
+    if force_startup_notify:
+        if hot_signature:
+            state.last_hot_signature = hot_signature
+            state.last_hot_sent_at = current_time.isoformat()
+        else:
+            state.last_no_hot_summary_at = current_time.isoformat()
+        _mark_latest_due_fixed_summary_sent(current_time, config, state)
         return TYieldReminderDecision(
-            reason="daily",
+            reason="startup",
             should_notify=True,
-            local_message=build_local_message(report, config, reason="daily"),
-            notification=build_notification_message(report, config, reason="daily"),
+            local_message=build_local_message(
+                report,
+                config,
+                reason="startup",
+                note="notify 命令启动首轮，按规则强制推送一次。",
+            ),
+            notification=build_notification_message(report, config, reason="startup"),
+        )
+
+    fixed_summary_time = _latest_due_fixed_summary_time(current_time, config, state)
+    if fixed_summary_time:
+        state.last_fixed_summary_sent[fixed_summary_time] = current_time.date().isoformat()
+        if hot_signature is None:
+            state.last_no_hot_summary_at = current_time.isoformat()
+        reason = f"fixed:{fixed_summary_time}"
+        return TYieldReminderDecision(
+            reason=reason,
+            should_notify=True,
+            local_message=build_local_message(report, config, reason=reason),
+            notification=build_notification_message(report, config, reason=reason),
         )
 
     if hot_signature:
@@ -497,6 +907,20 @@ def evaluate_reminder(
             notification=None,
         )
 
+    if _is_no_hot_summary_due(current_time, config, state):
+        state.last_no_hot_summary_at = current_time.isoformat()
+        return TYieldReminderDecision(
+            reason="no_hot_summary",
+            should_notify=True,
+            local_message=build_local_message(
+                report,
+                config,
+                reason="no_hot_summary",
+                note=f"当前没有高收益候选，按 {config.no_hot_summary_interval_hours:g} 小时摘要间隔推送。",
+            ),
+            notification=build_notification_message(report, config, reason="no_hot_summary"),
+        )
+
     return TYieldReminderDecision(
         reason="local_only",
         should_notify=False,
@@ -514,6 +938,8 @@ def run_once(
     settings: Settings,
     config: TYieldReminderConfig,
     state: TYieldReminderState,
+    *,
+    force_startup_notify: bool = False,
 ) -> TYieldReminderDecision:
     report = scan_t_yield(
         settings,
@@ -523,7 +949,12 @@ def run_once(
         cache_max_age_minutes=config.cache_max_age_minutes,
         inventory_filter=INVENTORY_FILTER_ALL,
     )
-    return evaluate_reminder(report, config, state)
+    return evaluate_reminder(
+        report,
+        config,
+        state,
+        force_startup_notify=force_startup_notify,
+    )
 
 
 def _seconds_until_next_run(now: datetime, interval_minutes: int) -> int:
@@ -597,22 +1028,26 @@ def main(argv: list[str] | None = None) -> int:
     state = load_state()
 
     if args.once:
-        decision = run_once(settings, config, state)
+        decision = run_once(settings, config, state, force_startup_notify=True)
         save_state(state)
         _deliver(settings, decision)
         return 0
 
     print("做T提醒脚本已启动。按 Ctrl+C 可以停止。")
-    print("提醒规则: 高收益快报 + 15:30 固定提醒")
+    print("提醒规则: 高收益快报 + 固定摘要 + 无高收益摘要")
     print(
         f"轮询间隔: {config.poll_interval_minutes} 分钟 | "
         f"高收益阈值: {config.hot_threshold_pct:.2f}% | "
+        f"无高收益摘要: {config.no_hot_summary_interval_hours:g} 小时 | "
+        f"固定提醒: {', '.join(config.fixed_summary_times)} | "
         f"饰品范围: {inventory_scope_label(config.inventory_scope)}"
     )
 
+    is_first_run = True
     try:
         while True:
-            decision = run_once(settings, config, state)
+            decision = run_once(settings, config, state, force_startup_notify=is_first_run)
+            is_first_run = False
             save_state(state)
             _deliver(settings, decision)
             now = datetime.now().astimezone()
