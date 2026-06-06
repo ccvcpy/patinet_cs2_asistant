@@ -105,6 +105,7 @@ def scan_strategies(
     cache_max_age_minutes: int | None = 180,
     pool_market_hash_names: list[str] | None = None,
     inventory_payload: dict[str, Any] | None = None,
+    weapon_case_market_hash_names: set[str] | None = None,
 ) -> StrategyScanReport:
     """Scan the inventory pool and evaluate strategies for each item type.
 
@@ -143,7 +144,7 @@ def scan_strategies(
             row for row in all_inventory_types if row.get("market_hash_name") in pool_set
         ]
 
-    pool_total = len(pool_market_hash_names) if pool_market_hash_names is not None else len(all_inventory_types)
+    matched_inventory_type_count = len(all_inventory_types)
 
     if not all_inventory_types:
         return StrategyScanReport(
@@ -154,7 +155,7 @@ def scan_strategies(
             transfer_candidates=[],
             hold_items=[],
             all_evaluated=[],
-            total_pool_types=pool_total,
+            total_pool_types=matched_inventory_type_count,
             missing_price_count=0,
         )
 
@@ -221,7 +222,8 @@ def scan_strategies(
             continue
 
         item_is_weapon_case = (
-            looks_like_weapon_case_name(mhn)
+            (weapon_case_market_hash_names is not None and mhn in weapon_case_market_hash_names)
+            or looks_like_weapon_case_name(mhn)
             or looks_like_weapon_case_name(state.name_cn)
             or looks_like_weapon_case_name(item_type.get("name_cn"))
         )
@@ -280,6 +282,6 @@ def scan_strategies(
         transfer_candidates=transfer_candidates,
         hold_items=hold_items,
         all_evaluated=all_evaluated,
-        total_pool_types=pool_total,
+        total_pool_types=matched_inventory_type_count,
         missing_price_count=missing_price_count,
     )

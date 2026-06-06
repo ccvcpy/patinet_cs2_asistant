@@ -8,6 +8,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -19,7 +20,9 @@ from cs2_assistant.config import PROJECT_ROOT
 
 
 class SteamMarketError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload
 
 
 def _parse_cookie_string(raw: str) -> dict[str, str]:
@@ -260,7 +263,13 @@ class SteamMarketClient:
 
         # Steam's sellitem API 'price' field = seller's net amount in cents.
         # Caller passes buyer's listing price, so we convert here.
-        seller_net_cents = int(round(price * steam_net_factor * 100))
+        seller_net_cents = int(
+            (
+                Decimal(str(float(price)))
+                * Decimal(str(float(steam_net_factor)))
+                * Decimal("100")
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
         data = {
             "sessionid": self.sessionid,
             "appid": app_id,
@@ -269,18 +278,28 @@ class SteamMarketClient:
             "amount": quantity,
             "price": seller_net_cents,
         }
+        profile_inventory_url = f"{self.base_url}/profiles/{self.steam_id64}/inventory"
         response = self._request(
             "POST",
             "/market/sellitem/",
             data=data,
-            headers={"Referer": f"{self.base_url}/market"},
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Origin": self.base_url,
+                "Referer": profile_inventory_url,
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            },
         )
         try:
             payload = response.json()
         except ValueError as exc:
             raise SteamMarketError(f"Steam sellitem invalid JSON: {response.text}") from exc
         if payload.get("success") != 1:
-            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
+            raise SteamMarketError(json.dumps(payload, ensure_ascii=False), payload=payload)
         return payload
 
     def buy_listing(
@@ -428,6 +447,63 @@ class SteamMarketClient:
             return response.json()
         except ValueError as exc:
             raise SteamMarketError(f"Steam mylistings invalid JSON: {response.text}") from exc
+
+    def market_history(self, *, start: int = 0, count: int = 100) -> dict[str, Any]:
+        params = {"query": "", "start": start, "count": count, "norender": 1}
+        response = self._request("GET", "/market/myhistory/render/", params=params)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SteamMarketError(f"Steam market history invalid JSON: {response.text}") from exc
+        if payload.get("success") not in (1, True, None):
+            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
+        return payload
+
+    def find_sale_receipt(
+        self,
+        listing_id: str,
+        *,
+        count: int = 100,
+        max_pages: int = 3,
+    ) -> dict[str, Any] | None:
+        listing_id = str(listing_id or "").strip()
+        if not listing_id:
+            return None
+        start = 0
+        for _ in range(max(1, int(max_pages))):
+            payload = self.market_history(start=start, count=count)
+            events = payload.get("events") or []
+            purchases = payload.get("purchases") or {}
+            if not isinstance(events, list) or not events:
+                return None
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                if str(event.get("listingid") or "") != listing_id:
+                    continue
+                if int(event.get("event_type") or 0) != 3:
+                    continue
+                purchase_id = str(event.get("purchaseid") or "")
+                purchase = {}
+                if isinstance(purchases, dict):
+                    purchase = purchases.get(f"{listing_id}_{purchase_id}") or purchases.get(listing_id) or {}
+                received_amount = purchase.get("received_amount") if isinstance(purchase, dict) else None
+                try:
+                    received_value = float(received_amount) / 100.0 if received_amount is not None else None
+                except (TypeError, ValueError):
+                    received_value = None
+                return {
+                    "listingId": listing_id,
+                    "purchaseId": purchase_id,
+                    "timeSold": event.get("time_event"),
+                    "receivedAmount": received_value,
+                    "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
+                }
+            start += int(count)
+            total = payload.get("total_count")
+            if total is not None and start >= int(total):
+                return None
+        return None
 
     def list_active_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
         payload = self.my_listings(start=start, count=count)

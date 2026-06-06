@@ -218,3 +218,24 @@ class C5GameClient:
             body["lowPrice"] = low_price
         data = self._request("POST", "/merchant/trade/v2/quick-buy", json_body=body)
         return dict(data or {})
+
+    def buyer_order_status(
+        self,
+        *,
+        page_num: int = 1,
+        page_size: int = 100,
+        status: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"pageNum": page_num, "pageSize": page_size}
+        if status is not None:
+            body["status"] = status
+        data = self._request("POST", "/merchant/order/v2/buyer/status", json_body=body)
+        return dict(data or {})
+
+    def buyer_order_detail(self, order_id: str) -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/merchant/order/v2/buy/detail",
+            params={"orderId": order_id},
+        )
+        return dict(data or {})

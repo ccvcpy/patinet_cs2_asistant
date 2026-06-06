@@ -3,8 +3,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient
+from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient, SteamMarketClient
 from cs2_assistant.models import MarketState
+from cs2_assistant.services.pricing import choose_orderbook_price
 from cs2_assistant.utils import chunked, safe_float, safe_int
 
 DEFAULT_C5_SETTLEMENT_FACTOR = 0.869
@@ -108,6 +109,8 @@ class MarketService:
         steamdt_client: SteamDTClient | None = None,
         csqaq_client: CSQAQClient | None = None,
         c5_client: C5GameClient | None = None,
+        steam_market_client: SteamMarketClient | None = None,
+        steam_market_clients: list[SteamMarketClient] | None = None,
         app_id: int = 730,
         include_c5_purchase_prices: bool = True,
         fallback_max_workers: int = 4,
@@ -115,6 +118,9 @@ class MarketService:
         self.steamdt_client = steamdt_client
         self.csqaq_client = csqaq_client
         self.c5_client = c5_client
+        self.steam_market_clients = list(steam_market_clients or [])
+        if steam_market_client is not None:
+            self.steam_market_clients.append(steam_market_client)
         self.app_id = app_id
         self.include_c5_purchase_prices = include_c5_purchase_prices
         self.fallback_max_workers = max(1, int(fallback_max_workers))
@@ -136,6 +142,9 @@ class MarketService:
         if self.steamdt_client:
             self._load_steamdt_prices(states, market_hash_names)
 
+        if self.steam_market_clients:
+            self._load_steam_market_prices(states, market_hash_names)
+
         if self.c5_client:
             for batch in chunked(market_hash_names, 100):
                 try:
@@ -156,6 +165,49 @@ class MarketService:
                 state.steam_sell_price,
             )
         return list(states.values())
+
+    def _load_steam_market_prices(
+        self,
+        states: dict[str, MarketState],
+        market_hash_names: list[str],
+    ) -> None:
+        def load_one(market_hash_name: str) -> tuple[str, dict[str, Any] | None, list[str]]:
+            errors: list[str] = []
+            for client in self.steam_market_clients:
+                try:
+                    payload = client.order_book(
+                        app_id=self.app_id,
+                        market_hash_name=market_hash_name,
+                    )
+                    return market_hash_name, payload, errors
+                except Exception as exc:
+                    account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
+                    errors.append(f"{account_label}: {exc}")
+            return market_hash_name, None, errors
+
+        max_workers = min(self.fallback_max_workers, len(market_hash_names))
+        if max_workers <= 1:
+            results = [load_one(market_hash_name) for market_hash_name in market_hash_names]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(load_one, market_hash_names))
+
+        for market_hash_name, payload, errors in results:
+            state = states.get(market_hash_name)
+            if state is None:
+                continue
+            if payload is None:
+                state.raw_json["steam_orderbook_error"] = " | ".join(errors) if errors else "empty_orderbook_response"
+                continue
+            if errors:
+                state.raw_json["steam_orderbook_retry_errors"] = errors
+            state.raw_json["steam_orderbook"] = payload
+            decision = choose_orderbook_price(payload or {}, wall_min_count=1, price_offset=0.0)
+            if decision is None:
+                state.raw_json["steam_orderbook_error"] = "empty_sell_orderbook"
+                continue
+            state.steam_sell_price = decision.list_price
+            state.steam_price_source = "steam_orderbook"
 
     def _load_steamdt_prices(
         self,

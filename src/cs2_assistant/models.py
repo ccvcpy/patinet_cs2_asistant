@@ -154,7 +154,7 @@ class StrategyConfig:
     guadao_item_scope: str = GUADAO_ITEM_SCOPE_CASE_ONLY
     price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
-    max_buy_per_cycle: int = 3
+    max_transfer_buy_per_cycle: int = 3
     cycle_interval_minutes: int = 15
     listing_check_interval_minutes: int = 5
     dry_run: bool = True
@@ -168,7 +168,6 @@ class StrategyConfig:
     case_max_open_guadao_count: int = 100
     force_refresh_before_execution: bool = True
     steam_price_cache_ttl: float = 60.0
-    verify_steam_before_rebuy: bool = True
     rebuy_steam_drop_tolerance_pct: float = 5.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -187,7 +186,7 @@ class StrategyConfig:
             "guadaoItemScope": normalize_guadao_item_scope(self.guadao_item_scope),
             "priceTolerancePct": self.price_tolerance_pct,
             "maxListPerCycle": self.max_list_per_cycle,
-            "maxBuyPerCycle": self.max_buy_per_cycle,
+            "maxTransferBuyPerCycle": self.max_transfer_buy_per_cycle,
             "cycleIntervalMinutes": self.cycle_interval_minutes,
             "listingCheckIntervalMinutes": self.listing_check_interval_minutes,
             "dryRun": self.dry_run,
@@ -201,7 +200,6 @@ class StrategyConfig:
             "caseMaxOpenGuadaoCount": self.case_max_open_guadao_count,
             "forceRefreshBeforeExecution": self.force_refresh_before_execution,
             "steamPriceCacheTtl": self.steam_price_cache_ttl,
-            "verifySteamBeforeRebuy": self.verify_steam_before_rebuy,
             "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
         }
 
@@ -231,7 +229,12 @@ class StrategyConfig:
             guadao_item_scope=normalize_guadao_item_scope(data.get("guadaoItemScope", GUADAO_ITEM_SCOPE_CASE_ONLY)),
             price_tolerance_pct=float(data.get("priceTolerancePct", 1.0)),
             max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
-            max_buy_per_cycle=int(data.get("maxBuyPerCycle", 3)),
+            max_transfer_buy_per_cycle=int(
+                data.get(
+                    "maxTransferBuyPerCycle",
+                    data.get("maxBuyPerCycle", 3),
+                )
+            ),
             cycle_interval_minutes=int(data.get("cycleIntervalMinutes", 15)),
             listing_check_interval_minutes=int(data.get("listingCheckIntervalMinutes", 5)),
             dry_run=_as_bool(data.get("dryRun"), True),
@@ -249,9 +252,16 @@ class StrategyConfig:
             case_max_open_guadao_count=int(data.get("caseMaxOpenGuadaoCount", 100)),
             force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
             steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
-            verify_steam_before_rebuy=_as_bool(data.get("verifySteamBeforeRebuy"), True),
             rebuy_steam_drop_tolerance_pct=float(data.get("rebuySteamDropTolerancePct", 5.0)),
         )
+
+    @property
+    def max_buy_per_cycle(self) -> int:
+        return self.max_transfer_buy_per_cycle
+
+    @max_buy_per_cycle.setter
+    def max_buy_per_cycle(self, value: int) -> None:
+        self.max_transfer_buy_per_cycle = int(value)
 
 
 @dataclass(slots=True)

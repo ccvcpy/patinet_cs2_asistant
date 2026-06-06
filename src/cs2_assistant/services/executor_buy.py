@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from cs2_assistant.clients import C5GameClient, C5GameError, SteamMarketClient
-from cs2_assistant.services.pricing import fetch_listing_price
 from cs2_assistant.utils import safe_float
 
 
@@ -16,9 +15,12 @@ class RebuyResult:
     skipped: bool
     reason: str
     actual_price: float | None = None
+    max_price: float | None = None
     steam_price_now: float | None = None
+    steam_reference_price: float | None = None
     listing_ratio_now: float | None = None
     payload: dict[str, Any] | None = None
+    out_trade_no: str | None = None
 
 
 def _parse_c5_error(exc: Exception) -> dict[str, Any] | None:
@@ -50,51 +52,30 @@ def execute_rebuy(
     app_id: int,
     tolerance_pct: float,
     dry_run: bool,
-    verify_steam: bool = False,
-    force_refresh: bool = True,
-    pricing_kwargs: dict[str, Any] | None = None,
     steam_net_factor: float = 0.869,
     guadao_max_listing_ratio: float | None = None,
     trade_url: str | None = None,
+    use_live_price_as_max: bool = False,
 ) -> RebuyResult:
     live_price = fetch_c5_price(client, market_hash_name, app_id)
     if live_price is None:
         return RebuyResult(False, False, "missing_price")
 
-    steam_price_now = None
-    # ratio 用实际卖出价计算：C5补仓价 / (Steam实际卖出价 × 税后系数)
+    steam_reference_price = (
+        float(expected_steam_list_price)
+        if expected_steam_list_price is not None and expected_steam_list_price > 0
+        else None
+    )
+    # ratio 用实际卖出时记录的 Steam 挂价计算：C5补仓价 / (Steam卖出价 * 税后系数)
+    steam_price_now = steam_reference_price
     listing_ratio_now = None
-    if expected_steam_list_price and expected_steam_list_price > 0:
-        listing_ratio_now = live_price / (expected_steam_list_price * steam_net_factor)
+    if steam_reference_price and steam_reference_price > 0:
+        listing_ratio_now = live_price / (steam_reference_price * steam_net_factor)
 
-    if guadao_max_listing_ratio is not None and listing_ratio_now is not None:
-        if listing_ratio_now > guadao_max_listing_ratio:
-            return RebuyResult(
-                False,
-                True,
-                "ratio_no_longer_profitable",
-                actual_price=live_price,
-                steam_price_now=steam_price_now,
-                listing_ratio_now=listing_ratio_now,
-            )
-
-    if verify_steam:
-        if not steam_client:
-            return RebuyResult(False, True, "steam_price_unavailable", actual_price=live_price)
-        kwargs = dict(pricing_kwargs or {})
-        kwargs.setdefault("force_refresh", force_refresh)
-        decision = fetch_listing_price(
-            steam_client,
-            app_id=app_id,
-            market_hash_name=market_hash_name,
-            **kwargs,
-        )
-        if decision is None:
-            return RebuyResult(False, True, "steam_price_unavailable", actual_price=live_price)
-        steam_price_now = decision.list_price
-
-    pricing_steam_list_price = steam_price_now if steam_price_now and steam_price_now > 0 else expected_steam_list_price
-    if (
+    pricing_steam_list_price = expected_steam_list_price
+    if use_live_price_as_max:
+        max_price = float(live_price) * (1.0 + float(tolerance_pct) / 100.0)
+    elif (
         guadao_max_listing_ratio is not None
         and pricing_steam_list_price is not None
         and pricing_steam_list_price > 0
@@ -103,14 +84,31 @@ def execute_rebuy(
     else:
         max_price = float(expected_price) * (1.0 + float(tolerance_pct) / 100.0)
 
+    if guadao_max_listing_ratio is not None and listing_ratio_now is not None:
+        if listing_ratio_now > guadao_max_listing_ratio:
+            return RebuyResult(
+                False,
+                True,
+                "ratio_no_longer_profitable",
+                actual_price=live_price,
+                max_price=max_price,
+                steam_price_now=steam_price_now,
+                steam_reference_price=steam_reference_price,
+                listing_ratio_now=listing_ratio_now,
+                out_trade_no=None,
+            )
+
     if dry_run:
         return RebuyResult(
             True,
             True,
             "dry_run",
             actual_price=live_price,
+            max_price=max_price,
             steam_price_now=steam_price_now,
+            steam_reference_price=steam_reference_price,
             listing_ratio_now=listing_ratio_now,
+            out_trade_no=None,
         )
 
     out_trade_no = uuid.uuid4().hex
@@ -125,24 +123,30 @@ def execute_rebuy(
         )
     except C5GameError as exc:
         payload = _parse_c5_error(exc)
-        if payload and payload.get("errorCode") == 1317:
+        if payload and payload.get("errorCode") in {1317, 1014452}:
             return RebuyResult(
                 False,
                 True,
                 "no_matching_listing",
                 actual_price=live_price,
+                max_price=max_price,
                 steam_price_now=steam_price_now,
+                steam_reference_price=steam_reference_price,
                 listing_ratio_now=listing_ratio_now,
                 payload=payload,
+                out_trade_no=out_trade_no,
             )
         return RebuyResult(
             False,
             False,
             f"c5_api_error: {exc}",
             actual_price=live_price,
+            max_price=max_price,
             steam_price_now=steam_price_now,
+            steam_reference_price=steam_reference_price,
             listing_ratio_now=listing_ratio_now,
             payload=payload,
+            out_trade_no=out_trade_no,
         )
     except Exception as exc:
         return RebuyResult(
@@ -150,15 +154,21 @@ def execute_rebuy(
             False,
             f"c5_api_error: {exc}",
             actual_price=live_price,
+            max_price=max_price,
             steam_price_now=steam_price_now,
+            steam_reference_price=steam_reference_price,
             listing_ratio_now=listing_ratio_now,
+            out_trade_no=out_trade_no,
         )
     return RebuyResult(
         True,
         False,
         "ok",
         actual_price=live_price,
+        max_price=max_price,
         steam_price_now=steam_price_now,
+        steam_reference_price=steam_reference_price,
         listing_ratio_now=listing_ratio_now,
         payload=payload,
+        out_trade_no=out_trade_no,
     )

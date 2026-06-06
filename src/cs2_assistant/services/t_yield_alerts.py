@@ -31,22 +31,26 @@ def build_t_yield_notification(
         title += f" C5>={min_price:g}"
 
     lines = [
-        "做T收益率提醒",
+        "做T收益提醒",
         f"条件: Top {top_n} | C5>={min_price:g}",
+        "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
         "",
     ]
 
     if rows:
         for row in rows:
             inventory_status = str(row.get("inventoryStatusSummary") or "").strip()
-            inventory_part = f" | {inventory_status}" if inventory_status else ""
             account_summary = _account_summary(list(row.get("steamAccounts", [])))
-            lines.append(f"{row['rank']}. {row['name']}{inventory_part}")
+            lines.append(f"{row['rank']}. {row['name']}")
             lines.append(
-                f"   收益率 {row['tYieldPct']} | 折算比 {row['ratio']} | "
-                f"C5 {row['c5LowestSellPrice']} | Steam {row['steamLowestSellPrice']} | "
-                f"账号 {account_summary}"
+                f"利润 {row['tYieldPct']} | "
+                f"折算比 {row['ratio']} | 挂刀比 {row.get('listingRatio', '-')}"
             )
+            lines.append(f"C5 {row['c5LowestSellPrice']} | Steam {row['steamLowestSellPrice']}")
+            if inventory_status:
+                lines.append(f"库存 {inventory_status}")
+            lines.append(f"账号 {account_summary}")
+            lines.append("")
     else:
         lines.append("当前没有符合条件的做T候选。")
 
@@ -54,12 +58,10 @@ def build_t_yield_notification(
         lines.extend(["", f"缺少 Steam 价格: {len(missing_steam_prices)} 个"])
         for issue in missing_steam_prices[:10]:
             inventory_status = str(issue.get("inventoryStatusSummary") or "").strip()
-            inventory_part = f" | {inventory_status}" if inventory_status else ""
-            lines.append(
-                f"- {issue['name']}{inventory_part} | C5 {issue['c5SellPrice']} | "
-                f"HashName={issue['marketHashName']}"
-            )
+            lines.append(f"- {issue['name']}")
+            lines.append(f"  C5 {issue['c5SellPrice']} | {inventory_status}")
+            lines.append(f"  HashName={issue['marketHashName']}")
         if len(missing_steam_prices) > 10:
             lines.append(f"- 其余 {len(missing_steam_prices) - 10} 个请用脚本查看。")
 
-    return NotificationMessage(title=title, body="\n".join(lines))
+    return NotificationMessage(title=title, body="\n".join(lines).strip())

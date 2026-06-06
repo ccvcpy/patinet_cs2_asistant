@@ -99,12 +99,56 @@ class StrategyClassificationTestCase(unittest.TestCase):
                 report = scan_strategies(
                     settings,
                     config,
-                    pool_market_hash_names=["Kilowatt Case"],
+                    pool_market_hash_names=["Kilowatt Case", "Austin 2025 Legends Autograph Capsule"],
                     inventory_payload=inventory_payload,
                 )
 
         self.assertEqual(1, len(report.all_evaluated))
+        self.assertEqual(1, report.total_pool_types)
         self.assertEqual("Kilowatt Case", report.all_evaluated[0].market_hash_name)
+
+    def test_scan_strategies_accepts_catalog_case_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                db_path=Path(temp_dir) / "assistant.db",
+                c5_api_key="c5-key",
+                steamdt_api_key="steamdt-key",
+            )
+            config = StrategyConfig(
+                min_price=1.0,
+                guadao_max_listing_ratio=0.90,
+                transfer_min_real_ratio=9999,
+                guadao_item_scope="case_only",
+            )
+            inventory_payload = {
+                "source": "live",
+                "accounts": [{"steamId": "steam-1", "nickname": "main"}],
+                "list": [
+                    {
+                        "assetId": "asset-1",
+                        "marketHashName": "Catalog Classified Container",
+                        "name": "Catalog Classified Container",
+                        "steamId": "steam-1",
+                        "ifTradable": True,
+                        "price": 1.0,
+                    }
+                ],
+            }
+
+            with patch(
+                "cs2_assistant.services.strategy.build_market_service",
+                return_value=FakeMarketService(),
+            ):
+                report = scan_strategies(
+                    settings,
+                    config,
+                    pool_market_hash_names=["Catalog Classified Container"],
+                    inventory_payload=inventory_payload,
+                    weapon_case_market_hash_names={"Catalog Classified Container"},
+                )
+
+        self.assertEqual(1, len(report.guadao_candidates))
+        self.assertEqual("Catalog Classified Container", report.guadao_candidates[0].market_hash_name)
 
 
 if __name__ == "__main__":

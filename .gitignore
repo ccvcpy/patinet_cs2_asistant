@@ -8,6 +8,7 @@ logs/
 
 .claude/
 config/accounts.json
+config/network.json
 config/*.bak*
 config/playwright_steam/
 maFiles/
