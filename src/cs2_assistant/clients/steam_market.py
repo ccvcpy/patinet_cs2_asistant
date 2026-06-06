@@ -505,6 +505,59 @@ class SteamMarketClient:
                 return None
         return None
 
+    def find_sale_receipt_by_asset(
+        self,
+        asset_id: str,
+        *,
+        count: int = 100,
+        max_pages: int = 3,
+    ) -> dict[str, Any] | None:
+        asset_id = str(asset_id or "").strip()
+        if not asset_id:
+            return None
+        start = 0
+        for _ in range(max(1, int(max_pages))):
+            payload = self.market_history(start=start, count=count)
+            events = payload.get("events") or []
+            purchases = payload.get("purchases") or {}
+            if not isinstance(events, list) or not events:
+                return None
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                if int(event.get("event_type") or 0) != 3:
+                    continue
+                event_asset_id = str(
+                    event.get("assetid")
+                    or event.get("asset_id")
+                    or (event.get("asset") or {}).get("id")
+                    or ""
+                ).strip()
+                if event_asset_id != asset_id:
+                    continue
+                listing_id = str(event.get("listingid") or "")
+                purchase_id = str(event.get("purchaseid") or "")
+                purchase = {}
+                if isinstance(purchases, dict):
+                    purchase = purchases.get(f"{listing_id}_{purchase_id}") or purchases.get(listing_id) or {}
+                received_amount = purchase.get("received_amount") if isinstance(purchase, dict) else None
+                try:
+                    received_value = float(received_amount) / 100.0 if received_amount is not None else None
+                except (TypeError, ValueError):
+                    received_value = None
+                return {
+                    "listingId": listing_id,
+                    "purchaseId": purchase_id,
+                    "timeSold": event.get("time_event"),
+                    "receivedAmount": received_value,
+                    "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
+                }
+            start += int(count)
+            total = payload.get("total_count")
+            if total is not None and start >= int(total):
+                return None
+        return None
+
     def list_active_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
         payload = self.my_listings(start=start, count=count)
         listings_raw = payload.get("listings") or {}
