@@ -43,7 +43,9 @@ class FakeSteamClient:
         self.steam_id64 = "76561198000000000"
         self.buy_calls: list[dict[str, object]] = []
         self.active_listing_ids: set[str] = set()
+        self.active_listing_assets: dict[str, str] = {}
         self.sale_receipts: dict[str, dict[str, object]] = {}
+        self.sale_receipts_by_asset: dict[str, dict[str, object]] = {}
         self.sell_calls: list[dict[str, object]] = []
         self.trade_url = "https://steamcommunity.com/tradeoffer/new/?partner=39734272&token=abc"
         self.confirm_calls = 0
@@ -112,13 +114,22 @@ class FakeSteamClient:
 
     def list_active_listings(self) -> list[object]:
         class Listing:
-            def __init__(self, listing_id: str) -> None:
+            def __init__(self, listing_id: str, asset_id: str | None = None) -> None:
                 self.listing_id = listing_id
+                self.asset_id = asset_id
 
-        return [Listing(listing_id) for listing_id in sorted(self.active_listing_ids)]
+        listings = [Listing(listing_id) for listing_id in sorted(self.active_listing_ids)]
+        listings.extend(
+            Listing(listing_id, asset_id)
+            for asset_id, listing_id in sorted(self.active_listing_assets.items())
+        )
+        return listings
 
     def find_sale_receipt(self, listing_id: str) -> dict[str, object] | None:
         return self.sale_receipts.get(listing_id)
+
+    def find_sale_receipt_by_asset(self, asset_id: str) -> dict[str, object] | None:
+        return self.sale_receipts_by_asset.get(asset_id)
 
 
 class FakeC5Client:
@@ -482,6 +493,29 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
                     "steamId": self.engine.steam_client.steam_id64,
                     "ifTradable": True,
                     "price": 1.35,
+                }
+            ]
+        }
+
+        with patch("cs2_assistant.services.executor_engine.fetch_all_c5_inventories", return_value=payload):
+            self.engine._sync_assets()
+
+        old_asset = self.db.get_asset("asset-old")
+        self.assertIsNotNone(old_asset)
+        assert old_asset is not None
+        self.assertEqual("listing_pending", old_asset["status"])
+
+    def test_sync_assets_keeps_pending_assets_present_in_live_inventory(self) -> None:
+        self.db.set_asset_status("asset-old", "listing_pending")
+        payload = {
+            "list": [
+                {
+                    "assetId": "asset-old",
+                    "marketHashName": "Revolution Case",
+                    "name": "Revolution Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "price": 20.0,
                 }
             ]
         }
@@ -1048,6 +1082,131 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("listing_pending", asset["status"])
         self.assertEqual(1, self.engine._pending_confirmation_count)
         self.assertEqual(1, len(self.engine.serverchan.messages))
+
+    def test_sellitem_pending_confirmation_error_auto_confirms_to_listed(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.settings.steam_identity_secret = "secret"
+        self.engine.settings.steam_device_id = "device"
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.92,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        self.engine.steam_client.active_listing_assets["asset-old"] = "listing-from-asset"
+        payload = {
+            "success": False,
+            "message": "already listed and waiting for confirmation",
+        }
+
+        def raise_pending_confirmation(**kwargs: object) -> dict[str, object]:
+            raise SteamMarketError("sellitem pending confirmation", payload=payload)
+
+        self.engine._sell_item_with_retry = raise_pending_confirmation  # type: ignore[method-assign]
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
+
+        self.assertEqual(1, listed)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        self.assertEqual("listed", sell_op["status"])
+        self.assertIn('"confirmationStatus": "confirmed"', sell_op["note"])
+        self.assertIn('"confirmationSource": "sellitem_pending_confirmation"', sell_op["note"])
+        self.assertIn('"listingId": "listing-from-asset"', sell_op["note"])
+        self.assertIn('"rebuyPrice": 20.0', sell_op["note"])
+        self.assertEqual([], self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="deferred", limit=10))
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("listed", asset["status"])
+        self.assertEqual(1, self.engine.steam_client.confirm_calls)
+        self.assertEqual(0, self.engine._pending_confirmation_count)
+
+    def test_sellitem_pending_confirmation_error_marks_sold_when_sold_before_active_seen(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.settings.steam_identity_secret = "secret"
+        self.engine.settings.steam_device_id = "device"
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.92,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        self.engine.steam_client.sale_receipts_by_asset["asset-old"] = {
+            "listingId": "listing-sold",
+            "receivedAmount": 21.55,
+            "purchaseId": "purchase-1",
+            "timeSold": "2026-06-06T00:00:00+00:00",
+            "receivedCurrencyId": 23,
+        }
+        payload = {
+            "success": False,
+            "message": "already listed and waiting for confirmation",
+        }
+
+        def raise_pending_confirmation(**kwargs: object) -> dict[str, object]:
+            raise SteamMarketError("sellitem pending confirmation", payload=payload)
+
+        self.engine._sell_item_with_retry = raise_pending_confirmation  # type: ignore[method-assign]
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
+
+        self.assertEqual(1, listed)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        self.assertEqual("sold", sell_op["status"])
+        self.assertIn('"listingId": "listing-sold"', sell_op["note"])
+        self.assertIn('"steamSellerNetPriceSource": "steam_history"', sell_op["note"])
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("sold", asset["status"])
+        rebuy_ops = self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10)
+        self.assertEqual(1, len(rebuy_ops))
+        self.assertEqual("pending", rebuy_ops[0]["status"])
+        self.assertEqual(1, self.engine.steam_client.confirm_calls)
+        self.assertEqual(0, self.engine._pending_confirmation_count)
+
+    def test_existing_deferred_pending_confirmation_auto_confirms_before_cooldown(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.settings.steam_identity_secret = "secret"
+        self.engine.settings.steam_device_id = "device"
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.92,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        self.engine.steam_client.active_listing_assets["asset-old"] = "listing-from-asset"
+        pending_error = SteamMarketError(
+            "already listed and waiting for confirmation",
+            payload={"success": False, "message": "already listed and waiting for confirmation"},
+        )
+        self.engine._record_listing_transient_defer(
+            candidate=build_guadao_candidate(),
+            asset_id="asset-old",
+            price=25.0,
+            account=None,
+            steam_id64=self.engine.steam_client.steam_id64,
+            error=pending_error,
+        )
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
+
+        self.assertEqual(1, listed)
+        self.assertEqual([], self.engine.steam_client.sell_calls)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        self.assertEqual("listed", sell_op["status"])
+        self.assertIn('"confirmationStatus": "confirmed"', sell_op["note"])
+        self.assertIn('"confirmationSource": "sellitem_pending_confirmation"', sell_op["note"])
+        self.assertIn('"listingId": "listing-from-asset"', sell_op["note"])
+        self.assertIn('"rebuyPrice": 20.0', sell_op["note"])
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("listed", asset["status"])
+        self.assertEqual(1, self.engine.steam_client.confirm_calls)
 
     def test_listing_confirm_failure_is_not_silent(self) -> None:
         self.engine.config.dry_run = False

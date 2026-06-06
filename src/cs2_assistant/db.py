@@ -778,7 +778,7 @@ class Database:
                 steam_id = excluded.steam_id,
                 tradable = excluded.tradable,
                 status = CASE
-                    WHEN inventory_assets.status IN ('listed', 'sold', 'listing_failed') THEN inventory_assets.status
+                    WHEN inventory_assets.status IN ('listed', 'sold', 'listing_pending', 'listing_failed') THEN inventory_assets.status
                     ELSE excluded.status
                 END,
                 last_seen_at = excluded.last_seen_at

@@ -117,14 +117,44 @@ def _steam_account_log_label(note: dict[str, Any]) -> str | None:
     return steam_id or None
 
 
+def _message_indicates_pending_confirmation(message: str) -> bool:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return False
+    pending_markers = (
+        "等待确认",
+        "待确认",
+        "请确认",
+        "waiting confirmation",
+        "waiting for confirmation",
+        "awaiting confirmation",
+        "confirm or cancel",
+        "confirm or remove",
+        "already listed",
+    )
+    return any(marker in normalized for marker in pending_markers)
+
+
 def _is_transient_listing_error(exc: Exception) -> bool:
     payload = getattr(exc, "payload", None)
     if isinstance(payload, dict):
         # Steam sellitem's generic retryable failure is a structured
         # success=false JSON response. The message is localized, so do not
         # depend on a specific language.
-        return payload.get("success") is False and isinstance(payload.get("message"), str)
+        message = payload.get("message")
+        return (
+            payload.get("success") is False
+            and isinstance(message, str)
+            and not _message_indicates_pending_confirmation(message)
+        )
     return False
+
+
+def _is_pending_confirmation_sellitem_error(exc: Exception) -> bool:
+    payload = getattr(exc, "payload", None)
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return False
+    return _message_indicates_pending_confirmation(str(payload.get("message") or ""))
 
 
 def _is_market_auth_error(exc: Exception) -> bool:
@@ -1144,19 +1174,25 @@ class ExecutionEngine:
                 targets.append((steam_id, account))
         return targets
 
-    def _latest_listing_defer_state(self, asset_id: str) -> ListingDeferState | None:
-        row = self.db.conn.execute(
-            """
+    def _latest_listing_operation(self, asset_id: str, *, statuses: tuple[str, ...]) -> Any | None:
+        if not statuses:
+            return None
+        placeholders = ", ".join("?" for _ in statuses)
+        return self.db.conn.execute(
+            f"""
             SELECT id, note
             FROM pool_operations
             WHERE operation_type = ?
               AND asset_id = ?
-              AND status = 'deferred'
+              AND status IN ({placeholders})
             ORDER BY id DESC
             LIMIT 1
             """,
-            (OP_SELL_STEAM, asset_id),
+            (OP_SELL_STEAM, asset_id, *statuses),
         ).fetchone()
+
+    def _latest_listing_defer_state(self, asset_id: str) -> ListingDeferState | None:
+        row = self._latest_listing_operation(asset_id, statuses=("deferred",))
         if row is None:
             return None
         note = _read_note(row["note"])
@@ -1227,6 +1263,88 @@ class ExecutionEngine:
             defer_count=defer_count,
             reason="transient_sellitem_failure",
         )
+
+    def _record_listing_pending_confirmation_from_sellitem(
+        self,
+        *,
+        candidate: StrategyCandidate,
+        asset_id: str,
+        price: float,
+        account: Account | None,
+        steam_id64: str | None,
+        message: str,
+        client: SteamMarketClient | None = None,
+    ) -> tuple[int, str]:
+        pending_count_before = self._pending_confirmation_count
+        confirmation_note, status_after = self._handle_listing_confirmation(
+            market_hash_name=candidate.market_hash_name,
+            asset_id=asset_id,
+            listing_id="",
+            client=client,
+            account=account,
+        )
+        confirmation_note["confirmationSource"] = "sellitem_pending_confirmation"
+        confirmation_note["sellitemPendingMessage"] = message
+        op_status = "listed" if status_after == POOL_STATUS_LISTED else POOL_STATUS_LISTING_PENDING
+        asset_status = "listed" if status_after == POOL_STATUS_LISTED else "listing_pending"
+        note_dict = {
+            "assetId": asset_id,
+            "marketHashName": candidate.market_hash_name,
+            "listingId": None,
+            "rebuyPrice": candidate.rebuy_price,
+            "steamListPrice": price,
+            "steamSellerNetPrice": _steam_seller_net_from_gross(price, self.config.steam_net_factor),
+            "strategy": candidate.primary_strategy,
+            "needsConfirmation": True,
+            "listingPendingAt": utc_now_iso(),
+            **self._account_note_fields(account, steam_id64),
+            **confirmation_note,
+        }
+        note = _build_note(note_dict)
+        previous = self._latest_listing_operation(
+            asset_id,
+            statuses=(POOL_STATUS_LISTING_PENDING, "deferred"),
+        )
+        if previous is not None:
+            op_id = safe_int(previous["id"]) or 0
+            if op_id:
+                self.db.update_pool_operation(op_id, status=op_status, note=note)
+            else:
+                op_id = 0
+        else:
+            op_id = self.db.add_pool_operation(
+                market_hash_name=candidate.market_hash_name,
+                strategy=candidate.primary_strategy,
+                operation_type=OP_SELL_STEAM,
+                expected_price=price,
+                asset_id=asset_id,
+                note=note,
+            )
+            self.db.update_pool_operation(op_id, status=op_status, note=note)
+        self.db.set_pool_status(candidate.market_hash_name, status_after)
+        self.db.set_asset_status(asset_id, asset_status)
+        if status_after == POOL_STATUS_LISTING_PENDING and client is not None and op_id:
+            listing_id = str(note_dict.get("listingId") or "").strip()
+            sale_receipt = self._lookup_steam_sale_receipt(client, listing_id)
+            if sale_receipt is None:
+                sale_receipt = self._lookup_steam_sale_receipt_by_asset(client, asset_id)
+            if sale_receipt is not None:
+                self._pending_confirmation_count = pending_count_before
+                existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
+                op = self.db.conn.execute(
+                    "SELECT * FROM pool_operations WHERE id = ?",
+                    (op_id,),
+                ).fetchone()
+                if op is not None:
+                    self._mark_steam_listing_sold(
+                        op,
+                        note_dict,
+                        sale_receipt=sale_receipt,
+                        existing_rebuy_sources=existing_rebuy_sources,
+                        existing_rebuy_sell_ops=existing_rebuy_sell_ops,
+                    )
+                    return op_id, POOL_STATUS_PENDING_REBUY
+        return op_id, status_after
 
     def _refresh_scan_listing_prices_from_steam(self, report: Any) -> int:
         if not self.steam_client or not self.config.auto_list_enabled:
@@ -2040,6 +2158,39 @@ class ExecutionEngine:
                 defer_state = self._active_listing_defer_state(str(asset_id))
                 if defer_state is not None:
                     picked_asset_ids.add(str(asset_id))
+                    defer_row = self._latest_listing_operation(str(asset_id), statuses=("deferred",))
+                    defer_note = _read_note(defer_row["note"]) if defer_row is not None else {}
+                    defer_message = str(defer_note.get("deferMessage") or "").strip()
+                    if _message_indicates_pending_confirmation(defer_message):
+                        _, status_after = self._record_listing_pending_confirmation_from_sellitem(
+                            candidate=candidate,
+                            asset_id=str(asset_id),
+                            price=decision.list_price,
+                            account=selected_account,
+                            steam_id64=selected_steam_id64,
+                            message=defer_message,
+                            client=client,
+                        )
+                        status_map[candidate.market_hash_name] = status_after
+                        if status_after == POOL_STATUS_LISTED:
+                            print(
+                                f"[上架确认] {candidate.market_hash_name} | "
+                                f"账号={selected_account.name if selected_account else selected_steam_id64} | "
+                                f"asset={asset_id} | "
+                                f"Steam挂价 CNY {decision.list_price:.2f} | "
+                                "状态: Steam 已返回待令牌确认，已自动确认并验证为活跃挂单"
+                            )
+                        else:
+                            print(
+                                f"[上架待确认] {candidate.market_hash_name} | "
+                                f"账号={selected_account.name if selected_account else selected_steam_id64} | "
+                                f"asset={asset_id} | "
+                                f"Steam挂价 CNY {decision.list_price:.2f} | "
+                                "状态: Steam 已返回待令牌确认，已尝试自动确认，仍需继续追踪"
+                            )
+                        list_count += 1
+                        wait_before_next_listing = True
+                        continue
                     if str(asset_id) not in defer_logged_asset_ids:
                         local_retry_at = defer_state.deferred_until.astimezone(timezone(timedelta(hours=8)))
                         print(
@@ -2066,6 +2217,36 @@ class ExecutionEngine:
                         price=decision.list_price,
                     )
                 except SteamMarketError as exc:
+                    if _is_pending_confirmation_sellitem_error(exc):
+                        _, status_after = self._record_listing_pending_confirmation_from_sellitem(
+                            candidate=candidate,
+                            asset_id=str(asset_id),
+                            price=decision.list_price,
+                            account=selected_account,
+                            steam_id64=selected_steam_id64,
+                            message=str(exc),
+                            client=client,
+                        )
+                        status_map[candidate.market_hash_name] = status_after
+                        if status_after == POOL_STATUS_LISTED:
+                            print(
+                                f"[上架确认] {candidate.market_hash_name} | "
+                                f"账号={selected_account.name if selected_account else selected_steam_id64} | "
+                                f"asset={asset_id} | "
+                                f"Steam挂价 CNY {decision.list_price:.2f} | "
+                                "状态: Steam 已返回待令牌确认，已自动确认并验证为活跃挂单"
+                            )
+                        else:
+                            print(
+                                f"[上架待确认] {candidate.market_hash_name} | "
+                                f"账号={selected_account.name if selected_account else selected_steam_id64} | "
+                                f"asset={asset_id} | "
+                                f"Steam挂价 CNY {decision.list_price:.2f} | "
+                                "状态: Steam 已返回待令牌确认，已尝试自动确认，仍需继续追踪"
+                            )
+                        list_count += 1
+                        wait_before_next_listing = True
+                        continue
                     if _is_transient_listing_error(exc):
                         backoff_until = self._set_listing_account_backoff(client)
                         defer_state = self._record_listing_transient_defer(
@@ -2219,6 +2400,7 @@ class ExecutionEngine:
         def retry_steam_guard_confirmation() -> None:
             nonlocal active_listing_ids, active_asset_ids
             nonlocal confirmation_retry_attempted, confirmation_retry_error, confirmation_retry_count
+            nonlocal active
             if confirmation_retry_attempted:
                 return
             confirmation_retry_attempted = True
@@ -2232,6 +2414,7 @@ class ExecutionEngine:
                 refreshed_active = active_client.list_active_listings()
             except Exception:
                 return
+            active = refreshed_active
             active_listing_ids, active_asset_ids = self._active_listing_identity_sets(refreshed_active)
 
         candidate_ops = self.db.list_pool_operations_by_type_and_statuses(
@@ -2252,6 +2435,8 @@ class ExecutionEngine:
                 asset_id=asset_id,
             ):
                 sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
+                if sale_receipt is None and asset_id:
+                    sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
                 if sale_receipt is not None:
                     if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
                         existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
@@ -2277,6 +2462,10 @@ class ExecutionEngine:
                         listing_id=listing_id,
                         asset_id=asset_id,
                     ):
+                        if not listing_id:
+                            recovered_listing_id = self._active_listing_id_for_asset(active, asset_id)
+                            if recovered_listing_id:
+                                note["listingId"] = recovered_listing_id
                         note["confirmationStatus"] = "confirmed_late"
                         note["confirmationRecoveredAt"] = utc_now_iso()
                         note["confirmationRetryCount"] = confirmation_retry_count
@@ -2284,6 +2473,8 @@ class ExecutionEngine:
                         updated += 1
                         continue
                     sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
+                    if sale_receipt is None and asset_id:
+                        sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
                     if sale_receipt is not None:
                         if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
                             existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
@@ -2335,6 +2526,10 @@ class ExecutionEngine:
                 continue
             note["confirmationStatus"] = "confirmed_late"
             note["confirmationRecoveredAt"] = utc_now_iso()
+            if not listing_id:
+                recovered_listing_id = self._active_listing_id_for_asset(active, asset_id)
+                if recovered_listing_id:
+                    note["listingId"] = recovered_listing_id
             self._mark_steam_listing_active(op, note)
             updated += 1
         return updated
@@ -2351,6 +2546,19 @@ class ExecutionEngine:
             if str(getattr(lst, "asset_id", "") or "").strip()
         }
         return listing_ids, asset_ids
+
+    def _active_listing_id_for_asset(self, active: list[Any], asset_id: str) -> str | None:
+        expected_asset_id = str(asset_id or "").strip()
+        if not expected_asset_id:
+            return None
+        for listing in active:
+            listing_asset_id = str(getattr(listing, "asset_id", "") or "").strip()
+            if listing_asset_id != expected_asset_id:
+                continue
+            listing_id = str(getattr(listing, "listing_id", "") or "").strip()
+            if listing_id:
+                return listing_id
+        return None
 
     def _listing_is_active(
         self,
@@ -2546,9 +2754,8 @@ class ExecutionEngine:
         note["confirmationStatus"] = "confirmed"
         note["confirmationCount"] = confirmed_count
         try:
-            active_listing_ids, active_asset_ids = self._active_listing_identity_sets(
-                active_client.list_active_listings()
-            )
+            active_listings = active_client.list_active_listings()
+            active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active_listings)
         except Exception as exc:
             note["confirmationStatus"] = "confirm_sent_waiting_active_listing"
             note["confirmationMessage"] = f"confirmed but active listing check failed: {exc}"
@@ -2564,6 +2771,10 @@ class ExecutionEngine:
             note["confirmationMessage"] = "confirmed but listing is not visible in Steam active listings yet"
             self._pending_confirmation_count += 1
             return note, POOL_STATUS_LISTING_PENDING
+        if not listing_id:
+            recovered_listing_id = self._active_listing_id_for_asset(active_listings, asset_id)
+            if recovered_listing_id:
+                note["listingId"] = recovered_listing_id
         note["activeVerifiedAt"] = utc_now_iso()
         return note, POOL_STATUS_LISTED
 
@@ -3011,6 +3222,20 @@ class ExecutionEngine:
             return None
         return receipt if isinstance(receipt, dict) else None
 
+    def _lookup_steam_sale_receipt_by_asset(
+        self,
+        client: SteamMarketClient,
+        asset_id: str,
+    ) -> dict[str, Any] | None:
+        finder = getattr(client, "find_sale_receipt_by_asset", None)
+        if not asset_id or not callable(finder):
+            return None
+        try:
+            receipt = finder(asset_id)
+        except Exception:
+            return None
+        return receipt if isinstance(receipt, dict) else None
+
     def _load_existing_rebuy_source_keys(self) -> tuple[set[str], set[str]]:
         existing_rebuy_sources: set[str] = set()
         existing_rebuy_sell_ops: set[str] = set()
@@ -3035,6 +3260,10 @@ class ExecutionEngine:
     ) -> None:
         listing_id = str(note.get("listingId") or "").strip()
         asset_id = str(op["asset_id"] or "").strip()
+        if not listing_id and sale_receipt:
+            listing_id = str(sale_receipt.get("listingId") or "").strip()
+            if listing_id:
+                note["listingId"] = listing_id
         self.db.update_pool_operation(op["id"], status="sold")
         self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
         if asset_id:
