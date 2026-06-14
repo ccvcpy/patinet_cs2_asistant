@@ -97,6 +97,59 @@ class TYieldReminderTestCase(unittest.TestCase):
         assert decision.notification is not None
         self.assertIn("账号 115", decision.notification.body)
 
+    def test_hot_notification_includes_warm_and_regular_candidates(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+        )
+        state = TYieldReminderState()
+        decision = evaluate_reminder(
+            _report(
+                _candidate(name="Hot Candidate", pct=12.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+                _candidate(name="Warm Candidate", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+                _candidate(name="Regular Candidate", pct=-1.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+            ),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        self.assertTrue(decision.should_notify)
+        self.assertEqual("hot", decision.reason)
+        self.assertIsNotNone(decision.notification)
+        assert decision.notification is not None
+        self.assertIn("[一档] Hot Candidate", decision.notification.body)
+        self.assertIn("[二档] Warm Candidate", decision.notification.body)
+        self.assertIn("[普通] Regular Candidate", decision.notification.body)
+
+    def test_hot_duplicate_does_not_send_warm_separately(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+            warm_cooldown_hours=0.5,
+        )
+        state = TYieldReminderState()
+        first = evaluate_reminder(
+            _report(
+                _candidate(name="Hot Candidate", pct=12.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+                _candidate(name="Warm Candidate A", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+            ),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        second = evaluate_reminder(
+            _report(
+                _candidate(name="Hot Candidate", pct=12.0, status=INVENTORY_FILTER_TRADABLE_ONLY),
+                _candidate(name="Warm Candidate B", pct=5.5, status=INVENTORY_FILTER_TRADABLE_ONLY),
+            ),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 15, 0),
+        )
+        self.assertTrue(first.should_notify)
+        self.assertFalse(second.should_notify)
+        self.assertEqual("hot_duplicate", second.reason)
+
     def test_duplicate_hot_candidate_does_not_notify_again(self) -> None:
         config = TYieldReminderConfig()
         state = TYieldReminderState()
@@ -191,7 +244,10 @@ class TYieldReminderTestCase(unittest.TestCase):
         self.assertEqual("fixed:15:30", decision.reason)
 
     def test_fixed_summary_only_sends_once_per_day_after_target_time(self) -> None:
-        config = TYieldReminderConfig(fixed_summary_times=["15:30"])
+        config = TYieldReminderConfig(
+            fixed_summary_times=["15:30"],
+            warm_threshold_pct=9.8,
+        )
         state = TYieldReminderState(
             last_fixed_summary_sent={"15:30": "2026-04-01"},
             last_no_hot_summary_at="2026-04-01T14:00:00",
@@ -205,9 +261,89 @@ class TYieldReminderTestCase(unittest.TestCase):
         self.assertFalse(decision.should_notify)
         self.assertEqual("local_only", decision.reason)
 
+    def test_warm_candidate_triggers_notification(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+        )
+        state = TYieldReminderState()
+        decision = evaluate_reminder(
+            _report(_candidate(name="Warm Candidate", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        self.assertTrue(decision.should_notify)
+        self.assertEqual("warm", decision.reason)
+        self.assertIsNotNone(decision.notification)
+        assert decision.notification is not None
+        self.assertIn("做T机会提醒", decision.notification.body)
+        self.assertIn("[二档] Warm Candidate", decision.notification.body)
+
+    def test_warm_candidate_is_suppressed_during_cooldown(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+            warm_cooldown_hours=2.0,
+        )
+        state = TYieldReminderState()
+        first = evaluate_reminder(
+            _report(_candidate(name="Warm Candidate A", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        second = evaluate_reminder(
+            _report(_candidate(name="Warm Candidate B", pct=5.5, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 15, 0),
+        )
+        self.assertTrue(first.should_notify)
+        self.assertFalse(second.should_notify)
+        self.assertEqual("warm_cooldown", second.reason)
+
+    def test_warm_candidate_sends_after_cooldown_when_changed(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+            warm_cooldown_hours=2.0,
+        )
+        state = TYieldReminderState()
+        first = evaluate_reminder(
+            _report(_candidate(name="Warm Candidate A", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 14, 0),
+        )
+        second = evaluate_reminder(
+            _report(_candidate(name="Warm Candidate B", pct=5.5, status=INVENTORY_FILTER_TRADABLE_ONLY)),
+            config,
+            state,
+            now=datetime(2026, 4, 1, 16, 10),
+        )
+        self.assertTrue(first.should_notify)
+        self.assertTrue(second.should_notify)
+        self.assertEqual("warm", second.reason)
+
+    def test_duplicate_warm_candidate_does_not_notify_after_cooldown(self) -> None:
+        config = TYieldReminderConfig(
+            hot_threshold_pct=10.0,
+            warm_threshold_pct=1.0,
+            warm_cooldown_hours=2.0,
+        )
+        state = TYieldReminderState()
+        report = _report(_candidate(name="Warm Candidate", pct=5.0, status=INVENTORY_FILTER_TRADABLE_ONLY))
+        first = evaluate_reminder(report, config, state, now=datetime(2026, 4, 1, 14, 0))
+        second = evaluate_reminder(report, config, state, now=datetime(2026, 4, 1, 16, 10))
+        self.assertTrue(first.should_notify)
+        self.assertFalse(second.should_notify)
+        self.assertEqual("warm_duplicate", second.reason)
+
     def test_no_hot_summary_sends_after_configured_interval(self) -> None:
         config = TYieldReminderConfig(
             fixed_summary_times=["15:30"],
+            warm_threshold_pct=9.8,
             no_hot_summary_interval_hours=4,
         )
         state = TYieldReminderState(last_no_hot_summary_at="2026-04-01T09:00:00")
@@ -219,9 +355,15 @@ class TYieldReminderTestCase(unittest.TestCase):
         )
         self.assertTrue(decision.should_notify)
         self.assertEqual("no_hot_summary", decision.reason)
+        self.assertIsNotNone(decision.notification)
+        assert decision.notification is not None
+        self.assertIn("[普通] Tradable Candidate", decision.notification.body)
 
     def test_local_only_when_no_hot_and_not_summary_time(self) -> None:
-        config = TYieldReminderConfig(fixed_summary_times=["15:30"])
+        config = TYieldReminderConfig(
+            fixed_summary_times=["15:30"],
+            warm_threshold_pct=9.8,
+        )
         state = TYieldReminderState(last_no_hot_summary_at="2026-04-01T12:30:00")
         decision = evaluate_reminder(
             _report(_candidate(name="Tradable Candidate", pct=9.5, status=INVENTORY_FILTER_TRADABLE_ONLY)),

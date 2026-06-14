@@ -40,7 +40,7 @@ from cs2_assistant.models import (
     StrategyConfig,
     guadao_scope_allows_item,
 )
-from cs2_assistant.services.executor_buy import execute_rebuy
+from cs2_assistant.services.executor_buy import execute_rebuy, is_retryable_c5_network_error
 from cs2_assistant.services.market import calculate_listing_ratio, calculate_transfer_real_ratio
 from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price
 from cs2_assistant.services.strategy import classify_strategies, load_strategy_config, scan_strategies
@@ -66,6 +66,8 @@ LISTING_CONFIRMATION_PENDING_STATUSES = {
     "manual_required",
     "failed",
     "not_found",
+    "market_pending_visible",
+    "market_pending_remove_failed",
     "confirm_sent_waiting_active_listing",
     "listing_missing_unverified",
 }
@@ -432,6 +434,7 @@ class ExecutionEngine:
         self._last_inventory_payload: dict[str, Any] = {}
         self._inventory_items_by_asset_id: dict[str, dict[str, Any]] = {}
         self._pending_confirmation_count = 0
+        self._market_pending_cleanup_failed_count = 0
         self._stop_requested = False
         self._stop_reason: str | None = None
         self._case_open_guadao_limit_notified = False
@@ -596,7 +599,12 @@ class ExecutionEngine:
     def run(self, *, once: bool = False) -> None:
         self._refresh_all_account_cookies_on_startup()
         while True:
-            self.run_once(wait_for_cycle=True)
+            try:
+                self.run_once(wait_for_cycle=True)
+            except C5GameError as exc:
+                if once or not is_retryable_c5_network_error(exc):
+                    raise
+                print(f"[警告] C5 网络临时断开，本轮跳过，下一轮继续: {exc}")
             if self._stop_requested:
                 if self._stop_reason:
                     print(f"[停止] {self._stop_reason}")
@@ -607,6 +615,7 @@ class ExecutionEngine:
 
     def run_once(self, *, wait_for_cycle: bool = True) -> None:
         self._pending_confirmation_count = 0
+        self._market_pending_cleanup_failed_count = 0
         self._steam_market_validated_accounts = set()
         self._sync_assets()
         if not getattr(self, "_recent_rebuy_delivery_failures_checked", False):
@@ -666,6 +675,11 @@ class ExecutionEngine:
             print(
                 f"[提醒] {self._pending_confirmation_count} 件物品待 Steam Guard 确认，"
                 "请运行: python main.py steam confirm"
+            )
+        if self._market_pending_cleanup_failed_count > 0:
+            print(
+                f"[提醒] {self._market_pending_cleanup_failed_count} 件 Steam 网页待确认挂单无法自动撤下，"
+                "请在 Steam 市场等待确认列表手动撤下；此状态运行 steam confirm 通常无效"
             )
 
     def _pool_names_for_strategy_scan(self, pool_names: list[str]) -> list[str]:
@@ -1285,8 +1299,15 @@ class ExecutionEngine:
         )
         confirmation_note["confirmationSource"] = "sellitem_pending_confirmation"
         confirmation_note["sellitemPendingMessage"] = message
-        op_status = "listed" if status_after == POOL_STATUS_LISTED else POOL_STATUS_LISTING_PENDING
-        asset_status = "listed" if status_after == POOL_STATUS_LISTED else "listing_pending"
+        if status_after == POOL_STATUS_LISTED:
+            op_status = "listed"
+            asset_status = "listed"
+        elif status_after == POOL_STATUS_HOLDING and confirmation_note.get("confirmationStatus") == "market_pending_removed":
+            op_status = "canceled"
+            asset_status = "available"
+        else:
+            op_status = POOL_STATUS_LISTING_PENDING
+            asset_status = "listing_pending"
         note_dict = {
             "assetId": asset_id,
             "marketHashName": candidate.market_hash_name,
@@ -1321,8 +1342,12 @@ class ExecutionEngine:
                 note=note,
             )
             self.db.update_pool_operation(op_id, status=op_status, note=note)
-        self.db.set_pool_status(candidate.market_hash_name, status_after)
         self.db.set_asset_status(asset_id, asset_status)
+        if op_status == "canceled":
+            if not self._has_other_open_guadao_operation(candidate.market_hash_name, exclude_op_id=op_id):
+                self.db.set_pool_status(candidate.market_hash_name, POOL_STATUS_HOLDING)
+        else:
+            self.db.set_pool_status(candidate.market_hash_name, status_after)
         if status_after == POOL_STATUS_LISTING_PENDING and client is not None and op_id:
             listing_id = str(note_dict.get("listingId") or "").strip()
             sale_receipt = self._lookup_steam_sale_receipt(client, listing_id)
@@ -2180,6 +2205,8 @@ class ExecutionEngine:
                                 f"Steam挂价 CNY {decision.list_price:.2f} | "
                                 "状态: Steam 已返回待令牌确认，已自动确认并验证为活跃挂单"
                             )
+                        elif status_after == POOL_STATUS_HOLDING:
+                            pass
                         else:
                             print(
                                 f"[上架待确认] {candidate.market_hash_name} | "
@@ -2188,8 +2215,9 @@ class ExecutionEngine:
                                 f"Steam挂价 CNY {decision.list_price:.2f} | "
                                 "状态: Steam 已返回待令牌确认，已尝试自动确认，仍需继续追踪"
                             )
-                        list_count += 1
-                        wait_before_next_listing = True
+                        if status_after != POOL_STATUS_HOLDING:
+                            list_count += 1
+                            wait_before_next_listing = True
                         continue
                     if str(asset_id) not in defer_logged_asset_ids:
                         local_retry_at = defer_state.deferred_until.astimezone(timezone(timedelta(hours=8)))
@@ -2236,6 +2264,8 @@ class ExecutionEngine:
                                 f"Steam挂价 CNY {decision.list_price:.2f} | "
                                 "状态: Steam 已返回待令牌确认，已自动确认并验证为活跃挂单"
                             )
+                        elif status_after == POOL_STATUS_HOLDING:
+                            pass
                         else:
                             print(
                                 f"[上架待确认] {candidate.market_hash_name} | "
@@ -2244,8 +2274,9 @@ class ExecutionEngine:
                                 f"Steam挂价 CNY {decision.list_price:.2f} | "
                                 "状态: Steam 已返回待令牌确认，已尝试自动确认，仍需继续追踪"
                             )
-                        list_count += 1
-                        wait_before_next_listing = True
+                        if status_after != POOL_STATUS_HOLDING:
+                            list_count += 1
+                            wait_before_next_listing = True
                         continue
                     if _is_transient_listing_error(exc):
                         backoff_until = self._set_listing_account_backoff(client)
@@ -2295,11 +2326,18 @@ class ExecutionEngine:
                     account=selected_account,
                 )
 
-                op_status = "listed" if status_after == POOL_STATUS_LISTED else POOL_STATUS_LISTING_PENDING
-                asset_status = "listed" if status_after == POOL_STATUS_LISTED else "listing_pending"
-                self.db.set_pool_status(candidate.market_hash_name, status_after)
-                self.db.set_asset_status(asset_id, asset_status)
-                status_map[candidate.market_hash_name] = status_after
+                if status_after == POOL_STATUS_LISTED:
+                    op_status = "listed"
+                    asset_status = "listed"
+                elif (
+                    status_after == POOL_STATUS_HOLDING
+                    and confirmation_note.get("confirmationStatus") == "market_pending_removed"
+                ):
+                    op_status = "canceled"
+                    asset_status = "available"
+                else:
+                    op_status = POOL_STATUS_LISTING_PENDING
+                    asset_status = "listing_pending"
 
                 note = _build_note(
                     {
@@ -2324,6 +2362,14 @@ class ExecutionEngine:
                     note=note,
                 )
                 self.db.update_pool_operation(op_id, status=op_status)
+                self.db.set_asset_status(asset_id, asset_status)
+                if op_status == "canceled":
+                    if not self._has_other_open_guadao_operation(candidate.market_hash_name, exclude_op_id=op_id):
+                        self.db.set_pool_status(candidate.market_hash_name, POOL_STATUS_HOLDING)
+                    status_map[candidate.market_hash_name] = POOL_STATUS_HOLDING
+                else:
+                    self.db.set_pool_status(candidate.market_hash_name, status_after)
+                    status_map[candidate.market_hash_name] = status_after
                 if status_after == POOL_STATUS_LISTED:
                     print(
                         f"[上架] {candidate.market_hash_name} | "
@@ -2333,6 +2379,8 @@ class ExecutionEngine:
                         f"Steam挂价 CNY {decision.list_price:.2f} | "
                         f"预计到手 CNY {decision.list_price * self.config.steam_net_factor:.2f}"
                     )
+                elif status_after == POOL_STATUS_HOLDING:
+                    pass
                 else:
                     print(
                         f"[上架待确认] {candidate.market_hash_name} | "
@@ -2343,8 +2391,9 @@ class ExecutionEngine:
                         f"预计到手 CNY {decision.list_price * self.config.steam_net_factor:.2f} | "
                         f"状态: Steam Guard 未确认，未计为真实活跃挂单"
                     )
-                list_count += 1
-                wait_before_next_listing = True
+                if status_after != POOL_STATUS_HOLDING:
+                    list_count += 1
+                    wait_before_next_listing = True
 
         return list_count
 
@@ -2502,8 +2551,36 @@ class ExecutionEngine:
                             else "not_found"
                         )
                         retry_note["confirmationRetryCount"] = confirmation_retry_count
+                    pending_market_listing = self._pending_market_confirmation_listing(
+                        active_client,
+                        listing_id=listing_id,
+                        asset_id=asset_id,
+                    )
+                    if pending_market_listing is not None:
+                        pending_listing_id = str(getattr(pending_market_listing, "listing_id", "") or "").strip()
+                        retry_note["listingId"] = pending_listing_id or retry_note.get("listingId")
+                        retry_note["marketPendingListingId"] = pending_listing_id
+                        retry_note["confirmationRetryStatus"] = "market_pending_visible"
+                        retry_note["confirmationMessage"] = (
+                            "Steam market mylistings shows this listing waiting for confirmation, "
+                            "but mobileconf returned no confirmation"
+                        )
+                        removed, remove_error = self._remove_market_pending_confirmation_listing(
+                            active_client,
+                            pending_market_listing,
+                        )
+                        if removed:
+                            retry_note["marketPendingRemovedAt"] = utc_now_iso()
+                            self._release_removed_market_pending_listing(op, retry_note)
+                            continue
+                        retry_note["confirmationStatus"] = "market_pending_remove_failed"
+                        retry_note["confirmationRetryMessage"] = (
+                            f"automatic remove failed: {remove_error}"
+                        )
+                        self._market_pending_cleanup_failed_count += 1
                     if (
                         confirmation_retry_error is None
+                        and pending_market_listing is None
                         and (confirmation_retry_count or 0) <= 0
                         and self._pending_listing_asset_is_relistable(op)
                     ):
@@ -2560,6 +2637,57 @@ class ExecutionEngine:
                 return listing_id
         return None
 
+    def _pending_market_confirmation_listing(
+        self,
+        client: SteamMarketClient | None,
+        *,
+        listing_id: str,
+        asset_id: str,
+    ) -> Any | None:
+        if not client:
+            return None
+        loader = getattr(client, "list_confirmation_pending_listings", None)
+        if not callable(loader):
+            return None
+        expected_listing_id = str(listing_id or "").strip()
+        expected_asset_id = str(asset_id or "").strip()
+        if not expected_listing_id and not expected_asset_id:
+            return None
+        try:
+            pending_listings = loader()
+        except Exception as exc:
+            print(f"[警告] 获取 Steam 待确认挂单列表失败: {exc}")
+            return None
+        for listing in pending_listings:
+            pending_listing_id = str(getattr(listing, "listing_id", "") or "").strip()
+            pending_asset_id = str(getattr(listing, "asset_id", "") or "").strip()
+            if expected_listing_id and pending_listing_id == expected_listing_id:
+                return listing
+            if expected_asset_id and pending_asset_id == expected_asset_id:
+                return listing
+        return None
+
+    def _remove_market_pending_confirmation_listing(
+        self,
+        client: SteamMarketClient | None,
+        listing: Any,
+    ) -> tuple[bool, str | None]:
+        if not client:
+            return False, "missing Steam client"
+        listing_id = str(getattr(listing, "listing_id", "") or "").strip()
+        if not listing_id:
+            return False, "missing listing id"
+        remover = getattr(client, "remove_listing", None)
+        if not callable(remover):
+            return False, "Steam client does not support remove_listing"
+        try:
+            removed = bool(remover(listing_id))
+        except Exception as exc:
+            return False, str(exc)
+        if not removed:
+            return False, "Steam remove_listing returned false"
+        return True, None
+
     def _listing_is_active(
         self,
         *,
@@ -2598,6 +2726,13 @@ class ExecutionEngine:
     def _pending_listing_asset_is_relistable(self, op: Any) -> bool:
         asset_id = str(op["asset_id"] or "").strip()
         if not asset_id:
+            return False
+        note = _read_note(op["note"])
+        if (
+            note.get("sellitemPendingMessage")
+            or note.get("marketPendingListingId")
+            or note.get("confirmationStatus") in {"market_pending_visible", "market_pending_remove_failed"}
+        ):
             return False
         created_at = _parse_iso(op["created_at"])
         if created_at and (_now_utc() - created_at).total_seconds() < self._guadao_wait_seconds():
@@ -2647,6 +2782,26 @@ class ExecutionEngine:
         print(
             f"[挂单待确认失效] {op['market_hash_name']} | asset={asset_id or '-'} | "
             "未找到令牌确认/活跃挂单/卖出回执，且资产已重新可交易；已释放旧记录，下轮可重新上架"
+        )
+
+    def _release_removed_market_pending_listing(self, op: Any, note: dict[str, Any]) -> None:
+        asset_id = str(op["asset_id"] or "").strip()
+        listing_id = str(note.get("marketPendingListingId") or note.get("listingId") or "").strip()
+        note["needsConfirmation"] = False
+        note["confirmationStatus"] = "market_pending_removed"
+        note["marketPendingRemovedAt"] = note.get("marketPendingRemovedAt") or utc_now_iso()
+        self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
+        if asset_id:
+            self.db.set_asset_status(asset_id, "available")
+        if not self._has_other_open_guadao_operation(
+            op["market_hash_name"],
+            exclude_op_id=int(op["id"]),
+        ):
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+        print(
+            f"[挂单待确认清理] {op['market_hash_name']} | asset={asset_id or '-'} | "
+            f"listing={listing_id or '-'} | "
+            "Steam 网页待确认挂单已撤下，资产已释放，下轮可重新上架"
         )
 
     def _backfill_listing_ids(self, *, client: SteamMarketClient | None = None) -> int:
@@ -2740,6 +2895,44 @@ class ExecutionEngine:
             return note, POOL_STATUS_LISTING_PENDING
 
         if confirmed_count <= 0:
+            pending_market_listing = self._pending_market_confirmation_listing(
+                active_client,
+                listing_id=listing_id,
+                asset_id=asset_id,
+            )
+            if pending_market_listing is not None:
+                pending_listing_id = str(getattr(pending_market_listing, "listing_id", "") or "").strip()
+                note["listingId"] = pending_listing_id or listing_id
+                note["marketPendingListingId"] = pending_listing_id
+                note["confirmationStatus"] = "market_pending_visible"
+                note["confirmationMessage"] = (
+                    "Steam market mylistings shows this listing waiting for confirmation, "
+                    "but mobileconf returned no confirmation"
+                )
+                removed, remove_error = self._remove_market_pending_confirmation_listing(
+                    active_client,
+                    pending_market_listing,
+                )
+                if removed:
+                    note["needsConfirmation"] = False
+                    note["confirmationStatus"] = "market_pending_removed"
+                    note["marketPendingRemovedAt"] = utc_now_iso()
+                    print(
+                        f"[挂单待确认清理] {market_hash_name} | asset={asset_id} | "
+                        f"listing={pending_listing_id or '-'} | "
+                        "Steam 网页存在待确认挂单但移动确认列表为空，已自动撤下并释放资产"
+                    )
+                    return note, POOL_STATUS_HOLDING
+                note["confirmationStatus"] = "market_pending_remove_failed"
+                note["confirmationMessage"] = (
+                    f"{note['confirmationMessage']}; automatic remove failed: {remove_error}"
+                )
+                self._market_pending_cleanup_failed_count += 1
+                print(
+                    f"[提醒] Steam 网页待确认挂单无法自动撤下 | {market_hash_name} | "
+                    f"asset={asset_id} | listing={pending_listing_id or '-'} | error={remove_error}"
+                )
+                return note, POOL_STATUS_LISTING_PENDING
             note["confirmationStatus"] = "not_found"
             note["confirmationMessage"] = "no pending Steam Guard confirmation found"
             self._pending_confirmation_count += 1
@@ -3890,6 +4083,7 @@ class ExecutionEngine:
             )
             if result.reason in (
                 "steam_crashed",
+                "c5_network_error",
                 "ratio_no_longer_profitable",
                 "no_matching_listing",
             ):
@@ -3918,6 +4112,7 @@ class ExecutionEngine:
                             "listingRatioNow": result.listing_ratio_now,
                             "noMatchingSince": no_matching_since.isoformat() if no_matching_since else None,
                             "c5OutTradeNo": getattr(result, "out_trade_no", None),
+                            "c5ErrorPayload": getattr(result, "payload", None),
                         }
                     ),
                 )

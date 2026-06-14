@@ -33,15 +33,7 @@ from cs2_assistant.clients import (
     SteamMarketClient,
 )
 from cs2_assistant.clients.steam_market import SteamMarketError
-from cs2_assistant.config import (
-    NETWORK_CONFIG_PATH,
-    PROJECT_ROOT,
-    Settings,
-    apply_proxy_mode,
-    load_network_proxy_mode,
-    load_settings,
-    save_network_proxy_mode,
-)
+from cs2_assistant.config import PROJECT_ROOT, Settings, load_settings
 from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
@@ -1565,27 +1557,6 @@ def cmd_notify_t_profit(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Global config commands
-# ---------------------------------------------------------------------------
-
-
-def cmd_config_proxy(args: argparse.Namespace) -> int:
-    if args.mode:
-        mode = apply_proxy_mode(args.mode)
-        save_network_proxy_mode(mode)
-        print(f"网络代理模式已保存: {mode}")
-    else:
-        mode = apply_proxy_mode(load_network_proxy_mode())
-        print(f"当前网络代理模式: {mode}")
-    if mode == "none":
-        print("含义: 不使用系统/环境代理，C5 和 Steam 请求直接连接。")
-    else:
-        print("含义: 使用系统/环境代理，例如 HTTP_PROXY / HTTPS_PROXY。")
-    print(f"配置文件: {NETWORK_CONFIG_PATH}")
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Pool / strategy commands
 # ---------------------------------------------------------------------------
 
@@ -2179,6 +2150,95 @@ def _is_balance_insufficient_rebuy_note(note: dict[str, Any]) -> bool:
     return "70001" in failed_reason or "余额不足" in failed_reason or "insufficient balance" in failed_reason.lower()
 
 
+def _load_successful_rebuy_source_ids(
+    db: Database,
+    *,
+    completed_at_lte: str | None = None,
+) -> set[int]:
+    params: list[Any] = []
+    completed_filter = ""
+    if completed_at_lte:
+        completed_filter = " AND completed_at IS NOT NULL AND completed_at <= ?"
+        params.append(completed_at_lte)
+    rows = db.conn.execute(
+        f"""
+        SELECT note
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+          AND status = 'completed'
+          {completed_filter}
+        """,
+        tuple(params),
+    ).fetchall()
+    source_ids: set[int] = set()
+    for row in rows:
+        note = _read_note_dict(row["note"])
+        c5_order_id = str(note.get("c5OrderId") or "").strip()
+        c5_final_status = str(note.get("c5FinalStatus") or "").strip()
+        if c5_order_id and c5_final_status != "c5_success":
+            continue
+        source_id = safe_int(note.get("sourceSellOperationId"))
+        if source_id is not None:
+            source_ids.add(source_id)
+    return source_ids
+
+
+def _load_balance_insufficient_rebuy_source_ids(
+    db: Database,
+    *,
+    completed_at_lte: str | None = None,
+) -> set[int]:
+    rows = db.conn.execute(
+        """
+        SELECT note, created_at, completed_at
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+        """
+    ).fetchall()
+    source_ids: set[int] = set()
+    for row in rows:
+        if completed_at_lte:
+            op_time = str(row["completed_at"] or row["created_at"] or "")
+            if op_time and op_time > completed_at_lte:
+                continue
+        note = _read_note_dict(row["note"])
+        if not _is_balance_insufficient_rebuy_note(note):
+            continue
+        source_id = safe_int(note.get("sourceSellOperationId"))
+        if source_id is not None:
+            source_ids.add(source_id)
+    return source_ids
+
+
+def _sell_steam_report_row(sell: Any, steam_net_factor: float) -> dict[str, Any] | None:
+    sell_note = _read_note_dict(sell["note"])
+    steam_gross = (
+        safe_float(sell_note.get("steamListPrice"))
+        or safe_float(sell["actual_price"])
+        or safe_float(sell["expected_price"])
+    )
+    if steam_gross is None or steam_gross <= 0:
+        return None
+    steam_net = _steam_seller_net_from_notes(
+        steam_gross=steam_gross,
+        steam_net_factor=steam_net_factor,
+        sell_note=sell_note,
+    )
+    if steam_net is None or steam_net <= 0:
+        return None
+    return {
+        "completedAt": sell["completed_at"],
+        "completedAtLocal": _to_local_display(sell["completed_at"]),
+        "marketHashName": str(sell["market_hash_name"] or "").strip(),
+        "steamGross": steam_gross,
+        "steamNet": steam_net,
+        "cash": 0.0,
+        "sellOperationId": int(sell["id"]),
+        "assetId": str(sell["asset_id"] or ""),
+        "listingId": str(sell_note.get("listingId") or ""),
+    }
+
+
 def _build_unclosed_sold_steam_summary(
     db: Database,
     *,
@@ -2203,40 +2263,8 @@ def _build_unclosed_sold_steam_summary(
         tuple(params),
     ).fetchall()
 
-    successful_rebuy_rows = db.conn.execute(
-        """
-        SELECT note
-        FROM pool_operations
-        WHERE operation_type = 'rebuy_on_c5'
-          AND status = 'completed'
-        """
-    ).fetchall()
-    closed_sell_ids: set[int] = set()
-    for row in successful_rebuy_rows:
-        note = _read_note_dict(row["note"])
-        c5_order_id = str(note.get("c5OrderId") or "").strip()
-        c5_final_status = str(note.get("c5FinalStatus") or "").strip()
-        if c5_order_id and c5_final_status != "c5_success":
-            continue
-        source_id = safe_int(note.get("sourceSellOperationId"))
-        if source_id is not None:
-            closed_sell_ids.add(source_id)
-
-    ignored_sell_ids: set[int] = set()
-    rebuy_note_rows = db.conn.execute(
-        """
-        SELECT note
-        FROM pool_operations
-        WHERE operation_type = 'rebuy_on_c5'
-        """
-    ).fetchall()
-    for row in rebuy_note_rows:
-        note = _read_note_dict(row["note"])
-        if not _is_balance_insufficient_rebuy_note(note):
-            continue
-        source_id = safe_int(note.get("sourceSellOperationId"))
-        if source_id is not None:
-            ignored_sell_ids.add(source_id)
+    closed_sell_ids = _load_successful_rebuy_source_ids(db)
+    ignored_sell_ids = _load_balance_insufficient_rebuy_source_ids(db)
 
     summary = _empty_guadao_report_summary()
     item_summaries: dict[str, dict[str, Any]] = {}
@@ -2244,27 +2272,9 @@ def _build_unclosed_sold_steam_summary(
         sell_id = int(sell["id"])
         if sell_id in closed_sell_ids or sell_id in ignored_sell_ids:
             continue
-        sell_note = _read_note_dict(sell["note"])
-        steam_gross = (
-            safe_float(sell_note.get("steamListPrice"))
-            or safe_float(sell["actual_price"])
-            or safe_float(sell["expected_price"])
-        )
-        if steam_gross is None or steam_gross <= 0:
+        row = _sell_steam_report_row(sell, steam_net_factor)
+        if row is None:
             continue
-        steam_net = _steam_seller_net_from_notes(
-            steam_gross=steam_gross,
-            steam_net_factor=steam_net_factor,
-            sell_note=sell_note,
-        )
-        if steam_net is None or steam_net <= 0:
-            continue
-        row = {
-            "marketHashName": str(sell["market_hash_name"] or "").strip(),
-            "steamGross": steam_gross,
-            "steamNet": steam_net,
-            "cash": 0.0,
-        }
         _add_guadao_report_row(summary, row)
         item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
         _add_guadao_report_row(item_summary, row)
@@ -2313,32 +2323,9 @@ def _build_sold_steam_time_summary(
     item_summaries: dict[str, dict[str, Any]] = {}
     detail_rows: list[dict[str, Any]] = []
     for sell in sold_rows:
-        sell_note = _read_note_dict(sell["note"])
-        steam_gross = (
-            safe_float(sell_note.get("steamListPrice"))
-            or safe_float(sell["actual_price"])
-            or safe_float(sell["expected_price"])
-        )
-        if steam_gross is None or steam_gross <= 0:
+        row = _sell_steam_report_row(sell, steam_net_factor)
+        if row is None:
             continue
-        steam_net = _steam_seller_net_from_notes(
-            steam_gross=steam_gross,
-            steam_net_factor=steam_net_factor,
-            sell_note=sell_note,
-        )
-        if steam_net is None or steam_net <= 0:
-            continue
-        row = {
-            "completedAt": sell["completed_at"],
-            "completedAtLocal": _to_local_display(sell["completed_at"]),
-            "marketHashName": str(sell["market_hash_name"] or "").strip(),
-            "steamGross": steam_gross,
-            "steamNet": steam_net,
-            "cash": 0.0,
-            "sellOperationId": int(sell["id"]),
-            "assetId": str(sell["asset_id"] or ""),
-            "listingId": str(sell_note.get("listingId") or ""),
-        }
         detail_rows.append(row)
         _add_guadao_report_row(summary, row)
         item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
@@ -2353,6 +2340,60 @@ def _build_sold_steam_time_summary(
         "summary": _finalize_guadao_report_summary(summary),
         "items": finalized_items,
         "details": detail_rows,
+    }
+
+
+def _build_sold_steam_reconciliation_summary(
+    db: Database,
+    *,
+    start_utc: str,
+    end_utc: str,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    params: list[Any] = [start_utc, end_utc]
+    market_filter = ""
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+
+    sold_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'sell_on_steam'
+          AND status = 'sold'
+          AND completed_at IS NOT NULL
+          AND completed_at >= ?
+          AND completed_at <= ?
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    closed_sell_ids = _load_successful_rebuy_source_ids(db, completed_at_lte=end_utc)
+    ignored_sell_ids = _load_balance_insufficient_rebuy_source_ids(db, completed_at_lte=end_utc)
+    closed = _empty_guadao_report_summary()
+    unclosed = _empty_guadao_report_summary()
+    ignored = _empty_guadao_report_summary()
+
+    for sell in sold_rows:
+        row = _sell_steam_report_row(sell, steam_net_factor)
+        if row is None:
+            continue
+        sell_id = int(sell["id"])
+        if sell_id in closed_sell_ids:
+            _add_guadao_report_row(closed, row)
+        elif sell_id in ignored_sell_ids:
+            _add_guadao_report_row(ignored, row)
+        else:
+            _add_guadao_report_row(unclosed, row)
+
+    return {
+        "closed": _finalize_guadao_report_summary(closed),
+        "unclosed": _finalize_guadao_report_summary(unclosed),
+        "ignored": _finalize_guadao_report_summary(ignored),
     }
 
 
@@ -2475,6 +2516,13 @@ def _build_guadao_discount_report(
             steam_net_factor=steam_net_factor,
             market_hash_name=market_hash_name,
         ),
+        "steamSoldReconciliation": _build_sold_steam_reconciliation_summary(
+            db,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            steam_net_factor=steam_net_factor,
+            market_hash_name=market_hash_name,
+        ),
         "closedFromSellOutsideRange": _finalize_guadao_report_summary(closed_from_sell_outside_range),
         "unclosedSoldSteam": _build_unclosed_sold_steam_summary(
             db,
@@ -2527,6 +2575,26 @@ def _print_guadao_discount_report(
         f"Steam面值 {_fmt_cny(steam_sold['steamGross'])} | "
         f"Steam到手 {_fmt_cny(steam_sold['steamNet'])}"
     )
+    reconciliation = report.get("steamSoldReconciliation", {})
+    sold_closed = reconciliation.get("closed", _empty_guadao_report_summary())
+    sold_unclosed = reconciliation.get("unclosed", _empty_guadao_report_summary())
+    sold_ignored = reconciliation.get("ignored", _empty_guadao_report_summary())
+    reconciled_net = (
+        float(sold_closed.get("steamNet") or 0.0)
+        + float(sold_unclosed.get("steamNet") or 0.0)
+        + float(sold_ignored.get("steamNet") or 0.0)
+    )
+    print(
+        "卖出时间对账: "
+        f"已闭环 {sold_closed['count']} 笔 {_fmt_cny(sold_closed['steamNet'])} + "
+        f"本期未闭环 {sold_unclosed['count']} 笔 {_fmt_cny(sold_unclosed['steamNet'])}"
+        + (
+            f" + 排除项 {sold_ignored['count']} 笔 {_fmt_cny(sold_ignored['steamNet'])}"
+            if sold_ignored["count"]
+            else ""
+        )
+        + f" = {_fmt_cny(reconciled_net)}"
+    )
     outside = report.get("closedFromSellOutsideRange", _empty_guadao_report_summary())
     if outside["count"]:
         print(
@@ -2535,7 +2603,7 @@ def _print_guadao_discount_report(
         )
     unclosed_sold = report.get("unclosedSoldSteam", {}).get("summary", _empty_guadao_report_summary())
     print(
-        f"当前未闭环已卖出: {unclosed_sold['count']} 笔 | "
+        f"当前未闭环存量(不按日期过滤): {unclosed_sold['count']} 笔 | "
         f"Steam面值 {_fmt_cny(unclosed_sold['steamGross'])} | "
         f"Steam到手 {_fmt_cny(unclosed_sold['steamNet'])}"
     )
@@ -3104,21 +3172,6 @@ def build_parser() -> argparse.ArgumentParser:
     import_catalog = subparsers.add_parser("import-catalog", help="导入本地 SteamDT 基础数据")
     import_catalog.add_argument("--file", help="SteamDT 基础数据 JSON 文件路径")
     import_catalog.set_defaults(handler=cmd_import_catalog)
-
-    config = subparsers.add_parser("config", help="全局运行配置")
-    config_subparsers = config.add_subparsers(dest="config_command", required=True)
-    config_proxy = config_subparsers.add_parser(
-        "proxy",
-        help="查看或设置网络代理模式",
-        description=(
-            "网络代理模式。\n\n"
-            "  system  使用系统/环境代理，例如 HTTP_PROXY / HTTPS_PROXY\n"
-            "  none    不使用代理，C5 和 Steam 请求直接连接"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-    config_proxy.add_argument("mode", nargs="?", choices=["system", "none"])
-    config_proxy.set_defaults(handler=cmd_config_proxy)
 
     catalog = subparsers.add_parser("catalog", help="饰品资料库")
     catalog_subparsers = catalog.add_subparsers(dest="catalog_command", required=True)

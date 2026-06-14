@@ -37,12 +37,10 @@ class FakeC5Client:
 
 
 class ResolveC5SteamIdTestCase(unittest.TestCase):
-    def test_config_proxy_command_is_registered(self) -> None:
+    def test_config_proxy_command_is_removed(self) -> None:
         parser = build_parser()
-        args = parser.parse_args(["config", "proxy", "none"])
-        self.assertEqual("config", args.command)
-        self.assertEqual("proxy", args.config_command)
-        self.assertEqual("none", args.mode)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["config", "proxy", "none"])
 
     def test_prefers_explicit_steam_id(self) -> None:
         client = FakeC5Client({"steamId": "from-api"})
@@ -461,6 +459,15 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertEqual(86.9, report["closedFromSellOutsideRange"]["steamNet"])
         self.assertEqual(1, report["steamSoldInRange"]["summary"]["count"])
         self.assertEqual(173.8, report["steamSoldInRange"]["summary"]["steamNet"])
+        self.assertEqual(0, report["steamSoldReconciliation"]["closed"]["count"])
+        self.assertEqual(1, report["steamSoldReconciliation"]["unclosed"]["count"])
+        self.assertEqual(173.8, report["steamSoldReconciliation"]["unclosed"]["steamNet"])
+        self.assertEqual(
+            report["steamSoldInRange"]["summary"]["steamNet"],
+            report["steamSoldReconciliation"]["closed"]["steamNet"]
+            + report["steamSoldReconciliation"]["unclosed"]["steamNet"]
+            + report["steamSoldReconciliation"]["ignored"]["steamNet"],
+        )
 
     def test_guadao_discount_report_counts_only_confirmed_c5_success_for_new_orders(self) -> None:
         self._add_closed_cycle(

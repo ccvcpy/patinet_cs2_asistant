@@ -558,9 +558,7 @@ class SteamMarketClient:
                 return None
         return None
 
-    def list_active_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
-        payload = self.my_listings(start=start, count=count)
-        listings_raw = payload.get("listings") or {}
+    def _parse_my_listing_rows(self, payload: dict[str, Any], listings_raw: Any) -> list[SteamListing]:
         assets: dict[str, Any] = payload.get("assets") or {}
         if isinstance(listings_raw, dict):
             listing_items = list(listings_raw.items())
@@ -617,6 +615,14 @@ class SteamMarketClient:
                 )
             )
         return parsed
+
+    def list_active_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
+        payload = self.my_listings(start=start, count=count)
+        return self._parse_my_listing_rows(payload, payload.get("listings") or {})
+
+    def list_confirmation_pending_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
+        payload = self.my_listings(start=start, count=count)
+        return self._parse_my_listing_rows(payload, payload.get("listings_to_confirm") or [])
 
     def fetch_confirmations(self) -> list[dict[str, Any]]:
         if not self.identity_secret or not self.device_id:

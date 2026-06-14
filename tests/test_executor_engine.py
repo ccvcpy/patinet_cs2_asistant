@@ -44,8 +44,11 @@ class FakeSteamClient:
         self.buy_calls: list[dict[str, object]] = []
         self.active_listing_ids: set[str] = set()
         self.active_listing_assets: dict[str, str] = {}
+        self.pending_listing_assets: dict[str, str] = {}
         self.sale_receipts: dict[str, dict[str, object]] = {}
         self.sale_receipts_by_asset: dict[str, dict[str, object]] = {}
+        self.removed_listing_ids: list[str] = []
+        self.remove_listing_should_fail = False
         self.sell_calls: list[dict[str, object]] = []
         self.trade_url = "https://steamcommunity.com/tradeoffer/new/?partner=39734272&token=abc"
         self.confirm_calls = 0
@@ -124,6 +127,26 @@ class FakeSteamClient:
             for asset_id, listing_id in sorted(self.active_listing_assets.items())
         )
         return listings
+
+    def list_confirmation_pending_listings(self) -> list[object]:
+        class Listing:
+            def __init__(self, listing_id: str, asset_id: str | None = None) -> None:
+                self.listing_id = listing_id
+                self.asset_id = asset_id
+
+        return [
+            Listing(listing_id, asset_id)
+            for asset_id, listing_id in sorted(self.pending_listing_assets.items())
+        ]
+
+    def remove_listing(self, listing_id: str) -> bool:
+        if self.remove_listing_should_fail:
+            return False
+        self.removed_listing_ids.append(listing_id)
+        for asset_id, pending_listing_id in list(self.pending_listing_assets.items()):
+            if pending_listing_id == listing_id:
+                del self.pending_listing_assets[asset_id]
+        return True
 
     def find_sale_receipt(self, listing_id: str) -> dict[str, object] | None:
         return self.sale_receipts.get(listing_id)
@@ -244,6 +267,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.engine._last_inventory_payload = {}
         self.engine._inventory_items_by_asset_id = {}
         self.engine._pending_confirmation_count = 0
+        self.engine._market_pending_cleanup_failed_count = 0
 
         self.db.upsert_pool_item("Revolution Case", 1, status=POOL_STATUS_HOLDING)
         old_asset = {
@@ -935,6 +959,31 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIn('"sourceSellOperationId": 1', pending[0]["note"])
         self.assertEqual(1, self.engine._open_case_guadao_count())
 
+    def test_c5_network_error_rebuy_stays_pending_for_retry(self) -> None:
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=1.23,
+            note='{"sourceSellOperationId": 1, "steamListPrice": 2.12}',
+        )
+        result = RebuyResult(
+            False,
+            True,
+            "c5_network_error",
+            payload={"error": "C5 request failed: connection reset"},
+        )
+
+        with patch("cs2_assistant.services.executor_engine.execute_rebuy", return_value=result):
+            rebought = self.engine._execute_rebuys()
+
+        self.assertEqual(0, rebought)
+        row = self.db.conn.execute("SELECT status, note FROM pool_operations WHERE id = ?", (op_id,)).fetchone()
+        assert row is not None
+        self.assertEqual("pending", row["status"])
+        self.assertIn('"lastSkipReason": "c5_network_error"', row["note"])
+        self.assertIn('"c5ErrorPayload": {"error": "C5 request failed: connection reset"}', row["note"])
+
     def test_no_matching_rebuy_timeout_does_not_stop_executor(self) -> None:
         op_id = self.db.add_pool_operation(
             market_hash_name="Revolution Case",
@@ -1446,6 +1495,61 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("available", asset["status"])
         pool_row = self.db.list_pool_items(status=POOL_STATUS_HOLDING)[0]
         self.assertEqual("Revolution Case", pool_row["market_hash_name"])
+
+    def test_pending_confirmation_removes_market_pending_listing_when_mobileconf_empty(self) -> None:
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"needsConfirmation":true,"confirmationStatus":"not_found"}',
+        )
+        self.db.update_pool_operation(op_id, status=POOL_STATUS_LISTING_PENDING)
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTING_PENDING)
+        self.db.set_asset_status("asset-old", "listing_pending")
+        self.engine.steam_client.confirm_result = 0
+        self.engine.steam_client.pending_listing_assets["asset-old"] = "pending-listing-1"
+
+        updated = self.engine._refresh_pending_listing_confirmations()
+
+        self.assertEqual(0, updated)
+        self.assertEqual(["pending-listing-1"], self.engine.steam_client.removed_listing_ids)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        self.assertEqual("canceled", sell_op["status"])
+        self.assertIn('"confirmationStatus": "market_pending_removed"', sell_op["note"])
+        self.assertIn('"marketPendingListingId": "pending-listing-1"', sell_op["note"])
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("available", asset["status"])
+
+    def test_sellitem_pending_message_is_not_released_by_c5_relistable_state(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 1
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"needsConfirmation":true,"confirmationStatus":"not_found","sellitemPendingMessage":"already listed and waiting confirmation"}',
+        )
+        old_created_at = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        self.db.conn.execute("UPDATE pool_operations SET created_at = ? WHERE id = ?", (old_created_at, op_id))
+        self.db.conn.commit()
+        self.db.update_pool_operation(op_id, status=POOL_STATUS_LISTING_PENDING)
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTING_PENDING)
+        self.db.set_asset_status("asset-old", "listing_pending")
+        self.engine.steam_client.confirm_result = 0
+
+        updated = self.engine._refresh_pending_listing_confirmations()
+
+        self.assertEqual(0, updated)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        self.assertEqual(POOL_STATUS_LISTING_PENDING, sell_op["status"])
+        self.assertIn('"confirmationRetryStatus": "not_found"', sell_op["note"])
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("listing_pending", asset["status"])
 
     def test_unverified_listed_operation_is_repaired_to_listing_pending_not_sold(self) -> None:
         self.engine.config.listing_check_interval_minutes = 0

@@ -157,6 +157,53 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         call = client.quick_buy_calls[0]
         self.assertAlmostEqual(1.30 * 1.01, float(call["max_price"]), places=6)
 
+    def test_execute_rebuy_treats_c5_price_network_error_as_retryable(self) -> None:
+        class NetworkErrorC5Client(FakeC5Client):
+            def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
+                raise C5GameError("C5 request failed: connection reset")
+
+        client = NetworkErrorC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.23,
+            expected_steam_list_price=2.12,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.skipped)
+        self.assertEqual("c5_network_error", result.reason)
+        self.assertEqual([], client.quick_buy_calls)
+
+    def test_execute_rebuy_treats_c5_buy_network_error_as_retryable(self) -> None:
+        class NetworkErrorC5Client(FakeC5Client):
+            def quick_buy(self, **kwargs: object) -> dict[str, object]:
+                self.quick_buy_calls.append(dict(kwargs))
+                raise C5GameError("C5 request failed: connection reset")
+
+        client = NetworkErrorC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.23,
+            expected_steam_list_price=2.12,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.skipped)
+        self.assertEqual("c5_network_error", result.reason)
+        self.assertEqual(1, len(client.quick_buy_calls))
+
     def test_execute_rebuy_treats_c5_1317_as_retryable_no_matching_listing(self) -> None:
         class NoMatchC5Client(FakeC5Client):
             def quick_buy(self, **kwargs: object) -> dict[str, object]:

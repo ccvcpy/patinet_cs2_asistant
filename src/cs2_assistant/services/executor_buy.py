@@ -34,6 +34,10 @@ def _parse_c5_error(exc: Exception) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def is_retryable_c5_network_error(exc: Exception) -> bool:
+    return str(exc).strip().startswith("C5 request failed:")
+
+
 def fetch_c5_price(client: C5GameClient, market_hash_name: str, app_id: int) -> float | None:
     data = client.price_batch([market_hash_name], app_id=app_id)
     payload = data.get(market_hash_name)
@@ -57,7 +61,19 @@ def execute_rebuy(
     trade_url: str | None = None,
     use_live_price_as_max: bool = False,
 ) -> RebuyResult:
-    live_price = fetch_c5_price(client, market_hash_name, app_id)
+    try:
+        live_price = fetch_c5_price(client, market_hash_name, app_id)
+    except C5GameError as exc:
+        if is_retryable_c5_network_error(exc):
+            return RebuyResult(
+                False,
+                True,
+                "c5_network_error",
+                payload={"error": str(exc)},
+            )
+        return RebuyResult(False, False, f"c5_api_error: {exc}", payload=_parse_c5_error(exc))
+    except Exception as exc:
+        return RebuyResult(False, False, f"c5_api_error: {exc}", payload={"error": str(exc)})
     if live_price is None:
         return RebuyResult(False, False, "missing_price")
 
@@ -123,6 +139,19 @@ def execute_rebuy(
         )
     except C5GameError as exc:
         payload = _parse_c5_error(exc)
+        if payload is None and is_retryable_c5_network_error(exc):
+            return RebuyResult(
+                False,
+                True,
+                "c5_network_error",
+                actual_price=live_price,
+                max_price=max_price,
+                steam_price_now=steam_price_now,
+                steam_reference_price=steam_reference_price,
+                listing_ratio_now=listing_ratio_now,
+                payload={"error": str(exc)},
+                out_trade_no=out_trade_no,
+            )
         if payload and payload.get("errorCode") in {1317, 1014452}:
             return RebuyResult(
                 False,
