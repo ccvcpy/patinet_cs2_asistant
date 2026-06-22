@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import requests
@@ -8,6 +9,10 @@ import requests
 
 class C5GameError(RuntimeError):
     pass
+
+
+def _redact_app_key(text: str) -> str:
+    return re.sub(r"(app-key=)[^&\s]+", r"\1<redacted>", text)
 
 
 class C5GameClient:
@@ -41,7 +46,7 @@ class C5GameClient:
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise C5GameError(f"C5 request failed: {exc}") from exc
+            raise C5GameError(f"C5 request failed: {_redact_app_key(str(exc))}") from exc
 
         try:
             payload = response.json()
@@ -55,6 +60,14 @@ class C5GameClient:
     def steam_info(self) -> dict[str, Any]:
         data = self._request("GET", "/merchant/account/v1/steamInfo")
         return dict(data or {})
+
+    def account_balance(self) -> dict[str, Any]:
+        info = self.steam_info()
+        return {
+            "balance": info.get("balance"),
+            "uid": info.get("uid"),
+            "nickname": info.get("nickname"),
+        }
 
     def inventory(self, steam_id: str, app_id: int = 730) -> dict[str, Any]:
         data = self._request("GET", f"/merchant/inventory/v2/{steam_id}/{app_id}")

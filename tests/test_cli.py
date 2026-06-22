@@ -1,9 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +38,74 @@ class FakeC5Client:
     def steam_info(self) -> dict:
         return self.payload
 
+
+class BalanceCommandTestCase(unittest.TestCase):
+    def test_top_level_balance_command_is_removed(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["balance"])
+
+    def test_account_balance_summarizes_all_accounts_without_executor(self) -> None:
+        from cs2_assistant import cli
+
+        class FakeSettings:
+            steam_market_base_url = "https://steam.test"
+
+        class FakeAccount:
+            def __init__(self, name: str, steam_id64: str | None, cookies: str | None) -> None:
+                self.id = name
+                self.name = name
+                self.steam_id64 = steam_id64
+                self.cookies = cookies
+                self.identity_secret = None
+                self.device_id = None
+
+        accounts = [
+            FakeAccount("a", "76561198000000001", "sessionid=s1; steamLoginSecure=76561198000000001%7C%7Ct"),
+            FakeAccount("b", "76561198000000002", "sessionid=s2; steamLoginSecure=76561198000000002%7C%7Ct"),
+            FakeAccount("missing", None, None),
+        ]
+
+        class FakeStore:
+            def list_accounts(self) -> list[FakeAccount]:
+                return accounts
+
+        wallet_by_steam_id = {
+            "76561198000000001": {"balance": 10.0, "delayed_balance": 1.25, "currency": "CNY"},
+            "76561198000000002": {"balance": 20.5, "delayed_balance": 0.0, "currency": "CNY"},
+        }
+
+        class FakeSteam:
+            def __init__(self, **kwargs: object) -> None:
+                self.steam_id64 = str(kwargs["steam_id64"])
+
+            def wallet_balance(self) -> dict:
+                return wallet_by_steam_id[self.steam_id64]
+
+        def explode_executor(*args: object, **kwargs: object) -> object:
+            raise AssertionError("account balance must not instantiate ExecutionEngine")
+
+        args = build_parser().parse_args(["account", "balance"])
+        with mock.patch.object(cli, "load_settings", return_value=FakeSettings()):
+            with mock.patch.object(cli, "_account_store", return_value=FakeStore()):
+                with mock.patch.object(cli, "SteamMarketClient", FakeSteam):
+                    with mock.patch.object(cli, "ExecutionEngine", side_effect=explode_executor):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output):
+                            code = args.handler(args)
+
+        self.assertEqual(0, code)
+        rendered = output.getvalue()
+        self.assertIn("g_rgWalletInfo", rendered)
+        self.assertIn("a", rendered)
+        self.assertIn("10.00", rendered)
+        self.assertIn("1.25", rendered)
+        self.assertIn("b", rendered)
+        self.assertIn("20.50", rendered)
+        self.assertIn("missing", rendered)
+        self.assertIn("skipped", rendered)
+        self.assertIn("TOTAL", rendered)
+        self.assertIn("30.50", rendered)
+        self.assertIn("31.75", rendered)
 
 class ResolveC5SteamIdTestCase(unittest.TestCase):
     def test_config_proxy_command_is_removed(self) -> None:
@@ -272,6 +343,12 @@ class ParserTestCase(unittest.TestCase):
         self.assertEqual("2026-05-10 08:00:00", start.strftime("%Y-%m-%d %H:%M:%S"))
         self.assertEqual("2026-05-10 17:59:59", end.strftime("%Y-%m-%d %H:%M:%S"))
 
+    def test_parse_report_boundary_expands_minute_precision(self) -> None:
+        start = _parse_report_boundary("2026-05-10T08:15", is_end=False)
+        end = _parse_report_boundary("2026-05-10T17:23", is_end=True)
+        self.assertEqual("2026-05-10 08:15:00", start.strftime("%Y-%m-%d %H:%M:%S"))
+        self.assertEqual("2026-05-10 17:23:59", end.strftime("%Y-%m-%d %H:%M:%S"))
+
     def test_pool_sync_command_is_removed(self) -> None:
         parser = build_parser()
         with self.assertRaises(SystemExit):
@@ -358,6 +435,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
                     "listingId": f"listing-{market_hash_name}",
                     "rebuyPrice": cash,
                     "steamListPrice": steam_price,
+                    "steamSoldAt": "2026-01-01T00:00:00+00:00",
                     "strategy": "guadao",
                 }
             ),
@@ -412,7 +490,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
             operation_type="sell_on_steam",
             expected_price=100.0,
             asset_id="asset-old",
-            note=json.dumps({"steamListPrice": 100.0}),
+            note=json.dumps({"steamListPrice": 100.0, "steamSoldAt": "2026-05-31T17:00:00+00:00"}),
         )
         self.db.update_pool_operation(old_sell_id, status="sold", actual_price=100.0)
         self._set_completed_at(old_sell_id, "2026-05-31T17:00:00+00:00")
@@ -432,7 +510,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
             operation_type="sell_on_steam",
             expected_price=200.0,
             asset_id="asset-current",
-            note=json.dumps({"steamListPrice": 200.0}),
+            note=json.dumps({"steamListPrice": 200.0, "steamSoldAt": "2026-05-31T18:30:00+00:00"}),
         )
         self.db.update_pool_operation(current_sell_id, status="sold", actual_price=200.0)
         self._set_completed_at(current_sell_id, "2026-05-31T18:30:00+00:00")
@@ -468,6 +546,52 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
             + report["steamSoldReconciliation"]["unclosed"]["steamNet"]
             + report["steamSoldReconciliation"]["ignored"]["steamNet"],
         )
+
+    def test_guadao_discount_report_uses_steam_sold_at_for_wallet_time(self) -> None:
+        early_sell_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=100.0,
+            asset_id="asset-early",
+            note=json.dumps(
+                {
+                    "steamListPrice": 100.0,
+                    "steamSellerNetPrice": 86.9,
+                    "steamSoldAt": "2026-06-22T04:50:00+00:00",
+                }
+            ),
+        )
+        self.db.update_pool_operation(early_sell_id, status="sold", actual_price=100.0)
+        self._set_completed_at(early_sell_id, "2026-06-22T06:30:00+00:00")
+
+        current_sell_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=200.0,
+            asset_id="asset-current",
+            note=json.dumps(
+                {
+                    "steamListPrice": 200.0,
+                    "steamSellerNetPrice": 173.8,
+                    "steamSoldAt": "2026-06-22T06:10:00+00:00",
+                }
+            ),
+        )
+        self.db.update_pool_operation(current_sell_id, status="sold", actual_price=200.0)
+        self._set_completed_at(current_sell_id, "2026-06-22T08:30:00+00:00")
+
+        report = _build_guadao_discount_report(
+            self.db,
+            start_utc="2026-06-22T05:06:00+00:00",
+            end_utc="2026-06-22T07:00:00+00:00",
+            steam_net_factor=0.869,
+        )
+
+        self.assertEqual(1, report["steamSoldInRange"]["summary"]["count"])
+        self.assertEqual(173.8, report["steamSoldInRange"]["summary"]["steamNet"])
+        self.assertEqual(["Revolution Case"], [row["marketHashName"] for row in report["steamSoldInRange"]["items"]])
 
     def test_guadao_discount_report_counts_only_confirmed_c5_success_for_new_orders(self) -> None:
         self._add_closed_cycle(
@@ -607,7 +731,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
                 {
                     "sourceSellOperationId": old_balance_sell_id,
                     "steamListPrice": 400.0,
-                    "failedReason": 'c5_api_error: {"errorCode": 70001, "errorMsg": "余额不足"}',
+                    "failedReason": 'c5_api_error: {"errorCode": 70001, "errorMsg": "浣欓涓嶈冻"}',
                 }
             ),
         )
