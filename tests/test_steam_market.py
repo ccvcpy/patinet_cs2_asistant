@@ -10,9 +10,10 @@ from cs2_assistant.clients.steam_market import SteamMarketClient
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict[str, object], *, status_code: int = 200) -> None:
+    def __init__(self, payload: dict[str, object], *, status_code: int = 200, text: str = "") -> None:
         self._payload = payload
         self.status_code = status_code
+        self.text = text
 
     def json(self) -> dict[str, object]:
         return self._payload
@@ -26,6 +27,44 @@ class _FakeResponse:
 
 
 class SteamMarketClientTests(unittest.TestCase):
+    def test_wallet_balance_parses_market_wallet_info(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+
+        captured: dict[str, object] = {}
+
+        def fake_request(
+            method: str,
+            path: str,
+            *,
+            params: dict[str, object] | None = None,
+            data: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            _allow_retry: bool = True,
+        ) -> _FakeResponse:
+            captured["method"] = method
+            captured["path"] = path
+            return _FakeResponse(
+                {},
+                text=(
+                    '<script>var g_rgWalletInfo = '
+                    '{"wallet_currency":23,"wallet_balance":"2139","wallet_delayed_balance":"0","success":1};'
+                    "</script>"
+                ),
+            )
+
+        client._request = fake_request  # type: ignore[method-assign]
+
+        wallet = client.wallet_balance()
+
+        self.assertEqual("GET", captured["method"])
+        self.assertEqual("/market/", captured["path"])
+        self.assertEqual(21.39, wallet["balance"])
+        self.assertEqual(0.0, wallet["delayed_balance"])
+        self.assertEqual("CNY", wallet["currency"])
+
     def test_sell_item_uses_inventory_referer_and_browser_headers(self) -> None:
         client = SteamMarketClient(
             cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",

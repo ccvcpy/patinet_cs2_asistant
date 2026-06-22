@@ -90,6 +90,49 @@ class SteamListing:
     status: int | None
 
 
+_STEAM_CURRENCY_CODES = {
+    1: "USD",
+    3: "EUR",
+    5: "RUB",
+    6: "PLN",
+    7: "BRL",
+    8: "JPY",
+    9: "NOK",
+    10: "IDR",
+    11: "MYR",
+    12: "PHP",
+    13: "SGD",
+    14: "THB",
+    15: "VND",
+    16: "KRW",
+    17: "TRY",
+    18: "UAH",
+    19: "MXN",
+    20: "CAD",
+    21: "AUD",
+    22: "NZD",
+    23: "CNY",
+    24: "INR",
+    25: "CLP",
+    26: "PEN",
+    27: "COP",
+    28: "ZAR",
+    29: "HKD",
+    30: "TWD",
+    31: "SAR",
+    32: "AED",
+}
+
+
+def _steam_wallet_amount(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return float(Decimal(str(raw)) / Decimal("100"))
+    except Exception:
+        return None
+
+
 class SteamMarketClient:
     def __init__(
         self,
@@ -221,6 +264,30 @@ class SteamMarketClient:
         if match:
             return match.group(0)
         raise SteamMarketError("无法从页面提取交易链接，请确认账号已登录且交易链接已启用")
+
+    def wallet_balance(self) -> dict[str, Any]:
+        response = self._request("GET", "/market/")
+        match = re.search(r"g_rgWalletInfo\s*=\s*(\{.*?\});", response.text, re.S)
+        if not match:
+            raise SteamMarketError("Steam wallet info not found")
+        try:
+            wallet_info = json.loads(match.group(1))
+        except ValueError as exc:
+            raise SteamMarketError("Steam wallet info invalid JSON") from exc
+        safe_currency_id: int | None = None
+        currency_id: int | str | None
+        try:
+            safe_currency_id = int(wallet_info.get("wallet_currency"))
+            currency_id = safe_currency_id
+        except Exception:
+            currency_id = wallet_info.get("wallet_currency")
+        return {
+            "balance": _steam_wallet_amount(wallet_info.get("wallet_balance")),
+            "delayed_balance": _steam_wallet_amount(wallet_info.get("wallet_delayed_balance")),
+            "currency": _STEAM_CURRENCY_CODES.get(safe_currency_id, str(currency_id or "")),
+            "currency_id": currency_id,
+            "raw": wallet_info,
+        }
 
     def remove_listing(self, listing_id: str) -> bool:
         """Cancel a Steam market listing by listing ID."""

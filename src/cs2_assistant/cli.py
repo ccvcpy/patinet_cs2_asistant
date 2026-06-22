@@ -2061,6 +2061,17 @@ def _parse_report_boundary(value: str, *, is_end: bool) -> datetime:
             raise ValueError(f"无效小时: {hour_only_match.group(2)}")
         local_time = time(hour, 59, 59) if is_end else time(hour, 0, 0)
         return datetime.combine(day, local_time, tzinfo=CN_TZ)
+    minute_only_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[T\s](\d{2}):(\d{2})", raw)
+    if minute_only_match:
+        day = datetime.strptime(minute_only_match.group(1), "%Y-%m-%d").date()
+        hour = int(minute_only_match.group(2))
+        minute = int(minute_only_match.group(3))
+        if hour < 0 or hour > 23:
+            raise ValueError(f"无效小时: {minute_only_match.group(2)}")
+        if minute < 0 or minute > 59:
+            raise ValueError(f"无效分钟: {minute_only_match.group(3)}")
+        local_time = time(hour, minute, 59) if is_end else time(hour, minute, 0)
+        return datetime.combine(day, local_time, tzinfo=CN_TZ)
     parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=CN_TZ)
@@ -2081,6 +2092,42 @@ def _to_local_display(value: str | None) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    numeric = safe_float(text)
+    if numeric is not None and re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return datetime.fromtimestamp(float(numeric), timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _sell_steam_sold_at(sell: Any, *, allow_completed_fallback: bool = True) -> datetime | None:
+    note = _read_note_dict(sell["note"])
+    sold_at = _parse_utc_datetime(note.get("steamSoldAt") or note.get("timeSold"))
+    if sold_at is not None:
+        return sold_at
+    if not allow_completed_fallback:
+        return None
+    return _parse_utc_datetime(sell["completed_at"])
 
 
 def _empty_guadao_report_summary() -> dict[str, Any]:
@@ -2226,9 +2273,12 @@ def _sell_steam_report_row(sell: Any, steam_net_factor: float) -> dict[str, Any]
     )
     if steam_net is None or steam_net <= 0:
         return None
+    sold_at = _format_utc_datetime(_sell_steam_sold_at(sell))
     return {
         "completedAt": sell["completed_at"],
         "completedAtLocal": _to_local_display(sell["completed_at"]),
+        "soldAt": sold_at,
+        "soldAtLocal": _to_local_display(sold_at),
         "marketHashName": str(sell["market_hash_name"] or "").strip(),
         "steamGross": steam_gross,
         "steamNet": steam_net,
@@ -2298,13 +2348,73 @@ def _build_sold_steam_time_summary(
     steam_net_factor: float,
     market_hash_name: str | None = None,
 ) -> dict[str, Any]:
-    params: list[Any] = [start_utc, end_utc]
+    start_dt = _parse_utc_datetime(start_utc)
+    end_dt = _parse_utc_datetime(end_utc)
+    params: list[Any] = []
     market_filter = ""
     if market_hash_name:
         market_filter = " AND market_hash_name = ?"
         params.append(market_hash_name)
 
     sold_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'sell_on_steam'
+          AND status = 'sold'
+          AND completed_at IS NOT NULL
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    summary = _empty_guadao_report_summary()
+    item_summaries: dict[str, dict[str, Any]] = {}
+    detail_rows: list[dict[str, Any]] = []
+    for sell in sold_rows:
+        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        if sold_at is None:
+            continue
+        if start_dt is not None and sold_at < start_dt:
+            continue
+        if end_dt is not None and sold_at > end_dt:
+            continue
+        row = _sell_steam_report_row(sell, steam_net_factor)
+        if row is None:
+            continue
+        detail_rows.append(row)
+        _add_guadao_report_row(summary, row)
+        item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
+        _add_guadao_report_row(item_summary, row)
+
+    finalized_items = [
+        {"marketHashName": name, **_finalize_guadao_report_summary(item_summary)}
+        for name, item_summary in item_summaries.items()
+    ]
+    finalized_items.sort(key=lambda row: (-int(row["count"]), row["marketHashName"]))
+    return {
+        "summary": _finalize_guadao_report_summary(summary),
+        "items": finalized_items,
+        "details": detail_rows,
+    }
+
+
+def _build_sold_steam_missing_sold_at_summary(
+    db: Database,
+    *,
+    start_utc: str,
+    end_utc: str,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    params: list[Any] = [start_utc, end_utc]
+    market_filter = ""
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+
+    rows = db.conn.execute(
         f"""
         SELECT *
         FROM pool_operations
@@ -2322,7 +2432,9 @@ def _build_sold_steam_time_summary(
     summary = _empty_guadao_report_summary()
     item_summaries: dict[str, dict[str, Any]] = {}
     detail_rows: list[dict[str, Any]] = []
-    for sell in sold_rows:
+    for sell in rows:
+        if _sell_steam_sold_at(sell, allow_completed_fallback=False) is not None:
+            continue
         row = _sell_steam_report_row(sell, steam_net_factor)
         if row is None:
             continue
@@ -2351,7 +2463,9 @@ def _build_sold_steam_reconciliation_summary(
     steam_net_factor: float,
     market_hash_name: str | None = None,
 ) -> dict[str, Any]:
-    params: list[Any] = [start_utc, end_utc]
+    start_dt = _parse_utc_datetime(start_utc)
+    end_dt = _parse_utc_datetime(end_utc)
+    params: list[Any] = []
     market_filter = ""
     if market_hash_name:
         market_filter = " AND market_hash_name = ?"
@@ -2364,8 +2478,6 @@ def _build_sold_steam_reconciliation_summary(
         WHERE operation_type = 'sell_on_steam'
           AND status = 'sold'
           AND completed_at IS NOT NULL
-          AND completed_at >= ?
-          AND completed_at <= ?
           {market_filter}
         ORDER BY completed_at ASC, id ASC
         """,
@@ -2379,6 +2491,13 @@ def _build_sold_steam_reconciliation_summary(
     ignored = _empty_guadao_report_summary()
 
     for sell in sold_rows:
+        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        if sold_at is None:
+            continue
+        if start_dt is not None and sold_at < start_dt:
+            continue
+        if end_dt is not None and sold_at > end_dt:
+            continue
         row = _sell_steam_report_row(sell, steam_net_factor)
         if row is None:
             continue
@@ -2444,6 +2563,8 @@ def _build_guadao_discount_report(
     item_summaries: dict[str, dict[str, Any]] = {}
     summary = _empty_guadao_report_summary()
     closed_from_sell_outside_range = _empty_guadao_report_summary()
+    start_dt = _parse_utc_datetime(start_utc)
+    end_dt = _parse_utc_datetime(end_utc)
 
     for rebuy in rebuy_rows:
         rebuy_note = _read_note_dict(rebuy["note"])
@@ -2492,8 +2613,18 @@ def _build_guadao_discount_report(
         _add_guadao_report_row(summary, detail)
         item_summary = item_summaries.setdefault(item_name, _empty_guadao_report_summary())
         _add_guadao_report_row(item_summary, detail)
-        sell_completed_at = str(sell["completed_at"] or "") if sell is not None else ""
-        if sell_completed_at and (sell_completed_at < start_utc or sell_completed_at > end_utc):
+        sell_sold_at = (
+            _sell_steam_sold_at(sell, allow_completed_fallback=False)
+            if sell is not None
+            else None
+        )
+        if (
+            sell_sold_at is not None
+            and (
+                (start_dt is not None and sell_sold_at < start_dt)
+                or (end_dt is not None and sell_sold_at > end_dt)
+            )
+        ):
             _add_guadao_report_row(closed_from_sell_outside_range, detail)
 
     finalized_items = [
@@ -2517,6 +2648,13 @@ def _build_guadao_discount_report(
             market_hash_name=market_hash_name,
         ),
         "steamSoldReconciliation": _build_sold_steam_reconciliation_summary(
+            db,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            steam_net_factor=steam_net_factor,
+            market_hash_name=market_hash_name,
+        ),
+        "steamSoldMissingSoldAt": _build_sold_steam_missing_sold_at_summary(
             db,
             start_utc=start_utc,
             end_utc=end_utc,
@@ -2595,6 +2733,13 @@ def _print_guadao_discount_report(
         )
         + f" = {_fmt_cny(reconciled_net)}"
     )
+    missing_sold_at = report.get("steamSoldMissingSoldAt", {}).get("summary", _empty_guadao_report_summary())
+    if missing_sold_at["count"]:
+        print(
+            f"成交时间缺失: {missing_sold_at['count']} 笔 | "
+            f"程序确认到手 {_fmt_cny(missing_sold_at['steamNet'])}；"
+            "这些流水缺少 Steam 官方成交时间，不能直接用于本时间段钱包入账对账。"
+        )
     outside = report.get("closedFromSellOutsideRange", _empty_guadao_report_summary())
     if outside["count"]:
         print(
@@ -3124,6 +3269,57 @@ def cmd_account_set_credentials(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_account_balance(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    store = _account_store(settings)
+    accounts = store.list_accounts()
+    print("Steam 余额统计")
+    print("来源: https://steamcommunity.com/market/ 页面内 g_rgWalletInfo")
+    print("字段: wallet_balance=可用余额；wallet_delayed_balance=入账冻结/待入账余额")
+    print()
+    print(f"{'账号':<18} {'SteamID':<22} {'可用余额':>12} {'入账冻结':>12} {'合计':>12} 状态")
+
+    total_balance = 0.0
+    total_delayed = 0.0
+    for account in accounts:
+        status = "ok"
+        error: str | None = None
+        balance = 0.0
+        delayed = 0.0
+        if not account.cookies or not account.steam_id64:
+            status = "skipped"
+            error = "missing Steam cookies or steam_id64"
+        else:
+            try:
+                wallet = SteamMarketClient(
+                    cookies=account.cookies,
+                    steam_id64=account.steam_id64,
+                    identity_secret=account.identity_secret,
+                    device_id=account.device_id,
+                    account_id=account.id,
+                    base_url=settings.steam_market_base_url,
+                ).wallet_balance()
+                balance = safe_float(wallet.get("balance")) or 0.0
+                delayed = safe_float(wallet.get("delayed_balance")) or 0.0
+                total_balance += balance
+                total_delayed += delayed
+            except Exception as exc:
+                status = "error"
+                error = str(exc)
+        print(
+            f"{account.name:<18} {account.steam_id64 or '-':<22} "
+            f"{balance:>12.2f} {delayed:>12.2f} {balance + delayed:>12.2f} {status}"
+        )
+        if error:
+            print(f"  错误: {error}")
+
+    print(
+        f"{'TOTAL':<18} {'-':<22} "
+        f"{total_balance:>12.2f} {total_delayed:>12.2f} {total_balance + total_delayed:>12.2f} -"
+    )
+    return 0
+
+
 def cmd_steam_login(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     store = _account_store(settings)
@@ -3337,6 +3533,8 @@ def build_parser() -> argparse.ArgumentParser:
     account_remove.set_defaults(handler=cmd_account_remove)
     account_status = account_subparsers.add_parser("status", help="查看账户状态")
     account_status.set_defaults(handler=cmd_account_status)
+    account_balance = account_subparsers.add_parser("balance", help="统计所有本地 Steam 账号钱包余额")
+    account_balance.set_defaults(handler=cmd_account_balance)
 
     def add_t_profit_parser(name: str, *, hidden: bool = False) -> None:
         t_profit = subparsers.add_parser(
@@ -3441,13 +3639,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--from",
         dest="date_from",
         required=True,
-        help="开始日期/时间，例如 2026-05-10 或 2026-05-10T08",
+        help="开始日期/时间，例如 2026-05-10、2026-05-10T08 或 2026-05-10T08:15",
     )
     pool_guadao_report.add_argument(
         "--to",
         dest="date_to",
         default=None,
-        help="结束日期/时间，默认到现在；支持精确到小时，例如 2026-05-10T17",
+        help="结束日期/时间，默认到现在；支持精确到分钟，例如 2026-05-10T17:23",
     )
     pool_guadao_report.add_argument("--item", dest="market_hash_name", default=None, help="只统计某个 market_hash_name")
     pool_guadao_report.add_argument("--detail", action="store_true", help="显示每笔闭环明细")
