@@ -193,6 +193,30 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_strategy_eval_mhn
             ON strategy_evaluations(market_hash_name, evaluated_at);
 
+            CREATE TABLE IF NOT EXISTS guadao_case_ratio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_hash_name TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                name_cn TEXT,
+                c5_sell_price REAL,
+                c5_sell_count INTEGER,
+                steam_list_price REAL,
+                steam_wall_price REAL,
+                steam_after_tax_price REAL,
+                listing_ratio REAL,
+                c5_price_source TEXT,
+                steam_price_source TEXT,
+                status TEXT NOT NULL DEFAULT 'ok',
+                error TEXT,
+                raw_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guadao_case_ratio_mhn_time
+            ON guadao_case_ratio_snapshots(market_hash_name, observed_at);
+
+            CREATE INDEX IF NOT EXISTS idx_guadao_case_ratio_time
+            ON guadao_case_ratio_snapshots(observed_at);
+
             CREATE TABLE IF NOT EXISTS pool_operations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_hash_name TEXT NOT NULL,
@@ -945,6 +969,83 @@ class Database:
             """,
             (limit,),
         ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Guadao case ratio monitor snapshots
+    # ------------------------------------------------------------------
+
+    def save_guadao_case_ratio_snapshots(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO guadao_case_ratio_snapshots (
+                market_hash_name,
+                observed_at,
+                name_cn,
+                c5_sell_price,
+                c5_sell_count,
+                steam_list_price,
+                steam_wall_price,
+                steam_after_tax_price,
+                listing_ratio,
+                c5_price_source,
+                steam_price_source,
+                status,
+                error,
+                raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["market_hash_name"],
+                    row["observed_at"],
+                    row.get("name_cn"),
+                    row.get("c5_sell_price"),
+                    row.get("c5_sell_count"),
+                    row.get("steam_list_price"),
+                    row.get("steam_wall_price"),
+                    row.get("steam_after_tax_price"),
+                    row.get("listing_ratio"),
+                    row.get("c5_price_source"),
+                    row.get("steam_price_source"),
+                    row.get("status") or "ok",
+                    row.get("error"),
+                    json.dumps(row.get("raw_json") or {}, ensure_ascii=False),
+                )
+                for row in rows
+            ],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def list_guadao_case_ratio_snapshots(
+        self,
+        *,
+        start_utc: str,
+        end_utc: str,
+        market_hash_name: str | None = None,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [start_utc, end_utc]
+        market_filter = ""
+        if market_hash_name:
+            market_filter = " AND market_hash_name = ?"
+            params.append(market_hash_name)
+        return self.conn.execute(
+            f"""
+            SELECT *
+            FROM guadao_case_ratio_snapshots
+            WHERE observed_at >= ?
+              AND observed_at <= ?
+              {market_filter}
+            ORDER BY market_hash_name ASC, observed_at ASC, id ASC
+            """,
+            tuple(params),
+        ).fetchall()
+
+    def latest_guadao_case_ratio_snapshot_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS count FROM guadao_case_ratio_snapshots").fetchone()
+        return int(row["count"] if row is not None else 0)
 
     # ------------------------------------------------------------------
     # Pool operations

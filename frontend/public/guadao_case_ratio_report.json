@@ -1,0 +1,26 @@
+{
+  "generatedAt": "2026-06-23T12:07:00+00:00",
+  "startUtc": "2026-06-22T12:06:53+00:00",
+  "endUtc": "2026-06-23T12:06:53+00:00",
+  "rangeHours": 24.0,
+  "bucketSize": 0.005,
+  "expectedIntervalMinutes": 5.0,
+  "maxGapMinutes": 12.5,
+  "snapshotCount": 0,
+  "statusCounts": {},
+  "crateTypeCounts": {},
+  "crateTypeSnapshotCounts": {},
+  "crateTypeLabels": {
+    "weapon_case": "武器箱",
+    "capsule": "胶囊",
+    "souvenir_package": "纪念包",
+    "container": "容器",
+    "crate": "箱子",
+    "other": "其他"
+  },
+  "recommendationCrateType": "all",
+  "legacySteamMinorUnitCorrectedCount": 0,
+  "itemCount": 0,
+  "items": [],
+  "recommendations": []
+}

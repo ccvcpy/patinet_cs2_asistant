@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import base64
 import unittest
 from unittest.mock import patch
 
 import requests
 
 from cs2_assistant.accounts import Account
-from cs2_assistant.clients.steam_market import SteamMarketClient
+from cs2_assistant.clients.steam_market import SteamListing, SteamMarketClient, SteamMarketError
 
 
 class _FakeResponse:
@@ -27,6 +28,59 @@ class _FakeResponse:
 
 
 class SteamMarketClientTests(unittest.TestCase):
+    def test_confirm_all_refuses_unscoped_confirmation(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+
+        with self.assertRaises(SteamMarketError):
+            client.confirm_all()
+
+    def test_confirm_listing_assets_only_allows_matching_asset_confirmation(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            identity_secret=base64.b64encode(b"1" * 20).decode("ascii"),
+            device_id="device-1",
+        )
+        client.list_confirmation_pending_listings = lambda: [  # type: ignore[method-assign]
+            SteamListing("listing-good", "asset-good", "Kilowatt Case", None, None),
+            SteamListing("listing-other", "asset-other", "AK-47 | Redline", None, None),
+        ]
+        client.fetch_confirmations = lambda: [  # type: ignore[method-assign]
+            {"id": "conf-good", "nonce": "nonce-good", "creator_id": "listing-good"},
+            {"id": "conf-other", "nonce": "nonce-other", "creator_id": "listing-other"},
+            {"id": "conf-trade", "nonce": "nonce-trade", "creator_id": "trade-offer-1"},
+        ]
+        captured: dict[str, object] = {}
+
+        def fake_post(
+            url: str,
+            *,
+            params: dict[str, object],
+            files: list[tuple[str, tuple[None, str]]],
+            timeout: int,
+        ) -> _FakeResponse:
+            captured["url"] = url
+            captured["params"] = params
+            captured["files"] = files
+            return _FakeResponse({"success": True})
+
+        client._session.post = fake_post  # type: ignore[method-assign]
+
+        confirmed = client.confirm_listing_assets(asset_ids=["asset-good"])
+
+        self.assertEqual(1, confirmed)
+        self.assertEqual("https://steamcommunity.com/mobileconf/multiajaxop", captured["url"])
+        params = captured["params"]
+        assert isinstance(params, dict)
+        self.assertEqual("allow", params["op"])
+        self.assertEqual(
+            [("cid[]", (None, "conf-good")), ("ck[]", (None, "nonce-good"))],
+            captured["files"],
+        )
+
     def test_wallet_balance_parses_market_wallet_info(self) -> None:
         client = SteamMarketClient(
             cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",

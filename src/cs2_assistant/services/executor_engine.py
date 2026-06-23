@@ -2442,29 +2442,30 @@ class ExecutionEngine:
         updated = 0
         existing_rebuy_sources: set[str] | None = None
         existing_rebuy_sell_ops: set[str] | None = None
-        confirmation_retry_attempted = False
-        confirmation_retry_error: Exception | None = None
-        confirmation_retry_count: int | None = None
-
-        def retry_steam_guard_confirmation() -> None:
+        def retry_steam_guard_confirmation(
+            *,
+            listing_id: str,
+            asset_id: str,
+        ) -> tuple[int | None, Exception | None]:
             nonlocal active_listing_ids, active_asset_ids
-            nonlocal confirmation_retry_attempted, confirmation_retry_error, confirmation_retry_count
             nonlocal active
-            if confirmation_retry_attempted:
-                return
-            confirmation_retry_attempted = True
+            confirmer = getattr(active_client, "confirm_listing_assets", None)
+            if not callable(confirmer):
+                return None, SteamMarketError("Steam client does not support scoped listing confirmation")
             try:
-                confirmation_retry_count = active_client.confirm_all()
+                confirmation_retry_count = confirmer(
+                    asset_ids=[asset_id],
+                    listing_ids=[listing_id] if listing_id else None,
+                )
             except Exception as exc:
-                confirmation_retry_error = exc
-                confirmation_retry_count = None
-                return
+                return None, exc
             try:
                 refreshed_active = active_client.list_active_listings()
             except Exception:
-                return
+                return confirmation_retry_count, None
             active = refreshed_active
             active_listing_ids, active_asset_ids = self._active_listing_identity_sets(refreshed_active)
+            return confirmation_retry_count, None
 
         candidate_ops = self.db.list_pool_operations_by_type_and_statuses(
             OP_SELL_STEAM,
@@ -2504,7 +2505,10 @@ class ExecutionEngine:
                     or not note.get("activeVerifiedAt")
                 )
                 if needs_confirmation_retry:
-                    retry_steam_guard_confirmation()
+                    confirmation_retry_count, confirmation_retry_error = retry_steam_guard_confirmation(
+                        listing_id=listing_id,
+                        asset_id=asset_id,
+                    )
                     if self._listing_is_active(
                         active_listing_ids=active_listing_ids,
                         active_asset_ids=active_asset_ids,
@@ -2877,7 +2881,13 @@ class ExecutionEngine:
         try:
             if not active_client:
                 raise SteamMarketError("missing Steam client")
-            confirmed_count = active_client.confirm_all()
+            confirmer = getattr(active_client, "confirm_listing_assets", None)
+            if not callable(confirmer):
+                raise SteamMarketError("Steam client does not support scoped listing confirmation")
+            confirmed_count = confirmer(
+                asset_ids=[asset_id],
+                listing_ids=[listing_id] if listing_id else None,
+            )
         except Exception as exc:
             note["confirmationStatus"] = "failed"
             note["confirmationMessage"] = str(exc)

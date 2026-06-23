@@ -2,10 +2,12 @@ import { computed, ref } from "vue";
 import AccountProfitPage from "./pages/account_profit.vue";
 import SteamBalancesPage from "./pages/steam_balances.vue";
 import GuadaoReportPage from "./pages/guadao_report.vue";
+import CaseRatioMonitorPage from "./pages/case_ratio_monitor.vue";
 const pages = [
     { key: "account", label: "挂刀余额核对", component: AccountProfitPage },
     { key: "steam", label: "Steam余额统计", component: SteamBalancesPage },
     { key: "guadao", label: "挂刀报表", component: GuadaoReportPage },
+    { key: "case-ratio", label: "箱子挂刀比", component: CaseRatioMonitorPage },
 ];
 const activePage = ref("account");
 const activeComponent = computed(() => pages.find((page) => page.key === activePage.value)?.component ?? AccountProfitPage);

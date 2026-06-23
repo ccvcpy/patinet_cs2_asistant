@@ -52,6 +52,7 @@ class FakeSteamClient:
         self.sell_calls: list[dict[str, object]] = []
         self.trade_url = "https://steamcommunity.com/tradeoffer/new/?partner=39734272&token=abc"
         self.confirm_calls = 0
+        self.confirm_asset_calls: list[dict[str, object]] = []
         self.confirm_should_fail = False
         self.confirm_result = 1
         self.orderbook_should_fail = False
@@ -110,7 +111,11 @@ class FakeSteamClient:
         }
 
     def confirm_all(self) -> int:
+        raise AssertionError("confirm_all must not be used; use confirm_listing_assets")
+
+    def confirm_listing_assets(self, *, asset_ids: object, listing_ids: object | None = None) -> int:
         self.confirm_calls += 1
+        self.confirm_asset_calls.append({"asset_ids": asset_ids, "listing_ids": listing_ids})
         if self.confirm_should_fail:
             raise RuntimeError("confirm boom")
         return self.confirm_result
@@ -1308,6 +1313,10 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertIn('"confirmationStatus": "confirmed"', sell_op["note"])
         self.assertIn('"activeVerifiedAt":', sell_op["note"])
         self.assertEqual(1, self.engine.steam_client.confirm_calls)
+        self.assertEqual(
+            [{"asset_ids": ["asset-old"], "listing_ids": ["listing-1"]}],
+            self.engine.steam_client.confirm_asset_calls,
+        )
         self.assertEqual(0, self.engine._pending_confirmation_count)
 
     def test_listing_auto_confirm_waits_until_listing_is_active(self) -> None:
@@ -1394,12 +1403,15 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.db.update_pool_operation(op_id, status=POOL_STATUS_LISTING_PENDING)
         self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTING_PENDING)
 
-        def confirm_and_activate() -> int:
+        def confirm_and_activate(*, asset_ids: object, listing_ids: object | None = None) -> int:
             self.engine.steam_client.confirm_calls += 1
+            self.engine.steam_client.confirm_asset_calls.append(
+                {"asset_ids": asset_ids, "listing_ids": listing_ids}
+            )
             self.engine.steam_client.active_listing_ids.add("listing-1")
             return 1
 
-        self.engine.steam_client.confirm_all = confirm_and_activate
+        self.engine.steam_client.confirm_listing_assets = confirm_and_activate
 
         updated = self.engine._refresh_pending_listing_confirmations()
 

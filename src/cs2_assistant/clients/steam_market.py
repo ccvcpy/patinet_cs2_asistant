@@ -9,7 +9,7 @@ import struct
 import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import quote, unquote
 
 import requests
@@ -507,6 +507,41 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload
 
+    def price_history(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        currency: int = 23,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/market/pricehistory/",
+            params={
+                "appid": app_id,
+                "market_hash_name": market_hash_name,
+                "currency": currency,
+            },
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": (
+                    f"{self.base_url}/market/listings/{app_id}/"
+                    f"{quote(market_hash_name, safe='')}"
+                ),
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SteamMarketError(f"Steam pricehistory invalid JSON: {response.text}") from exc
+        if payload.get("success") not in (None, 1, True):
+            raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
+        return payload
+
     def my_listings(self, *, start: int = 0, count: int = 100) -> dict[str, Any]:
         params = {"start": start, "count": count, "norender": 1}
         response = self._request("GET", "/market/mylistings", params=params)
@@ -713,9 +748,9 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload.get("conf") or []
 
-    def confirm_all(self) -> int:
-        confirmations = self.fetch_confirmations()
-        if not confirmations:
+    def _allow_confirmations(self, confirmations: Iterable[dict[str, Any]]) -> int:
+        selected = list(confirmations)
+        if not selected:
             return 0
         if not self.identity_secret or not self.device_id:
             raise SteamMarketError("missing identity_secret or device_id")
@@ -732,7 +767,7 @@ class SteamMarketClient:
             "op": "allow",
         }
         multipart: list[tuple[str, tuple[None, str]]] = []
-        for conf in confirmations:
+        for conf in selected:
             multipart.append(("cid[]", (None, str(conf.get("id")))))
             multipart.append(("ck[]", (None, str(conf.get("nonce")))))
         url = f"{self.base_url}/mobileconf/multiajaxop"
@@ -744,4 +779,58 @@ class SteamMarketClient:
             raise SteamMarketError(f"Steam confirm invalid JSON: {response.text}") from exc
         if not payload.get("success"):
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
-        return len(confirmations)
+        return len(selected)
+
+    @staticmethod
+    def _normalize_id_set(values: Iterable[Any] | None) -> set[str]:
+        if values is None:
+            return set()
+        return {str(value or "").strip() for value in values if str(value or "").strip()}
+
+    @staticmethod
+    def _confirmation_listing_id(confirmation: dict[str, Any]) -> str | None:
+        for key in ("creator_id", "creatorid", "listing_id", "listingid"):
+            value = str(confirmation.get(key) or "").strip()
+            if value:
+                return value
+        return None
+
+    def confirm_listing_ids(self, listing_ids: Iterable[Any]) -> int:
+        expected_listing_ids = self._normalize_id_set(listing_ids)
+        if not expected_listing_ids:
+            return 0
+        confirmations = self.fetch_confirmations()
+        selected = [
+            confirmation
+            for confirmation in confirmations
+            if self._confirmation_listing_id(confirmation) in expected_listing_ids
+        ]
+        return self._allow_confirmations(selected)
+
+    def confirm_listing_assets(
+        self,
+        *,
+        asset_ids: Iterable[Any],
+        listing_ids: Iterable[Any] | None = None,
+    ) -> int:
+        expected_asset_ids = self._normalize_id_set(asset_ids)
+        if not expected_asset_ids:
+            return 0
+        expected_listing_ids = self._normalize_id_set(listing_ids)
+        pending_listing_ids: set[str] = set()
+        for listing in self.list_confirmation_pending_listings():
+            pending_asset_id = str(getattr(listing, "asset_id", "") or "").strip()
+            pending_listing_id = str(getattr(listing, "listing_id", "") or "").strip()
+            if not pending_asset_id or not pending_listing_id:
+                continue
+            if pending_asset_id not in expected_asset_ids:
+                continue
+            if expected_listing_ids and pending_listing_id not in expected_listing_ids:
+                continue
+            pending_listing_ids.add(pending_listing_id)
+        return self.confirm_listing_ids(pending_listing_ids)
+
+    def confirm_all(self) -> int:
+        raise SteamMarketError(
+            "refusing to confirm all Steam confirmations; use confirm_listing_assets with explicit asset_id targets"
+        )

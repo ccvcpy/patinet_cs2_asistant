@@ -251,6 +251,8 @@ Steam Guard 待确认时：
 python .\main.py steam confirm
 ```
 
+安全边界：`steam confirm` 只会读取本地数据库里本程序 `sell_on_steam` 待确认流水的 `asset_id`，并通过 Steam 待确认挂单列表映射到对应 `listing_id` 后确认。它不会全量确认当前账号 mobile confirmations；映射不到本程序 asset 的确认会保持未确认。
+
 测试单个资产能否被 Steam `sellitem` 接受：
 
 ```powershell

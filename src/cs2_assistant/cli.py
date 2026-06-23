@@ -38,6 +38,8 @@ from cs2_assistant.db import Database
 from cs2_assistant.reminders.t_yield import main as t_yield_reminder_main
 from cs2_assistant.services import AlertService, MarketService, NotificationService
 from cs2_assistant.models import (
+    OP_SELL_STEAM,
+    POOL_STATUS_LISTING_PENDING,
     STRATEGY_GUADAO,
     STRATEGY_HOLD,
     STRATEGY_LABELS,
@@ -63,6 +65,19 @@ from cs2_assistant.services.pricing import (
     clear_pricing_cache,
     fetch_listing_price,
     get_pricing_cache_snapshot,
+)
+from cs2_assistant.services.guadao_case_monitor import (
+    DEFAULT_COLLECTION_INTERVAL_MINUTES,
+    DEFAULT_RATIO_BUCKET_SIZE,
+    build_case_ratio_report,
+    build_steam_clients_for_monitor,
+    collect_case_ratio_snapshots,
+    default_case_report_window,
+    enrich_case_ratio_report_with_steam_liquidity,
+    ensure_case_report_frontend_payload,
+    list_case_monitor_targets,
+    save_case_ratio_snapshots,
+    write_case_ratio_report_files,
 )
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
@@ -124,6 +139,21 @@ def _print_json(payload: Any) -> None:
     except UnicodeEncodeError:
         sys.stdout.buffer.write(serialized.encode("utf-8", errors="replace"))
         sys.stdout.buffer.write(b"\n")
+
+
+def _configure_console_encoding() -> None:
+    """Avoid Windows GBK console crashes on item names with special symbols."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (TypeError, ValueError, OSError):
+            try:
+                reconfigure(errors="replace")
+            except (TypeError, ValueError, OSError):
+                pass
 
 
 def _resolve_c5_steam_id(client: C5GameClient, provided_steam_id: str | None) -> str:
@@ -2832,6 +2862,241 @@ def cmd_pool_guadao_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _case_ratio_report_frontend_path() -> Path:
+    return PROJECT_ROOT / "frontend" / "public" / "guadao_case_ratio_report.json"
+
+
+def _case_ratio_report_output_dir(settings: Settings) -> Path:
+    stamp = datetime.now(CN_TZ).strftime("%Y%m%d_%H%M%S")
+    return settings.db_path.parent / "reports" / "guadao_case_ratio" / stamp
+
+
+def _case_monitor_items_arg(args: argparse.Namespace) -> list[str] | None:
+    items = getattr(args, "market_hash_names", None) or []
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    return normalized or None
+
+
+def _print_case_monitor_collect_summary(snapshots: list[Any], *, saved_count: int) -> None:
+    status_counts: dict[str, int] = {}
+    for snapshot in snapshots:
+        status_counts[snapshot.status] = int(status_counts.get(snapshot.status, 0)) + 1
+    ok_rows = sorted(
+        [snapshot for snapshot in snapshots if snapshot.status == "ok" and snapshot.listing_ratio is not None],
+        key=lambda snapshot: float(snapshot.listing_ratio or 0.0),
+    )
+    print(f"箱子挂刀比快照已保存: {saved_count} 条")
+    print("状态: " + "、".join(f"{status} {count}" for status, count in sorted(status_counts.items())))
+    if not ok_rows:
+        return
+    print("\n本轮最低挂刀比:")
+    for index, snapshot in enumerate(ok_rows[:10], start=1):
+        print(
+            f"{index}. {snapshot.market_hash_name} | "
+            f"比例 {snapshot.listing_ratio:.4f} | "
+            f"C5 {snapshot.c5_sell_price:.2f} | "
+            f"Steam挂价 {snapshot.steam_list_price:.2f} | "
+            f"预计到手 {snapshot.steam_after_tax_price:.2f}"
+        )
+
+
+def cmd_pool_case_monitor_collect(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    if not settings.c5_api_key:
+        raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY")
+
+    db = _open_db(settings)
+    try:
+        targets = list_case_monitor_targets(
+            db,
+            market_hash_names=_case_monitor_items_arg(args),
+            limit=args.limit,
+        )
+    finally:
+        db.close()
+    if not targets:
+        print("没有找到可监控的箱子。请先运行 catalog sync-csgo-api --category crates 或传 --item。")
+        return 0
+
+    steam_clients = build_steam_clients_for_monitor(settings)
+    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+    print(
+        f"开始采集箱子挂刀比 | 箱子 {len(targets)} 个 | "
+        f"Steam cookie {len(steam_clients)} 个 | C5=c5api | Steam=official orderbook"
+    )
+    snapshots = collect_case_ratio_snapshots(
+        settings=settings,
+        config=config,
+        targets=targets,
+        c5_client=c5_client,
+        steam_clients=steam_clients,
+        max_workers=args.max_workers,
+    )
+    db = _open_db(settings)
+    try:
+        saved_count = save_case_ratio_snapshots(db, snapshots)
+    finally:
+        db.close()
+    _print_case_monitor_collect_summary(snapshots, saved_count=saved_count)
+    return 0
+
+
+def cmd_pool_case_monitor_run(args: argparse.Namespace) -> int:
+    import time as time_module
+
+    interval_minutes = float(args.interval_minutes)
+    if interval_minutes <= 0:
+        raise ValueError("--interval-minutes 必须大于 0")
+    cycle = 0
+    while True:
+        cycle += 1
+        print(f"\n[case-monitor] 第 {cycle} 轮 | {datetime.now(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+        try:
+            code = cmd_pool_case_monitor_collect(args)
+        except Exception as exc:
+            print(f"[case-monitor] 本轮采集失败: {exc}", file=sys.stderr)
+            if args.once:
+                return 1
+        else:
+            if code != 0 and args.once:
+                return int(code)
+        if args.once:
+            return 0
+        print(f"下一轮采集: {interval_minutes:g} 分钟后")
+        time_module.sleep(interval_minutes * 60.0)
+
+
+def _case_report_boundaries_from_args(args: argparse.Namespace) -> tuple[datetime, datetime]:
+    if args.date_to:
+        end_local = _parse_report_boundary(args.date_to, is_end=True)
+    else:
+        end_local = datetime.now(CN_TZ)
+    if args.date_from:
+        start_local = _parse_report_boundary(args.date_from, is_end=False)
+    else:
+        start_utc, _ = default_case_report_window(args.hours)
+        start_dt = datetime.fromisoformat(start_utc)
+        start_local = start_dt.astimezone(CN_TZ)
+        if args.date_to:
+            start_local = end_local - timedelta(hours=float(args.hours))
+    if end_local <= start_local:
+        raise ValueError("报告结束时间必须晚于开始时间")
+    return start_local, end_local
+
+
+def _print_case_ratio_report(report: dict[str, Any], *, start_local: datetime, end_local: datetime) -> None:
+    print("CS2 箱子挂刀比监控报告")
+    print(
+        "范围: "
+        f"{start_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} ~ "
+        f"{end_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} (北京时间)"
+    )
+    print("口径: 挂刀比 = C5最低在售价 / (Steam箱子挂价 × steamNetFactor)，Steam挂价取官方 orderbook 20 卖家累计墙。")
+    print(
+        f"快照 {report['snapshotCount']} 条 | 有效箱子 {report['itemCount']} 个 | "
+        f"采样间隔 {report['expectedIntervalMinutes']} 分钟 | 最大连续缺口 {report['maxGapMinutes']} 分钟"
+    )
+    print(
+        f"推荐类别: {report.get('recommendationCrateType', 'all')} | "
+        f"旧 Steam 小额价格修正 {report.get('legacySteamMinorUnitCorrectedCount', 0)} 条"
+    )
+    if report.get("steamLiquidityStatus"):
+        print(
+            f"Steam流动性: {report.get('steamLiquidityStatus')} | "
+            f"刷新时间 {report.get('steamLiquidityRefreshedAt') or '-'}"
+        )
+    if report.get("statusCounts"):
+        print("状态: " + "、".join(f"{key} {value}" for key, value in sorted(report["statusCounts"].items())))
+    if report.get("crateTypeCounts"):
+        labels = report.get("crateTypeLabels") or {}
+        print(
+            "类别: "
+            + "、".join(
+                f"{labels.get(key, key)} {value}"
+                for key, value in sorted(report["crateTypeCounts"].items())
+            )
+        )
+
+    recommendations = list(report.get("recommendations") or [])
+    if not recommendations:
+        print("当前范围内没有可用于推荐的有效快照。")
+        return
+
+    print("\n推荐去挂的箱子:")
+    print(f"{'排名':>4} {'类别':<6} {'箱子':<34} {'建议':>8} {'源':<8} {'24h量':>8} {'速度':<5} {'稳健墙':>8} {'覆盖':>8}")
+    for index, row in enumerate(recommendations, start=1):
+        print(
+            f"{index:>4} "
+            f"{str(row.get('crateTypeLabel') or row.get('crateType') or '-')[:6]:<6} "
+            f"{str(row['marketHashName'])[:34]:<34} "
+            f"{float(row.get('effectiveRecommendedMaxListingRatio') or row['recommendedMaxListingRatio']):>8.4f} "
+            f"{str(row.get('steamReferenceSourceLabel') or '20墙')[:8]:<8} "
+            f"{int(row.get('steamVolume24h') or 0):>8} "
+            f"{str(row.get('liquidityLabel') or '-')[:5]:<5} "
+            f"{float(row['recommendedMaxListingRatio']):>8.4f} "
+            f"{float(row['coveragePct']):>7.2f}%"
+        )
+
+    print("\n比例区间占用示例（推荐前 5）:")
+    for row in recommendations[:5]:
+        buckets = row.get("buckets") or []
+        bucket_text = "；".join(
+            f"{bucket['bucket']} {bucket['durationLabel']}"
+            for bucket in buckets[:6]
+        )
+        print(f"- {row['marketHashName']}: {bucket_text or '-'}")
+
+
+def cmd_pool_case_monitor_report(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    config = load_strategy_config(settings)
+    start_local, end_local = _case_report_boundaries_from_args(args)
+    db = _open_db(settings)
+    try:
+        report = build_case_ratio_report(
+            db,
+            start_utc=_to_utc_iso(start_local),
+            end_utc=_to_utc_iso(end_local),
+            market_hash_name=args.market_hash_name,
+            recommendation_crate_type=args.recommendation_type,
+            bucket_size=args.bucket_size,
+            expected_interval_minutes=args.expected_interval_minutes,
+            max_gap_minutes=args.max_gap_minutes,
+            top_n=args.top,
+        )
+    finally:
+        db.close()
+    if not args.no_refresh_liquidity:
+        steam_clients = build_steam_clients_for_monitor(settings)
+        if steam_clients:
+            report = enrich_case_ratio_report_with_steam_liquidity(
+                report,
+                settings=settings,
+                config=config,
+                steam_clients=steam_clients,
+                recommendation_crate_type=args.recommendation_type,
+                top_n=args.top,
+                max_workers=args.liquidity_workers,
+            )
+        else:
+            report["steamLiquidityStatus"] = "skipped_no_steam_client"
+
+    frontend_path = ensure_case_report_frontend_payload(report, _case_ratio_report_frontend_path())
+    output_dir = Path(args.output_dir) if args.output_dir else _case_ratio_report_output_dir(settings)
+    paths = write_case_ratio_report_files(report, output_dir)
+
+    if args.dump_json:
+        _print_json(report)
+    else:
+        _print_case_ratio_report(report, start_local=start_local, end_local=end_local)
+        print("\n已生成报告文件:")
+        for label, path in paths.items():
+            print(f"- {label}: {path}")
+        print(f"- webData: {frontend_path}")
+    return 0
+
+
 def cmd_executor_status(args: argparse.Namespace) -> int:
     return cmd_pool_status(args)
 
@@ -3033,11 +3298,64 @@ def cmd_steam_listings(args: argparse.Namespace) -> int:
     return 0
 
 
+STEAM_CONFIRM_PENDING_STATUSES = {
+    "pending",
+    "manual_required",
+    "failed",
+    "not_found",
+    "market_pending_visible",
+    "market_pending_remove_failed",
+    "confirm_sent_waiting_active_listing",
+    "listing_missing_unverified",
+}
+
+
+def _load_program_confirmation_targets(db: Database, client: SteamMarketClient) -> list[str]:
+    rows = db.conn.execute(
+        """
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = ?
+          AND status IN (?, 'listed')
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        (OP_SELL_STEAM, POOL_STATUS_LISTING_PENDING),
+    ).fetchall()
+    asset_ids: set[str] = set()
+    for row in rows:
+        note = _read_note_dict(row["note"])
+        confirmation_status = str(note.get("confirmationStatus") or "").strip()
+        needs_confirmation = bool(note.get("needsConfirmation"))
+        if (
+            row["status"] != POOL_STATUS_LISTING_PENDING
+            and confirmation_status not in STEAM_CONFIRM_PENDING_STATUSES
+            and not needs_confirmation
+        ):
+            continue
+        note_steam_id = str(note.get("steamId64") or note.get("steam_id64") or "").strip()
+        if note_steam_id and note_steam_id != str(client.steam_id64 or "").strip():
+            continue
+        asset_id = str(row["asset_id"] or "").strip()
+        if not asset_id:
+            continue
+        asset_ids.add(asset_id)
+    return sorted(asset_ids)
+
+
 def cmd_steam_confirm(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     client = _build_steam_client(settings)
-    count = client.confirm_all()
-    print(f"Confirmed {count} listings.")
+    db = _open_db(settings)
+    try:
+        asset_ids = _load_program_confirmation_targets(db, client)
+    finally:
+        db.close()
+    if not asset_ids:
+        print("Confirmed 0 listings. 未找到本程序待确认的 Steam 上架 asset。")
+        return 0
+    count = client.confirm_listing_assets(asset_ids=asset_ids)
+    print(f"Confirmed {count} listings. 限定本程序 asset 数: {len(asset_ids)}")
     return 0
 
 
@@ -3063,7 +3381,10 @@ def cmd_steam_test_list(args: argparse.Namespace) -> int:
 
     if not args.no_confirm:
         try:
-            count = client.confirm_all()
+            count = client.confirm_listing_assets(
+                asset_ids=[args.asset_id],
+                listing_ids=[listing_id] if listing_id else None,
+            )
             print(f"[测试确认] 已确认 {count} 个挂单")
         except SteamMarketError as exc:
             print(f"[测试确认失败] {exc}")
@@ -3652,6 +3973,88 @@ def build_parser() -> argparse.ArgumentParser:
     pool_guadao_report.add_argument("--dump-json", action="store_true", help="输出 JSON")
     pool_guadao_report.set_defaults(handler=cmd_pool_guadao_report)
 
+    pool_case_monitor = pool_subparsers.add_parser(
+        "case-monitor",
+        help="箱子挂刀比行情监控",
+        description=(
+            "箱子挂刀比行情监控，只采集和分析 C5/Steam 价格与 24h 成交数据。\n"
+            "该命令不会触发 Steam 上架、C5 补仓、确认报价或执行器状态推进。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    pool_case_monitor_subparsers = pool_case_monitor.add_subparsers(dest="case_monitor_command", required=True)
+
+    pool_case_monitor_collect = pool_case_monitor_subparsers.add_parser(
+        "collect",
+        help="采集一次箱子挂刀比快照",
+    )
+    pool_case_monitor_collect.add_argument(
+        "--item",
+        dest="market_hash_names",
+        action="append",
+        default=None,
+        help="只采集指定 market_hash_name；可重复传入",
+    )
+    pool_case_monitor_collect.add_argument("--limit", type=int, default=None, help="最多采集多少个品类")
+    pool_case_monitor_collect.add_argument("--max-workers", type=int, default=1, help="并发采集线程数")
+    pool_case_monitor_collect.set_defaults(handler=cmd_pool_case_monitor_collect)
+
+    pool_case_monitor_run = pool_case_monitor_subparsers.add_parser(
+        "run",
+        help="持续采集箱子挂刀比快照",
+    )
+    pool_case_monitor_run.add_argument(
+        "--item",
+        dest="market_hash_names",
+        action="append",
+        default=None,
+        help="只采集指定 market_hash_name；可重复传入",
+    )
+    pool_case_monitor_run.add_argument("--limit", type=int, default=None, help="最多采集多少个品类")
+    pool_case_monitor_run.add_argument("--max-workers", type=int, default=1, help="并发采集线程数")
+    pool_case_monitor_run.add_argument(
+        "--interval-minutes",
+        type=float,
+        default=DEFAULT_COLLECTION_INTERVAL_MINUTES,
+        help="采集间隔分钟数",
+    )
+    pool_case_monitor_run.add_argument("--once", action="store_true", help="只采集一轮后退出")
+    pool_case_monitor_run.set_defaults(handler=cmd_pool_case_monitor_run)
+
+    pool_case_monitor_report = pool_case_monitor_subparsers.add_parser(
+        "report",
+        help="生成箱子挂刀比 24h 报表",
+    )
+    pool_case_monitor_report.add_argument("--from", dest="date_from", default=None, help="开始日期/时间")
+    pool_case_monitor_report.add_argument("--to", dest="date_to", default=None, help="结束日期/时间，默认到现在")
+    pool_case_monitor_report.add_argument("--hours", type=float, default=24.0, help="未指定 --from 时向前统计多少小时")
+    pool_case_monitor_report.add_argument("--item", dest="market_hash_name", default=None, help="只分析某个 market_hash_name")
+    pool_case_monitor_report.add_argument("--top", type=int, default=10, help="推荐列表最多显示多少项")
+    pool_case_monitor_report.add_argument(
+        "--recommendation-type",
+        choices=["weapon_case", "capsule", "souvenir_package", "container", "crate", "all"],
+        default="all",
+        help="推荐品类过滤",
+    )
+    pool_case_monitor_report.add_argument(
+        "--bucket-size",
+        type=float,
+        default=DEFAULT_RATIO_BUCKET_SIZE,
+        help="挂刀比区间宽度",
+    )
+    pool_case_monitor_report.add_argument(
+        "--expected-interval-minutes",
+        type=float,
+        default=DEFAULT_COLLECTION_INTERVAL_MINUTES,
+        help="预期采集间隔分钟数，用于判断覆盖率",
+    )
+    pool_case_monitor_report.add_argument("--max-gap-minutes", type=float, default=None, help="最大允许采集断档分钟数")
+    pool_case_monitor_report.add_argument("--liquidity-workers", type=int, default=8, help="Steam 24h 成交量刷新并发数")
+    pool_case_monitor_report.add_argument("--no-refresh-liquidity", action="store_true", help="不刷新 Steam 24h 成交量")
+    pool_case_monitor_report.add_argument("--output-dir", default=None, help="报表输出目录")
+    pool_case_monitor_report.add_argument("--dump-json", action="store_true", help="额外输出 JSON")
+    pool_case_monitor_report.set_defaults(handler=cmd_pool_case_monitor_report)
+
     # ---- executor ----
     executor = subparsers.add_parser(
         "executor",
@@ -3793,6 +4196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_console_encoding()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

@@ -17,6 +17,38 @@ class PricingDecision:
     reason: str
 
 
+@dataclass(slots=True)
+class OrderbookPriceSummary:
+    seller_floor_price: float | None
+    seller_floor_count: float | None
+    seller_wall_price: float | None
+    seller_wall_list_price: float | None
+    seller_wall_count: float | None
+    buyer_max_price: float | None
+    buyer_max_count: float | None
+    sell_order_count_total: int | None
+    buy_order_count_total: int | None
+    wall_to_floor_ratio: float | None
+    wall_to_buyer_ratio: float | None
+    spread_ratio: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sellerFloorPrice": self.seller_floor_price,
+            "sellerFloorCount": self.seller_floor_count,
+            "sellerWallPrice": self.seller_wall_price,
+            "sellerWallListPrice": self.seller_wall_list_price,
+            "sellerWallCount": self.seller_wall_count,
+            "buyerMaxPrice": self.buyer_max_price,
+            "buyerMaxCount": self.buyer_max_count,
+            "sellOrderCountTotal": self.sell_order_count_total,
+            "buyOrderCountTotal": self.buy_order_count_total,
+            "wallToFloorRatio": self.wall_to_floor_ratio,
+            "wallToBuyerRatio": self.wall_to_buyer_ratio,
+            "spreadRatio": self.spread_ratio,
+        }
+
+
 _STEAM_PRICE_TTL = 60.0
 _price_cache: dict[tuple[Any, ...], tuple[float, PricingDecision]] = {}
 _cache_lock = threading.Lock()
@@ -92,17 +124,117 @@ def _extract_orderbook_sell_rows(payload: dict[str, Any]) -> list[list[Any]]:
     return []
 
 
+def _extract_orderbook_buy_rows(payload: dict[str, Any]) -> list[list[Any]]:
+    for key in (
+        "rgCompactBuyOrders",
+        "buy_orderbook",
+        "buy_orders",
+        "buy",
+        "bids",
+        "bid",
+        "buy_order_graph",
+    ):
+        rows = _normalize_orderbook_rows(payload.get(key))
+        if rows:
+            return rows
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _extract_orderbook_buy_rows(data)
+    return []
+
+
+def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
 def _parse_orderbook_price(value: Any) -> float | None:
     price = _parse_price_text(str(value))
     if price is None:
         return None
-    # Steam orderbook uses the selected currency's minor unit for compact
-    # prices. For CNY currency=23 this means fen: 210 -> CNY 2.10,
-    # 14199 -> CNY 141.99. Keep already-decimal display prices intact.
+    # Steam compact orderbook uses the selected currency's minor unit.
+    # For CNY currency=23 this means fen: 89 -> CNY 0.89,
+    # 210 -> CNY 2.10, 14199 -> CNY 141.99. Keep display
+    # strings that already contain decimals intact.
     if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
-        if price >= 100:
-            return price / 100.0
+        return price / 100.0
     return price
+
+
+def _top_orderbook_row(rows: list[list[Any]]) -> tuple[float | None, float | None]:
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        price = _parse_orderbook_price(row[0])
+        count = safe_float(row[1])
+        if price is not None and count is not None:
+            return price, count
+    return None, None
+
+
+def summarize_orderbook_prices(
+    payload: dict[str, Any],
+    *,
+    wall_min_count: int = 20,
+    price_offset: float = 0.01,
+    min_price: float | None = None,
+) -> OrderbookPriceSummary:
+    sell_rows = _extract_orderbook_sell_rows(payload)
+    buy_rows = _extract_orderbook_buy_rows(payload)
+    seller_floor_price, seller_floor_count = _top_orderbook_row(sell_rows)
+    buyer_max_price, buyer_max_count = _top_orderbook_row(buy_rows)
+
+    wall_decision = choose_orderbook_price(
+        payload,
+        wall_min_count=wall_min_count,
+        price_offset=price_offset,
+        min_price=min_price,
+    )
+    seller_wall_price = wall_decision.wall_price if wall_decision else None
+    seller_wall_list_price = wall_decision.list_price if wall_decision else None
+
+    seller_wall_count: float | None = None
+    if seller_wall_price is not None:
+        cumulative = 0.0
+        for row in sell_rows:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            price = _parse_orderbook_price(row[0])
+            count = safe_float(row[1])
+            if price is None or count is None:
+                continue
+            cumulative += count
+            if price == seller_wall_price:
+                seller_wall_count = cumulative
+            if cumulative >= wall_min_count:
+                seller_wall_count = cumulative
+                break
+
+    data = _payload_data(payload)
+    sell_total = safe_float(data.get("cSellOrders") or data.get("sell_order_count"))
+    buy_total = safe_float(data.get("cBuyOrders") or data.get("buy_order_count"))
+
+    def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+        if numerator is None or denominator is None or denominator <= 0:
+            return None
+        return numerator / denominator
+
+    return OrderbookPriceSummary(
+        seller_floor_price=seller_floor_price,
+        seller_floor_count=seller_floor_count,
+        seller_wall_price=seller_wall_price,
+        seller_wall_list_price=seller_wall_list_price,
+        seller_wall_count=seller_wall_count,
+        buyer_max_price=buyer_max_price,
+        buyer_max_count=buyer_max_count,
+        sell_order_count_total=int(sell_total) if sell_total is not None else None,
+        buy_order_count_total=int(buy_total) if buy_total is not None else None,
+        wall_to_floor_ratio=_ratio(seller_wall_list_price, seller_floor_price),
+        wall_to_buyer_ratio=_ratio(seller_wall_list_price, buyer_max_price),
+        spread_ratio=_ratio(seller_floor_price - buyer_max_price, seller_floor_price)
+        if seller_floor_price is not None and buyer_max_price is not None
+        else None,
+    )
 
 
 def choose_orderbook_price(

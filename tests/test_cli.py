@@ -25,10 +25,18 @@ from cs2_assistant.cli import (
     _parse_report_boundary,
     _resolve_c5_steam_id,
     _summarize_inventory_types,
+    cmd_pool_case_monitor_collect,
+    cmd_pool_case_monitor_report,
+    cmd_pool_case_monitor_run,
 )
 from cs2_assistant.db import Database
-from cs2_assistant.models import MarketState
-from cs2_assistant.models import StrategyConfig
+from cs2_assistant.models import (
+    MarketState,
+    OP_SELL_STEAM,
+    POOL_STATUS_LISTING_PENDING,
+    STRATEGY_GUADAO,
+    StrategyConfig,
+)
 
 
 class FakeC5Client:
@@ -106,6 +114,85 @@ class BalanceCommandTestCase(unittest.TestCase):
         self.assertIn("TOTAL", rendered)
         self.assertIn("30.50", rendered)
         self.assertIn("31.75", rendered)
+
+
+class SteamConfirmCommandTestCase(unittest.TestCase):
+    def test_steam_confirm_uses_program_asset_targets(self) -> None:
+        from cs2_assistant import cli
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "assistant.db"
+            db = Database(db_path)
+            db.initialize()
+            op_id = db.add_pool_operation(
+                market_hash_name="Kilowatt Case",
+                strategy=STRATEGY_GUADAO,
+                operation_type=OP_SELL_STEAM,
+                expected_price=2.0,
+                asset_id="asset-program",
+                note=json.dumps(
+                    {
+                        "listingId": "listing-program",
+                        "needsConfirmation": True,
+                        "confirmationStatus": "not_found",
+                        "steamId64": "76561198000000001",
+                    }
+                ),
+            )
+            db.update_pool_operation(op_id, status=POOL_STATUS_LISTING_PENDING)
+            skipped_id = db.add_pool_operation(
+                market_hash_name="AK-47 | Redline (Field-Tested)",
+                strategy=STRATEGY_GUADAO,
+                operation_type=OP_SELL_STEAM,
+                expected_price=20.0,
+                asset_id="asset-other-account",
+                note=json.dumps(
+                    {
+                        "listingId": "listing-other-account",
+                        "needsConfirmation": True,
+                        "confirmationStatus": "not_found",
+                        "steamId64": "76561198000000002",
+                    }
+                ),
+            )
+            db.update_pool_operation(skipped_id, status=POOL_STATUS_LISTING_PENDING)
+            db.close()
+
+            class FakeSettings:
+                steam_market_base_url = "https://steam.test"
+                steam_cookies = None
+                steam_identity_secret = None
+                steam_device_id = None
+                db_path = Path(tmpdir) / "assistant.db"
+
+            class FakeSteam:
+                steam_id64 = "76561198000000001"
+
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, object]] = []
+
+                def confirm_listing_assets(self, *, asset_ids: object, listing_ids: object | None = None) -> int:
+                    self.calls.append({"asset_ids": asset_ids, "listing_ids": listing_ids})
+                    return 1
+
+                def confirm_all(self) -> int:
+                    raise AssertionError("steam confirm must not call confirm_all")
+
+            fake_steam = FakeSteam()
+            args = build_parser().parse_args(["steam", "confirm"])
+            with mock.patch.object(cli, "load_settings", return_value=FakeSettings()):
+                with mock.patch.object(cli, "_build_steam_client", return_value=fake_steam):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        code = args.handler(args)
+
+            self.assertEqual(0, code)
+            self.assertEqual(
+                [{"asset_ids": ["asset-program"], "listing_ids": None}],
+                fake_steam.calls,
+            )
+            self.assertIn("Confirmed 1 listings", output.getvalue())
+
 
 class ResolveC5SteamIdTestCase(unittest.TestCase):
     def test_config_proxy_command_is_removed(self) -> None:
@@ -336,6 +423,37 @@ class ParserTestCase(unittest.TestCase):
         self.assertEqual("guadao-report", args.pool_command)
         self.assertEqual("2026-05-10T08", args.date_from)
         self.assertEqual("2026-05-10T17", args.date_to)
+
+    def test_pool_case_monitor_collect_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["pool", "case-monitor", "collect", "--item", "Kilowatt Case", "--limit", "2"])
+        self.assertEqual("pool", args.command)
+        self.assertEqual("case-monitor", args.pool_command)
+        self.assertEqual("collect", args.case_monitor_command)
+        self.assertEqual(["Kilowatt Case"], args.market_hash_names)
+        self.assertEqual(2, args.limit)
+        self.assertIs(args.handler, cmd_pool_case_monitor_collect)
+
+    def test_pool_case_monitor_run_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["pool", "case-monitor", "run", "--once"])
+        self.assertEqual("pool", args.command)
+        self.assertEqual("case-monitor", args.pool_command)
+        self.assertEqual("run", args.case_monitor_command)
+        self.assertTrue(args.once)
+        self.assertEqual(5.0, args.interval_minutes)
+        self.assertIs(args.handler, cmd_pool_case_monitor_run)
+
+    def test_pool_case_monitor_report_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["pool", "case-monitor", "report", "--hours", "168", "--top", "5"])
+        self.assertEqual("pool", args.command)
+        self.assertEqual("case-monitor", args.pool_command)
+        self.assertEqual("report", args.case_monitor_command)
+        self.assertEqual(168.0, args.hours)
+        self.assertEqual(5, args.top)
+        self.assertEqual("all", args.recommendation_type)
+        self.assertIs(args.handler, cmd_pool_case_monitor_report)
 
     def test_parse_report_boundary_expands_hour_precision(self) -> None:
         start = _parse_report_boundary("2026-05-10T08", is_end=False)
