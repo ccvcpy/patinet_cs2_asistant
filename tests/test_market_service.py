@@ -110,16 +110,21 @@ class FakeC5Client:
 
 
 class FakeSteamMarketClient:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, currency: int | None = None, price: int = 22200) -> None:
         self.fail = fail
+        self.currency = currency
+        self.price = price
 
     def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
         if self.fail:
             raise RuntimeError("steam account unavailable")
-        return {
+        payload = {
             "success": 1,
-            "rgCompactSellOrders": [[22200, 4]],
+            "rgCompactSellOrders": [[self.price, 4]],
         }
+        if self.currency is not None:
+            payload["eCurrency"] = self.currency
+        return payload
 
 
 class FakeC5PriceBatchFailureClient:
@@ -240,6 +245,54 @@ class MarketServiceTestCase(unittest.TestCase):
         state = states[0]
         self.assertEqual(222.0, state.steam_sell_price)
         self.assertEqual("steam_orderbook", state.steam_price_source)
+
+    def test_steam_orderbook_rejects_wrong_currency_and_tries_next_client(self) -> None:
+        service = MarketService(
+            c5_client=FakeC5Client(),
+            steam_currency=23,
+            steam_market_clients=[
+                FakeSteamMarketClient(currency=1, price=3400),
+                FakeSteamMarketClient(currency=23, price=179),
+            ],
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertEqual(1.79, state.steam_sell_price)
+        self.assertEqual("steam_orderbook", state.steam_price_source)
+        self.assertIn("currency mismatch", " ".join(state.raw_json["steam_orderbook_retry_errors"]))
+
+    def test_steam_orderbook_wrong_currency_does_not_override_third_party_price(self) -> None:
+        service = MarketService(
+            steamdt_client=FakeSteamDTClient(),
+            c5_client=FakeC5Client(),
+            steam_currency=23,
+            steam_market_client=FakeSteamMarketClient(currency=1, price=3400),
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertEqual(200.0, state.steam_sell_price)
+        self.assertEqual("steamdt", state.steam_price_source)
+        self.assertIn("currency mismatch", state.raw_json["steam_orderbook_error"])
 
     def test_c5_price_batch_failure_does_not_abort_scan(self) -> None:
         service = MarketService(

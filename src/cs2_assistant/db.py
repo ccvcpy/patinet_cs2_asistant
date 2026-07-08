@@ -175,6 +175,66 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_inventory_assets_steam
             ON inventory_assets(steam_id);
 
+            CREATE TABLE IF NOT EXISTS asset_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id TEXT NOT NULL,
+                market_hash_name TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                operation_id INTEGER,
+                reserved_until TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                released_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_asset_reservations_asset
+            ON asset_reservations(asset_id, status);
+
+            CREATE INDEX IF NOT EXISTS idx_asset_reservations_owner
+            ON asset_reservations(owner, status);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_reservations_live_asset
+            ON asset_reservations(asset_id)
+            WHERE status IN ('active', 'consumed');
+
+            CREATE TABLE IF NOT EXISTS profit_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_no TEXT NOT NULL UNIQUE,
+                market_hash_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                step_key TEXT NOT NULL DEFAULT 'discovered',
+                step_index INTEGER NOT NULL DEFAULT 0,
+                a_asset_id TEXT,
+                a_steam_id TEXT,
+                b_asset_id TEXT,
+                steam_listing_id TEXT,
+                c5_product_id TEXT,
+                steam_buy_price REAL,
+                steam_balance_discount REAL,
+                steam_real_cost REAL,
+                c5_listing_price REAL,
+                c5_expected_net_price REAL,
+                c5_sold_net_price REAL,
+                expected_profit REAL,
+                realized_profit REAL,
+                expected_roi REAL,
+                realized_roi REAL,
+                error TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trades_status
+            ON profit_trades(status, updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trades_asset
+            ON profit_trades(a_asset_id, status);
+
             CREATE TABLE IF NOT EXISTS strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_hash_name TEXT NOT NULL,
@@ -844,14 +904,27 @@ class Database:
         steam_id: str | None = None,
         exclude_asset_ids: set[str] | None = None,
     ) -> sqlite3.Row | None:
+        now = utc_now_iso()
         sql = """
             SELECT asset_id, market_hash_name, steam_id
             FROM inventory_assets
             WHERE market_hash_name = ?
               AND tradable = 1
               AND status = 'available'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM asset_reservations r
+                  WHERE r.asset_id = inventory_assets.asset_id
+                    AND (
+                        r.status = 'consumed'
+                        OR (
+                            r.status = 'active'
+                            AND (r.reserved_until IS NULL OR r.reserved_until > ?)
+                        )
+                    )
+              )
         """
-        params: list[Any] = [market_hash_name]
+        params: list[Any] = [market_hash_name, now]
         if steam_id:
             sql += " AND steam_id = ?"
             params.append(steam_id)
@@ -886,6 +959,7 @@ class Database:
         steam_id: str | None = None,
         tradable: bool | None = None,
         status: str | None = None,
+        exclude_reserved: bool = False,
     ) -> list[sqlite3.Row]:
         sql = """
             SELECT asset_id, market_hash_name, steam_id, tradable, status, last_seen_at, created_at
@@ -905,6 +979,22 @@ class Database:
         if status is not None:
             sql += " AND status = ?"
             params.append(status)
+        if exclude_reserved:
+            sql += """
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM asset_reservations r
+                    WHERE r.asset_id = inventory_assets.asset_id
+                      AND (
+                          r.status = 'consumed'
+                          OR (
+                              r.status = 'active'
+                              AND (r.reserved_until IS NULL OR r.reserved_until > ?)
+                          )
+                      )
+                )
+            """
+            params.append(utc_now_iso())
         sql += " ORDER BY asset_id ASC"
         return self.conn.execute(sql, tuple(params)).fetchall()
 
@@ -916,6 +1006,386 @@ class Database:
     ) -> list[str]:
         rows = self.list_assets(market_hash_name=market_hash_name, steam_id=steam_id)
         return [str(row["asset_id"]) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Asset reservations / profit-trade isolation
+    # ------------------------------------------------------------------
+
+    def release_expired_asset_reservations(self) -> int:
+        now = utc_now_iso()
+        cursor = self.conn.execute(
+            """
+            UPDATE asset_reservations
+            SET status = 'released',
+                updated_at = ?,
+                released_at = ?
+            WHERE status = 'active'
+              AND reserved_until IS NOT NULL
+              AND reserved_until <= ?
+            """,
+            (now, now, now),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
+
+    def reserve_asset(
+        self,
+        *,
+        asset_id: str,
+        market_hash_name: str,
+        owner: str,
+        purpose: str,
+        reserved_until: str | None = None,
+        operation_id: int | None = None,
+        note: str | None = None,
+    ) -> int | None:
+        self.release_expired_asset_reservations()
+        now = utc_now_iso()
+        try:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO asset_reservations (
+                    asset_id,
+                    market_hash_name,
+                    owner,
+                    purpose,
+                    status,
+                    operation_id,
+                    reserved_until,
+                    note,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                """,
+                (
+                    asset_id,
+                    market_hash_name,
+                    owner,
+                    purpose,
+                    operation_id,
+                    reserved_until,
+                    note,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return None
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def get_active_asset_reservation(self, asset_id: str) -> sqlite3.Row | None:
+        now = utc_now_iso()
+        return self.conn.execute(
+            """
+            SELECT *
+            FROM asset_reservations
+            WHERE asset_id = ?
+              AND (
+                  status = 'consumed'
+                  OR (
+                      status = 'active'
+                      AND (reserved_until IS NULL OR reserved_until > ?)
+                  )
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (asset_id, now),
+        ).fetchone()
+
+    def consume_asset_reservation(
+        self,
+        *,
+        asset_id: str,
+        owner: str | None = None,
+        operation_id: int | None = None,
+        note: str | None = None,
+    ) -> bool:
+        now = utc_now_iso()
+        sql = """
+            UPDATE asset_reservations
+            SET status = 'consumed',
+                updated_at = ?,
+                operation_id = COALESCE(?, operation_id),
+                note = COALESCE(?, note)
+            WHERE asset_id = ?
+              AND status = 'active'
+        """
+        params: list[Any] = [now, operation_id, note, asset_id]
+        if owner:
+            sql += " AND owner = ?"
+            params.append(owner)
+        cursor = self.conn.execute(sql, tuple(params))
+        self.conn.commit()
+        return int(cursor.rowcount) > 0
+
+    def update_asset_reservation_deadline(
+        self,
+        *,
+        asset_id: str,
+        owner: str | None = None,
+        operation_id: int | None = None,
+        reserved_until: str | None = None,
+        note: str | None = None,
+    ) -> bool:
+        now = utc_now_iso()
+        sql = """
+            UPDATE asset_reservations
+            SET reserved_until = ?,
+                updated_at = ?,
+                operation_id = COALESCE(?, operation_id),
+                note = COALESCE(?, note)
+            WHERE asset_id = ?
+              AND status = 'active'
+        """
+        params: list[Any] = [reserved_until, now, operation_id, note, asset_id]
+        if owner:
+            sql += " AND owner = ?"
+            params.append(owner)
+        cursor = self.conn.execute(sql, tuple(params))
+        self.conn.commit()
+        return int(cursor.rowcount) > 0
+
+    def attach_asset_reservation_operation(
+        self,
+        *,
+        reservation_id: int,
+        operation_id: int,
+        note: str | None = None,
+    ) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE asset_reservations
+            SET operation_id = ?,
+                updated_at = ?,
+                note = COALESCE(?, note)
+            WHERE id = ?
+              AND status IN ('active', 'consumed')
+            """,
+            (operation_id, utc_now_iso(), note, reservation_id),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount) > 0
+
+    def release_asset_reservation(
+        self,
+        *,
+        asset_id: str,
+        owner: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        now = utc_now_iso()
+        sql = """
+            UPDATE asset_reservations
+            SET status = 'released',
+                updated_at = ?,
+                released_at = ?,
+                note = COALESCE(?, note)
+            WHERE asset_id = ?
+              AND status IN ('active', 'consumed')
+        """
+        params: list[Any] = [now, now, reason, asset_id]
+        if owner:
+            sql += " AND owner = ?"
+            params.append(owner)
+        cursor = self.conn.execute(sql, tuple(params))
+        self.conn.commit()
+        return int(cursor.rowcount) > 0
+
+    def list_asset_reservations(
+        self,
+        *,
+        owner: str | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM asset_reservations WHERE 1 = 1"
+        params: list[Any] = []
+        if owner:
+            sql += " AND owner = ?"
+            params.append(owner)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return self.conn.execute(sql, tuple(params)).fetchall()
+
+    # ------------------------------------------------------------------
+    # Profit trades
+    # ------------------------------------------------------------------
+
+    def add_profit_trade(
+        self,
+        *,
+        trade_no: str,
+        market_hash_name: str,
+        status: str = "candidate",
+        step_key: str = "discovered",
+        step_index: int = 0,
+        a_asset_id: str | None = None,
+        a_steam_id: str | None = None,
+        b_asset_id: str | None = None,
+        steam_listing_id: str | None = None,
+        c5_product_id: str | None = None,
+        steam_buy_price: float | None = None,
+        steam_balance_discount: float | None = None,
+        steam_real_cost: float | None = None,
+        c5_listing_price: float | None = None,
+        c5_expected_net_price: float | None = None,
+        c5_sold_net_price: float | None = None,
+        expected_profit: float | None = None,
+        realized_profit: float | None = None,
+        expected_roi: float | None = None,
+        realized_roi: float | None = None,
+        error: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        cursor = self.conn.execute(
+            """
+            INSERT INTO profit_trades (
+                trade_no,
+                market_hash_name,
+                status,
+                step_key,
+                step_index,
+                a_asset_id,
+                a_steam_id,
+                b_asset_id,
+                steam_listing_id,
+                c5_product_id,
+                steam_buy_price,
+                steam_balance_discount,
+                steam_real_cost,
+                c5_listing_price,
+                c5_expected_net_price,
+                c5_sold_net_price,
+                expected_profit,
+                realized_profit,
+                expected_roi,
+                realized_roi,
+                error,
+                note,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade_no,
+                market_hash_name,
+                status,
+                step_key,
+                step_index,
+                a_asset_id,
+                a_steam_id,
+                b_asset_id,
+                steam_listing_id,
+                c5_product_id,
+                steam_buy_price,
+                steam_balance_discount,
+                steam_real_cost,
+                c5_listing_price,
+                c5_expected_net_price,
+                c5_sold_net_price,
+                expected_profit,
+                realized_profit,
+                expected_roi,
+                realized_roi,
+                error,
+                note,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def update_profit_trade(
+        self,
+        trade_id: int,
+        **fields: Any,
+    ) -> None:
+        allowed = {
+            "status",
+            "step_key",
+            "step_index",
+            "a_asset_id",
+            "a_steam_id",
+            "b_asset_id",
+            "steam_listing_id",
+            "c5_product_id",
+            "steam_buy_price",
+            "steam_balance_discount",
+            "steam_real_cost",
+            "c5_listing_price",
+            "c5_expected_net_price",
+            "c5_sold_net_price",
+            "expected_profit",
+            "realized_profit",
+            "expected_roi",
+            "realized_roi",
+            "error",
+            "note",
+        }
+        parts: list[str] = []
+        params: list[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            parts.append(f"{key} = ?")
+            params.append(value)
+        if not parts:
+            return
+        parts.append("updated_at = ?")
+        params.append(utc_now_iso())
+        status = fields.get("status")
+        if status in {"completed", "failed", "manual_required", "cancelled"}:
+            parts.append("completed_at = ?")
+            params.append(utc_now_iso())
+        params.append(trade_id)
+        self.conn.execute(
+            f"UPDATE profit_trades SET {', '.join(parts)} WHERE id = ?",
+            tuple(params),
+        )
+        self.conn.commit()
+
+    def get_profit_trade(self, trade_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM profit_trades WHERE id = ?",
+            (trade_id,),
+        ).fetchone()
+
+    def get_live_profit_trade_for_asset(self, asset_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT *
+            FROM profit_trades
+            WHERE a_asset_id = ?
+              AND status NOT IN ('completed', 'failed', 'manual_required', 'cancelled')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (asset_id,),
+        ).fetchone()
+
+    def list_profit_trades(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM profit_trades"
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return self.conn.execute(sql, tuple(params)).fetchall()
 
     # ------------------------------------------------------------------
     # Strategy evaluations

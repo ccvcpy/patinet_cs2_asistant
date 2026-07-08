@@ -133,6 +133,178 @@ def _steam_wallet_amount(raw: Any) -> float | None:
         return None
 
 
+def _safe_int(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(Decimal(str(raw)))
+    except Exception:
+        return None
+
+
+def _first_int(raw: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = _safe_int(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _confirmation_id_from_payload(payload: dict[str, Any]) -> str:
+    confirmation = payload.get("confirmation")
+    if isinstance(confirmation, dict):
+        for key in ("confirmation_id", "confirmationid", "id"):
+            value = str(confirmation.get(key) or "").strip()
+            if value:
+                return value
+    for key in ("confirmation_id", "confirmationid", "confirmationId"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _market_listing_hash_name(row: dict[str, Any]) -> str | None:
+    description = row.get("description")
+    if isinstance(description, dict):
+        value = description.get("market_hash_name") or description.get("market_name")
+        if value:
+            return str(value)
+    value = row.get("market_hash_name") or row.get("marketHashName")
+    if value:
+        return str(value)
+    return None
+
+
+def _compact_listing_asset(asset: Any) -> Any:
+    if not isinstance(asset, dict):
+        return asset
+    keys = ("id", "assetid", "classid", "instanceid", "amount", "appid", "contextid")
+    return {key: asset.get(key) for key in keys if key in asset}
+
+
+def _normalize_listing_row(
+    row: dict[str, Any],
+    *,
+    raw_listing_id: str | None = None,
+) -> dict[str, Any] | None:
+    listing_id = str(row.get("listingid") or raw_listing_id or "").strip()
+    if not listing_id:
+        return None
+
+    asset = row.get("asset")
+    if isinstance(asset, dict) and _safe_int(asset.get("amount")) == 0:
+        return None
+    if row.get("bMine") is True:
+        return None
+
+    subtotal = _first_int(
+        row,
+        (
+            "converted_price",
+            "unPricePerUnit",
+            "unPrice",
+            "subtotal",
+            "price",
+        ),
+    )
+    fee = _first_int(
+        row,
+        (
+            "converted_fee",
+            "unFeePerUnit",
+            "unFee",
+            "fee",
+        ),
+    )
+    total = _first_int(
+        row,
+        (
+            "converted_total",
+            "unTotal",
+            "unTotalPerUnit",
+            "total",
+        ),
+    )
+    if total is None and subtotal is not None and fee is not None:
+        total = subtotal + fee
+    if subtotal is None and total is not None and fee is not None:
+        subtotal = total - fee
+    if fee is None and total is not None and subtotal is not None:
+        fee = total - subtotal
+    if subtotal is None or fee is None or total is None or total <= 0:
+        return None
+
+    currency = _first_int(
+        row,
+        (
+            "converted_currencyid",
+            "currencyid",
+            "eCurrency",
+            "currency",
+        ),
+    )
+    description = row.get("description") if isinstance(row.get("description"), dict) else None
+    return {
+        "listingid": listing_id,
+        "converted_price": int(subtotal),
+        "converted_fee": int(fee),
+        "converted_total": int(total),
+        "converted_currencyid": currency,
+        "eCurrency": currency,
+        "asset": _compact_listing_asset(asset),
+        "description": description,
+        "market_hash_name": _market_listing_hash_name(row),
+        "strSubtotal": row.get("strSubtotal"),
+        "unPrice": row.get("unPrice"),
+        "unFee": row.get("unFee"),
+        "unPricePerUnit": row.get("unPricePerUnit"),
+        "unFeePerUnit": row.get("unFeePerUnit"),
+        "bMine": row.get("bMine"),
+    }
+
+
+def _normalize_market_search_payload(
+    payload: dict[str, Any],
+    *,
+    market_hash_name: str,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    listinginfo: dict[str, Any] = {}
+    rows = payload.get("listings")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_hash_name = _market_listing_hash_name(row)
+            if row_hash_name and row_hash_name != market_hash_name:
+                continue
+            normalized = _normalize_listing_row(row)
+            if normalized is None:
+                continue
+            listinginfo[str(normalized["listingid"])] = normalized
+            if limit is not None and len(listinginfo) >= limit:
+                break
+    elif isinstance(rows, dict):
+        for listing_id, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            row_hash_name = _market_listing_hash_name(row)
+            if row_hash_name and row_hash_name != market_hash_name:
+                continue
+            normalized = _normalize_listing_row(row, raw_listing_id=str(listing_id))
+            if normalized is None:
+                continue
+            listinginfo[str(normalized["listingid"])] = normalized
+            if limit is not None and len(listinginfo) >= limit:
+                break
+
+    result = dict(payload)
+    result["success"] = payload.get("success", True)
+    result["listinginfo"] = listinginfo
+    return result
+
+
 class SteamMarketClient:
     def __init__(
         self,
@@ -212,7 +384,8 @@ class SteamMarketClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
-        data: dict[str, Any] | None = None,
+        data: dict[str, Any] | str | None = None,
+        files: Any | None = None,
         headers: dict[str, str] | None = None,
         _allow_retry: bool = True,
     ) -> requests.Response:
@@ -229,6 +402,7 @@ class SteamMarketClient:
                         url=url,
                         params=params,
                         data=data,
+                        files=files,
                         headers=merged_headers,
                         timeout=self.timeout,
                     )
@@ -246,6 +420,7 @@ class SteamMarketClient:
                     url=url,
                     params=params,
                     data=data,
+                    files=files,
                     headers=merged_headers,
                     timeout=self.timeout,
                 )
@@ -377,36 +552,219 @@ class SteamMarketClient:
         subtotal: int,
         fee: int,
         total: int,
+        currency: int = 23,
+        country: str = "CN",
+        tradefee_tax: int = 0,
+        market_hash_name: str | None = None,
     ) -> dict[str, Any]:
         if not listing_id:
             raise SteamMarketError("listing_id is required")
         if subtotal < 0 or fee < 0 or total <= 0:
             raise SteamMarketError("subtotal, fee, total must be valid cents values")
 
-        data = {
-            "sessionid": self.sessionid,
-            "currency": 23,
-            "subtotal": int(subtotal),
-            "fee": int(fee),
-            "total": int(total),
-            "quantity": 1,
-        }
-        response = self._request(
-            "POST",
-            f"/market/buylisting/{listing_id}",
-            data=data,
-            headers={"Referer": f"{self.base_url}/market/listings/{app_id}"},
+        referer_name = quote(str(market_hash_name or "").strip(), safe="")
+        referer = (
+            f"{self.base_url}/market/listings/{app_id}/{referer_name}"
+            if referer_name
+            else f"{self.base_url}/market/listings/{app_id}"
+        )
+
+        def post(confirmation: str = "0") -> dict[str, Any]:
+            data = {
+                "sessionid": self.sessionid,
+                "currency": int(currency),
+                "subtotal": int(subtotal),
+                "fee": int(fee),
+                "total": int(total),
+                "tradefee_tax": int(tradefee_tax),
+                "quantity": 1,
+                "first_name": "",
+                "last_name": "",
+                "billing_address": "",
+                "billing_address_two": "",
+                "billing_country": country,
+                "billing_city": "",
+                "billing_state": "",
+                "billing_postal_code": "",
+                "confirmation": confirmation,
+                "save_my_address": "0",
+            }
+            files = [(key, (None, str(value))) for key, value in data.items()]
+            response = self._session.post(
+                f"{self.base_url}/market/buylisting/{listing_id}",
+                files=files,
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Origin": self.base_url,
+                    "Referer": referer,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                    ),
+                },
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise SteamMarketError(f"Steam buylisting invalid JSON: {response.text}") from exc
+            wallet_info = payload.get("wallet_info") or {}
+            success = payload.get("success")
+            wallet_success = wallet_info.get("success")
+            if response.ok and (success in (1, True) or wallet_success in (1, True)):
+                return payload
+            if payload.get("need_confirmation"):
+                return payload
+            message = payload.get("message") or wallet_info.get("message") or payload
+            raise SteamMarketError(json.dumps(message, ensure_ascii=False), payload=payload)
+
+        first_payload = post("0")
+        wallet_info = first_payload.get("wallet_info") or {}
+        if first_payload.get("success") in (1, True) or wallet_info.get("success") in (1, True):
+            return first_payload
+
+        confirmation_id = _confirmation_id_from_payload(first_payload)
+        if not confirmation_id:
+            raise SteamMarketError(
+                f"Steam buylisting requires confirmation but returned no confirmation_id: "
+                f"{json.dumps(first_payload, ensure_ascii=False)}",
+                payload=first_payload,
+            )
+        self._allow_confirmation_creator_id(confirmation_id, action="Steam buylisting")
+        second_payload = post(confirmation_id)
+        second_wallet_info = second_payload.get("wallet_info") or {}
+        if second_payload.get("success") in (1, True) or second_wallet_info.get("success") in (1, True):
+            return second_payload
+        raise SteamMarketError(json.dumps(second_payload, ensure_ascii=False), payload=second_payload)
+
+    def create_buy_order(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        price_total: int,
+        quantity: int = 1,
+        currency: int = 23,
+        country: str = "CN",
+        return_uncertain_after_confirmation: bool = False,
+    ) -> dict[str, Any]:
+        if not market_hash_name:
+            raise SteamMarketError("market_hash_name is required")
+        if price_total <= 0 or quantity <= 0:
+            raise SteamMarketError("price_total and quantity must be positive")
+
+        def post(confirmation: str = "0", *, return_error_payload: bool = False) -> dict[str, Any]:
+            data = {
+                "sessionid": self.sessionid,
+                "currency": int(currency),
+                "appid": int(app_id),
+                "market_hash_name": market_hash_name,
+                "price_total": int(price_total),
+                "tradefee_tax": 0,
+                "quantity": int(quantity),
+                "first_name": "",
+                "last_name": "",
+                "billing_address": "",
+                "billing_address_two": "",
+                "billing_country": country,
+                "billing_city": "",
+                "billing_state": "",
+                "billing_postal_code": "",
+                "confirmation": confirmation,
+                "save_my_address": "0",
+            }
+            response = self._session.post(
+                f"{self.base_url}/market/createbuyorder/",
+                data=data,
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Origin": self.base_url,
+                    "Referer": (
+                        f"{self.base_url}/market/listings/{app_id}/"
+                        f"{quote(market_hash_name, safe='')}"
+                    ),
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                    ),
+                },
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise SteamMarketError(
+                    f"Steam createbuyorder invalid JSON: {response.text}"
+                ) from exc
+            if response.ok and payload.get("success") == 1:
+                return payload
+            if payload.get("need_confirmation"):
+                return payload
+            if return_error_payload:
+                payload["_steam_http_status"] = response.status_code
+                payload["_outcome_uncertain_after_confirmation"] = True
+                return payload
+            message = payload.get("message") or payload.get("error") or payload
+            raise SteamMarketError(json.dumps(message, ensure_ascii=False), payload=payload)
+
+        first_payload = post("0")
+        if first_payload.get("success") == 1:
+            return first_payload
+
+        confirmation_id = _confirmation_id_from_payload(first_payload)
+        if not confirmation_id:
+            raise SteamMarketError(
+                f"Steam createbuyorder requires confirmation but returned no confirmation_id: "
+                f"{json.dumps(first_payload, ensure_ascii=False)}",
+                payload=first_payload,
+            )
+        self._allow_confirmation_creator_id(confirmation_id, action="Steam createbuyorder")
+        second_payload = post(
+            confirmation_id,
+            return_error_payload=return_uncertain_after_confirmation,
+        )
+        if second_payload.get("_outcome_uncertain_after_confirmation"):
+            return second_payload
+        if second_payload.get("success") != 1:
+            raise SteamMarketError(json.dumps(second_payload, ensure_ascii=False), payload=second_payload)
+        return second_payload
+
+    def cancel_buy_order(self, *, buy_order_id: str) -> dict[str, Any]:
+        buy_order_id = str(buy_order_id or "").strip()
+        if not buy_order_id:
+            raise SteamMarketError("buy_order_id is required")
+        response = self._session.post(
+            f"{self.base_url}/market/cancelbuyorder/",
+            data={
+                "sessionid": self.sessionid,
+                "buy_orderid": buy_order_id,
+            },
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Origin": self.base_url,
+                "Referer": f"{self.base_url}/market/",
+                "X-Requested-With": "XMLHttpRequest",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+            },
+            timeout=self.timeout,
+            allow_redirects=False,
         )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise SteamMarketError(f"Steam buylisting invalid JSON: {response.text}") from exc
-        wallet_info = payload.get("wallet_info") or {}
-        success = wallet_info.get("success")
-        if success not in (1, True):
-            message = payload.get("message") or wallet_info.get("message") or payload
-            raise SteamMarketError(json.dumps(message, ensure_ascii=False))
-        return payload
+            raise SteamMarketError(f"Steam cancelbuyorder invalid JSON: {response.text}") from exc
+        if response.ok and payload.get("success") in (1, True):
+            return payload
+        message = payload.get("message") or payload.get("error") or payload
+        raise SteamMarketError(json.dumps(message, ensure_ascii=False), payload=payload)
 
     def search_listings(
         self,
@@ -415,29 +773,58 @@ class SteamMarketClient:
         market_hash_name: str,
         start: int = 0,
         count: int = 10,
+        currency: int = 23,
+        country: str = "CN",
+        language: str = "schinese",
     ) -> dict[str, Any]:
         encoded_name = quote(market_hash_name, safe="")
         params = {
-            "start": start,
-            "count": count,
-            "currency": 23,
-            "language": "schinese",
-            "country": "CN",
-            "norender": 1,
+            "currency": int(currency),
+            "language": language,
+            "country": country,
         }
+        query = {
+            "appid": int(app_id),
+            "strItemName": market_hash_name,
+            "filters": {},
+            "accessoryFilters": {},
+            "propertyFilters": {},
+            "disableGrouping": True,
+            "start": int(start),
+        }
+        # Steam's current market UI no longer returns the legacy JSON from
+        # /render/. The React route action behind the new page returns concrete
+        # listing ids with unPrice/unFee, which are the values buylisting needs.
         response = self._request(
-            "GET",
-            f"/market/listings/{app_id}/{encoded_name}/render/",
+            "POST",
+            f"/market/listings/{app_id}/{encoded_name}",
             params=params,
+            data=json.dumps([query], ensure_ascii=False, separators=(",", ":")),
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json; charset=utf-8",
+                "Origin": self.base_url,
+                "Referer": f"{self.base_url}/market/listings/{app_id}/{encoded_name}",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                ),
+                "X-Valve-Request-Type": "routeAction",
+                "X-Valve-Action-Type": "4OPT6VBA:Search",
+            },
         )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise SteamMarketError(f"Steam listings render invalid JSON: {response.text}") from exc
+            raise SteamMarketError(f"Steam listings search invalid JSON: {response.text}") from exc
         success = payload.get("success")
         if success not in (1, True, None):
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
-        return payload
+        return _normalize_market_search_payload(
+            payload,
+            market_hash_name=market_hash_name,
+            limit=max(1, int(count)) if count else None,
+        )
 
     def price_overview(
         self,
@@ -629,19 +1016,21 @@ class SteamMarketClient:
                     continue
                 if int(event.get("event_type") or 0) != 3:
                     continue
-                event_asset_id = str(
-                    event.get("assetid")
-                    or event.get("asset_id")
-                    or (event.get("asset") or {}).get("id")
-                    or ""
-                ).strip()
-                if event_asset_id != asset_id:
-                    continue
                 listing_id = str(event.get("listingid") or "")
                 purchase_id = str(event.get("purchaseid") or "")
                 purchase = {}
                 if isinstance(purchases, dict):
                     purchase = purchases.get(f"{listing_id}_{purchase_id}") or purchases.get(listing_id) or {}
+                purchase_asset = purchase.get("asset") if isinstance(purchase, dict) else None
+                event_asset_id = str(
+                    event.get("assetid")
+                    or event.get("asset_id")
+                    or (event.get("asset") or {}).get("id")
+                    or (purchase_asset or {}).get("id")
+                    or ""
+                ).strip()
+                if event_asset_id != asset_id:
+                    continue
                 received_amount = purchase.get("received_amount") if isinstance(purchase, dict) else None
                 try:
                     received_value = float(received_amount) / 100.0 if received_amount is not None else None
@@ -780,6 +1169,19 @@ class SteamMarketClient:
         if not payload.get("success"):
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return len(selected)
+
+    def _allow_confirmation_creator_id(self, confirmation_id: str, *, action: str) -> int:
+        expected = str(confirmation_id or "").strip()
+        if not expected:
+            raise SteamMarketError(f"{action} confirmation_id is empty")
+        confirmations = [
+            confirmation
+            for confirmation in self.fetch_confirmations()
+            if str(confirmation.get("creator_id") or "").strip() == expected
+        ]
+        if len(confirmations) != 1:
+            raise SteamMarketError(f"{action} confirmation not found or ambiguous: {expected}")
+        return self._allow_confirmations(confirmations)
 
     @staticmethod
     def _normalize_id_set(values: Iterable[Any] | None) -> set[str]:

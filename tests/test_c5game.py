@@ -9,6 +9,17 @@ from cs2_assistant.clients.c5game import C5GameClient, C5GameError
 
 
 class C5GameClientTests(unittest.TestCase):
+    def test_request_sends_compression_accept_encoding(self) -> None:
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"success": true, "data": {}}'
+
+        with patch("requests.request", return_value=response) as mocked:
+            C5GameClient("secret-key").steam_info()
+
+        headers = mocked.call_args.kwargs["headers"]
+        self.assertEqual("gzip, deflate, br", headers["Accept-Encoding"])
+
     def test_request_error_redacts_app_key_from_message(self) -> None:
         response = requests.Response()
         response.status_code = 502

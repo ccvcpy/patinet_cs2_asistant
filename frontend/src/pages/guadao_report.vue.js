@@ -8,10 +8,10 @@ const rows = ref([
     { name: "Revolution Case", count: 66, steamGross: 198.4, steamNet: 172.18, c5Cash: 111.81 },
 ]);
 const filteredRows = computed(() => {
-    const keyword = itemName.value.trim().toLowerCase();
-    if (!keyword)
+    const nameFilter = itemName.value.trim().toLowerCase();
+    if (!nameFilter)
         return rows.value;
-    return rows.value.filter((row) => row.name.toLowerCase().includes(keyword));
+    return rows.value.filter((row) => row.name.toLowerCase().includes(nameFilter));
 });
 const closedCount = computed(() => filteredRows.value.reduce((sum, row) => sum + row.count, 0));
 const steamGrossTotal = computed(() => filteredRows.value.reduce((sum, row) => sum + row.steamGross, 0));

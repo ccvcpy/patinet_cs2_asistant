@@ -24,7 +24,20 @@ class FakeMarketService:
                 market_hash_name=str(item["market_hash_name"]),
                 name_cn=str(item.get("name_cn") or item["market_hash_name"]),
                 steam_sell_price=2.0,
-                steam_price_source="test",
+                steam_price_source="steam_orderbook",
+            )
+            for item in items
+        ]
+
+
+class FakeThirdPartyMarketService:
+    def refresh_items(self, items: list[dict]) -> list[MarketState]:
+        return [
+            MarketState(
+                market_hash_name=str(item["market_hash_name"]),
+                name_cn=str(item.get("name_cn") or item["market_hash_name"]),
+                steam_sell_price=0.34,
+                steam_price_source="steamdt",
             )
             for item in items
         ]
@@ -149,6 +162,88 @@ class StrategyClassificationTestCase(unittest.TestCase):
 
         self.assertEqual(1, len(report.guadao_candidates))
         self.assertEqual("Catalog Classified Container", report.guadao_candidates[0].market_hash_name)
+
+    def test_scan_strategies_requires_orderbook_steam_price_for_real_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                db_path=Path(temp_dir) / "assistant.db",
+                c5_api_key="c5-key",
+                steamdt_api_key="steamdt-key",
+            )
+            config = StrategyConfig(
+                dry_run=False,
+                min_price=1.0,
+                guadao_max_listing_ratio=0.90,
+                transfer_min_real_ratio=9999,
+            )
+            inventory_payload = {
+                "source": "live",
+                "list": [
+                    {
+                        "assetId": "asset-1",
+                        "marketHashName": "Kilowatt Case",
+                        "name": "Kilowatt Case",
+                        "ifTradable": True,
+                        "price": 1.0,
+                    }
+                ],
+            }
+
+            with patch(
+                "cs2_assistant.services.strategy.build_market_service",
+                return_value=FakeThirdPartyMarketService(),
+            ):
+                report = scan_strategies(
+                    settings,
+                    config,
+                    pool_market_hash_names=["Kilowatt Case"],
+                    inventory_payload=inventory_payload,
+                    weapon_case_market_hash_names={"Kilowatt Case"},
+                )
+
+        self.assertEqual([], report.all_evaluated)
+        self.assertEqual(1, report.missing_price_count)
+
+    def test_scan_strategies_allows_third_party_steam_price_for_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                db_path=Path(temp_dir) / "assistant.db",
+                c5_api_key="c5-key",
+                steamdt_api_key="steamdt-key",
+            )
+            config = StrategyConfig(
+                dry_run=True,
+                min_price=1.0,
+                guadao_max_listing_ratio=4.00,
+                transfer_min_real_ratio=9999,
+            )
+            inventory_payload = {
+                "source": "live",
+                "list": [
+                    {
+                        "assetId": "asset-1",
+                        "marketHashName": "Kilowatt Case",
+                        "name": "Kilowatt Case",
+                        "ifTradable": True,
+                        "price": 1.0,
+                    }
+                ],
+            }
+
+            with patch(
+                "cs2_assistant.services.strategy.build_market_service",
+                return_value=FakeThirdPartyMarketService(),
+            ):
+                report = scan_strategies(
+                    settings,
+                    config,
+                    pool_market_hash_names=["Kilowatt Case"],
+                    inventory_payload=inventory_payload,
+                    weapon_case_market_hash_names={"Kilowatt Case"},
+                )
+
+        self.assertEqual(1, len(report.all_evaluated))
+        self.assertEqual("steamdt", report.all_evaluated[0].steam_price_source)
 
 
 if __name__ == "__main__":

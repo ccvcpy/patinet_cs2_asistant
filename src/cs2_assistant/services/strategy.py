@@ -189,6 +189,9 @@ def scan_strategies(
 
         # Determine steam_sell_price
         steam_sell_price = state.steam_sell_price
+        if not config.dry_run and state.steam_price_source != "steam_orderbook":
+            missing_price_count += 1
+            continue
         if steam_sell_price is None:
             missing_price_count += 1
             continue

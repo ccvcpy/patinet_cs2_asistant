@@ -31,7 +31,10 @@ class C5GameClient:
     ) -> Any:
         merged_params = dict(params or {})
         merged_params["app-key"] = self.api_key
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br",
+        }
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
@@ -79,6 +82,17 @@ class C5GameClient:
         data = self._request(
             "POST",
             "/merchant/product/price/batch",
+            json_body={"appId": str(app_id), "marketHashNames": market_hash_names},
+        )
+        return dict(data or {})
+
+    def price_statistics_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, Any]:
+        """Batch query C5 item statistics used for liquidity/risk checks."""
+        if not market_hash_names:
+            return {}
+        data = self._request(
+            "POST",
+            "/merchant/market/v2/item/stat/hash/name",
             json_body={"appId": str(app_id), "marketHashNames": market_hash_names},
         )
         return dict(data or {})
@@ -249,6 +263,31 @@ class C5GameClient:
         data = self._request(
             "GET",
             "/merchant/order/v2/buy/detail",
+            params={"orderId": order_id},
+        )
+        return dict(data or {})
+
+    def seller_order_list(
+        self,
+        *,
+        app_id: int,
+        steam_id: str | None = None,
+        status: int | None = None,
+        page: int = 1,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"appId": app_id, "page": page, "limit": limit}
+        if steam_id:
+            params["steamId"] = steam_id
+        if status is not None:
+            params["status"] = status
+        data = self._request("GET", "/merchant/order/v1/list", params=params)
+        return dict(data or {})
+
+    def seller_order_detail(self, order_id: str) -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/merchant/order/v1/detail",
             params={"orderId": order_id},
         )
         return dict(data or {})

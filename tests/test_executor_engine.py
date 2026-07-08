@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -246,6 +247,24 @@ def build_guadao_candidate() -> StrategyCandidate:
     )
 
 
+def build_guadao_candidate_for(market_hash_name: str, *, rebuy_price: float = 20.0) -> StrategyCandidate:
+    return StrategyCandidate(
+        name=market_hash_name,
+        market_hash_name=market_hash_name,
+        inventory_count=1,
+        tradable_count=1,
+        rebuy_price=rebuy_price,
+        rebuy_price_source="c5_batch",
+        steam_sell_price=25.0,
+        steam_price_source="steam_market",
+        steam_after_tax_price=21.73,
+        listing_ratio=0.69,
+        transfer_real_ratio=0.07,
+        recommended_strategies=[STRATEGY_GUADAO],
+        steam_accounts=["main-steam"],
+    )
+
+
 class ExecutorEngineTransferTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -291,6 +310,38 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.temp_dir.cleanup()
+
+    def test_pick_tradable_asset_skips_profit_trade_reserved_asset(self) -> None:
+        reserved_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        reservation_id = self.db.reserve_asset(
+            asset_id="asset-old",
+            market_hash_name="Revolution Case",
+            owner="profit_trade",
+            purpose="sell_existing_a",
+            reserved_until=reserved_until,
+        )
+
+        self.assertIsNotNone(reservation_id)
+        asset = self.db.pick_tradable_asset(
+            "Revolution Case",
+            steam_id=self.engine.steam_client.steam_id64,
+        )
+        self.assertIsNone(asset)
+
+    def test_transfer_sell_asset_skips_profit_trade_reserved_asset(self) -> None:
+        reserved_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        self.db.reserve_asset(
+            asset_id="asset-old",
+            market_hash_name="Revolution Case",
+            owner="profit_trade",
+            purpose="sell_existing_a",
+            reserved_until=reserved_until,
+        )
+
+        asset_id, inventory_item = self.engine._find_transfer_sell_asset("Revolution Case")
+
+        self.assertIsNone(asset_id)
+        self.assertIsNone(inventory_item)
 
     def test_case_listing_uses_case_specific_price_offset(self) -> None:
         self.engine.config.listing_price_offset = 0.01
@@ -817,6 +868,155 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual(1, len(rebuy_ops))
         self.assertEqual("pending", rebuy_ops[0]["status"])
 
+    def test_guadao_refresh_listing_falls_back_to_asset_sale_receipt(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 0
+        self.engine.steam_client.sale_receipts_by_asset["asset-old"] = {
+            "listingId": "listing-1",
+            "purchaseId": "purchase-1",
+            "timeSold": 1782755467,
+            "receivedAmount": 2.52,
+            "receivedCurrencyId": "2023",
+        }
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=2.88,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":1.69,"steamListPrice":2.88,"activeVerifiedAt":"2026-01-01T00:00:00+00:00"}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(1, sold)
+        op = self.db.conn.execute("SELECT * FROM pool_operations WHERE id = ?", (op_id,)).fetchone()
+        note = json.loads(op["note"])
+        self.assertEqual(1782755467, note["steamSoldAt"])
+        self.assertEqual("purchase-1", note["steamPurchaseId"])
+        self.assertEqual("steam_history", note["steamSellerNetPriceSource"])
+        self.assertAlmostEqual(2.52, float(note["steamSellerNetPrice"]))
+
+    def test_stale_guadao_listed_active_listing_is_removed_before_local_restore(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 0
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        self.db.set_asset_status("asset-old", "listed")
+        stale_created_at = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0,"activeVerifiedAt":"2026-01-01T00:00:00+00:00"}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+        self.db.conn.execute("UPDATE pool_operations SET created_at = ? WHERE id = ?", (stale_created_at, op_id))
+        self.db.conn.commit()
+        self.engine.steam_client.active_listing_assets["asset-old"] = "listing-1"
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(0, sold)
+        self.assertEqual(["listing-1"], self.engine.steam_client.removed_listing_ids)
+        op = self.db.conn.execute("SELECT * FROM pool_operations WHERE id = ?", (op_id,)).fetchone()
+        self.assertEqual("canceled", op["status"])
+        note = json.loads(op["note"])
+        self.assertEqual("removed", note["staleListedCleanupStatus"])
+        self.assertEqual("available", self.db.get_asset("asset-old")["status"])
+        pool_row = self.db.list_pool_items(status=POOL_STATUS_HOLDING)[0]
+        self.assertEqual("Revolution Case", pool_row["market_hash_name"])
+        self.assertEqual([], self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10))
+
+    def test_stale_guadao_listed_missing_remote_with_sale_receipt_advances_to_rebuy(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 999
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        self.db.set_asset_status("asset-old", "listed")
+        stale_created_at = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0,"activeVerifiedAt":"2026-01-01T00:00:00+00:00"}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+        self.db.conn.execute("UPDATE pool_operations SET created_at = ? WHERE id = ?", (stale_created_at, op_id))
+        self.db.conn.commit()
+        self.engine.steam_client.sale_receipts["listing-1"] = {
+            "receivedAmount": 21.55,
+            "purchaseId": "purchase-1",
+        }
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(1, sold)
+        op = self.db.conn.execute("SELECT * FROM pool_operations WHERE id = ?", (op_id,)).fetchone()
+        self.assertEqual("sold", op["status"])
+        self.assertEqual("sold", self.db.get_asset("asset-old")["status"])
+        pool_row = self.db.list_pool_items(status=POOL_STATUS_PENDING_REBUY)[0]
+        self.assertEqual("Revolution Case", pool_row["market_hash_name"])
+        rebuy_ops = self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10)
+        self.assertEqual(1, len(rebuy_ops))
+
+    def test_stale_guadao_listed_missing_remote_without_receipt_requires_manual_review(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 0
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        self.db.set_asset_status("asset-old", "listed")
+        stale_created_at = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note='{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0,"activeVerifiedAt":"2026-01-01T00:00:00+00:00"}',
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+        self.db.conn.execute("UPDATE pool_operations SET created_at = ? WHERE id = ?", (stale_created_at, op_id))
+        self.db.conn.commit()
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(0, sold)
+        op = self.db.conn.execute("SELECT * FROM pool_operations WHERE id = ?", (op_id,)).fetchone()
+        self.assertEqual("manual_required", op["status"])
+        note = json.loads(op["note"])
+        self.assertEqual("manual_required", note["staleListedCleanupStatus"])
+        self.assertIn("missing active Steam listing and sale receipt", note["manualReviewReason"])
+        self.assertEqual("listed", self.db.get_asset("asset-old")["status"])
+        pool_row = self.db.list_pool_items(status=POOL_STATUS_LISTED)[0]
+        self.assertEqual("Revolution Case", pool_row["market_hash_name"])
+        self.assertEqual([], self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10))
+
+    def test_guadao_refresh_listing_carries_frozen_ratio_to_rebuy_op(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 0
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note=(
+                '{"listingId":"listing-1","rebuyPrice":20.0,"steamListPrice":25.0,'
+                '"activeVerifiedAt":"2026-01-01T00:00:00+00:00",'
+                '"listingRatioAtOpen":0.62,"maxRebuyRatioAtOpen":0.62,'
+                '"guadaoMaxListingRatioAtOpen":0.69,"steamNetFactorAtOpen":0.869}'
+            ),
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(1, sold)
+        rebuy_ops = self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10)
+        self.assertEqual(1, len(rebuy_ops))
+        note = json.loads(rebuy_ops[0]["note"])
+        self.assertAlmostEqual(0.62, float(note["listingRatioAtOpen"]), places=6)
+        self.assertAlmostEqual(0.62, float(note["maxRebuyRatioAtOpen"]), places=6)
+        self.assertAlmostEqual(0.69, float(note["guadaoMaxListingRatioAtOpen"]), places=6)
+
     def test_guadao_refresh_listing_prints_net_amount(self) -> None:
         self.engine.config.listing_check_interval_minutes = 0
         op_id = self.db.add_pool_operation(
@@ -854,6 +1054,132 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual(1, listed)
         printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
         self.assertIn("65.43%", printed)
+
+    def test_guadao_listing_orders_candidates_by_live_listing_ratio(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.config.guadao_max_listing_ratio = 0.69
+        self.engine.config.max_list_per_cycle = 2
+        kilowatt_asset = {
+            "assetId": "asset-kilowatt",
+            "marketHashName": "Kilowatt Case",
+            "steamId": self.engine.steam_client.steam_id64,
+            "ifTradable": True,
+            "tradableTime": None,
+            "token": "token-kilowatt",
+            "styleToken": "style-kilowatt",
+            "price": 10.0,
+        }
+        self.db.upsert_pool_item("Kilowatt Case", 1, status=POOL_STATUS_HOLDING)
+        self.db.upsert_inventory_assets([kilowatt_asset])
+
+        decisions = {
+            "Revolution Case": ListingDecision(25.0, 0.68, 0.07, None),
+            "Kilowatt Case": ListingDecision(25.0, 0.62, 0.07, None),
+        }
+
+        def decide(candidate: StrategyCandidate) -> ListingDecision:
+            return decisions[candidate.market_hash_name]
+
+        self.engine._decide_listing = decide  # type: ignore[method-assign]
+        report = type(
+            "Report",
+            (),
+            {
+                "guadao_candidates": [
+                    build_guadao_candidate_for("Revolution Case"),
+                    build_guadao_candidate_for("Kilowatt Case", rebuy_price=10.0),
+                ]
+            },
+        )()
+
+        listed = self.engine._execute_guadao_listings(
+            report,
+            {
+                "Revolution Case": POOL_STATUS_HOLDING,
+                "Kilowatt Case": POOL_STATUS_HOLDING,
+            },
+        )
+
+        self.assertEqual(2, listed)
+        self.assertEqual("asset-kilowatt", self.engine.steam_client.sell_calls[0]["asset_id"])
+        self.assertEqual("asset-old", self.engine.steam_client.sell_calls[1]["asset_id"])
+
+    def test_guadao_listing_uses_recent_sell_speed_as_tie_breaker(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.config.guadao_max_listing_ratio = 0.69
+        self.engine.config.max_list_per_cycle = 2
+        kilowatt_asset = {
+            "assetId": "asset-kilowatt",
+            "marketHashName": "Kilowatt Case",
+            "steamId": self.engine.steam_client.steam_id64,
+            "ifTradable": True,
+            "tradableTime": None,
+            "token": "token-kilowatt",
+            "styleToken": "style-kilowatt",
+            "price": 10.0,
+        }
+        self.db.upsert_pool_item("Kilowatt Case", 1, status=POOL_STATUS_HOLDING)
+        self.db.upsert_inventory_assets([kilowatt_asset])
+        sold_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-sold",
+            note="{}",
+        )
+        self.db.update_pool_operation(sold_id, status="sold")
+
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.62,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        report = type(
+            "Report",
+            (),
+            {
+                "guadao_candidates": [
+                    build_guadao_candidate_for("Revolution Case"),
+                    build_guadao_candidate_for("Kilowatt Case", rebuy_price=10.0),
+                ]
+            },
+        )()
+
+        listed = self.engine._execute_guadao_listings(
+            report,
+            {
+                "Revolution Case": POOL_STATUS_HOLDING,
+                "Kilowatt Case": POOL_STATUS_HOLDING,
+            },
+        )
+
+        self.assertEqual(2, listed)
+        self.assertEqual("asset-kilowatt", self.engine.steam_client.sell_calls[0]["asset_id"])
+
+    def test_guadao_listing_freezes_open_ratio_in_sell_note(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.config.guadao_max_listing_ratio = 0.69
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.62,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
+
+        self.assertEqual(1, listed)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        note = json.loads(sell_op["note"])
+        self.assertAlmostEqual(0.62, float(note["listingRatioAtOpen"]), places=6)
+        self.assertAlmostEqual(0.62, float(note["maxRebuyRatioAtOpen"]), places=6)
+        self.assertAlmostEqual(0.69, float(note["guadaoMaxListingRatioAtOpen"]), places=6)
 
     def test_guadao_does_not_continue_listing_when_cycle_is_open(self) -> None:
         self.engine.config.dry_run = True
@@ -988,6 +1314,29 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("pending", row["status"])
         self.assertIn('"lastSkipReason": "c5_network_error"', row["note"])
         self.assertIn('"c5ErrorPayload": {"error": "C5 request failed: connection reset"}', row["note"])
+
+    def test_rebuy_uses_frozen_open_ratio_instead_of_current_global_ratio(self) -> None:
+        self.engine.config.guadao_max_listing_ratio = 0.69
+        self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=1.23,
+            note=(
+                '{"sourceSellOperationId": 1, "steamListPrice": 2.12, '
+                '"maxRebuyRatioAtOpen": 0.62, "guadaoMaxListingRatioAtOpen": 0.69, '
+                '"steamNetFactorAtOpen": 0.869}'
+            ),
+        )
+        result = RebuyResult(True, False, "ok", actual_price=1.23)
+
+        with patch("cs2_assistant.services.executor_engine.execute_rebuy", return_value=result) as rebuy_mock:
+            rebought = self.engine._execute_rebuys()
+
+        self.assertEqual(1, rebought)
+        kwargs = rebuy_mock.call_args.kwargs
+        self.assertAlmostEqual(0.62, float(kwargs["guadao_max_listing_ratio"]), places=6)
+        self.assertAlmostEqual(0.869, float(kwargs["steam_net_factor"]), places=6)
 
     def test_no_matching_rebuy_timeout_does_not_stop_executor(self) -> None:
         op_id = self.db.add_pool_operation(
@@ -1616,6 +1965,39 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
         self.assertEqual("sold", sell_op["status"])
         self.assertIn('"steamSellerNetPriceSource": "steam_history"', sell_op["note"])
+        self.assertEqual(1, len(self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10)))
+
+    def test_listed_operation_with_sale_receipt_persists_time_without_received_amount(self) -> None:
+        self.engine.config.listing_check_interval_minutes = 999
+        self.db.set_pool_status("Revolution Case", POOL_STATUS_LISTED)
+        op_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_SELL_STEAM,
+            expected_price=25.0,
+            asset_id="asset-old",
+            note=(
+                '{"listingId":"listing-1","rebuyPrice":20.0,'
+                '"steamListPrice":25.0,"steamSellerNetPrice":21.55}'
+            ),
+        )
+        self.db.update_pool_operation(op_id, status="listed")
+        self.engine.steam_client.sale_receipts["listing-1"] = {
+            "purchaseId": "purchase-1",
+            "timeSold": "2026-06-06T00:00:00+00:00",
+            "receivedCurrencyId": "2023",
+        }
+
+        sold = self.engine._refresh_listings()
+
+        self.assertEqual(1, sold)
+        sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
+        note = json.loads(sell_op["note"])
+        self.assertEqual("sold", sell_op["status"])
+        self.assertEqual("2026-06-06T00:00:00+00:00", note["steamSoldAt"])
+        self.assertEqual("purchase-1", note["steamPurchaseId"])
+        self.assertEqual("2023", note["steamHistoryCurrencyId"])
+        self.assertNotEqual("steam_history", note.get("steamSellerNetPriceSource"))
         self.assertEqual(1, len(self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=10)))
 
     @patch("cs2_assistant.services.executor_engine.scan_strategies")

@@ -20,9 +20,10 @@ const rows = ref<ReportRow[]>([
 ]);
 
 const filteredRows = computed(() => {
-  const keyword = itemName.value.trim().toLowerCase();
-  if (!keyword) return rows.value;
-  return rows.value.filter((row) => row.name.toLowerCase().includes(keyword));
+  const nameFilter = itemName.value.trim().toLowerCase();
+  if (!nameFilter) return rows.value;
+
+  return rows.value.filter((row) => row.name.toLowerCase().includes(nameFilter));
 });
 
 const closedCount = computed(() => filteredRows.value.reduce((sum, row) => sum + row.count, 0));

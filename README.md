@@ -120,21 +120,32 @@ data/strategy_config.json
 
 ```json
 {
-  "executionEnabled": true,
-  "autoListEnabled": true,
-  "autoRebuyEnabled": true,
-  "dryRun": false,
-  "guadaoItemScope": "case_only",
-  "guadaoMaxListingRatio": 0.69,
-  "listingWallMinCount": 20,
-  "listingPriceOffset": 0.01,
-  "caseListingPriceOffset": -0.01,
-  "caseMaxOpenGuadaoCount": 100,
-  "maxListPerCycle": 10
+  "common": {
+    "executionEnabled": true,
+    "dryRun": false,
+    "balanceDiscount": 0.73
+  },
+  "guadaoBalance": {
+    "guadaoItemScope": "case_only",
+    "guadaoMaxListingRatio": 0.69,
+    "listingWallMinCount": 20,
+    "caseListingPriceOffset": -0.01,
+    "caseMaxOpenGuadaoCount": 100,
+    "maxListPerCycle": 10
+  },
+  "profitTrade": {
+    "enabled": true,
+    "allowRealExecution": false,
+    "minRoi": 0.07,
+    "minItemValue": 50
+  },
+  "legacyTransfer": {
+    "transferMinRealRatio": 9999
+  }
 }
 ```
 
-也就是说，当前本地配置默认是真实执行态。正式运行前必须先确认这些值，尤其是：
+也就是说，当前挂刀公共执行配置是非 dry-run；但 `profitTrade.allowRealExecution` 仍是 `false`，新做T执行器不会直接触发真实 Steam 买入或 C5 上架。正式运行前必须先确认这些值，尤其是：
 
 - `executionEnabled`
 - `dryRun`
@@ -143,6 +154,8 @@ data/strategy_config.json
 - `guadaoItemScope`
 - `guadaoMaxListingRatio`
 - `maxListPerCycle`
+- `profitTrade.enabled`
+- `profitTrade.allowRealExecution`
 
 `guadaoItemScope` 当前只按以下两类理解：
 
@@ -173,6 +186,15 @@ GET /market/orderbook?q=Load&qp=[730,"market_hash_name"]
 - 拿不到 Steam 实时价格，可以跳过。
 - 不能 fallback 到 CSQAQ/SteamDT 聚合价继续真实上架。
 - `dry-run` 才允许用扫描阶段已有价格模拟流程。
+
+新开挂刀的比例选择口径：
+
+- `guadaoMaxListingRatio` 是硬上限，只负责把 `listing_ratio <= 上限` 的品种纳入可导候选池。
+- 执行器真正上架前，会对每个候选重新读取一次 Steam `orderbook`，按当前执行挂价计算一个真实 `listing_ratio`。
+- 进入候选池后，不再计算额外的全局动态阈值；每个品种直接使用自己本轮实时算出来的 `listing_ratio`。
+- 本轮开新挂刀时，按每个品种自己的实时 `listing_ratio` 从低到高选择；比例相同时，再优先选择最近卖出更快的品种。
+- 不做盘口分桶，也不按 Steam 墙里有多少个卖单来“吃深度”；每个候选只看当前规则取出的一个执行挂价和一个比例。
+- 每笔新挂刀都会在流水 `note` 里冻结 `listingRatioAtOpen`、`maxRebuyRatioAtOpen`、`guadaoMaxListingRatioAtOpen` 和 `steamNetFactorAtOpen`，后续补仓优先按这笔流水自己的冻结口径闭环。
 
 箱子模式当前固定口径：
 
@@ -272,13 +294,13 @@ Steam已卖出税后到手 = steamListPrice * steamNetFactor
 补仓比例 = C5补仓价 / Steam已卖出税后到手
 ```
 
-只有当：
+新流水优先使用开单时冻结的最高补仓比例：
 
 ```text
-补仓比例 <= guadaoMaxListingRatio
+补仓比例 <= maxRebuyRatioAtOpen
 ```
 
-才允许继续补仓。C5 网络临时错误应延迟重试，不应误判成永久失败。
+旧流水没有 `maxRebuyRatioAtOpen` 时，才兼容使用当前 `guadaoMaxListingRatio`。C5 网络临时错误应延迟重试，不应误判成永久失败。
 
 注意：卖出流水里可能同时保存 `steamSellerNetPrice`、`steamSellerNetPriceSource=steam_history`、`steamSoldAt` 等来自 Steam 历史成交页的字段。这些字段用于日志、报表和钱包对账；真实补仓判断仍不要在补仓时重新读取 Steam 实时挂价。
 
@@ -308,6 +330,7 @@ python .\main.py pool guadao-report --from 2026-06-16 --to 2026-06-22 --detail
 - `总览`：按 C5 补仓完成时间统计闭环。它回答的是“这段时间补仓闭环了多少”，不是“这段时间 Steam 钱包入账了多少”。
 - `Steam入账口径(按卖出时间)`：按 Steam 官方历史成交时间统计。代码只把 `note.steamSoldAt` / `note.timeSold` 视为钱包入账时间，不再把 `pool_operations.completed_at` 当作卖出时间。
 - `卖出时间对账`：把本时间段 Steam 卖出拆成已闭环、未闭环和因余额不足忽略的流水，用于解释为什么卖出入账和 C5 补仓闭环不是同一个集合。
+- 报表里的 `C5金额` / `总折比` 列：闭环栏使用实际 C5 补仓现金；未闭环栏使用当前数据库能归集到的待补/后续补仓金额，仅供分析，最终仍以 C5 成功成交记录为准。
 - `成交时间缺失`：说明这批 sold 流水只有程序确认时间，缺少 Steam 官方成交时间，不能直接拿来做钱包时间窗口对账。需要从 Steam market history 回填后再比较钱包差额。
 - `对账提示`：说明 `总览` 里有多少是“历史卖出、本期补仓”，这部分不应计入本时间段 Steam 钱包入账。
 - `当前未闭环存量`：当前仍未成功补仓闭环的卖出流水，不按报表日期过滤。
@@ -345,6 +368,94 @@ C5 库存/C5价 + CSQAQ Steam主价 + SteamDT Steam兜底
 ```
 
 这个价格源只适合扫描和提醒，不可替代真实执行时的 Steam `orderbook`。
+
+## 搬砖做T执行器
+
+新搬砖做T入口是 `profit-trade`，不要和旧 `t-profit` 扫描提醒混用。
+
+查看或切换后端开关：
+
+```powershell
+python .\main.py profit-trade config
+python .\main.py profit-trade config --enable
+python .\main.py profit-trade config --disable
+python .\main.py profit-trade config --allow-real-execution
+python .\main.py profit-trade config --disallow-real-execution
+```
+
+扫描机会：
+
+```powershell
+python .\main.py profit-trade scan --limit 20
+python .\main.py profit-trade scan --limit 20 --record
+python .\main.py profit-trade scan --limit 1 --scan-max-items 5 --dump-json
+python .\main.py profit-trade run-once
+```
+
+扫描默认只读取数据，不买、不卖、不锁。`--record` 会把机会写入 `profit_trades` 候选流水；再次记录扫描会先取消旧的买 B 前候选，再写入新候选，避免复用已经过期的 ROI。`--lock` 会写入流水并短时间锁定 A 资产，但仍然不会买 B 或上架 C5。
+
+扫描会先用 C5 库存参考价和 `profitTrade.minItemValue` 预筛，再只对 `profitTrade.scanMaxItems` 内的高价值可交易品种读取 Steam 官方 `orderbook`，避免全量库存逐个取价拖慢前端/API。
+
+手动锁定一笔候选流水：
+
+```powershell
+python .\main.py profit-trade lock 123
+python .\main.py profit-trade buy 123
+python .\main.py profit-trade list-c5 123
+python .\main.py profit-trade refresh-sales
+```
+
+`buy` 只处理 `locked` 流水：执行前重新读取 Steam `orderbook`，用当前卖家最低价走 `createbuyorder`，按实际付款价复算 ROI。买 B 前如果 A 锁已过期、价格移动超出容忍范围，或 ROI 低于 `profitTrade.minRoi`，不会买入，并会释放短期 A 锁、取消该笔买 B 前流水；只有 Steam 买入已触发或 C5 上架状态不确定时，才进入人工处理。
+
+profitTrade 的 ROI 口径和 notify 做T提醒保持一致：
+
+```text
+面折比 = C5挂价 / Steam买入价
+C5预计到手折比 = 面折比 * 0.99
+ROI = C5预计到手折比 - guadaoMaxListingRatio
+真实成本 = Steam买入价 * guadaoMaxListingRatio
+预计收益 = C5挂价 * 0.99 - 真实成本
+```
+
+买 B 的 Steam 账号选择规则是：优先用 A 资产所属 Steam 账号；如果这个账号余额不足，再从其他本地账号里选择“可用余额足够且余额最小”的账号。余额是否足够按 Steam 实际付款价判断，收益核算仍按 `guadaoMaxListingRatio`。
+
+`list-c5` 只处理 `steam_bought` 流水：C5 `sale_create` 成功后才把 A 资产锁从 `active` 转成 `consumed`。这意味着 A 已经被 profitTrade 长期占用，不能再被挂刀或旧 `legacyTransfer` 选中。
+
+`run-once` 是后端执行器的一轮运行入口：
+
+- `profitTrade.allowRealExecution=false` 时，只扫描并写入候选，不会锁 A、买 B 或上架 C5。
+- `profitTrade.allowRealExecution=true` 时，会先推进已买入待上架的流水；然后取消旧候选，重新扫描新鲜机会，并在同一轮连续完成 `发现机会 -> 审计通过 -> 锁定A -> 买入B -> C5上架`。`C5售出 -> 收益结算` 依赖 C5 后续售出，需要之后轮次刷新。
+
+`refresh-sales` 会读取 C5 当前在售列表；已过检查窗口且 productId 不再出现在在售列表里的 `c5_listed` 流水，会按本程序上架价与 `profitTrade.c5CurrentSaleNetFactor` 结算到 `completed`。没有 C5 成交详情 API 前，`c5SoldNetPriceSource` 会标记为 `estimated_from_listing_price`。
+
+启动前端可调用的本地 API：
+
+```powershell
+python .\main.py profit-trade serve-api
+```
+
+再启动前端：
+
+```powershell
+cd frontend
+npm run dev
+```
+
+前端 `搬砖做T` 页会通过 `/api/profit-trade/dashboard` 读取后端状态，并通过 `/api/profit-trade/config` 分别开关 `profitTrade.enabled` 与 `profitTrade.allowRealExecution`。如果 API 没启动，页面只读取 `frontend/public/profit_trade_dashboard.json` 静态快照。
+
+当前安全边界：
+
+- `profitTrade.enabled` 已可从后端和前端切换，它只表示新做T执行器允许工作。
+- `profitTrade.allowRealExecution` 默认是 `false`。只有它为 `true`，且单笔流水已经进入对应步骤时，`buy` / `list-c5` 或前端按钮才会触发真实 Steam 买入 / C5 上架。
+- 数据库已新增 `asset_reservations` 和 `profit_trades`，用于记录做T流水和单资产锁。
+- profitTrade 锁住的 A 资产会被挂刀和旧 `legacyTransfer` 跳过，避免两个执行器抢同一个 `asset_id`。
+- 单笔进度固定为：`发现机会 -> 审计通过 -> 锁定A -> 买入B -> C5上架 -> C5售出 -> 收益结算`。
+- 当前 C5 在售价估算到手按 `price * 0.99`；C5 最近成交价按“已扣手续费”处理，不再二次乘 `0.99`。
+- ServerChan 日报只通过前端按钮或命令手动触发：
+
+```powershell
+python .\main.py profit-trade daily-report --send
+```
 
 ## 开发与测试
 

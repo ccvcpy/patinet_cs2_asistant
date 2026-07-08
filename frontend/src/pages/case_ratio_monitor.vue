@@ -461,3 +461,258 @@ onMounted(loadReport);
     </template>
   </main>
 </template>
+
+<style scoped>
+.case-monitor-page {
+  max-width: 1280px;
+}
+
+.case-monitor-page .metrics-grid.compact {
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+}
+
+.case-monitor-page .metric-card {
+  min-height: 92px;
+}
+
+.case-report-meta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr)) minmax(220px, 1.2fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.case-report-meta > div,
+.case-report-meta label {
+  display: grid;
+  gap: 4px;
+}
+
+.case-report-meta input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid #c8d2dc;
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+
+.case-filter-panel {
+  padding: 10px;
+}
+
+.segmented-control {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segment-button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #c7d2dd;
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #2a3a4b;
+  background: #ffffff;
+}
+
+.segment-button.active {
+  border-color: #2f6b52;
+  color: #174634;
+  background: #eef8f3;
+}
+
+.recommendation-list {
+  display: grid;
+  gap: 8px;
+}
+
+.case-recommendation-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 34px minmax(280px, 1fr) 86px 86px 72px 96px;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid #d7dee6;
+  border-radius: 6px;
+  padding: 10px 12px;
+  text-align: left;
+  color: #172033;
+  background: #ffffff;
+}
+
+.case-recommendation-row.active {
+  border-color: #78a894;
+  background: #f2fbf6;
+}
+
+.case-recommendation-row .rank {
+  width: 26px;
+  height: 26px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #ffffff;
+  background: #2f6b52;
+  font-weight: 700;
+}
+
+.case-recommendation-row .item-name {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  font-weight: 700;
+}
+
+.case-recommendation-row .item-name small {
+  color: #687487;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.focus-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.focus-heading h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.focus-heading > strong {
+  color: #2f6b52;
+  font-size: 30px;
+  line-height: 1;
+}
+
+.case-focus-grid,
+.price-source-grid,
+.threshold-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.case-focus-grid > div,
+.price-source-grid > div,
+.threshold-card {
+  min-height: 72px;
+  border: 1px solid #e0e6ec;
+  border-radius: 6px;
+  padding: 10px;
+  background: #fbfcfd;
+  display: grid;
+  gap: 4px;
+}
+
+.case-focus-grid strong,
+.price-source-grid strong,
+.threshold-card strong {
+  overflow-wrap: anywhere;
+}
+
+.threshold-card em {
+  color: #687487;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.ratio-timeline {
+  position: relative;
+  height: 28px;
+  margin-top: 14px;
+  overflow: hidden;
+  border: 1px solid #d7dee6;
+  border-radius: 999px;
+  background: #eef2f5;
+}
+
+.timeline-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+}
+
+.bucket-bars {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.bucket-row {
+  display: grid;
+  grid-template-columns: 120px minmax(180px, 1fr) 72px 72px;
+  gap: 10px;
+  align-items: center;
+}
+
+.bar-track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #edf1f4;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: inherit;
+}
+
+.case-ratio-table {
+  min-width: 1320px;
+}
+
+.case-ratio-table td:nth-child(2) {
+  max-width: 320px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 980px) {
+  .case-monitor-page .metrics-grid.compact,
+  .case-report-meta,
+  .case-focus-grid,
+  .price-source-grid,
+  .threshold-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .case-recommendation-row {
+    grid-template-columns: 30px minmax(0, 1fr) 76px;
+  }
+
+  .case-recommendation-row > span:nth-last-child(-n + 3) {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .case-monitor-page .metrics-grid.compact,
+  .case-report-meta,
+  .case-focus-grid,
+  .price-source-grid,
+  .threshold-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .case-recommendation-row {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+
+  .case-recommendation-row > span:nth-child(n + 4) {
+    display: none;
+  }
+
+  .bucket-row {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

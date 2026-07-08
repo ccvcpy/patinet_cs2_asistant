@@ -21,8 +21,11 @@ from cs2_assistant.cli import (
     build_parser,
     _build_guadao_discount_report,
     _build_market_price_gap_rows,
+    _display_width,
     _list_c5_steam_accounts,
+    _pad_display,
     _parse_report_boundary,
+    _print_guadao_discount_report,
     _resolve_c5_steam_id,
     _summarize_inventory_types,
     cmd_pool_case_monitor_collect,
@@ -501,6 +504,71 @@ class ParserTestCase(unittest.TestCase):
         self.assertEqual("start", args.executor_command)
         self.assertEqual(4, args.max_transfer_buy)
 
+    def test_profit_trade_config_enable_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "config", "--enable"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("config", args.profit_trade_command)
+        self.assertTrue(args.enable)
+
+    def test_profit_trade_config_real_execution_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "config", "--allow-real-execution"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("config", args.profit_trade_command)
+        self.assertTrue(args.allow_real_execution)
+
+    def test_profit_trade_serve_api_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "serve-api", "--port", "8766"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("serve-api", args.profit_trade_command)
+        self.assertEqual(8766, args.port)
+
+    def test_profit_trade_scan_record_lock_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "scan", "--record", "--lock", "--limit", "3", "--scan-max-items", "5"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("scan", args.profit_trade_command)
+        self.assertTrue(args.record)
+        self.assertTrue(args.lock)
+        self.assertEqual(3, args.limit)
+        self.assertEqual(5, args.scan_max_items)
+
+    def test_profit_trade_lock_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "lock", "12"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("lock", args.profit_trade_command)
+        self.assertEqual(12, args.trade_id)
+
+    def test_profit_trade_buy_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "buy", "12"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("buy", args.profit_trade_command)
+        self.assertEqual(12, args.trade_id)
+
+    def test_profit_trade_list_c5_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "list-c5", "12"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("list-c5", args.profit_trade_command)
+        self.assertEqual(12, args.trade_id)
+
+    def test_profit_trade_run_once_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "run-once", "--scan-max-items", "5"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("run-once", args.profit_trade_command)
+        self.assertEqual(5, args.scan_max_items)
+
+    def test_profit_trade_refresh_sales_parses(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["profit-trade", "refresh-sales"])
+        self.assertEqual("profit-trade", args.command)
+        self.assertEqual("refresh-sales", args.profit_trade_command)
+
 
 class StrategyConfigCompatTestCase(unittest.TestCase):
     def test_from_dict_prefers_new_max_transfer_buy_key(self) -> None:
@@ -519,8 +587,30 @@ class StrategyConfigCompatTestCase(unittest.TestCase):
     def test_to_dict_writes_new_max_transfer_buy_key(self) -> None:
         config = StrategyConfig(max_transfer_buy_per_cycle=6)
         payload = config.to_dict()
-        self.assertEqual(6, payload["maxTransferBuyPerCycle"])
+        self.assertEqual(6, payload["legacyTransfer"]["maxTransferBuyPerCycle"])
         self.assertNotIn("maxBuyPerCycle", payload)
+
+    def test_from_dict_accepts_categorized_profit_trade_config(self) -> None:
+        config = StrategyConfig.from_dict(
+            {
+                "common": {
+                    "listingCheckIntervalMinutes": 0.5,
+                },
+                "profitTrade": {
+                    "enabled": True,
+                    "minRoi": 0.12,
+                    "minItemValue": 80,
+                },
+                "legacyTransfer": {
+                    "maxTransferBuyPerCycle": 0,
+                },
+            }
+        )
+        self.assertTrue(config.profit_trade_enabled)
+        self.assertEqual(0.12, config.profit_trade_min_roi)
+        self.assertEqual(80, config.profit_trade_min_item_value)
+        self.assertEqual(0, config.max_transfer_buy_per_cycle)
+        self.assertEqual(0.5, config.listing_check_interval_minutes)
 
 
 class GuadaoDiscountReportTestCase(unittest.TestCase):
@@ -597,9 +687,47 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertEqual(190.0, report["summary"]["cash"])
         self.assertEqual(2, report["steamSoldInRange"]["summary"]["count"])
         self.assertEqual(260.7, report["steamSoldInRange"]["summary"]["steamNet"])
+        self.assertEqual(190.0, report["steamSoldInRange"]["summary"]["cash"])
+        self.assertAlmostEqual(190.0 / 260.7, report["steamSoldInRange"]["summary"]["totalDiscountRatio"])
+        self.assertEqual(190.0, report["steamSoldReconciliation"]["closed"]["cash"])
+        self.assertAlmostEqual(190.0 / 260.7, report["steamSoldReconciliation"]["closed"]["totalDiscountRatio"])
         self.assertAlmostEqual(190.0 / 260.7, report["summary"]["totalDiscountRatio"])
         self.assertAlmostEqual(190.0 / 300.0, report["summary"]["faceDiscountRatio"])
         self.assertEqual(["Kilowatt Case", "Revolution Case"], sorted(row["marketHashName"] for row in report["items"]))
+
+    def test_display_padding_uses_terminal_width_for_chinese(self) -> None:
+        self.assertEqual(4, _display_width("项目"))
+        self.assertEqual("项目  ", _pad_display("项目", 6))
+        self.assertEqual("  项目", _pad_display("项目", 6, align="right"))
+
+    def test_print_guadao_discount_report_uses_readable_tables(self) -> None:
+        self._add_closed_cycle("Kilowatt Case", steam_price=100.0, cash=60.0)
+        self._add_closed_cycle("Rio 2022 Legends Sticker Capsule", steam_price=10.0, cash=6.0)
+        report = _build_guadao_discount_report(
+            self.db,
+            start_utc="2000-01-01T00:00:00+00:00",
+            end_utc="2100-01-01T00:00:00+00:00",
+            steam_net_factor=0.869,
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_guadao_discount_report(
+                report,
+                start_local=datetime(2026, 6, 22, 13, 6, tzinfo=timezone.utc),
+                end_local=datetime(2026, 6, 22, 23, 0, 59, tzinfo=timezone.utc),
+                show_detail=False,
+            )
+
+        text = output.getvalue()
+        self.assertIn("口径:\n", text)
+        self.assertIn("  - 主表按 Steam 官方卖出时间对账本时间段钱包入账。", text)
+        self.assertIn("本期历史补仓", text)
+        self.assertIn("本期历史未闭环", text)
+        self.assertNotIn("口径: 按 C5 补仓完成时间统计", text)
+        self.assertNotIn("概览:", text)
+        self.assertIn("Rio 2022 Legends Sticker Capsule", text)
+        self.assertIn("CNY 6.00", text)
 
     def test_guadao_discount_report_separates_rebuy_time_from_steam_wallet_time(self) -> None:
         old_sell_id = self.db.add_pool_operation(
@@ -653,17 +781,64 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertEqual(86.9, report["summary"]["steamNet"])
         self.assertEqual(1, report["closedFromSellOutsideRange"]["count"])
         self.assertEqual(86.9, report["closedFromSellOutsideRange"]["steamNet"])
+        self.assertEqual(0, report["historicalUnclosedBeforeRange"]["count"])
         self.assertEqual(1, report["steamSoldInRange"]["summary"]["count"])
         self.assertEqual(173.8, report["steamSoldInRange"]["summary"]["steamNet"])
+        self.assertEqual(130.0, report["steamSoldInRange"]["summary"]["cash"])
         self.assertEqual(0, report["steamSoldReconciliation"]["closed"]["count"])
         self.assertEqual(1, report["steamSoldReconciliation"]["unclosed"]["count"])
         self.assertEqual(173.8, report["steamSoldReconciliation"]["unclosed"]["steamNet"])
+        self.assertEqual(130.0, report["steamSoldReconciliation"]["unclosed"]["cash"])
         self.assertEqual(
             report["steamSoldInRange"]["summary"]["steamNet"],
             report["steamSoldReconciliation"]["closed"]["steamNet"]
             + report["steamSoldReconciliation"]["unclosed"]["steamNet"]
             + report["steamSoldReconciliation"]["ignored"]["steamNet"],
         )
+
+    def test_guadao_discount_report_tracks_historical_unclosed_before_range(self) -> None:
+        historical_sell_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=100.0,
+            asset_id="asset-old",
+            note=json.dumps({"steamListPrice": 100.0, "steamSoldAt": "2026-05-31T17:00:00+00:00"}),
+        )
+        self.db.update_pool_operation(historical_sell_id, status="sold", actual_price=100.0)
+        self._set_completed_at(historical_sell_id, "2026-05-31T17:00:00+00:00")
+        pending_rebuy_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy="guadao",
+            operation_type="rebuy_on_c5",
+            expected_price=60.0,
+            note=json.dumps({"sourceSellOperationId": historical_sell_id, "steamListPrice": 100.0}),
+        )
+        self.db.update_pool_operation(pending_rebuy_id, status="pending", actual_price=60.0)
+        self._set_completed_at(pending_rebuy_id, "2026-06-01T10:00:00+00:00")
+
+        current_sell_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=200.0,
+            asset_id="asset-current",
+            note=json.dumps({"steamListPrice": 200.0, "steamSoldAt": "2026-06-01T12:00:00+00:00"}),
+        )
+        self.db.update_pool_operation(current_sell_id, status="sold", actual_price=200.0)
+        self._set_completed_at(current_sell_id, "2026-06-01T12:00:00+00:00")
+
+        report = _build_guadao_discount_report(
+            self.db,
+            start_utc="2026-06-01T00:00:00+00:00",
+            end_utc="2026-06-01T23:59:59+00:00",
+            steam_net_factor=0.869,
+        )
+
+        self.assertEqual(1, report["steamSoldReconciliation"]["unclosed"]["count"])
+        self.assertEqual(1, report["historicalUnclosedBeforeRange"]["count"])
+        self.assertEqual(86.9, report["historicalUnclosedBeforeRange"]["steamNet"])
+        self.assertEqual(60.0, report["historicalUnclosedBeforeRange"]["cash"])
 
     def test_guadao_discount_report_uses_steam_sold_at_for_wallet_time(self) -> None:
         early_sell_id = self.db.add_pool_operation(

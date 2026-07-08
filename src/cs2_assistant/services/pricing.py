@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cs2_assistant.clients.steam_market import SteamMarketClient, SteamMarketError
-from cs2_assistant.utils import safe_float
+from cs2_assistant.utils import safe_float, safe_int
 
 
 @dataclass(slots=True)
@@ -326,6 +326,15 @@ def fetch_listing_price(
     except SteamMarketError:
         if debug:
             raise
+        return None
+
+    data = _payload_data(orderbook or {})
+    actual_currency = safe_int(data.get("eCurrency"))
+    if actual_currency is not None and actual_currency != int(currency):
+        if debug:
+            raise SteamMarketError(
+                f"Steam orderbook currency mismatch: expected={currency} actual={actual_currency}"
+            )
         return None
 
     decision = choose_orderbook_price(

@@ -539,7 +539,7 @@ def build_notification_message(
         f"范围: {scope_label}",
         f"库存源: {report.inventory_source}",
         "价格源: C5官方API / Steam官方orderbook",
-        "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+        "公式: 折算比=C5/Steam×0.99 | 利润=折算比-导余额折扣 | 面折比=C5/Steam",
         *filter_lines,
         "",
         *_top_lines(shown_candidates, config),
@@ -572,7 +572,7 @@ def build_local_message(
         f"- 范围: {inventory_scope_label(config.inventory_scope)}",
         f"- 库存源: {report.inventory_source}",
         "- 价格源: C5官方API / Steam官方orderbook",
-        "- 公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+        "- 公式: 折算比=C5/Steam×0.99 | 利润=折算比-导余额折扣 | 面折比=C5/Steam",
         *_filter_summary_lines(report, config, scoped_candidates, missing_issues, shown_candidates),
     ]
     if report.inventory_source == "cache" and report.inventory_cached_at:

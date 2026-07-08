@@ -41,8 +41,8 @@ class TYieldAlertsTestCase(unittest.TestCase):
             ],
         )
         self.assertIn("做T收益提醒", message.body)
-        self.assertIn("公式: 折算比=C5/Steam", message.body)
-        self.assertIn("挂刀比 1.0869", message.body)
+        self.assertIn("公式: 折算比=C5/Steam×0.99", message.body)
+        self.assertIn("面折比 1.0869", message.body)
         self.assertIn("Rezan The Ready | Sabre", message.body)
         self.assertIn("混合库存", message.body)
         self.assertIn("缺少 Steam 价格", message.body)

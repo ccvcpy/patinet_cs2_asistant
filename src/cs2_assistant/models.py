@@ -63,11 +63,13 @@ class NotificationMessage:
 
 STRATEGY_GUADAO = "guadao"        # 挂刀做T
 STRATEGY_TRANSFER = "transfer"    # 导余额做T
+STRATEGY_PROFIT_TRADE = "profit_trade"  # 搬砖做T
 STRATEGY_HOLD = "hold"            # 持有不动（不满足任何策略）
 
 STRATEGY_LABELS: dict[str, str] = {
-    STRATEGY_GUADAO: "挂刀做T",
-    STRATEGY_TRANSFER: "导余额做T",
+    STRATEGY_GUADAO: "挂刀导余额",
+    STRATEGY_TRANSFER: "旧导余额做T",
+    STRATEGY_PROFIT_TRADE: "搬砖做T",
     STRATEGY_HOLD: "持有",
 }
 
@@ -99,6 +101,10 @@ OP_SELL_STEAM = "sell_on_steam"       # 在 Steam 挂卖
 OP_REBUY_C5 = "rebuy_on_c5"          # 在 C5 补仓
 OP_TRANSFER_BUY = "transfer_buy"     # 导余额：用余额在 Steam 买入
 OP_TRANSFER_SELL = "transfer_sell"   # 导余额：在 C5 卖出
+OP_PROFIT_AUDIT = "profit_audit"      # 搬砖做T：机会审计
+OP_PROFIT_LOCK_ASSET = "profit_lock_asset"  # 搬砖做T：锁定旧底仓 A
+OP_PROFIT_BUY_STEAM = "profit_buy_steam"    # 搬砖做T：Steam 买入替换 B
+OP_PROFIT_SELL_C5 = "profit_sell_c5"        # 搬砖做T：C5 卖出 A
 
 GUADAO_ITEM_SCOPE_CASE_ONLY = "case_only"
 GUADAO_ITEM_SCOPE_NON_CASE_ONLY = "non_case_only"
@@ -145,6 +151,44 @@ class StrategyConfig:
     balance_discount: float = 0.73
     guadao_max_listing_ratio: float = 0.95
     transfer_min_real_ratio: float = 0.05
+    profit_trade_enabled: bool = False
+    profit_trade_allow_real_execution: bool = False
+    profit_trade_allow_reprice_execution: bool = False
+    profit_trade_balance_discount: float = 0.69
+    profit_trade_min_roi: float = 0.07
+    profit_trade_min_item_value: float = 50.0
+    profit_trade_max_buy_per_cycle: int = 1
+    profit_trade_daily_steam_budget: float = 1000.0
+    profit_trade_scan_max_items: int = 80
+    profit_trade_reservation_seconds: int = 60
+    profit_trade_steam_buy_price_tolerance_pct: float = 1.0
+    profit_trade_c5_current_sale_net_factor: float = 0.99
+    profit_trade_recent_sold_fee_already_deducted: bool = True
+    profit_trade_liquidity_min_recent_sales: int = 3
+    profit_trade_require_c5_recent_sales: bool = True
+    profit_trade_require_c5_market_depth: bool = True
+    profit_trade_c5_min_on_sale_count: int = 3
+    profit_trade_c5_min_purchase_count: int = 1
+    profit_trade_c5_min_purchase_sell_ratio: float = 0.70
+    profit_trade_c5_max_listing_premium_pct: float = 3.0
+    profit_trade_manual_review_roi: float = 0.20
+    profit_trade_reprice_enabled: bool = True
+    profit_trade_reprice_discount_pct: float = 1.0
+    profit_trade_reprice_min_discount: float = 0.1
+    profit_trade_reprice_max_discount: float = 50.0
+    profit_trade_reprice_cooldown_hours: float = 3.0
+    profit_trade_stale_reprice_after_hours: float = 12.0
+    profit_trade_stale_manual_review_after_hours: float = 24.0
+    profit_trade_stale_min_roi: float = 0.04
+    profit_trade_stale_price_offset: float = 0.01
+    profit_trade_sticker_slab_status: str = "blocked"
+    profit_trade_sticker_status: str = "blocked"
+    profit_trade_protected_asset_ids: list[str] | None = None
+    profit_trade_protected_market_hash_names: list[str] | None = None
+    profit_trade_protected_steam_ids: list[str] | None = None
+    profit_trade_ai_audit_enabled: bool = False
+    profit_trade_ai_audit_provider: str = "deepseek"
+    profit_trade_ai_audit_model: str = ""
     min_price: float = 10.0
     poll_interval_minutes: int = 30
     top_n: int = 20
@@ -156,7 +200,7 @@ class StrategyConfig:
     max_list_per_cycle: int = 5
     max_transfer_buy_per_cycle: int = 3
     cycle_interval_minutes: int = 15
-    listing_check_interval_minutes: int = 5
+    listing_check_interval_minutes: float = 5.0
     dry_run: bool = True
     steam_context_id: str = "2"
     steam_currency: int = 23
@@ -172,35 +216,85 @@ class StrategyConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "steamNetFactor": self.steam_net_factor,
-            "c5SettlementFactor": self.c5_settlement_factor,
-            "balanceDiscount": self.balance_discount,
-            "guadaoMaxListingRatio": self.guadao_max_listing_ratio,
-            "transferMinRealRatio": self.transfer_min_real_ratio,
-            "minPrice": self.min_price,
-            "pollIntervalMinutes": self.poll_interval_minutes,
-            "topN": self.top_n,
-            "executionEnabled": self.execution_enabled,
-            "autoListEnabled": self.auto_list_enabled,
-            "autoRebuyEnabled": self.auto_rebuy_enabled,
-            "guadaoItemScope": normalize_guadao_item_scope(self.guadao_item_scope),
-            "priceTolerancePct": self.price_tolerance_pct,
-            "maxListPerCycle": self.max_list_per_cycle,
-            "maxTransferBuyPerCycle": self.max_transfer_buy_per_cycle,
-            "cycleIntervalMinutes": self.cycle_interval_minutes,
-            "listingCheckIntervalMinutes": self.listing_check_interval_minutes,
-            "dryRun": self.dry_run,
-            "steamContextId": self.steam_context_id,
-            "steamCurrency": self.steam_currency,
-            "steamCountry": self.steam_country,
-            "steamLanguage": self.steam_language,
-            "listingWallMinCount": self.listing_wall_min_count,
-            "listingPriceOffset": self.listing_price_offset,
-            "caseListingPriceOffset": self.case_listing_price_offset,
-            "caseMaxOpenGuadaoCount": self.case_max_open_guadao_count,
-            "forceRefreshBeforeExecution": self.force_refresh_before_execution,
-            "steamPriceCacheTtl": self.steam_price_cache_ttl,
-            "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
+            "common": {
+                "steamNetFactor": self.steam_net_factor,
+                "c5SettlementFactor": self.c5_settlement_factor,
+                "balanceDiscount": self.balance_discount,
+                "minPrice": self.min_price,
+                "executionEnabled": self.execution_enabled,
+                "dryRun": self.dry_run,
+                "cycleIntervalMinutes": self.cycle_interval_minutes,
+                "listingCheckIntervalMinutes": self.listing_check_interval_minutes,
+                "steamContextId": self.steam_context_id,
+                "steamCurrency": self.steam_currency,
+                "steamCountry": self.steam_country,
+                "steamLanguage": self.steam_language,
+                "forceRefreshBeforeExecution": self.force_refresh_before_execution,
+                "steamPriceCacheTtl": self.steam_price_cache_ttl,
+            },
+            "guadaoBalance": {
+                "guadaoMaxListingRatio": self.guadao_max_listing_ratio,
+                "autoListEnabled": self.auto_list_enabled,
+                "autoRebuyEnabled": self.auto_rebuy_enabled,
+                "guadaoItemScope": normalize_guadao_item_scope(self.guadao_item_scope),
+                "priceTolerancePct": self.price_tolerance_pct,
+                "maxListPerCycle": self.max_list_per_cycle,
+                "listingWallMinCount": self.listing_wall_min_count,
+                "listingPriceOffset": self.listing_price_offset,
+                "caseListingPriceOffset": self.case_listing_price_offset,
+                "caseMaxOpenGuadaoCount": self.case_max_open_guadao_count,
+                "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
+            },
+            "profitTrade": {
+                "enabled": self.profit_trade_enabled,
+                "allowRealExecution": self.profit_trade_allow_real_execution,
+                "allowRepriceExecution": self.profit_trade_allow_reprice_execution,
+                "balanceDiscount": self.profit_trade_balance_discount,
+                "minRoi": self.profit_trade_min_roi,
+                "minItemValue": self.profit_trade_min_item_value,
+                "maxBuyPerCycle": self.profit_trade_max_buy_per_cycle,
+                "dailySteamBudget": self.profit_trade_daily_steam_budget,
+                "scanMaxItems": self.profit_trade_scan_max_items,
+                "reservationSeconds": self.profit_trade_reservation_seconds,
+                "steamBuyPriceTolerancePct": self.profit_trade_steam_buy_price_tolerance_pct,
+                "c5CurrentSaleNetFactor": self.profit_trade_c5_current_sale_net_factor,
+                "recentSoldFeeAlreadyDeducted": self.profit_trade_recent_sold_fee_already_deducted,
+                "liquidityMinRecentSales": self.profit_trade_liquidity_min_recent_sales,
+                "requireC5RecentSales": self.profit_trade_require_c5_recent_sales,
+                "requireC5MarketDepth": self.profit_trade_require_c5_market_depth,
+                "c5MinOnSaleCount": self.profit_trade_c5_min_on_sale_count,
+                "c5MinPurchaseCount": self.profit_trade_c5_min_purchase_count,
+                "c5MinPurchaseSellRatio": self.profit_trade_c5_min_purchase_sell_ratio,
+                "c5MaxListingPremiumPct": self.profit_trade_c5_max_listing_premium_pct,
+                "manualReviewRoi": self.profit_trade_manual_review_roi,
+                "repriceEnabled": self.profit_trade_reprice_enabled,
+                "repriceDiscountPct": self.profit_trade_reprice_discount_pct,
+                "repriceMinDiscount": self.profit_trade_reprice_min_discount,
+                "repriceMaxDiscount": self.profit_trade_reprice_max_discount,
+                "repriceCooldownHours": self.profit_trade_reprice_cooldown_hours,
+                "staleRepriceAfterHours": self.profit_trade_stale_reprice_after_hours,
+                "staleManualReviewAfterHours": self.profit_trade_stale_manual_review_after_hours,
+                "staleMinRoi": self.profit_trade_stale_min_roi,
+                "stalePriceOffset": self.profit_trade_stale_price_offset,
+                "stickerSlabStatus": self.profit_trade_sticker_slab_status,
+                "stickerStatus": self.profit_trade_sticker_status,
+                "protectedAssetIds": list(self.profit_trade_protected_asset_ids or []),
+                "protectedMarketHashNames": list(self.profit_trade_protected_market_hash_names or []),
+                "protectedSteamIds": list(self.profit_trade_protected_steam_ids or []),
+            },
+            "notifications": {
+                "pollIntervalMinutes": self.poll_interval_minutes,
+                "topN": self.top_n,
+            },
+            "aiAudit": {
+                "enabled": self.profit_trade_ai_audit_enabled,
+                "provider": self.profit_trade_ai_audit_provider,
+                "model": self.profit_trade_ai_audit_model,
+            },
+            "legacyTransfer": {
+                "transferMinRealRatio": self.transfer_min_real_ratio,
+                "maxTransferBuyPerCycle": self.max_transfer_buy_per_cycle,
+            },
         }
 
     @classmethod
@@ -214,45 +308,176 @@ class StrategyConfig:
                 return value.strip().lower() in {"1", "true", "yes", "y", "on"}
             return default
 
+        def _section(name: str) -> dict[str, Any]:
+            value = data.get(name)
+            return value if isinstance(value, dict) else {}
+
+        common = _section("common")
+        guadao_balance = _section("guadaoBalance")
+        profit_trade = _section("profitTrade")
+        notifications = _section("notifications")
+        ai_audit = _section("aiAudit")
+        legacy_transfer = _section("legacyTransfer")
+
+        def _get(section: dict[str, Any], key: str, default: Any) -> Any:
+            if key in section:
+                return section[key]
+            return data.get(key, default)
+
+        def _as_str_list(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [value.strip()] if value.strip() else []
+            if isinstance(value, (list, tuple, set)):
+                return [str(item).strip() for item in value if str(item).strip()]
+            return []
+
+        def _as_item_type_status(status_value: Any, legacy_allow_value: Any) -> str:
+            text = str(status_value or "").strip().lower()
+            if text in {"active", "enabled", "on", "scan", "include"}:
+                return "active"
+            if text in {"blocked", "disabled", "off", "hide", "exclude"}:
+                return "blocked"
+            if legacy_allow_value is not None:
+                return "active" if _as_bool(legacy_allow_value, False) else "blocked"
+            return "blocked"
+
         return cls(
-            steam_net_factor=float(data.get("steamNetFactor", 0.869)),
-            c5_settlement_factor=float(data.get("c5SettlementFactor", 0.869)),
-            balance_discount=float(data.get("balanceDiscount", 0.73)),
-            guadao_max_listing_ratio=float(data.get("guadaoMaxListingRatio", 0.95)),
-            transfer_min_real_ratio=float(data.get("transferMinRealRatio", 0.05)),
-            min_price=float(data.get("minPrice", 10.0)),
-            poll_interval_minutes=int(data.get("pollIntervalMinutes", 30)),
-            top_n=int(data.get("topN", 20)),
-            execution_enabled=_as_bool(data.get("executionEnabled"), False),
-            auto_list_enabled=_as_bool(data.get("autoListEnabled"), True),
-            auto_rebuy_enabled=_as_bool(data.get("autoRebuyEnabled"), True),
-            guadao_item_scope=normalize_guadao_item_scope(data.get("guadaoItemScope", GUADAO_ITEM_SCOPE_CASE_ONLY)),
-            price_tolerance_pct=float(data.get("priceTolerancePct", 1.0)),
-            max_list_per_cycle=int(data.get("maxListPerCycle", 5)),
+            steam_net_factor=float(_get(common, "steamNetFactor", 0.869)),
+            c5_settlement_factor=float(_get(common, "c5SettlementFactor", 0.869)),
+            balance_discount=float(_get(common, "balanceDiscount", 0.73)),
+            guadao_max_listing_ratio=float(_get(guadao_balance, "guadaoMaxListingRatio", 0.95)),
+            transfer_min_real_ratio=float(_get(legacy_transfer, "transferMinRealRatio", 0.05)),
+            profit_trade_enabled=_as_bool(_get(profit_trade, "enabled", False), False),
+            profit_trade_allow_real_execution=_as_bool(
+                _get(profit_trade, "allowRealExecution", False),
+                False,
+            ),
+            profit_trade_allow_reprice_execution=_as_bool(
+                _get(profit_trade, "allowRepriceExecution", False),
+                False,
+            ),
+            profit_trade_balance_discount=float(
+                _get(profit_trade, "balanceDiscount", _get(common, "balanceDiscount", 0.69))
+            ),
+            profit_trade_min_roi=float(_get(profit_trade, "minRoi", 0.07)),
+            profit_trade_min_item_value=float(_get(profit_trade, "minItemValue", 50.0)),
+            profit_trade_max_buy_per_cycle=int(_get(profit_trade, "maxBuyPerCycle", 1)),
+            profit_trade_daily_steam_budget=float(_get(profit_trade, "dailySteamBudget", 1000.0)),
+            profit_trade_scan_max_items=int(_get(profit_trade, "scanMaxItems", 80)),
+            profit_trade_reservation_seconds=int(_get(profit_trade, "reservationSeconds", 60)),
+            profit_trade_steam_buy_price_tolerance_pct=float(
+                _get(profit_trade, "steamBuyPriceTolerancePct", 1.0)
+            ),
+            profit_trade_c5_current_sale_net_factor=float(
+                _get(profit_trade, "c5CurrentSaleNetFactor", 0.99)
+            ),
+            profit_trade_recent_sold_fee_already_deducted=_as_bool(
+                _get(profit_trade, "recentSoldFeeAlreadyDeducted", True),
+                True,
+            ),
+            profit_trade_liquidity_min_recent_sales=int(
+                _get(profit_trade, "liquidityMinRecentSales", 3)
+            ),
+            profit_trade_require_c5_recent_sales=_as_bool(
+                _get(profit_trade, "requireC5RecentSales", True),
+                True,
+            ),
+            profit_trade_require_c5_market_depth=_as_bool(
+                _get(profit_trade, "requireC5MarketDepth", True),
+                True,
+            ),
+            profit_trade_c5_min_on_sale_count=int(
+                _get(profit_trade, "c5MinOnSaleCount", 3)
+            ),
+            profit_trade_c5_min_purchase_count=int(
+                _get(profit_trade, "c5MinPurchaseCount", 1)
+            ),
+            profit_trade_c5_min_purchase_sell_ratio=float(
+                _get(profit_trade, "c5MinPurchaseSellRatio", 0.70)
+            ),
+            profit_trade_c5_max_listing_premium_pct=float(
+                _get(profit_trade, "c5MaxListingPremiumPct", 3.0)
+            ),
+            profit_trade_manual_review_roi=float(_get(profit_trade, "manualReviewRoi", 0.20)),
+            profit_trade_reprice_enabled=_as_bool(
+                _get(profit_trade, "repriceEnabled", True),
+                True,
+            ),
+            profit_trade_reprice_discount_pct=float(_get(profit_trade, "repriceDiscountPct", 1.0)),
+            profit_trade_reprice_min_discount=float(_get(profit_trade, "repriceMinDiscount", 0.1)),
+            profit_trade_reprice_max_discount=float(_get(profit_trade, "repriceMaxDiscount", 50.0)),
+            profit_trade_reprice_cooldown_hours=float(_get(profit_trade, "repriceCooldownHours", 3.0)),
+            profit_trade_stale_reprice_after_hours=float(
+                _get(profit_trade, "staleRepriceAfterHours", 12.0)
+            ),
+            profit_trade_stale_manual_review_after_hours=float(
+                _get(profit_trade, "staleManualReviewAfterHours", 24.0)
+            ),
+            profit_trade_stale_min_roi=float(_get(profit_trade, "staleMinRoi", 0.04)),
+            profit_trade_stale_price_offset=float(_get(profit_trade, "stalePriceOffset", 0.01)),
+            profit_trade_sticker_slab_status=_as_item_type_status(
+                _get(profit_trade, "stickerSlabStatus", None),
+                _get(profit_trade, "allowStickerSlab", None),
+            ),
+            profit_trade_sticker_status=_as_item_type_status(
+                _get(profit_trade, "stickerStatus", None),
+                _get(profit_trade, "allowSticker", None),
+            ),
+            profit_trade_protected_asset_ids=_as_str_list(
+                _get(profit_trade, "protectedAssetIds", [])
+            ),
+            profit_trade_protected_market_hash_names=_as_str_list(
+                _get(profit_trade, "protectedMarketHashNames", [])
+            ),
+            profit_trade_protected_steam_ids=_as_str_list(
+                _get(profit_trade, "protectedSteamIds", [])
+            ),
+            profit_trade_ai_audit_enabled=_as_bool(_get(ai_audit, "enabled", False), False),
+            profit_trade_ai_audit_provider=str(_get(ai_audit, "provider", "deepseek")),
+            profit_trade_ai_audit_model=str(_get(ai_audit, "model", "")),
+            min_price=float(_get(common, "minPrice", 10.0)),
+            poll_interval_minutes=int(_get(notifications, "pollIntervalMinutes", 30)),
+            top_n=int(_get(notifications, "topN", 20)),
+            execution_enabled=_as_bool(_get(common, "executionEnabled", False), False),
+            auto_list_enabled=_as_bool(_get(guadao_balance, "autoListEnabled", True), True),
+            auto_rebuy_enabled=_as_bool(_get(guadao_balance, "autoRebuyEnabled", True), True),
+            guadao_item_scope=normalize_guadao_item_scope(
+                _get(guadao_balance, "guadaoItemScope", GUADAO_ITEM_SCOPE_CASE_ONLY)
+            ),
+            price_tolerance_pct=float(_get(guadao_balance, "priceTolerancePct", 1.0)),
+            max_list_per_cycle=int(_get(guadao_balance, "maxListPerCycle", 5)),
             max_transfer_buy_per_cycle=int(
-                data.get(
+                _get(
+                    legacy_transfer,
                     "maxTransferBuyPerCycle",
                     data.get("maxBuyPerCycle", 3),
                 )
             ),
-            cycle_interval_minutes=int(data.get("cycleIntervalMinutes", 15)),
-            listing_check_interval_minutes=int(data.get("listingCheckIntervalMinutes", 5)),
-            dry_run=_as_bool(data.get("dryRun"), True),
-            steam_context_id=str(data.get("steamContextId", "2")),
-            steam_currency=int(data.get("steamCurrency", 23)),
-            steam_country=str(data.get("steamCountry", "CN")),
-            steam_language=str(data.get("steamLanguage", "schinese")),
-            listing_wall_min_count=int(data.get("listingWallMinCount", 20)),
-            listing_price_offset=float(data.get("listingPriceOffset", 0.01)),
+            cycle_interval_minutes=int(_get(common, "cycleIntervalMinutes", 15)),
+            listing_check_interval_minutes=float(_get(common, "listingCheckIntervalMinutes", 5.0)),
+            dry_run=_as_bool(_get(common, "dryRun", True), True),
+            steam_context_id=str(_get(common, "steamContextId", "2")),
+            steam_currency=int(_get(common, "steamCurrency", 23)),
+            steam_country=str(_get(common, "steamCountry", "CN")),
+            steam_language=str(_get(common, "steamLanguage", "schinese")),
+            listing_wall_min_count=int(_get(guadao_balance, "listingWallMinCount", 20)),
+            listing_price_offset=float(_get(guadao_balance, "listingPriceOffset", 0.01)),
             case_listing_price_offset=(
-                float(data["caseListingPriceOffset"])
-                if data.get("caseListingPriceOffset") is not None
+                float(_get(guadao_balance, "caseListingPriceOffset", -0.01))
+                if _get(guadao_balance, "caseListingPriceOffset", -0.01) is not None
                 else None
             ),
-            case_max_open_guadao_count=int(data.get("caseMaxOpenGuadaoCount", 100)),
-            force_refresh_before_execution=_as_bool(data.get("forceRefreshBeforeExecution"), True),
-            steam_price_cache_ttl=float(data.get("steamPriceCacheTtl", 60.0)),
-            rebuy_steam_drop_tolerance_pct=float(data.get("rebuySteamDropTolerancePct", 5.0)),
+            case_max_open_guadao_count=int(_get(guadao_balance, "caseMaxOpenGuadaoCount", 100)),
+            force_refresh_before_execution=_as_bool(
+                _get(common, "forceRefreshBeforeExecution", True),
+                True,
+            ),
+            steam_price_cache_ttl=float(_get(common, "steamPriceCacheTtl", 60.0)),
+            rebuy_steam_drop_tolerance_pct=float(
+                _get(guadao_balance, "rebuySteamDropTolerancePct", 5.0)
+            ),
         )
 
     @property

@@ -205,9 +205,9 @@ class TYieldScanTestCase(unittest.TestCase):
         self.assertEqual(1, report.inventory_type_count)
         self.assertEqual(["Mixed Item"], [candidate.market_hash_name for candidate in report.candidates])
         candidate = report.candidates[0]
-        self.assertAlmostEqual(12.0 / 15.0, candidate.ratio)
-        self.assertAlmostEqual(12.0 / 15.0 - 0.73, candidate.t_yield_rate)
-        self.assertAlmostEqual((12.0 / 15.0) / 0.869, candidate.listing_ratio)
+        self.assertAlmostEqual((12.0 / 15.0) * 0.99, candidate.ratio)
+        self.assertAlmostEqual((12.0 / 15.0) * 0.99 - 0.73, candidate.t_yield_rate)
+        self.assertAlmostEqual(12.0 / 15.0, candidate.listing_ratio)
         self.assertEqual(
             ["Mixed Item"],
             [

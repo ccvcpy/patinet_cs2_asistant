@@ -83,6 +83,10 @@ STEAM_LISTING_MAX_ATTEMPTS = 10
 STEAM_LISTING_TRANSIENT_COOLDOWN_SECONDS = 30 * 60
 STEAM_LISTING_ACCOUNT_ATTEMPT_INTERVAL_SECONDS = 1.0
 STEAM_LISTING_ACCOUNT_BACKOFF_SECONDS = 3 * 60
+GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS = 48 * 60 * 60
+STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES = 2
+STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES = 30
+GUADAO_PENDING_CONFIRMATION_RELEASE_AFTER_SECONDS = 30 * 60
 
 
 def _format_decimal(value: Any, *, digits: int = 3) -> str:
@@ -348,6 +352,17 @@ class GuadaoAssetTarget:
     asset_id: str
     steam_id64: str | None
     account: Account | None
+
+
+@dataclass(slots=True)
+class GuadaoListingPlan:
+    candidate: StrategyCandidate
+    decision: ListingDecision
+    target: GuadaoAssetTarget
+    client: SteamMarketClient
+    steam_id64: str
+    account: Account | None
+    recent_sold_count: int
 
 
 @dataclass(slots=True)
@@ -733,6 +748,7 @@ class ExecutionEngine:
                 market_hash_name=candidate.market_hash_name,
                 tradable=True,
                 status="available",
+                exclude_reserved=True,
             )
             counts_by_steam_id: dict[str, int] = {}
             unknown_count = 0
@@ -845,6 +861,7 @@ class ExecutionEngine:
                 steam_id=steam_id,
                 tradable=True,
                 status="available",
+                exclude_reserved=True,
             )
             local_count = len(local_assets)
             if local_count > 0:
@@ -1255,6 +1272,7 @@ class ExecutionEngine:
                 "deferCount": defer_count,
                 "deferredAt": now.isoformat(),
                 "deferredUntil": deferred_until.isoformat(),
+                **self._guadao_open_ratio_note_from_price(candidate, price),
                 **self._account_note_fields(account, steam_id64),
             }
         )
@@ -1318,6 +1336,7 @@ class ExecutionEngine:
             "strategy": candidate.primary_strategy,
             "needsConfirmation": True,
             "listingPendingAt": utc_now_iso(),
+            **self._guadao_open_ratio_note_from_price(candidate, price),
             **self._account_note_fields(account, steam_id64),
             **confirmation_note,
         }
@@ -1349,27 +1368,51 @@ class ExecutionEngine:
         else:
             self.db.set_pool_status(candidate.market_hash_name, status_after)
         if status_after == POOL_STATUS_LISTING_PENDING and client is not None and op_id:
-            listing_id = str(note_dict.get("listingId") or "").strip()
-            sale_receipt = self._lookup_steam_sale_receipt(client, listing_id)
-            if sale_receipt is None:
-                sale_receipt = self._lookup_steam_sale_receipt_by_asset(client, asset_id)
-            if sale_receipt is not None:
+            if self._mark_pending_sell_operation_sold_if_receipted(
+                op_id=op_id,
+                note=note_dict,
+                client=client,
+                asset_id=asset_id,
+            ):
                 self._pending_confirmation_count = pending_count_before
-                existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
-                op = self.db.conn.execute(
-                    "SELECT * FROM pool_operations WHERE id = ?",
-                    (op_id,),
-                ).fetchone()
-                if op is not None:
-                    self._mark_steam_listing_sold(
-                        op,
-                        note_dict,
-                        sale_receipt=sale_receipt,
-                        existing_rebuy_sources=existing_rebuy_sources,
-                        existing_rebuy_sell_ops=existing_rebuy_sell_ops,
-                    )
-                    return op_id, POOL_STATUS_PENDING_REBUY
+                return op_id, POOL_STATUS_PENDING_REBUY
         return op_id, status_after
+
+    def _mark_pending_sell_operation_sold_if_receipted(
+        self,
+        *,
+        op_id: int,
+        note: dict[str, Any],
+        client: SteamMarketClient | None,
+        asset_id: str,
+        max_pages: int = STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES,
+    ) -> bool:
+        if not client or not op_id:
+            return False
+        listing_id = str(note.get("listingId") or "").strip()
+        sale_receipt = self._lookup_steam_sale_receipt_for_listing_or_asset(
+            client,
+            listing_id=listing_id,
+            asset_id=asset_id,
+            max_pages=max_pages,
+        )
+        if sale_receipt is None:
+            return False
+        existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
+        op = self.db.conn.execute(
+            "SELECT * FROM pool_operations WHERE id = ?",
+            (op_id,),
+        ).fetchone()
+        if op is None:
+            return False
+        self._mark_steam_listing_sold(
+            op,
+            note,
+            sale_receipt=sale_receipt,
+            existing_rebuy_sources=existing_rebuy_sources,
+            existing_rebuy_sell_ops=existing_rebuy_sell_ops,
+        )
+        return True
 
     def _refresh_scan_listing_prices_from_steam(self, report: Any) -> int:
         if not self.steam_client or not self.config.auto_list_enabled:
@@ -1613,6 +1656,7 @@ class ExecutionEngine:
                 market_hash_name=candidate.market_hash_name,
                 tradable=True,
                 status="available",
+                exclude_reserved=True,
             )
             if assets:
                 local_candidates.append(candidate)
@@ -2019,6 +2063,207 @@ class ExecutionEngine:
             pricing=pricing,
         )
 
+    def _decide_listing_compat(
+        self,
+        candidate: StrategyCandidate,
+        *,
+        client: SteamMarketClient | None,
+    ) -> ListingDecision | None:
+        try:
+            return self._decide_listing(candidate, client=client)
+        except TypeError as exc:
+            if "client" not in str(exc):
+                raise
+            # Some tests monkeypatch _decide_listing with the historical
+            # one-argument call shape.
+            return self._decide_listing(candidate)
+
+    def _finalize_listing_decision(
+        self,
+        candidate: StrategyCandidate,
+        decision: ListingDecision,
+        *,
+        client: SteamMarketClient,
+    ) -> ListingDecision | None:
+        if not self.config.force_refresh_before_execution:
+            return decision
+
+        price_offset = self._listing_price_offset_for_candidate(candidate)
+        final_pricing = fetch_listing_price(
+            client,
+            app_id=self.settings.app_id,
+            market_hash_name=candidate.market_hash_name,
+            wall_min_count=self._listing_wall_min_count_for_candidate(candidate),
+            price_offset=price_offset,
+            min_price=0.01,
+            country=self.config.steam_country,
+            language=self.config.steam_language,
+            currency=self.config.steam_currency,
+            force_refresh=True,
+            cache_ttl=self.config.steam_price_cache_ttl,
+        )
+        if final_pricing is None:
+            if not self.config.dry_run:
+                cycle_key = (candidate.market_hash_name, "steam_price_unavailable")
+                if cycle_key not in self._notified_listing_skips_cycle:
+                    self._notify_skip(candidate.market_hash_name, "steam_price_unavailable", {})
+                    self._notified_listing_skips_cycle.add(cycle_key)
+                print(
+                    f"[上架跳过] {candidate.market_hash_name} | "
+                    "force_refresh 未能获取 Steam 实时挂单墙价格，真实执行不上架"
+                )
+                return None
+            print(
+                f"[上架定价] {candidate.market_hash_name} | "
+                "force_refresh 实时取价失败，dry-run 沿用扫描价/缓存价继续判断"
+            )
+            final_pricing = decision.pricing
+
+        return self._decision_from_list_price(
+            candidate,
+            final_pricing.list_price if final_pricing is not None else decision.list_price,
+            pricing=final_pricing,
+        )
+
+    def _guadao_open_ratio_note(
+        self,
+        candidate: StrategyCandidate,
+        decision: ListingDecision | None,
+    ) -> dict[str, Any]:
+        listing_ratio = safe_float(decision.listing_ratio if decision is not None else None)
+        if listing_ratio is None:
+            listing_ratio = safe_float(candidate.listing_ratio)
+        hard_max_ratio = safe_float(self.config.guadao_max_listing_ratio)
+        if listing_ratio is None or listing_ratio <= 0:
+            return {
+                "guadaoMaxListingRatioAtOpen": hard_max_ratio,
+                "steamNetFactorAtOpen": self.config.steam_net_factor,
+            }
+        max_rebuy_ratio = listing_ratio
+        if hard_max_ratio is not None and hard_max_ratio > 0:
+            max_rebuy_ratio = min(max_rebuy_ratio, hard_max_ratio)
+        return {
+            "listingRatioAtOpen": listing_ratio,
+            "maxRebuyRatioAtOpen": max_rebuy_ratio,
+            "guadaoMaxListingRatioAtOpen": hard_max_ratio,
+            "steamNetFactorAtOpen": self.config.steam_net_factor,
+        }
+
+    def _guadao_open_ratio_note_from_price(
+        self,
+        candidate: StrategyCandidate,
+        price: float,
+    ) -> dict[str, Any]:
+        return self._guadao_open_ratio_note(
+            candidate,
+            self._decision_from_list_price(candidate, price, pricing=None),
+        )
+
+    def _rebuy_max_listing_ratio_for_note(self, note: dict[str, Any]) -> float:
+        frozen_ratio = safe_float(note.get("maxRebuyRatioAtOpen"))
+        if frozen_ratio is None:
+            frozen_ratio = safe_float(note.get("listingRatioAtOpen"))
+        if frozen_ratio is not None and frozen_ratio > 0:
+            hard_max_at_open = safe_float(note.get("guadaoMaxListingRatioAtOpen"))
+            if hard_max_at_open is not None and hard_max_at_open > 0:
+                return min(frozen_ratio, hard_max_at_open)
+            return frozen_ratio
+        return float(self.config.guadao_max_listing_ratio)
+
+    def _recent_guadao_sold_count(
+        self,
+        market_hash_name: str,
+        *,
+        lookback_minutes: int = 60,
+    ) -> int:
+        cutoff = _now_utc() - timedelta(minutes=max(1, lookback_minutes))
+        count = 0
+        for op in self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="sold", limit=1000):
+            if str(op["market_hash_name"]) != market_hash_name:
+                continue
+            note = _read_note(op["note"])
+            sold_at = _parse_iso(str(note.get("steamSoldAt") or "")) or _parse_iso(op["completed_at"])
+            if sold_at is None:
+                continue
+            if sold_at.tzinfo is None:
+                sold_at = sold_at.replace(tzinfo=timezone.utc)
+            if sold_at >= cutoff:
+                count += 1
+        return count
+
+    def _build_guadao_listing_plans(
+        self,
+        candidates: list[StrategyCandidate],
+        *,
+        status_map: dict[str, str],
+        picked_asset_ids: set[str],
+    ) -> list[GuadaoListingPlan]:
+        plans: list[GuadaoListingPlan] = []
+        for candidate in candidates:
+            if getattr(self, "_stop_requested", False):
+                break
+            if self._is_weapon_case(candidate.market_hash_name):
+                case_open_count = self._open_case_guadao_count()
+                if self._case_open_guadao_limit_reached(case_open_count):
+                    self._notify_case_open_guadao_limit(case_open_count)
+                    break
+            if not self._can_execute_guadao(status_map.get(candidate.market_hash_name)):
+                continue
+            if candidate.tradable_count <= 0:
+                continue
+
+            target = self._find_guadao_asset_target(
+                candidate,
+                exclude_asset_ids=picked_asset_ids,
+            )
+            while target is not None:
+                client = self._steam_client_for_account(target.account, target.steam_id64)
+                if client is not None:
+                    break
+                picked_asset_ids.add(target.asset_id)
+                target = self._find_guadao_asset_target(
+                    candidate,
+                    exclude_asset_ids=picked_asset_ids,
+                )
+            if target is None:
+                continue
+            client = self._steam_client_for_account(target.account, target.steam_id64)
+            if client is None:
+                continue
+
+            decision = self._decide_listing_compat(candidate, client=client)
+            if decision is None:
+                continue
+            decision = self._finalize_listing_decision(candidate, decision, client=client)
+            if decision is None:
+                continue
+            if decision.listing_ratio > self.config.guadao_max_listing_ratio:
+                continue
+
+            steam_id64 = str(getattr(client, "steam_id64", "") or target.steam_id64 or "").strip()
+            if not steam_id64:
+                continue
+            plans.append(
+                GuadaoListingPlan(
+                    candidate=candidate,
+                    decision=decision,
+                    target=target,
+                    client=client,
+                    steam_id64=steam_id64,
+                    account=target.account or self.account,
+                    recent_sold_count=self._recent_guadao_sold_count(candidate.market_hash_name),
+                )
+            )
+
+        plans.sort(
+            key=lambda plan: (
+                float(plan.decision.listing_ratio),
+                -plan.recent_sold_count,
+                plan.candidate.market_hash_name,
+            )
+        )
+        return plans
+
     def _execute_listings(self, report: Any, status_map: dict[str, str]) -> int:
         return self._execute_guadao_listings(report, status_map)
 
@@ -2050,8 +2295,17 @@ class ExecutionEngine:
             if candidate.primary_strategy == STRATEGY_GUADAO
             and self._guadao_scope_allows_market_hash_name(candidate.market_hash_name)
         ]
+        plans = self._build_guadao_listing_plans(
+            candidates,
+            status_map=status_map,
+            picked_asset_ids=picked_asset_ids,
+        )
 
-        for candidate in candidates:
+        for plan in plans:
+            candidate = plan.candidate
+            decision = plan.decision
+            target = plan.target
+            client = plan.client
             if getattr(self, "_stop_requested", False):
                 break
             if list_count >= self.config.max_list_per_cycle:
@@ -2066,79 +2320,22 @@ class ExecutionEngine:
             if candidate.tradable_count <= 0:
                 continue
 
-            target = self._find_guadao_asset_target(
-                candidate,
-                steam_id64=selected_steam_id64,
-                exclude_asset_ids=picked_asset_ids,
-            )
-            while target is not None and selected_steam_id64 is None:
-                client = self._steam_client_for_account(target.account, target.steam_id64)
-                if client is not None:
-                    break
-                picked_asset_ids.add(target.asset_id)
+            if selected_steam_id64 is None:
+                selected_steam_id64 = plan.steam_id64
+                selected_account = plan.account
+            elif plan.steam_id64 != selected_steam_id64:
                 target = self._find_guadao_asset_target(
                     candidate,
+                    steam_id64=selected_steam_id64,
                     exclude_asset_ids=picked_asset_ids,
                 )
-            if target is None:
-                continue
-            client = self._steam_client_for_account(target.account, target.steam_id64)
-            if client is None:
-                continue
-
-            try:
-                decision = self._decide_listing(candidate, client=client)
-            except TypeError as exc:
-                if "client" not in str(exc):
-                    raise
-                # Some tests monkeypatch _decide_listing with the historical
-                # one-argument call shape.
-                decision = self._decide_listing(candidate)
-            if decision is None:
-                continue
-            if self.config.force_refresh_before_execution:
-                price_offset = self._listing_price_offset_for_candidate(candidate)
-                final_pricing = fetch_listing_price(
-                    client,
-                    app_id=self.settings.app_id,
-                    market_hash_name=candidate.market_hash_name,
-                    wall_min_count=self._listing_wall_min_count_for_candidate(candidate),
-                    price_offset=price_offset,
-                    min_price=0.01,
-                    country=self.config.steam_country,
-                    language=self.config.steam_language,
-                    currency=self.config.steam_currency,
-                    force_refresh=True,
-                    cache_ttl=self.config.steam_price_cache_ttl,
-                )
-                if final_pricing is None:
-                    if not self.config.dry_run:
-                        cycle_key = (candidate.market_hash_name, "steam_price_unavailable")
-                        if cycle_key not in self._notified_listing_skips_cycle:
-                            self._notify_skip(candidate.market_hash_name, "steam_price_unavailable", {})
-                            self._notified_listing_skips_cycle.add(cycle_key)
-                        print(
-                            f"[上架跳过] {candidate.market_hash_name} | "
-                            "force_refresh 未能获取 Steam 实时挂单墙价格，真实执行不上架"
-                        )
-                        continue
-                    print(
-                        f"[上架定价] {candidate.market_hash_name} | "
-                        "force_refresh 实时取价失败，dry-run 沿用扫描价/缓存价继续判断"
-                    )
-                    final_pricing = decision.pricing
-                decision = self._decision_from_list_price(
-                    candidate,
-                    final_pricing.list_price if final_pricing is not None else decision.list_price,
-                    pricing=final_pricing,
-                )
-                if decision is None:
+                if target is None:
                     continue
-            if decision.listing_ratio > self.config.guadao_max_listing_ratio:
-                continue
+                client = self._steam_client_for_account(target.account, target.steam_id64)
+                if client is None:
+                    continue
+                selected_account = target.account or selected_account or self.account
 
-            selected_steam_id64 = str(getattr(client, "steam_id64", "") or target.steam_id64 or "").strip()
-            selected_account = target.account or self.account
             if not selected_steam_id64:
                 continue
             account_backoff_until = self._active_listing_account_backoff(client)
@@ -2318,6 +2515,7 @@ class ExecutionEngine:
                     "confirmationStatus": "pending",
                 }
                 status_after = POOL_STATUS_LISTED
+                pending_count_before = self._pending_confirmation_count
                 confirmation_note, status_after = self._handle_listing_confirmation(
                     market_hash_name=candidate.market_hash_name,
                     asset_id=asset_id,
@@ -2339,20 +2537,20 @@ class ExecutionEngine:
                     op_status = POOL_STATUS_LISTING_PENDING
                     asset_status = "listing_pending"
 
-                note = _build_note(
-                    {
-                        "listingId": listing_id,
-                        "rebuyPrice": candidate.rebuy_price,
-                        "steamListPrice": decision.list_price,
-                        "steamSellerNetPrice": _steam_seller_net_from_gross(
-                            decision.list_price,
-                            self.config.steam_net_factor,
-                        ),
-                        "strategy": candidate.primary_strategy,
-                        **self._account_note_fields(selected_account, selected_steam_id64),
-                        **confirmation_note,
-                    }
-                )
+                note_dict = {
+                    "listingId": listing_id,
+                    "rebuyPrice": candidate.rebuy_price,
+                    "steamListPrice": decision.list_price,
+                    "steamSellerNetPrice": _steam_seller_net_from_gross(
+                        decision.list_price,
+                        self.config.steam_net_factor,
+                    ),
+                    "strategy": candidate.primary_strategy,
+                    **self._guadao_open_ratio_note(candidate, decision),
+                    **self._account_note_fields(selected_account, selected_steam_id64),
+                    **confirmation_note,
+                }
+                note = _build_note(note_dict)
                 op_id = self.db.add_pool_operation(
                     market_hash_name=candidate.market_hash_name,
                     strategy=candidate.primary_strategy,
@@ -2370,7 +2568,21 @@ class ExecutionEngine:
                 else:
                     self.db.set_pool_status(candidate.market_hash_name, status_after)
                     status_map[candidate.market_hash_name] = status_after
-                if status_after == POOL_STATUS_LISTED:
+                immediate_sold = False
+                if op_status == POOL_STATUS_LISTING_PENDING and client is not None:
+                    immediate_sold = self._mark_pending_sell_operation_sold_if_receipted(
+                        op_id=op_id,
+                        note=note_dict,
+                        client=client,
+                        asset_id=asset_id,
+                    )
+                    if immediate_sold:
+                        self._pending_confirmation_count = pending_count_before
+                        status_after = POOL_STATUS_PENDING_REBUY
+                        status_map[candidate.market_hash_name] = POOL_STATUS_PENDING_REBUY
+                if immediate_sold:
+                    pass
+                elif status_after == POOL_STATUS_LISTED:
                     print(
                         f"[上架] {candidate.market_hash_name} | "
                         f"账号={selected_account.name if selected_account else selected_steam_id64} | "
@@ -2484,9 +2696,12 @@ class ExecutionEngine:
                 listing_id=listing_id,
                 asset_id=asset_id,
             ):
-                sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
-                if sale_receipt is None and asset_id:
-                    sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
+                sale_receipt = self._lookup_steam_sale_receipt_for_listing_or_asset(
+                    active_client,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                    max_pages=STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES,
+                )
                 if sale_receipt is not None:
                     if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
                         existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
@@ -2525,9 +2740,12 @@ class ExecutionEngine:
                         self._mark_steam_listing_active(op, note)
                         updated += 1
                         continue
-                    sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
-                    if sale_receipt is None and asset_id:
-                        sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
+                    sale_receipt = self._lookup_steam_sale_receipt_for_listing_or_asset(
+                        active_client,
+                        listing_id=listing_id,
+                        asset_id=asset_id,
+                        max_pages=STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES,
+                    )
                     if sale_receipt is not None:
                         if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
                             existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
@@ -2588,6 +2806,15 @@ class ExecutionEngine:
                         and (confirmation_retry_count or 0) <= 0
                         and self._pending_listing_asset_is_relistable(op)
                     ):
+                        if self._mark_pending_sell_operation_sold_if_receipted(
+                            op_id=int(op["id"]),
+                            note=retry_note,
+                            client=active_client,
+                            asset_id=asset_id,
+                            max_pages=STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES,
+                        ):
+                            updated += 1
+                            continue
                         self._release_stale_pending_listing(op, retry_note)
                         continue
                     self.db.update_pool_operation(
@@ -2739,7 +2966,14 @@ class ExecutionEngine:
         ):
             return False
         created_at = _parse_iso(op["created_at"])
-        if created_at and (_now_utc() - created_at).total_seconds() < self._guadao_wait_seconds():
+        age_seconds = (_now_utc() - created_at).total_seconds() if created_at else None
+        if (
+            note.get("confirmationStatus") == "confirm_sent_waiting_active_listing"
+            and age_seconds is not None
+            and age_seconds < GUADAO_PENDING_CONFIRMATION_RELEASE_AFTER_SECONDS
+        ):
+            return False
+        if age_seconds is not None and age_seconds < self._guadao_wait_seconds():
             return False
         inventory_item = self._inventory_items_by_asset_id.get(asset_id)
         if not inventory_item:
@@ -2806,6 +3040,102 @@ class ExecutionEngine:
             f"[挂单待确认清理] {op['market_hash_name']} | asset={asset_id or '-'} | "
             f"listing={listing_id or '-'} | "
             "Steam 网页待确认挂单已撤下，资产已释放，下轮可重新上架"
+        )
+
+    def _guadao_listed_age_seconds(self, op: Any, *, now: datetime) -> float | None:
+        created_at = _parse_iso(op["created_at"])
+        if created_at is None:
+            return None
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (now.astimezone(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds(),
+        )
+
+    def _is_stale_guadao_listed_operation(self, op: Any, *, now: datetime) -> bool:
+        age_seconds = self._guadao_listed_age_seconds(op, now=now)
+        return age_seconds is not None and age_seconds >= GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS
+
+    def _remove_stale_active_guadao_listing(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        client: SteamMarketClient,
+        active: list[Any],
+        active_listing_ids: set[str],
+    ) -> bool:
+        asset_id = str(op["asset_id"] or "").strip()
+        listing_id = str(note.get("listingId") or "").strip()
+        removable_listing_id = listing_id if listing_id and listing_id in active_listing_ids else None
+        if removable_listing_id is None and asset_id:
+            removable_listing_id = self._active_listing_id_for_asset(active, asset_id)
+            if removable_listing_id:
+                note["listingId"] = removable_listing_id
+        if not removable_listing_id:
+            note["staleListedCleanupStatus"] = "manual_required"
+            note["staleListedCleanupReason"] = "active listing matched asset but listing id is unavailable"
+            note["staleListedCheckedAt"] = utc_now_iso()
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            print(
+                f"[挂刀老挂单待处理] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                "远端仍在售但缺少可撤单 listingId，未恢复本地资产"
+            )
+            return False
+
+        remover = getattr(client, "remove_listing", None)
+        if not callable(remover):
+            remove_error = "Steam client does not support remove_listing"
+            removed = False
+        else:
+            try:
+                removed = bool(remover(removable_listing_id))
+                remove_error = None if removed else "Steam remove_listing returned false"
+            except Exception as exc:
+                removed = False
+                remove_error = str(exc)
+
+        if not removed:
+            note["staleListedCleanupStatus"] = "remove_failed"
+            note["staleListedCleanupReason"] = remove_error
+            note["staleListedCheckedAt"] = utc_now_iso()
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            print(
+                f"[挂刀老挂单撤单失败] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                f"listing={removable_listing_id} | 原因: {remove_error}"
+            )
+            return False
+
+        note["staleListedCleanupStatus"] = "removed"
+        note["staleListedRemovedAt"] = utc_now_iso()
+        note["staleListedRemoveReason"] = "listed more than 48 hours"
+        self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
+        if asset_id:
+            self.db.set_asset_status(asset_id, "available")
+        if not self._has_other_open_guadao_operation(
+            op["market_hash_name"],
+            exclude_op_id=int(op["id"]),
+        ):
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+        print(
+            f"[挂刀老挂单已撤单恢复] {op['market_hash_name']} | asset={asset_id or '-'} | "
+            f"listing={removable_listing_id} | 已超过48小时，Steam撤单成功后恢复本地资产"
+        )
+        return True
+
+    def _mark_stale_listed_manual_required(self, op: Any, note: dict[str, Any], *, reason: str) -> None:
+        asset_id = str(op["asset_id"] or "").strip()
+        listing_id = str(note.get("listingId") or "").strip()
+        note["staleListedCleanupStatus"] = "manual_required"
+        note["staleListedManualRequiredAt"] = utc_now_iso()
+        note["staleListedManualRequiredReason"] = reason
+        note["manualReviewReason"] = reason
+        self.db.update_pool_operation(op["id"], status="manual_required", note=_build_note(note))
+        self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_LISTED)
+        print(
+            f"[挂刀老挂单人工检查] {op['market_hash_name']} | asset={asset_id or '-'} | "
+            f"listing={listing_id or '-'} | 已超过48小时，远端不在售且无Steam卖出回执；未恢复本地资产"
         )
 
     def _backfill_listing_ids(self, *, client: SteamMarketClient | None = None) -> int:
@@ -2877,6 +3207,19 @@ class ExecutionEngine:
                 reason="missing_credentials",
             )
             return note, POOL_STATUS_LISTING_PENDING
+
+        if active_client is not None:
+            pending_market_listing = self._pending_market_confirmation_listing(
+                active_client,
+                listing_id=listing_id,
+                asset_id=asset_id,
+            )
+            if pending_market_listing is not None:
+                pending_listing_id = str(getattr(pending_market_listing, "listing_id", "") or "").strip()
+                if pending_listing_id:
+                    note["listingId"] = pending_listing_id
+                    note["marketPendingListingId"] = pending_listing_id
+                    listing_id = pending_listing_id
 
         try:
             if not active_client:
@@ -2956,6 +3299,8 @@ class ExecutionEngine:
 
         note["confirmationStatus"] = "confirmed"
         note["confirmationCount"] = confirmed_count
+        if listing_id:
+            note["listingId"] = listing_id
         try:
             active_listings = active_client.list_active_listings()
             active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active_listings)
@@ -3042,6 +3387,7 @@ class ExecutionEngine:
             steam_id=self.steam_client.steam_id64,
             tradable=True,
             status="available",
+            exclude_reserved=True,
         ):
             asset_id = str(asset_row["asset_id"])
             inventory_item = self._inventory_items_by_asset_id.get(asset_id)
@@ -3415,12 +3761,19 @@ class ExecutionEngine:
         self,
         client: SteamMarketClient,
         listing_id: str,
+        *,
+        max_pages: int = 3,
     ) -> dict[str, Any] | None:
         finder = getattr(client, "find_sale_receipt", None)
         if not listing_id or not callable(finder):
             return None
         try:
-            receipt = finder(listing_id)
+            receipt = finder(listing_id, max_pages=max_pages)
+        except TypeError:
+            try:
+                receipt = finder(listing_id)
+            except Exception:
+                return None
         except Exception:
             return None
         return receipt if isinstance(receipt, dict) else None
@@ -3429,15 +3782,39 @@ class ExecutionEngine:
         self,
         client: SteamMarketClient,
         asset_id: str,
+        *,
+        max_pages: int = 3,
     ) -> dict[str, Any] | None:
         finder = getattr(client, "find_sale_receipt_by_asset", None)
         if not asset_id or not callable(finder):
             return None
         try:
-            receipt = finder(asset_id)
+            receipt = finder(asset_id, max_pages=max_pages)
+        except TypeError:
+            try:
+                receipt = finder(asset_id)
+            except Exception:
+                return None
         except Exception:
             return None
         return receipt if isinstance(receipt, dict) else None
+
+    def _lookup_steam_sale_receipt_for_listing_or_asset(
+        self,
+        client: SteamMarketClient,
+        *,
+        listing_id: str,
+        asset_id: str,
+        max_pages: int = 3,
+    ) -> dict[str, Any] | None:
+        sale_receipt = self._lookup_steam_sale_receipt(client, listing_id, max_pages=max_pages)
+        if sale_receipt is None and asset_id:
+            sale_receipt = self._lookup_steam_sale_receipt_by_asset(
+                client,
+                asset_id,
+                max_pages=max_pages,
+            )
+        return sale_receipt
 
     def _load_existing_rebuy_source_keys(self) -> tuple[set[str], set[str]]:
         existing_rebuy_sources: set[str] = set()
@@ -3463,10 +3840,12 @@ class ExecutionEngine:
     ) -> None:
         listing_id = str(note.get("listingId") or "").strip()
         asset_id = str(op["asset_id"] or "").strip()
+        note_changed = False
         if not listing_id and sale_receipt:
             listing_id = str(sale_receipt.get("listingId") or "").strip()
             if listing_id:
                 note["listingId"] = listing_id
+                note_changed = True
         self.db.update_pool_operation(op["id"], status="sold")
         self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
         if asset_id:
@@ -3475,14 +3854,24 @@ class ExecutionEngine:
         steam_list_price = note.get("steamListPrice")
         steam_net_price = safe_float(note.get("steamSellerNetPrice"))
         receipt_net_price = safe_float(sale_receipt.get("receivedAmount")) if sale_receipt else None
+        if sale_receipt:
+            receipt_purchase_id = sale_receipt.get("purchaseId")
+            receipt_time_sold = sale_receipt.get("timeSold")
+            receipt_currency_id = sale_receipt.get("receivedCurrencyId")
+            if receipt_purchase_id not in (None, ""):
+                note["steamPurchaseId"] = receipt_purchase_id
+                note_changed = True
+            if receipt_time_sold not in (None, ""):
+                note["steamSoldAt"] = receipt_time_sold
+                note_changed = True
+            if receipt_currency_id not in (None, ""):
+                note["steamHistoryCurrencyId"] = receipt_currency_id
+                note_changed = True
         if receipt_net_price is not None and receipt_net_price > 0:
             steam_net_price = receipt_net_price
             note["steamSellerNetPrice"] = steam_net_price
             note["steamSellerNetPriceSource"] = "steam_history"
-            note["steamPurchaseId"] = sale_receipt.get("purchaseId")
-            note["steamSoldAt"] = sale_receipt.get("timeSold")
-            note["steamHistoryCurrencyId"] = sale_receipt.get("receivedCurrencyId")
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            note_changed = True
         elif steam_net_price is None:
             steam_net_price = _steam_seller_net_from_gross(
                 steam_list_price,
@@ -3491,7 +3880,9 @@ class ExecutionEngine:
             if steam_net_price is not None:
                 note["steamSellerNetPrice"] = steam_net_price
                 note["steamSellerNetPriceSource"] = "steam_net_factor"
-                self.db.update_pool_operation(op["id"], note=_build_note(note))
+                note_changed = True
+        if note_changed:
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
         sold_message = (
             f"[卖出] {op['market_hash_name']} | "
             f"账号={_steam_account_log_label(note) or '-'} | "
@@ -3523,6 +3914,10 @@ class ExecutionEngine:
                             "steamAccountId": note.get("steamAccountId"),
                             "steamAccountName": note.get("steamAccountName"),
                             "steamId64": note.get("steamId64"),
+                            "listingRatioAtOpen": note.get("listingRatioAtOpen"),
+                            "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
+                            "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
+                            "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
                         }
                     ),
                 )
@@ -3560,6 +3955,7 @@ class ExecutionEngine:
             note = _read_note(op["note"])
             listing_id = str(note.get("listingId") or "")
             asset_id = str(op["asset_id"] or "")
+            is_stale_listed = self._is_stale_guadao_listed_operation(op, now=now)
 
             if self._listing_is_active(
                 active_listing_ids=active_listing_ids,
@@ -3567,12 +3963,23 @@ class ExecutionEngine:
                 listing_id=listing_id,
                 asset_id=asset_id,
             ):
+                if is_stale_listed:
+                    self._remove_stale_active_guadao_listing(
+                        op,
+                        note,
+                        client=active_client,
+                        active=active,
+                        active_listing_ids=active_listing_ids,
+                    )
+                    continue
                 if not note.get("activeVerifiedAt"):
                     note["activeVerifiedAt"] = utc_now_iso()
                     self.db.update_pool_operation(op["id"], note=_build_note(note))
                 continue
 
             sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
+            if sale_receipt is None and asset_id:
+                sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
             if sale_receipt is not None:
                 self._mark_steam_listing_sold(
                     op,
@@ -3582,6 +3989,13 @@ class ExecutionEngine:
                     existing_rebuy_sell_ops=existing_rebuy_sell_ops,
                 )
                 sold_count += 1
+                continue
+            if is_stale_listed:
+                self._mark_stale_listed_manual_required(
+                    op,
+                    note,
+                    reason="stale listed operation missing active Steam listing and sale receipt",
+                )
                 continue
 
             created_at = _parse_iso(op["created_at"])
@@ -3850,6 +4264,10 @@ class ExecutionEngine:
             "sourceSellOperationId": note.get("sourceSellOperationId"),
             "sourceListing": note.get("sourceListing"),
             "steamListPrice": note.get("steamListPrice"),
+            "listingRatioAtOpen": note.get("listingRatioAtOpen"),
+            "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
+            "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
+            "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
             "steamAccountId": note.get("steamAccountId"),
             "steamAccountName": note.get("steamAccountName"),
             "steamId64": note.get("steamId64"),
@@ -4067,6 +4485,8 @@ class ExecutionEngine:
                 self.db.update_pool_operation(op["id"], note=_build_note(note))
             force_rebuy_replacement = bool(note.get("forceRebuyReplacement"))
             expected_steam_list = note.get("steamListPrice")
+            rebuy_max_listing_ratio = self._rebuy_max_listing_ratio_for_note(note)
+            rebuy_steam_net_factor = safe_float(note.get("steamNetFactorAtOpen")) or self.config.steam_net_factor
             rebuy_steam_client = self._steam_client_for_rebuy_note(note)
             trade_url = self._resolve_rebuy_trade_url(note)
             if not trade_url:
@@ -4084,10 +4504,10 @@ class ExecutionEngine:
                 app_id=self.settings.app_id,
                 tolerance_pct=self.config.price_tolerance_pct,
                 dry_run=self.config.dry_run,
-                steam_net_factor=self.config.steam_net_factor,
+                steam_net_factor=rebuy_steam_net_factor,
                 guadao_max_listing_ratio=None
                 if force_rebuy_replacement
-                else self.config.guadao_max_listing_ratio,
+                else rebuy_max_listing_ratio,
                 trade_url=trade_url,
                 use_live_price_as_max=force_rebuy_replacement,
             )
@@ -4128,7 +4548,7 @@ class ExecutionEngine:
                 )
                 if result.listing_ratio_now:
                     steam_sold_net = (
-                        float(result.steam_reference_price) * float(self.config.steam_net_factor)
+                        float(result.steam_reference_price) * float(rebuy_steam_net_factor)
                         if result.steam_reference_price is not None
                         else None
                     )
@@ -4295,3 +4715,4 @@ class ExecutionEngine:
             self.serverchan.send(title, body)
         except Exception:
             pass
+

@@ -28,6 +28,11 @@ def _safe_positive_float(value: Any) -> float | None:
     return number
 
 
+def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
 def calculate_ratio(
     c5_sell_price: float | None,
     steam_sell_price: float | None,
@@ -112,6 +117,7 @@ class MarketService:
         steam_market_client: SteamMarketClient | None = None,
         steam_market_clients: list[SteamMarketClient] | None = None,
         app_id: int = 730,
+        steam_currency: int = 23,
         include_c5_purchase_prices: bool = True,
         fallback_max_workers: int = 4,
     ):
@@ -122,6 +128,7 @@ class MarketService:
         if steam_market_client is not None:
             self.steam_market_clients.append(steam_market_client)
         self.app_id = app_id
+        self.steam_currency = steam_currency
         self.include_c5_purchase_prices = include_c5_purchase_prices
         self.fallback_max_workers = max(1, int(fallback_max_workers))
 
@@ -174,15 +181,24 @@ class MarketService:
         def load_one(market_hash_name: str) -> tuple[str, dict[str, Any] | None, list[str]]:
             errors: list[str] = []
             for client in self.steam_market_clients:
+                account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
                 try:
                     payload = client.order_book(
                         app_id=self.app_id,
                         market_hash_name=market_hash_name,
                     )
-                    return market_hash_name, payload, errors
                 except Exception as exc:
-                    account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
                     errors.append(f"{account_label}: {exc}")
+                    continue
+                data = _payload_data(payload or {})
+                currency = safe_int(data.get("eCurrency"))
+                if currency is not None and currency != int(self.steam_currency):
+                    errors.append(
+                        f"{account_label}: orderbook currency mismatch "
+                        f"expected={self.steam_currency} actual={currency}"
+                    )
+                    continue
+                return market_hash_name, payload, errors
             return market_hash_name, None, errors
 
         max_workers = min(self.fallback_max_workers, len(market_hash_names))

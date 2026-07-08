@@ -33,7 +33,7 @@ def build_t_yield_notification(
     lines = [
         "做T收益提醒",
         f"条件: Top {top_n} | C5>={min_price:g}",
-        "公式: 折算比=C5/Steam | 利润=折算比-导余额折扣 | 挂刀比=折算比/0.869",
+        "公式: 折算比=C5/Steam×0.99 | 利润=折算比-导余额折扣 | 面折比=C5/Steam",
         "",
     ]
 
@@ -44,7 +44,7 @@ def build_t_yield_notification(
             lines.append(f"{row['rank']}. {row['name']}")
             lines.append(
                 f"利润 {row['tYieldPct']} | "
-                f"折算比 {row['ratio']} | 挂刀比 {row.get('listingRatio', '-')}"
+                f"折算比 {row['ratio']} | 面折比 {row.get('listingRatio', '-')}"
             )
             lines.append(f"C5 {row['c5LowestSellPrice']} | Steam {row['steamLowestSellPrice']}")
             if inventory_status:

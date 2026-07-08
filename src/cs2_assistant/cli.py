@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -78,6 +79,20 @@ from cs2_assistant.services.guadao_case_monitor import (
     list_case_monitor_targets,
     save_case_ratio_snapshots,
     write_case_ratio_report_files,
+)
+from cs2_assistant.services.profit_trade import (
+    build_profit_trade_dashboard_payload,
+    execute_profit_trade_buy,
+    execute_profit_trade_list_c5,
+    lock_profit_trade,
+    manual_settle_profit_trade,
+    refresh_profit_trade_sales,
+    render_profit_trade_daily_report,
+    run_profit_trade_once,
+    scan_profit_trade_opportunities,
+    send_profit_trade_daily_report,
+    set_profit_trade_config,
+    write_profit_trade_dashboard_payload,
 )
 from cs2_assistant.services.t_yield_alerts import build_t_yield_notification
 from cs2_assistant.services.t_yield_scan import (
@@ -2232,6 +2247,14 @@ def _load_successful_rebuy_source_ids(
     *,
     completed_at_lte: str | None = None,
 ) -> set[int]:
+    return set(_load_successful_rebuys_by_source_id(db, completed_at_lte=completed_at_lte))
+
+
+def _load_successful_rebuys_by_source_id(
+    db: Database,
+    *,
+    completed_at_lte: str | None = None,
+) -> dict[int, Any]:
     params: list[Any] = []
     completed_filter = ""
     if completed_at_lte:
@@ -2239,15 +2262,16 @@ def _load_successful_rebuy_source_ids(
         params.append(completed_at_lte)
     rows = db.conn.execute(
         f"""
-        SELECT note
+        SELECT *
         FROM pool_operations
         WHERE operation_type = 'rebuy_on_c5'
           AND status = 'completed'
           {completed_filter}
+        ORDER BY completed_at ASC, id ASC
         """,
         tuple(params),
     ).fetchall()
-    source_ids: set[int] = set()
+    rebuy_by_source_id: dict[int, Any] = {}
     for row in rows:
         note = _read_note_dict(row["note"])
         c5_order_id = str(note.get("c5OrderId") or "").strip()
@@ -2256,8 +2280,51 @@ def _load_successful_rebuy_source_ids(
             continue
         source_id = safe_int(note.get("sourceSellOperationId"))
         if source_id is not None:
-            source_ids.add(source_id)
-    return source_ids
+            rebuy_by_source_id[source_id] = row
+    return rebuy_by_source_id
+
+
+def _rebuy_cash_value(rebuy: Any | None) -> float | None:
+    if rebuy is None:
+        return None
+    cash = safe_float(rebuy["actual_price"]) or safe_float(rebuy["expected_price"])
+    if cash is None or cash <= 0:
+        return None
+    return cash
+
+
+def _load_latest_rebuys_by_source_id(
+    db: Database,
+    *,
+    op_time_lte: str | None = None,
+) -> dict[int, Any]:
+    rows = db.conn.execute(
+        """
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'rebuy_on_c5'
+        ORDER BY created_at ASC, id ASC
+        """
+    ).fetchall()
+    rebuy_by_source_id: dict[int, Any] = {}
+    for row in rows:
+        if op_time_lte:
+            op_time = str(row["completed_at"] or row["created_at"] or "")
+            if op_time and op_time > op_time_lte:
+                continue
+        note = _read_note_dict(row["note"])
+        source_id = safe_int(note.get("sourceSellOperationId"))
+        if source_id is not None:
+            rebuy_by_source_id[source_id] = row
+    return rebuy_by_source_id
+
+
+def _apply_rebuy_cash_to_sell_report_row(row: dict[str, Any], cash: float | None) -> None:
+    if cash is None or cash <= 0:
+        return
+    row["cash"] = cash
+    row["totalDiscountRatio"] = cash / row["steamNet"] if row["steamNet"] > 0 else None
+    row["faceDiscountRatio"] = cash / row["steamGross"] if row["steamGross"] > 0 else None
 
 
 def _load_balance_insufficient_rebuy_source_ids(
@@ -2345,6 +2412,7 @@ def _build_unclosed_sold_steam_summary(
 
     closed_sell_ids = _load_successful_rebuy_source_ids(db)
     ignored_sell_ids = _load_balance_insufficient_rebuy_source_ids(db)
+    latest_rebuys = _load_latest_rebuys_by_source_id(db)
 
     summary = _empty_guadao_report_summary()
     item_summaries: dict[str, dict[str, Any]] = {}
@@ -2355,6 +2423,7 @@ def _build_unclosed_sold_steam_summary(
         row = _sell_steam_report_row(sell, steam_net_factor)
         if row is None:
             continue
+        _apply_rebuy_cash_to_sell_report_row(row, _rebuy_cash_value(latest_rebuys.get(sell_id)))
         _add_guadao_report_row(summary, row)
         item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
         _add_guadao_report_row(item_summary, row)
@@ -2402,6 +2471,7 @@ def _build_sold_steam_time_summary(
     summary = _empty_guadao_report_summary()
     item_summaries: dict[str, dict[str, Any]] = {}
     detail_rows: list[dict[str, Any]] = []
+    latest_rebuys = _load_latest_rebuys_by_source_id(db)
     for sell in sold_rows:
         sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
         if sold_at is None:
@@ -2413,6 +2483,8 @@ def _build_sold_steam_time_summary(
         row = _sell_steam_report_row(sell, steam_net_factor)
         if row is None:
             continue
+        rebuy_cash = _rebuy_cash_value(latest_rebuys.get(int(sell["id"])))
+        _apply_rebuy_cash_to_sell_report_row(row, rebuy_cash)
         detail_rows.append(row)
         _add_guadao_report_row(summary, row)
         item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
@@ -2462,12 +2534,15 @@ def _build_sold_steam_missing_sold_at_summary(
     summary = _empty_guadao_report_summary()
     item_summaries: dict[str, dict[str, Any]] = {}
     detail_rows: list[dict[str, Any]] = []
+    latest_rebuys = _load_latest_rebuys_by_source_id(db)
     for sell in rows:
         if _sell_steam_sold_at(sell, allow_completed_fallback=False) is not None:
             continue
         row = _sell_steam_report_row(sell, steam_net_factor)
         if row is None:
             continue
+        rebuy_cash = _rebuy_cash_value(latest_rebuys.get(int(sell["id"])))
+        _apply_rebuy_cash_to_sell_report_row(row, rebuy_cash)
         detail_rows.append(row)
         _add_guadao_report_row(summary, row)
         item_summary = item_summaries.setdefault(row["marketHashName"], _empty_guadao_report_summary())
@@ -2514,7 +2589,9 @@ def _build_sold_steam_reconciliation_summary(
         tuple(params),
     ).fetchall()
 
-    closed_sell_ids = _load_successful_rebuy_source_ids(db, completed_at_lte=end_utc)
+    successful_rebuys = _load_successful_rebuys_by_source_id(db, completed_at_lte=end_utc)
+    closed_sell_ids = set(successful_rebuys)
+    latest_rebuys = _load_latest_rebuys_by_source_id(db)
     ignored_sell_ids = _load_balance_insufficient_rebuy_source_ids(db, completed_at_lte=end_utc)
     closed = _empty_guadao_report_summary()
     unclosed = _empty_guadao_report_summary()
@@ -2533,10 +2610,13 @@ def _build_sold_steam_reconciliation_summary(
             continue
         sell_id = int(sell["id"])
         if sell_id in closed_sell_ids:
+            rebuy_cash = _rebuy_cash_value(successful_rebuys.get(sell_id))
+            _apply_rebuy_cash_to_sell_report_row(row, rebuy_cash)
             _add_guadao_report_row(closed, row)
         elif sell_id in ignored_sell_ids:
             _add_guadao_report_row(ignored, row)
         else:
+            _apply_rebuy_cash_to_sell_report_row(row, _rebuy_cash_value(latest_rebuys.get(sell_id)))
             _add_guadao_report_row(unclosed, row)
 
     return {
@@ -2544,6 +2624,57 @@ def _build_sold_steam_reconciliation_summary(
         "unclosed": _finalize_guadao_report_summary(unclosed),
         "ignored": _finalize_guadao_report_summary(ignored),
     }
+
+
+def _build_historical_unclosed_sold_steam_summary(
+    db: Database,
+    *,
+    start_utc: str,
+    end_utc: str,
+    steam_net_factor: float,
+    market_hash_name: str | None = None,
+) -> dict[str, Any]:
+    start_dt = _parse_utc_datetime(start_utc)
+    params: list[Any] = []
+    market_filter = ""
+    if market_hash_name:
+        market_filter = " AND market_hash_name = ?"
+        params.append(market_hash_name)
+
+    sold_rows = db.conn.execute(
+        f"""
+        SELECT *
+        FROM pool_operations
+        WHERE operation_type = 'sell_on_steam'
+          AND status = 'sold'
+          AND completed_at IS NOT NULL
+          {market_filter}
+        ORDER BY completed_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    closed_sell_ids = _load_successful_rebuy_source_ids(db, completed_at_lte=end_utc)
+    ignored_sell_ids = _load_balance_insufficient_rebuy_source_ids(db, completed_at_lte=end_utc)
+    latest_rebuys = _load_latest_rebuys_by_source_id(db, op_time_lte=end_utc)
+    summary = _empty_guadao_report_summary()
+
+    for sell in sold_rows:
+        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        if sold_at is None:
+            continue
+        if start_dt is not None and sold_at >= start_dt:
+            continue
+        sell_id = int(sell["id"])
+        if sell_id in closed_sell_ids or sell_id in ignored_sell_ids:
+            continue
+        row = _sell_steam_report_row(sell, steam_net_factor)
+        if row is None:
+            continue
+        _apply_rebuy_cash_to_sell_report_row(row, _rebuy_cash_value(latest_rebuys.get(sell_id)))
+        _add_guadao_report_row(summary, row)
+
+    return _finalize_guadao_report_summary(summary)
 
 
 def _build_guadao_discount_report(
@@ -2692,6 +2823,13 @@ def _build_guadao_discount_report(
             market_hash_name=market_hash_name,
         ),
         "closedFromSellOutsideRange": _finalize_guadao_report_summary(closed_from_sell_outside_range),
+        "historicalUnclosedBeforeRange": _build_historical_unclosed_sold_steam_summary(
+            db,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            steam_net_factor=steam_net_factor,
+            market_hash_name=market_hash_name,
+        ),
         "unclosedSoldSteam": _build_unclosed_sold_steam_summary(
             db,
             steam_net_factor=steam_net_factor,
@@ -2708,6 +2846,162 @@ def _fmt_pct(value: float | None) -> str:
     return "-" if value is None else f"{value * 100:.2f}%"
 
 
+def _display_width(value: Any) -> int:
+    width = 0
+    for char in str(value):
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def _clip_display(value: Any, width: int) -> str:
+    text = str(value)
+    if width <= 0 or _display_width(text) <= width:
+        return text
+    marker = "…" if width >= 2 else ""
+    marker_width = _display_width(marker)
+    target_width = max(0, width - marker_width)
+    used = 0
+    chars: list[str] = []
+    for char in text:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        )
+        if used + char_width > target_width:
+            break
+        chars.append(char)
+        used += char_width
+    return "".join(chars) + marker
+
+
+def _pad_display(value: Any, width: int, *, align: str = "left") -> str:
+    text = _clip_display(value, width)
+    padding = max(0, width - _display_width(text))
+    if align == "right":
+        return " " * padding + text
+    if align == "center":
+        left = padding // 2
+        right = padding - left
+        return " " * left + text + " " * right
+    return text + " " * padding
+
+
+def _print_display_table(
+    headers: list[str],
+    rows: list[list[Any]],
+    *,
+    widths: list[int],
+    aligns: list[str],
+    indent: str = "  ",
+    gap: str = "  ",
+) -> None:
+    def row_line(values: list[Any]) -> str:
+        cells = [
+            _pad_display(value, width, align=align)
+            for value, width, align in zip(values, widths, aligns)
+        ]
+        return indent + gap.join(cells)
+
+    print(row_line(headers))
+    for row in rows:
+        print(row_line(row))
+
+
+def _print_guadao_summary_table(
+    title: str,
+    rows: list[tuple[str, dict[str, Any], bool]],
+) -> None:
+    print(title)
+    table_rows: list[list[Any]] = []
+    for label, summary, c5_missing in rows:
+        cash = "-" if c5_missing else _fmt_cny(summary.get("cash"))
+        total_ratio = "-" if c5_missing else _fmt_pct(summary.get("totalDiscountRatio"))
+        face_ratio = "-" if c5_missing else _fmt_pct(summary.get("faceDiscountRatio"))
+        table_rows.append(
+            [
+                label,
+                int(summary.get("count") or 0),
+                _fmt_cny(summary.get("steamGross")),
+                _fmt_cny(summary.get("steamNet")),
+                cash,
+                total_ratio,
+                face_ratio,
+            ]
+        )
+    _print_display_table(
+        ["项目", "笔数", "Steam面值", "Steam到手", "C5金额", "总折比", "面值折比"],
+        table_rows,
+        widths=[18, 6, 14, 14, 14, 9, 9],
+        aligns=["left", "right", "right", "right", "right", "right", "right"],
+    )
+
+
+def _print_guadao_item_table(rows: list[dict[str, Any]]) -> None:
+    item_width = max(
+        18,
+        min(
+            42,
+            max([_display_width("饰品"), *[_display_width(row["marketHashName"]) for row in rows]]) + 2,
+        ),
+    )
+    _print_display_table(
+        ["饰品", "笔数", "Steam到手", "C5现金", "总折比", "面值折比"],
+        [
+            [
+                row["marketHashName"],
+                int(row["count"]),
+                _fmt_cny(row["steamNet"]),
+                _fmt_cny(row["cash"]),
+                _fmt_pct(row["totalDiscountRatio"]),
+                _fmt_pct(row["faceDiscountRatio"]),
+            ]
+            for row in rows
+        ],
+        widths=[item_width, 6, 14, 14, 9, 9],
+        aligns=["left", "right", "right", "right", "right", "right"],
+        indent="",
+    )
+
+
+def _print_guadao_detail_table(rows: list[dict[str, Any]]) -> None:
+    _print_display_table(
+        ["完成时间", "饰品", "Steam面值", "Steam到手", "C5现金", "总折比", "asset", "listing"],
+        [
+            [
+                row["completedAtLocal"],
+                row["marketHashName"],
+                _fmt_cny(row["steamGross"]),
+                _fmt_cny(row["steamNet"]),
+                _fmt_cny(row["cash"]),
+                _fmt_pct(row["totalDiscountRatio"]),
+                row["assetId"] or "-",
+                row["listingId"] or "-",
+            ]
+            for row in rows
+        ],
+        widths=[19, 32, 14, 14, 12, 9, 14, 18],
+        aligns=["left", "left", "right", "right", "right", "right", "right", "right"],
+        indent="",
+    )
+
+
+def _print_guadao_notes(lines: list[str]) -> None:
+    print("口径:")
+    for line in lines:
+        print(f"  - {line}")
+
+
+def _print_guadao_explanation(lines: list[str]) -> None:
+    print("  说明:")
+    for line in lines:
+        print(f"    - {line}")
+
+
+def _guadao_summary_has_c5_amount(summary: dict[str, Any]) -> bool:
+    return (safe_float(summary.get("cash")) or 0.0) > 0
+
+
 def _print_guadao_discount_report(
     report: dict[str, Any],
     *,
@@ -2722,101 +3016,60 @@ def _print_guadao_discount_report(
         f"{start_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} ~ "
         f"{end_local.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')} (北京时间)"
     )
-    print(
-        "口径: 按 C5 补仓完成时间统计；"
-        "新补仓订单仅统计 C5 最终成功记录；"
-        "总折比 = C5补仓现金 / Steam税后到手；"
-        "面值折比 = C5补仓现金 / Steam税前售价；"
-        "未闭环已卖出 Steam 余额为当前仍未成功补仓闭环的卖出流水，不按日期过滤。"
-    )
-    print(
-        f"总览: 闭环 {summary['count']} 笔 | "
-        f"Steam面值 {_fmt_cny(summary['steamGross'])} | "
-        f"Steam到手 {_fmt_cny(summary['steamNet'])} | "
-        f"C5现金 {_fmt_cny(summary['cash'])} | "
-        f"总折比 {_fmt_pct(summary['totalDiscountRatio'])} | "
-        f"面值折比 {_fmt_pct(summary['faceDiscountRatio'])}"
-    )
-    steam_sold = report.get("steamSoldInRange", {}).get("summary", _empty_guadao_report_summary())
-    print(
-        f"Steam入账口径(按卖出时间): 卖出 {steam_sold['count']} 笔 | "
-        f"Steam面值 {_fmt_cny(steam_sold['steamGross'])} | "
-        f"Steam到手 {_fmt_cny(steam_sold['steamNet'])}"
+    _print_guadao_notes(
+        [
+            "主表按 Steam 官方卖出时间对账本时间段钱包入账。",
+            "本期已闭环 = 本期 Steam 卖出，且截至结束时间已成功 C5 补仓。",
+            "本期未闭环 = 本期 Steam 卖出，但截至结束时间仍未成功 C5 补仓。",
+            "本期历史补仓 = 历史 Steam 卖出，本期完成 C5 补仓；不计入本期 Steam 入账。",
+            "本期历史未闭环 = 本期开始前已卖出，且截至结束时间仍未成功 C5 补仓。",
+            "总折比 = C5金额 / Steam税后到手；面值折比 = C5金额 / Steam税前售价。",
+        ]
     )
     reconciliation = report.get("steamSoldReconciliation", {})
     sold_closed = reconciliation.get("closed", _empty_guadao_report_summary())
     sold_unclosed = reconciliation.get("unclosed", _empty_guadao_report_summary())
     sold_ignored = reconciliation.get("ignored", _empty_guadao_report_summary())
-    reconciled_net = (
-        float(sold_closed.get("steamNet") or 0.0)
-        + float(sold_unclosed.get("steamNet") or 0.0)
-        + float(sold_ignored.get("steamNet") or 0.0)
+    historical_rebuy = report.get("closedFromSellOutsideRange", _empty_guadao_report_summary())
+    historical_unclosed = report.get("historicalUnclosedBeforeRange", _empty_guadao_report_summary())
+
+    _print_guadao_summary_table(
+        "卖出时间对账:",
+        [
+            ("本期已闭环", sold_closed, False),
+            ("本期未闭环", sold_unclosed, not _guadao_summary_has_c5_amount(sold_unclosed)),
+            ("本期历史补仓", historical_rebuy, False),
+            ("本期历史未闭环", historical_unclosed, not _guadao_summary_has_c5_amount(historical_unclosed)),
+            *([("排除项", sold_ignored, True)] if sold_ignored["count"] else []),
+        ],
     )
-    print(
-        "卖出时间对账: "
-        f"已闭环 {sold_closed['count']} 笔 {_fmt_cny(sold_closed['steamNet'])} + "
-        f"本期未闭环 {sold_unclosed['count']} 笔 {_fmt_cny(sold_unclosed['steamNet'])}"
-        + (
-            f" + 排除项 {sold_ignored['count']} 笔 {_fmt_cny(sold_ignored['steamNet'])}"
-            if sold_ignored["count"]
-            else ""
-        )
-        + f" = {_fmt_cny(reconciled_net)}"
+    _print_guadao_explanation(
+        [
+            "只有“本期已闭环 + 本期未闭环”对应本时间段 Steam 钱包入账。",
+            "“本期历史补仓”和“本期历史未闭环”来自本期开始前的 Steam 卖出，用来解释历史尾巴，不应加到本期 Steam 入账里。",
+        ]
     )
     missing_sold_at = report.get("steamSoldMissingSoldAt", {}).get("summary", _empty_guadao_report_summary())
     if missing_sold_at["count"]:
-        print(
-            f"成交时间缺失: {missing_sold_at['count']} 笔 | "
-            f"程序确认到手 {_fmt_cny(missing_sold_at['steamNet'])}；"
-            "这些流水缺少 Steam 官方成交时间，不能直接用于本时间段钱包入账对账。"
+        _print_guadao_summary_table(
+            "成交时间缺失:",
+            [("缺少Steam时间", missing_sold_at, False)],
         )
-    outside = report.get("closedFromSellOutsideRange", _empty_guadao_report_summary())
-    if outside["count"]:
-        print(
-            f"对账提示: 总览含历史卖出本期补仓 {outside['count']} 笔 | "
-            f"Steam到手 {_fmt_cny(outside['steamNet'])}，这部分不应计入本时间段 Steam 钱包入账。"
+        _print_guadao_explanation(
+            ["这些流水缺少 Steam 官方成交时间，不能直接用于本时间段钱包入账对账。"]
         )
-    unclosed_sold = report.get("unclosedSoldSteam", {}).get("summary", _empty_guadao_report_summary())
-    print(
-        f"当前未闭环存量(不按日期过滤): {unclosed_sold['count']} 笔 | "
-        f"Steam面值 {_fmt_cny(unclosed_sold['steamGross'])} | "
-        f"Steam到手 {_fmt_cny(unclosed_sold['steamNet'])}"
-    )
     if not report["items"]:
-        print("本时间段没有已完成补仓的挂刀闭环。")
+        print("本时间段没有已完成 C5 补仓的挂刀闭环。")
         return
 
-    print("\n按饰品汇总:")
-    print(f"{'饰品':<42} {'笔数':>4} {'Steam到手':>12} {'C5现金':>10} {'总折比':>8} {'面值折比':>8}")
-    for row in report["items"]:
-        print(
-            f"{row['marketHashName']:<42} "
-            f"{int(row['count']):>4} "
-            f"{row['steamNet']:>12.2f} "
-            f"{row['cash']:>10.2f} "
-            f"{_fmt_pct(row['totalDiscountRatio']):>8} "
-            f"{_fmt_pct(row['faceDiscountRatio']):>8}"
-        )
+    print("\n按饰品汇总(按 C5 补仓完成时间):")
+    _print_guadao_item_table(report["items"])
 
     if not show_detail:
         return
 
     print("\n明细:")
-    print(
-        f"{'完成时间':<19} {'饰品':<30} {'Steam面值':>9} {'Steam到手':>9} "
-        f"{'C5现金':>8} {'总折比':>8} {'asset':>12} {'listing':>18}"
-    )
-    for row in report["details"]:
-        print(
-            f"{row['completedAtLocal']:<19} "
-            f"{row['marketHashName']:<30} "
-            f"{row['steamGross']:>9.2f} "
-            f"{row['steamNet']:>9.2f} "
-            f"{row['cash']:>8.2f} "
-            f"{_fmt_pct(row['totalDiscountRatio']):>8} "
-            f"{(row['assetId'] or '-'):>12} "
-            f"{(row['listingId'] or '-'):>18}"
-        )
+    _print_guadao_detail_table(report["details"])
 
 
 def cmd_pool_guadao_report(args: argparse.Namespace) -> int:
@@ -3675,6 +3928,250 @@ def cmd_steam_cookie_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profit_trade_config(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    if args.enable and args.disable:
+        raise RuntimeError("--enable 和 --disable 不能同时使用")
+    if args.allow_real_execution and args.disallow_real_execution:
+        raise RuntimeError("--allow-real-execution 和 --disallow-real-execution 不能同时使用")
+    if args.allow_reprice_execution and args.disallow_reprice_execution:
+        raise RuntimeError("--allow-reprice-execution 和 --disallow-reprice-execution 不能同时使用")
+    enabled_value = args.enable if (args.enable or args.disable) else None
+    real_execution_value = (
+        True
+        if args.allow_real_execution
+        else False
+        if args.disallow_real_execution
+        else None
+    )
+    reprice_execution_value = (
+        True
+        if args.allow_reprice_execution
+        else False
+        if args.disallow_reprice_execution
+        else None
+    )
+    if enabled_value is not None or real_execution_value is not None or reprice_execution_value is not None:
+        config = set_profit_trade_config(
+            settings,
+            enabled=enabled_value,
+            allow_real_execution=real_execution_value,
+            allow_reprice_execution=reprice_execution_value,
+        )
+        write_profit_trade_dashboard_payload(settings)
+    else:
+        config = load_strategy_config(settings)
+
+    payload = build_profit_trade_dashboard_payload(settings, limit=0)["config"]
+    if args.dump_json:
+        _print_json(payload)
+        return 0
+
+    print("搬砖做T配置:")
+    print(f"  enabled:                  {payload['enabled']}")
+    print(f"  allowRealExecution:       {payload['allowRealExecution']}")
+    print(f"  allowRepriceExecution:    {payload['allowRepriceExecution']}")
+    print(f"  minRoi:                   {payload['minRoiPct']:.2f}%")
+    print(f"  minItemValue:             CNY {payload['minItemValue']:.2f}")
+    print(f"  maxBuyPerCycle:           {payload['maxBuyPerCycle']}")
+    print(f"  scanMaxItems:             {payload['scanMaxItems']}")
+    print(f"  reservationSeconds:       {payload['reservationSeconds']}")
+    print(f"  c5CurrentSaleNetFactor:   {payload['c5CurrentSaleNetFactor']}")
+    print(f"  recentSoldFeeDeducted:    {payload['recentSoldFeeAlreadyDeducted']}")
+    print(f"  liquidityMinRecentSales:  {payload['liquidityMinRecentSales']}")
+    print(f"  aiAudit:                  {payload['aiAudit']['enabled']} / {payload['aiAudit']['provider']}")
+    print(f"配置文件: {settings.db_path.parent / 'strategy_config.json'}")
+    _ = config
+    return 0
+
+
+def cmd_profit_trade_scan(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    report = scan_profit_trade_opportunities(
+        settings,
+        allow_cached_fallback=not args.no_cache_fallback,
+        cache_max_age_minutes=args.cache_max_age_minutes,
+        limit=args.limit,
+        scan_max_items=args.scan_max_items,
+        record=args.record or args.lock,
+        lock_asset=args.lock,
+    )
+    if args.dump_json:
+        _print_json(report.to_dict())
+        return 0
+
+    print(
+        f"profitTrade 扫描完成 | 评估 {report.evaluated_count} 个品种 | "
+        f"机会 {report.opportunity_count} 个 | 缺价 {report.missing_price_count} 个 | "
+        f"跳过 {report.skipped_count} 个"
+    )
+    if report.created_trade_ids:
+        print(f"已写入流水: {', '.join(str(value) for value in report.created_trade_ids)}")
+    if report.locked_trade_ids:
+        print(f"已锁定A: {', '.join(str(value) for value in report.locked_trade_ids)}")
+    for note in report.notes:
+        print(f"提示: {note}")
+    for index, opportunity in enumerate(report.opportunities[: args.limit], start=1):
+        print(
+            f"{index}. {opportunity.market_hash_name} | "
+            f"A={opportunity.asset_id} | "
+            f"Steam买入 CNY {opportunity.steam_buy_price:.2f} | "
+            f"折扣成本 CNY {opportunity.steam_real_cost:.2f} | "
+            f"C5预计到手 CNY {opportunity.c5_expected_net_price:.2f} | "
+            f"预计收益 CNY {opportunity.expected_profit:.2f} | "
+            f"ROI {opportunity.expected_roi_pct:.2f}%"
+        )
+    return 0
+
+
+def cmd_profit_trade_lock(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = lock_profit_trade(settings, int(args.trade_id))
+    if args.dump_json:
+        _print_json(result)
+        return 0
+    trade = result["trade"]
+    changed = "已锁定" if result.get("changed") else "未变化"
+    print(f"{changed}: {trade['tradeNo']} | {trade['marketHashName']} | asset={trade['aAssetId']}")
+    return 0
+
+
+def cmd_profit_trade_buy(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = execute_profit_trade_buy(settings, int(args.trade_id))
+    if args.dump_json:
+        _print_json(result)
+        return 0
+    trade = result["trade"]
+    if result.get("ok"):
+        print(
+            f"已买入B: {trade['tradeNo']} | {trade['marketHashName']} | "
+            f"Steam CNY {float(trade['steamBuyPrice'] or 0):.2f} | "
+            f"真实成本 CNY {float(trade['steamRealCost'] or 0):.2f}"
+        )
+    else:
+        print(f"买入B未执行: {trade['tradeNo']} | {trade.get('error') or '-'}")
+    return 0
+
+
+def cmd_profit_trade_list_c5(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = execute_profit_trade_list_c5(settings, int(args.trade_id))
+    if args.dump_json:
+        _print_json(result)
+        return 0
+    trade = result["trade"]
+    if result.get("ok"):
+        print(
+            f"已上架C5: {trade['tradeNo']} | {trade['marketHashName']} | "
+            f"asset={trade['aAssetId']} | product={trade['c5ProductId'] or '-'} | "
+            f"CNY {float(trade['c5ListingPrice'] or 0):.2f}"
+        )
+    else:
+        print(f"C5上架未完成: {trade['tradeNo']} | {trade.get('error') or '-'}")
+    return 0
+
+
+def cmd_profit_trade_run_once(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    report = run_profit_trade_once(
+        settings,
+        allow_cached_fallback=not args.no_cache_fallback,
+        cache_max_age_minutes=args.cache_max_age_minutes,
+        scan_max_items=args.scan_max_items,
+    )
+    write_profit_trade_dashboard_payload(settings)
+    if args.dump_json:
+        _print_json(report.to_dict())
+        return 0
+    print(
+        f"profitTrade 执行一轮完成 | enabled={report.enabled} | "
+        f"allowRealExecution={report.allow_real_execution} | "
+        f"买入B {len(report.bought_trade_ids)} | C5上架 {len(report.listed_trade_ids)} | "
+        f"结算 {len(report.settled_trade_ids)} | "
+        f"跳过 {len(report.skipped_trade_ids)} | 错误 {len(report.errors)}"
+    )
+    if report.scanned is not None:
+        print(
+            f"扫描: 评估 {report.scanned.evaluated_count} | "
+            f"机会 {report.scanned.opportunity_count} | "
+            f"写入 {len(report.scanned.created_trade_ids)} | "
+            f"锁定 {len(report.scanned.locked_trade_ids)}"
+        )
+    for error in report.errors:
+        print(f"错误: {error}")
+    return 0
+
+
+def cmd_profit_trade_refresh_sales(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = refresh_profit_trade_sales(settings)
+    write_profit_trade_dashboard_payload(settings)
+    if args.dump_json:
+        _print_json(result)
+        return 0
+    print(
+        f"C5状态刷新完成 | 结算 {len(result['settledTradeIds'])} | "
+        f"跳过 {len(result['skippedTradeIds'])} | 错误 {len(result['errors'])}"
+    )
+    for error in result["errors"]:
+        print(f"错误: {error}")
+    return 0
+
+
+def cmd_profit_trade_manual_settle(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    result = manual_settle_profit_trade(
+        settings,
+        int(args.trade_id),
+        sold_net_price=float(args.sold_net_price),
+        source=args.source,
+        memo=args.memo,
+    )
+    write_profit_trade_dashboard_payload(settings)
+    if args.dump_json:
+        _print_json(result)
+        return 0
+    trade = result["trade"]
+    print(
+        f"已手动完结: {trade['tradeNo']} | {trade['marketHashName']} | "
+        f"最终到手 CNY {float(trade['c5SoldNetPrice'] or 0):.2f} | "
+        f"最终收益 CNY {float(trade['realizedProfit'] or 0):.2f} | "
+        f"最终ROI {float(trade['realizedRoiPct'] or 0):.2f}%"
+    )
+    return 0
+
+
+def cmd_profit_trade_export_dashboard(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    output_path = Path(args.output) if args.output else None
+    path = write_profit_trade_dashboard_payload(
+        settings,
+        output_path=output_path,
+        limit=args.limit,
+    )
+    print(f"profitTrade 前端数据已生成: {path}")
+    return 0
+
+
+def cmd_profit_trade_daily_report(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    body = render_profit_trade_daily_report(settings)
+    print(body)
+    if args.send:
+        send_profit_trade_daily_report(settings)
+        print("ServerChan 已发送。")
+    return 0
+
+
+def cmd_profit_trade_serve_api(args: argparse.Namespace) -> int:
+    settings = _settings_from_args(args)
+    from cs2_assistant.services.web_api import run_profit_trade_api_server
+
+    run_profit_trade_api_server(settings, host=args.host, port=args.port)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CS2 理财助手 CLI",
@@ -3914,6 +4411,115 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_t_profit_parser("t-profit")
     add_t_profit_parser("t-yield", hidden=True)
+
+    profit_trade = subparsers.add_parser(
+        "profit-trade",
+        help="搬砖做T执行器",
+        description=(
+            "搬砖做T的新执行器入口。\n"
+            "当前入口负责配置开关、前端数据、日报和本地 API；真实交易动作不会由这些命令直接触发。"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    profit_trade_subparsers = profit_trade.add_subparsers(dest="profit_trade_command", required=True)
+
+    profit_trade_config = profit_trade_subparsers.add_parser("config", help="查看或切换搬砖做T开关")
+    profit_trade_config.add_argument("--enable", action="store_true", help="开启 profitTrade 扫描/执行开关")
+    profit_trade_config.add_argument("--disable", action="store_true", help="关闭 profitTrade 扫描/执行开关")
+    profit_trade_config.add_argument("--allow-real-execution", action="store_true", help="允许真实 Steam 买入 / C5 上架")
+    profit_trade_config.add_argument("--disallow-real-execution", action="store_true", help="禁止真实 Steam 买入 / C5 上架")
+    profit_trade_config.add_argument("--allow-reprice-execution", action="store_true", help="只允许已上架 C5 做T流水自动改价，不允许买B或新上架")
+    profit_trade_config.add_argument("--disallow-reprice-execution", action="store_true", help="禁止已上架 C5 做T流水自动改价")
+    profit_trade_config.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    profit_trade_config.set_defaults(handler=cmd_profit_trade_config)
+
+    profit_trade_scan = profit_trade_subparsers.add_parser(
+        "scan",
+        help="扫描搬砖做T机会；默认只输出，不写真实交易动作",
+    )
+    profit_trade_scan.add_argument("--limit", type=int, default=20, help="最多输出多少个机会")
+    profit_trade_scan.add_argument("--scan-max-items", type=int, default=None, help="最多对多少个预筛品种读取 Steam orderbook")
+    profit_trade_scan.add_argument("--record", action="store_true", help="把机会写入 profit_trades 候选流水")
+    profit_trade_scan.add_argument("--lock", action="store_true", help="写入流水并锁定 A 资产；不会买 B 或上架 C5")
+    profit_trade_scan.add_argument("--cache-max-age-minutes", type=int, default=180, help="允许使用的库存缓存最大时长")
+    profit_trade_scan.add_argument("--no-cache-fallback", action="store_true", help="库存拉取失败时不回退到缓存")
+    profit_trade_scan.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    profit_trade_scan.set_defaults(handler=cmd_profit_trade_scan)
+
+    profit_trade_lock = profit_trade_subparsers.add_parser(
+        "lock",
+        help="手动锁定一笔 candidate 做T流水的 A 资产",
+    )
+    profit_trade_lock.add_argument("trade_id", type=int)
+    profit_trade_lock.add_argument("--dump-json", action="store_true")
+    profit_trade_lock.set_defaults(handler=cmd_profit_trade_lock)
+
+    profit_trade_buy = profit_trade_subparsers.add_parser(
+        "buy",
+        help="对 locked 流水执行 Steam 买入 B；需要 allowRealExecution=true",
+    )
+    profit_trade_buy.add_argument("trade_id", type=int)
+    profit_trade_buy.add_argument("--dump-json", action="store_true")
+    profit_trade_buy.set_defaults(handler=cmd_profit_trade_buy)
+
+    profit_trade_list_c5 = profit_trade_subparsers.add_parser(
+        "list-c5",
+        help="对 steam_bought 流水把 A 上架 C5；需要 allowRealExecution=true",
+    )
+    profit_trade_list_c5.add_argument("trade_id", type=int)
+    profit_trade_list_c5.add_argument("--dump-json", action="store_true")
+    profit_trade_list_c5.set_defaults(handler=cmd_profit_trade_list_c5)
+
+    profit_trade_run_once = profit_trade_subparsers.add_parser(
+        "run-once",
+        help="执行一轮 profitTrade：扫描、锁A、买B、上架C5；真实动作需要 allowRealExecution=true",
+    )
+    profit_trade_run_once.add_argument("--scan-max-items", type=int, default=None, help="最多对多少个预筛品种读取 Steam orderbook")
+    profit_trade_run_once.add_argument("--cache-max-age-minutes", type=int, default=180, help="允许使用的库存缓存最大时长")
+    profit_trade_run_once.add_argument("--no-cache-fallback", action="store_true", help="库存拉取失败时不回退到缓存")
+    profit_trade_run_once.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    profit_trade_run_once.set_defaults(handler=cmd_profit_trade_run_once)
+
+    profit_trade_refresh_sales = profit_trade_subparsers.add_parser(
+        "refresh-sales",
+        help="刷新 C5 已上架流水状态，识别售出并结算收益",
+    )
+    profit_trade_refresh_sales.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    profit_trade_refresh_sales.set_defaults(handler=cmd_profit_trade_refresh_sales)
+
+    profit_trade_manual_settle = profit_trade_subparsers.add_parser(
+        "manual-settle",
+        help="手动把一笔做T流水按最终到手价完结",
+    )
+    profit_trade_manual_settle.add_argument("trade_id", type=int)
+    profit_trade_manual_settle.add_argument("--sold-net-price", type=float, required=True, help="最终实际到手金额，例如其他平台卖出到手 328")
+    profit_trade_manual_settle.add_argument("--source", default="manual_other_platform", help="结算来源标记")
+    profit_trade_manual_settle.add_argument("--memo", default=None, help="备注")
+    profit_trade_manual_settle.add_argument("--dump-json", action="store_true", help="输出 JSON")
+    profit_trade_manual_settle.set_defaults(handler=cmd_profit_trade_manual_settle)
+
+    profit_trade_export = profit_trade_subparsers.add_parser(
+        "export-dashboard",
+        help="导出前端 profitTrade 展示数据",
+    )
+    profit_trade_export.add_argument("--output", help="输出 JSON 路径，默认 frontend/public/profit_trade_dashboard.json")
+    profit_trade_export.add_argument("--limit", type=int, default=100, help="最多导出多少条流水")
+    profit_trade_export.set_defaults(handler=cmd_profit_trade_export_dashboard)
+
+    profit_trade_report = profit_trade_subparsers.add_parser(
+        "daily-report",
+        help="生成或发送搬砖做T日报",
+    )
+    profit_trade_report.add_argument("--send", action="store_true", help="同时通过 ServerChan 发送")
+    profit_trade_report.set_defaults(handler=cmd_profit_trade_daily_report)
+
+    profit_trade_api = profit_trade_subparsers.add_parser(
+        "serve-api",
+        help="启动本地 profitTrade API，供前端开关和日报按钮调用",
+    )
+    profit_trade_api.add_argument("--host", default="127.0.0.1")
+    profit_trade_api.add_argument("--port", type=int, default=8765)
+    profit_trade_api.set_defaults(handler=cmd_profit_trade_serve_api)
 
     # ---- pool (C5 inventory cooldown lookup) ----
     pool = subparsers.add_parser(

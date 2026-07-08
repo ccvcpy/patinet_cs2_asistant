@@ -127,6 +127,48 @@ debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
 const __VLS_ctx = {};
 let __VLS_components;
 let __VLS_directives;
+/** @type {__VLS_StyleScopedClasses['case-monitor-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-monitor-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-report-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-report-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-report-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['segment-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['item-name']} */ ;
+/** @type {__VLS_StyleScopedClasses['focus-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['focus-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-focus-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['price-source-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-focus-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['price-source-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['threshold-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['threshold-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-ratio-table']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-monitor-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['compact']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-report-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-focus-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['price-source-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['threshold-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-monitor-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['compact']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-report-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-focus-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['price-source-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['threshold-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['case-recommendation-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['bucket-row']} */ ;
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
     ...{ class: "page case-monitor-page" },
 });

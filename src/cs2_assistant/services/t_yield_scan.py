@@ -12,7 +12,6 @@ from cs2_assistant.accounts.steam_auth import try_steam_auto_relogin
 from cs2_assistant.clients import C5GameClient, C5GameError, CSQAQClient, SteamDTClient, SteamMarketClient
 from cs2_assistant.config import PROJECT_ROOT, Settings
 from cs2_assistant.services.market import (
-    DEFAULT_C5_SETTLEMENT_FACTOR,
     DEFAULT_STEAM_BALANCE_DISCOUNT,
     MarketService,
 )
@@ -25,6 +24,7 @@ INVENTORY_FILTER_TRADABLE_ONLY = "tradable_only"
 INVENTORY_FILTER_COOLDOWN_ONLY = "cooldown_only"
 INVENTORY_FILTER_MIXED_ONLY = "mixed_only"
 DEFAULT_DAILY_REMINDER_INVENTORY_FILTER = INVENTORY_FILTER_MIXED_ONLY
+T_YIELD_C5_SETTLEMENT_FACTOR = 0.99
 
 VALID_INVENTORY_FILTERS = {
     INVENTORY_FILTER_ALL,
@@ -658,7 +658,6 @@ def build_market_service(
                 account_id=account.id,
                 base_url=settings.steam_market_base_url,
             )
-            candidate_client.my_listings(start=0, count=1)
             steam_market_client = candidate_client
             break
         except Exception:
@@ -782,9 +781,9 @@ def scan_t_yield(
         steam_sell_price = float(state.steam_sell_price)
         if steam_sell_price <= 0:
             continue
-        ratio = float(c5_sell_price) / steam_sell_price
-        listing_ratio = ratio / DEFAULT_C5_SETTLEMENT_FACTOR
-        t_yield_rate = ratio - steam_discount
+        face_ratio = float(c5_sell_price) / steam_sell_price
+        settled_ratio = face_ratio * T_YIELD_C5_SETTLEMENT_FACTOR
+        t_yield_rate = settled_ratio - steam_discount
         if c5_sell_price < min_price:
             continue
 
@@ -800,8 +799,8 @@ def scan_t_yield(
                 c5_price_source=c5_price_source or "unknown",
                 steam_lowest_sell_price=steam_sell_price,
                 steam_price_source=state.steam_price_source or "unknown",
-                ratio=float(ratio),
-                listing_ratio=float(listing_ratio),
+                ratio=float(settled_ratio),
+                listing_ratio=float(face_ratio),
                 t_yield_rate=float(t_yield_rate),
             )
         )
