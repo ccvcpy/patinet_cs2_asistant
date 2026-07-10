@@ -5,10 +5,10 @@ const fallbackDashboard = {
         enabled: false,
         allowRealExecution: false,
         allowRepriceExecution: false,
-        balanceDiscount: 0.69,
-        balanceDiscountPct: 69,
-        minRoiPct: 7,
-        minItemValue: 5,
+        balanceDiscount: undefined,
+        balanceDiscountPct: undefined,
+        minRoiPct: undefined,
+        minItemValue: undefined,
         maxBuyPerCycle: 1,
         dailySteamBudget: 1000,
         scanMaxItems: 80,
@@ -73,9 +73,49 @@ const autoRunInFlight = ref(false);
 const lastRunAt = ref(null);
 const lastRunResult = ref("");
 const nowMs = ref(Date.now());
+const completedDateFrom = ref("");
+const completedDateTo = ref("");
+const completedPage = ref(1);
+const completedPageSize = 10;
 const sortedTrades = computed(() => [...dashboard.value.trades].sort((a, b) => b.id - a.id));
 const activeTrades = computed(() => sortedTrades.value.filter((trade) => trade.status !== "completed"));
 const completedTrades = computed(() => sortedTrades.value.filter((trade) => trade.status === "completed"));
+const completedHasDateFilter = computed(() => completedDateFrom.value !== "" || completedDateTo.value !== "");
+const completedFilteredTrades = computed(() => {
+    const from = parseDateStart(completedDateFrom.value);
+    const to = parseDateEnd(completedDateTo.value);
+    const hasFilter = from !== null || to !== null;
+    return completedTrades.value.filter((trade) => {
+        const time = completedTradePurchaseTimeMs(trade);
+        if (time === null)
+            return !hasFilter;
+        if (from !== null && time < from)
+            return false;
+        if (to !== null && time > to)
+            return false;
+        return true;
+    });
+});
+const completedTotalProfit = computed(() => completedTrades.value.reduce((total, trade) => total + (Number(trade.realizedProfit) || 0), 0));
+const completedFilteredProfit = computed(() => completedFilteredTrades.value.reduce((total, trade) => total + (Number(trade.realizedProfit) || 0), 0));
+const completedTotalSteamBuy = computed(() => completedTrades.value.reduce((total, trade) => total + (Number(trade.steamBuyPrice) || 0), 0));
+const completedFilteredSteamBuy = computed(() => completedFilteredTrades.value.reduce((total, trade) => total + (Number(trade.steamBuyPrice) || 0), 0));
+const completedProfitSummaryLabel = computed(() => (completedHasDateFilter.value ? "当前筛选总收益" : "总收益"));
+const completedSteamBuySummaryLabel = computed(() => (completedHasDateFilter.value ? "筛选已结算 Steam买入" : "已结算 Steam买入总额"));
+const completedTotalPages = computed(() => Math.max(1, Math.ceil(completedFilteredTrades.value.length / completedPageSize)));
+const completedCurrentPage = computed(() => Math.min(Math.max(1, completedPage.value), completedTotalPages.value));
+const completedPagedTrades = computed(() => {
+    const start = (completedCurrentPage.value - 1) * completedPageSize;
+    return completedFilteredTrades.value.slice(start, start + completedPageSize);
+});
+const completedPageRangeLabel = computed(() => {
+    const total = completedFilteredTrades.value.length;
+    if (total === 0)
+        return "0 / 0";
+    const start = (completedCurrentPage.value - 1) * completedPageSize + 1;
+    const end = Math.min(start + completedPageSize - 1, total);
+    return `${start}-${end} / ${total}`;
+});
 const protectedAssetCount = computed(() => dashboard.value.config.protectedAssetIds?.length ?? 0);
 const protectedNameCount = computed(() => dashboard.value.config.protectedMarketHashNames?.length ?? 0);
 const protectedSteamCount = computed(() => dashboard.value.config.protectedSteamIds?.length ?? 0);
@@ -149,6 +189,45 @@ function formatDateTime(value) {
         hour12: false,
     });
 }
+function parseDateStart(value) {
+    if (!value)
+        return null;
+    const date = new Date(`${value}T00:00:00`);
+    return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+function parseDateEnd(value) {
+    if (!value)
+        return null;
+    const date = new Date(`${value}T23:59:59.999`);
+    return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+function completedTradePurchaseTimeMs(trade) {
+    const raw = trade.steamBoughtAt;
+    if (!raw)
+        return null;
+    const time = new Date(raw).getTime();
+    return Number.isNaN(time) ? null : time;
+}
+function resetCompletedPage() {
+    completedPage.value = 1;
+}
+function setCompletedDatePreset(days) {
+    if (days === "all") {
+        completedDateFrom.value = "";
+        completedDateTo.value = "";
+        resetCompletedPage();
+        return;
+    }
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - Math.max(0, days - 1));
+    completedDateFrom.value = start.toISOString().slice(0, 10);
+    completedDateTo.value = end.toISOString().slice(0, 10);
+    resetCompletedPage();
+}
+function goCompletedPage(direction) {
+    completedPage.value = Math.min(completedTotalPages.value, Math.max(1, completedCurrentPage.value + direction));
+}
 function noteText(trade, key) {
     const value = trade.note?.[key];
     if (value === null || value === undefined || value === "")
@@ -196,6 +275,18 @@ function isStickerSlab(trade) {
     const hash = trade.marketHashName.toLowerCase();
     const name = String(trade.name || "");
     return hash.startsWith("sticker slab |") || name.includes("印花板");
+}
+function canManualSettle(trade) {
+    return trade.status === "c5_listed" || (trade.status === "manual_required"
+        && trade.stepIndex >= 4
+        && Number(trade.steamBuyPrice) > 0);
+}
+function hasTrackedSteamBuyOrder(trade) {
+    const buyOrderId = String(trade.note?.steamBuyOrderId ?? "").trim();
+    return buyOrderId !== "" || Boolean(trade.note?.steamBuyUnverifiedAt);
+}
+function dismissActionLabel(trade) {
+    return hasTrackedSteamBuyOrder(trade) ? "撤销求购并关闭" : "已知晓并隐藏";
 }
 function statusLabel(status) {
     const labels = {
@@ -380,21 +471,24 @@ async function manualSettleTrade(trade) {
 async function dismissTrade(trade) {
     message.value = "";
     try {
-        await fetchJson("/api/profit-trade/dismiss", {
+        const result = (await fetchJson("/api/profit-trade/dismiss", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 tradeId: trade.id,
                 reason: "user acknowledged and hid this trade",
             }),
-        });
+        }));
         apiOnline.value = true;
-        message.value = `${trade.tradeNo} 已隐藏`;
+        message.value = result.dismissed === false
+            ? `${trade.tradeNo} 未隐藏：${result.message ?? "Steam 求购已成交，流水已恢复"}`
+            : `${trade.tradeNo} ${hasTrackedSteamBuyOrder(trade) ? "求购已确认撤销并关闭" : "已隐藏"}`;
         await loadDashboard();
     }
     catch (error) {
         apiOnline.value = true;
-        message.value = `${trade.tradeNo} 隐藏失败：${error instanceof Error ? error.message : String(error)}`;
+        message.value = `${trade.tradeNo} 安全关闭失败：${error instanceof Error ? error.message : String(error)}`;
+        await loadDashboard();
     }
 }
 async function toggleStickerSlabStatus() {
@@ -782,6 +876,17 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
@@ -790,12 +895,17 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['positive']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['negative']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-summary-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-layout']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-filter-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['step-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-head']} */ ;
@@ -807,6 +917,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['step-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['wide']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
@@ -999,7 +1110,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-(__VLS_ctx.formatPct(__VLS_ctx.dashboard.config.balanceDiscountPct ?? 69));
+(__VLS_ctx.formatPct(__VLS_ctx.dashboard.config.balanceDiscountPct));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
@@ -1053,7 +1164,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-(__VLS_ctx.formatPct(__VLS_ctx.dashboard.config.balanceDiscountPct ?? 69));
+(__VLS_ctx.formatPct(__VLS_ctx.dashboard.config.balanceDiscountPct));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
 (__VLS_ctx.formatPct(__VLS_ctx.dashboard.config.minRoiPct));
@@ -1309,6 +1420,7 @@ else {
                 ...{ class: "mini-action dismiss-action" },
                 type: "button",
             });
+            (__VLS_ctx.dismissActionLabel(trade));
         }
         if (trade.aAssetId) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
@@ -1381,7 +1493,7 @@ else {
                 type: "button",
             });
         }
-        if (trade.status === 'c5_listed') {
+        if (__VLS_ctx.canManualSettle(trade)) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
                 ...{ class: "manual-settle-row" },
             });
@@ -1398,7 +1510,7 @@ else {
                             return;
                         if (!!(__VLS_ctx.activeTrades.length === 0))
                             return;
-                        if (!(trade.status === 'c5_listed'))
+                        if (!(__VLS_ctx.canManualSettle(trade)))
                             return;
                         __VLS_ctx.manualSettleTrade(trade);
                     } },
@@ -1511,7 +1623,98 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "soft-label" },
 });
+(__VLS_ctx.completedFilteredTrades.length);
 (__VLS_ctx.completedTrades.length);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+    ...{ class: "completed-filter-note" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "completed-toolbar" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+    ...{ onChange: (__VLS_ctx.resetCompletedPage) },
+    type: "date",
+});
+(__VLS_ctx.completedDateFrom);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+    ...{ onChange: (__VLS_ctx.resetCompletedPage) },
+    type: "date",
+});
+(__VLS_ctx.completedDateTo);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "completed-filter-actions" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setCompletedDatePreset(1);
+        } },
+    ...{ class: "mini-action" },
+    type: "button",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setCompletedDatePreset(7);
+        } },
+    ...{ class: "mini-action" },
+    type: "button",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setCompletedDatePreset('all');
+        } },
+    ...{ class: "mini-action" },
+    type: "button",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({
+    ...{ class: "completed-profit-summary" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+(__VLS_ctx.completedProfitSummaryLabel);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({
+    ...{ class: (__VLS_ctx.signedClass(__VLS_ctx.completedFilteredProfit)) },
+});
+(__VLS_ctx.formatMoney(__VLS_ctx.completedFilteredProfit));
+if (__VLS_ctx.completedHasDateFilter) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    (__VLS_ctx.formatMoney(__VLS_ctx.completedTotalProfit));
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+(__VLS_ctx.completedSteamBuySummaryLabel);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+(__VLS_ctx.formatMoney(__VLS_ctx.completedFilteredSteamBuy));
+if (__VLS_ctx.completedHasDateFilter) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    (__VLS_ctx.formatMoney(__VLS_ctx.completedTotalSteamBuy));
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "completed-pagination" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.goCompletedPage(-1);
+        } },
+    ...{ class: "mini-action" },
+    type: "button",
+    disabled: (__VLS_ctx.completedCurrentPage <= 1),
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+(__VLS_ctx.completedPageRangeLabel);
+(__VLS_ctx.completedCurrentPage);
+(__VLS_ctx.completedTotalPages);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.goCompletedPage(1);
+        } },
+    ...{ class: "mini-action" },
+    type: "button",
+    disabled: (__VLS_ctx.completedCurrentPage >= __VLS_ctx.completedTotalPages),
+});
 if (__VLS_ctx.completedTrades.length === 0) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
         ...{ class: "panel empty-state" },
@@ -1519,8 +1722,15 @@ if (__VLS_ctx.completedTrades.length === 0) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 }
+else if (__VLS_ctx.completedFilteredTrades.length === 0) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+        ...{ class: "panel empty-state" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+}
 else {
-    for (const [trade] of __VLS_getVForSourceType((__VLS_ctx.completedTrades))) {
+    for (const [trade] of __VLS_getVForSourceType((__VLS_ctx.completedPagedTrades))) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
             key: (`completed-${trade.id}`),
             ...{ class: "completed-trade-row" },
@@ -1534,6 +1744,10 @@ else {
         (trade.tradeNo);
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         (__VLS_ctx.steamAccountLabel(trade));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        (__VLS_ctx.formatDateTime(trade.steamBoughtAt));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        (__VLS_ctx.formatDateTime(trade.completedAt || trade.updatedAt));
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         (__VLS_ctx.formatMoney(__VLS_ctx.noteNumber(trade, "walletBalanceBefore")));
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -1670,6 +1884,18 @@ else {
 /** @type {__VLS_StyleScopedClasses['completed-zone']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel-title-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['soft-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-filter-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-filter-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
@@ -1689,8 +1915,22 @@ const __VLS_self = (await import('vue')).defineComponent({
             dailySteamBudgetDraft: dailySteamBudgetDraft,
             manualSettleInputs: manualSettleInputs,
             autoRunInFlight: autoRunInFlight,
+            completedDateFrom: completedDateFrom,
+            completedDateTo: completedDateTo,
             activeTrades: activeTrades,
             completedTrades: completedTrades,
+            completedHasDateFilter: completedHasDateFilter,
+            completedFilteredTrades: completedFilteredTrades,
+            completedTotalProfit: completedTotalProfit,
+            completedFilteredProfit: completedFilteredProfit,
+            completedTotalSteamBuy: completedTotalSteamBuy,
+            completedFilteredSteamBuy: completedFilteredSteamBuy,
+            completedProfitSummaryLabel: completedProfitSummaryLabel,
+            completedSteamBuySummaryLabel: completedSteamBuySummaryLabel,
+            completedTotalPages: completedTotalPages,
+            completedCurrentPage: completedCurrentPage,
+            completedPagedTrades: completedPagedTrades,
+            completedPageRangeLabel: completedPageRangeLabel,
             protectedAssetCount: protectedAssetCount,
             protectedNameCount: protectedNameCount,
             protectedSteamCount: protectedSteamCount,
@@ -1708,6 +1948,10 @@ const __VLS_self = (await import('vue')).defineComponent({
             lastRunLabel: lastRunLabel,
             formatMoney: formatMoney,
             formatPct: formatPct,
+            formatDateTime: formatDateTime,
+            resetCompletedPage: resetCompletedPage,
+            setCompletedDatePreset: setCompletedDatePreset,
+            goCompletedPage: goCompletedPage,
             noteText: noteText,
             noteNumber: noteNumber,
             balanceDiscountPct: balanceDiscountPct,
@@ -1715,6 +1959,8 @@ const __VLS_self = (await import('vue')).defineComponent({
             duplicateBuyText: duplicateBuyText,
             signedClass: signedClass,
             isStickerSlab: isStickerSlab,
+            canManualSettle: canManualSettle,
+            dismissActionLabel: dismissActionLabel,
             statusLabel: statusLabel,
             stepClass: stepClass,
             loadDashboard: loadDashboard,

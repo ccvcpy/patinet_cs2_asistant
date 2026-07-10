@@ -616,6 +616,7 @@ class SteamMarketClientTests(unittest.TestCase):
                     ],
                     "purchases": {
                         "listing-1_purchase-1": {
+                            "time_sold": 1780247000,
                             "received_amount": 1217,
                             "received_currencyid": "2023",
                         }
@@ -633,6 +634,7 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertIsNotNone(receipt)
         assert receipt is not None
         self.assertEqual("purchase-1", receipt["purchaseId"])
+        self.assertEqual(1780247000, receipt["timeSold"])
         self.assertEqual(12.17, receipt["receivedAmount"])
         self.assertEqual("2023", receipt["receivedCurrencyId"])
 
@@ -667,6 +669,7 @@ class SteamMarketClientTests(unittest.TestCase):
                     "purchases": {
                         "listing-1_purchase-1": {
                             "asset": {"id": "asset-1"},
+                            "time_sold": 1783512000,
                             "received_amount": 156,
                             "received_currencyid": "2023",
                         }
@@ -682,9 +685,83 @@ class SteamMarketClientTests(unittest.TestCase):
         assert receipt is not None
         self.assertEqual("listing-1", receipt["listingId"])
         self.assertEqual("purchase-1", receipt["purchaseId"])
-        self.assertEqual(1783512933, receipt["timeSold"])
+        self.assertEqual(1783512000, receipt["timeSold"])
         self.assertEqual(1.56, receipt["receivedAmount"])
         self.assertEqual("2023", receipt["receivedCurrencyId"])
+
+    def test_find_purchase_receipt_matches_item_time_and_paid_total(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+
+        def fake_request(
+            method: str,
+            path: str,
+            *,
+            params: dict[str, object] | None = None,
+            data: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            _allow_retry: bool = True,
+        ) -> _FakeResponse:
+            return _FakeResponse(
+                {
+                    "success": True,
+                    "total_count": 1,
+                    "events": [
+                        {
+                            "listingid": "listing-buy-1",
+                            "purchaseid": "purchase-buy-1",
+                            "event_type": 4,
+                            "time_event": 1783608287,
+                        }
+                    ],
+                    "purchases": {
+                        "listing-buy-1_purchase-buy-1": {
+                            "paid_amount": 14713,
+                            "paid_fee": 2206,
+                            "currencyid": "2023",
+                            "asset": {
+                                "appid": 730,
+                                "contextid": "16",
+                                "id": "old-asset-1",
+                                "new_id": "new-asset-1",
+                                "new_contextid": "2",
+                            },
+                        }
+                    },
+                    "assets": {
+                        "730": {
+                            "2": {
+                                "old-asset-1": {
+                                    "id": "old-asset-1",
+                                    "market_hash_name": "Desert Eagle | Mulberry (Factory New)",
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+
+        client._request = fake_request  # type: ignore[method-assign]
+
+        receipt = client.find_purchase_receipt(
+            market_hash_name="Desert Eagle | Mulberry (Factory New)",
+            expected_total=169.19,
+            earliest_time=1783608000,
+        )
+
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual("listing-buy-1", receipt["listingId"])
+        self.assertEqual("purchase-buy-1", receipt["purchaseId"])
+        self.assertEqual(1783608287, receipt["timePurchased"])
+        self.assertEqual(147.13, receipt["paidAmount"])
+        self.assertEqual(22.06, receipt["paidFee"])
+        self.assertEqual(169.19, receipt["paidTotal"])
+        self.assertEqual("old-asset-1", receipt["assetId"])
+        self.assertEqual("new-asset-1", receipt["newAssetId"])
+        self.assertEqual("Desert Eagle | Mulberry (Factory New)", receipt["marketHashName"])
 
 
 if __name__ == "__main__":

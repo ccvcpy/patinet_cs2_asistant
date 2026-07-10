@@ -42,8 +42,12 @@ PRE_STEAM_BUY_PROFIT_TRADE_STATUSES = {"candidate", "audited", "locked"}
 PRE_STEAM_BUY_STEP_KEYS = {"discovered", "audited", "asset_locked"}
 STEAM_BUY_VERIFY_ATTEMPTS = 8
 STEAM_BUY_VERIFY_DELAY_SECONDS = 2.0
+# Project policy: keep three failed createbuyorder attempts unless the user explicitly changes it.
 STEAM_BUY_LISTING_RETRY_ATTEMPTS = 3
+STEAM_BUY_CANCEL_VERIFY_ATTEMPTS = 3
+STEAM_BUY_CANCEL_VERIFY_DELAY_SECONDS = 0.35
 STEAM_BUY_FAILED_LISTING_TTL_SECONDS = 300.0
+C5_SALE_SYNC_PENDING_MAX_SECONDS = 3 * 60 * 60
 _STEAM_BUY_FAILED_LISTING_BLACKLIST: dict[tuple[str, str], float] = {}
 
 
@@ -125,6 +129,15 @@ class SteamBuyVerification:
     reason: str | None = None
     inventory_after_asset_ids: list[str] | None = None
     new_inventory_asset_ids: list[str] | None = None
+    purchase_receipt: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class SteamBuyOrderResolution:
+    outcome: str
+    verification: SteamBuyVerification
+    cancel_payload: dict[str, Any] | None = None
+    cancel_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -273,6 +286,7 @@ class ActiveC5SaleLookup:
 @dataclass(slots=True)
 class C5SellerOrderLookup:
     sold_orders_by_product_id: dict[str, dict[str, Any]]
+    sold_orders_by_asset_id: dict[str, dict[str, Any]]
     covered_steam_ids: set[str]
     errors: list[str]
 
@@ -431,6 +445,45 @@ def _build_steam_client_for_account(settings: Settings, account: Account) -> Ste
         account_id=account.id,
         base_url=settings.steam_market_base_url,
     )
+
+
+def _build_steam_client_for_profit_trade(
+    settings: Settings,
+    row: Any,
+    *,
+    steam_client: Any | None = None,
+) -> Any:
+    note = _read_note(row["note"])
+    target_account_id = str(note.get("steamAccountId") or "").strip()
+    target_steam_id = str(note.get("steamId") or row["a_steam_id"] or "").strip()
+    if steam_client is not None:
+        client_account_id = str(getattr(steam_client, "account_id", "") or "").strip()
+        client_steam_id = str(getattr(steam_client, "steam_id64", "") or "").strip()
+        account_matches = not target_account_id or not client_account_id or client_account_id == target_account_id
+        steam_matches = not target_steam_id or not client_steam_id or client_steam_id == target_steam_id
+        if account_matches and steam_matches:
+            return steam_client
+
+    store = AccountStore(PROJECT_ROOT / "config")
+    accounts = store.list_accounts()
+    selected: Account | None = None
+    if target_account_id:
+        selected = next((account for account in accounts if str(account.id) == target_account_id), None)
+    if selected is None and target_steam_id:
+        selected = next(
+            (
+                account
+                for account in accounts
+                if str(account.steam_id64 or "").strip() == target_steam_id
+            ),
+            None,
+        )
+    if selected is None or not selected.cookies:
+        raise RuntimeError(
+            f"cannot build Steam client for tracked buy order: "
+            f"accountId={target_account_id or '-'}, steamId={target_steam_id or '-'}"
+        )
+    return _build_steam_client_for_account(settings, selected)
 
 
 def _select_steam_buy_account(
@@ -849,9 +902,14 @@ def _steam_listing_already_purchased_error(exc: BaseException) -> bool:
     return (
         "已经购买" in text
         or "已被购买" in text
+        or "可能已被移除" in text
+        or "请刷新页面并重试" in text
         or "already purchased" in text
         or "someone else has already purchased" in text
         or "because another user has purchased" in text
+        or "item may have been removed" in text
+        or "please refresh the page and try again" in text
+        or "problem purchasing your item" in text
     )
 
 def _pick_lowest_steam_orderbook_buy_target(payload: dict[str, Any]) -> SteamBuyTarget | None:
@@ -1245,6 +1303,59 @@ def _fetch_c5_inventory_asset_ids_for_steam_buy(
     ), None
 
 
+def _iso_timestamp(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _find_official_steam_purchase_receipt(
+    client: Any,
+    *,
+    market_hash_name: str,
+    expected_total: int,
+    purchase_requested_at: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not hasattr(client, "find_purchase_receipt"):
+        return None, None
+    try:
+        receipt = client.find_purchase_receipt(
+            market_hash_name=market_hash_name,
+            expected_total=max(0, int(expected_total)) / 100.0,
+            earliest_time=_iso_timestamp(purchase_requested_at),
+            count=100,
+            max_pages=2,
+        )
+    except Exception as exc:
+        return None, f"Steam purchase history verification failed: {exc}"
+    return (receipt if isinstance(receipt, dict) else None), None
+
+
+def _verification_from_purchase_receipt(
+    latest: SteamBuyVerification,
+    receipt: dict[str, Any],
+) -> SteamBuyVerification:
+    new_asset_id = str(receipt.get("newAssetId") or "").strip()
+    verified_by = list(dict.fromkeys([*latest.verified_by, "market_history_event_type_4"]))
+    return SteamBuyVerification(
+        confirmed=True,
+        wallet_after=latest.wallet_after,
+        wallet_delta=latest.wallet_delta,
+        active_buy_orders=latest.active_buy_orders,
+        verified_by=verified_by,
+        inventory_after_asset_ids=latest.inventory_after_asset_ids,
+        new_inventory_asset_ids=[new_asset_id] if new_asset_id else latest.new_inventory_asset_ids,
+        purchase_receipt=receipt,
+    )
+
+
 def _verify_steam_buy_completed_with_inventory(
     client: Any,
     settings: Settings,
@@ -1259,6 +1370,8 @@ def _verify_steam_buy_completed_with_inventory(
     c5_client: Any | None = None,
     attempts: int | None = None,
     delay_seconds: float | None = None,
+    purchase_requested_at: str | None = None,
+    check_purchase_history: bool = True,
 ) -> SteamBuyVerification:
     max_attempts = max(1, int(attempts or STEAM_BUY_VERIFY_ATTEMPTS))
     wait_seconds = max(0.0, float(
@@ -1318,7 +1431,108 @@ def _verify_steam_buy_completed_with_inventory(
         if attempt + 1 < max_attempts:
             time.sleep(wait_seconds)
 
+    if method == "createbuyorder" and check_purchase_history:
+        purchase_receipt, purchase_history_error = _find_official_steam_purchase_receipt(
+            client,
+            market_hash_name=market_hash_name,
+            expected_total=expected_total,
+            purchase_requested_at=purchase_requested_at,
+        )
+        if purchase_receipt is not None:
+            return _verification_from_purchase_receipt(latest, purchase_receipt)
+        if purchase_history_error:
+            latest.reason = "; ".join(
+                reason for reason in (latest.reason, purchase_history_error) if reason
+            )
+
     return latest
+
+
+def _cancel_and_resolve_steam_buy_order(
+    client: Any,
+    *,
+    market_hash_name: str,
+    expected_total: int,
+    wallet_before_balance: float | None,
+    buy_order_id: str,
+    purchase_requested_at: str | None,
+) -> SteamBuyOrderResolution:
+    cancel_payload: dict[str, Any] | None = None
+    cancel_error: str | None = None
+    if not hasattr(client, "cancel_buy_order"):
+        cancel_error = "Steam client cannot cancel buy orders"
+    else:
+        try:
+            payload = client.cancel_buy_order(buy_order_id=buy_order_id)
+            cancel_payload = payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            cancel_error = str(exc)
+
+    latest = SteamBuyVerification(
+        confirmed=False,
+        wallet_after=None,
+        wallet_delta=None,
+        active_buy_orders=[],
+        verified_by=[],
+        reason="Steam buy-order terminal state could not be verified",
+    )
+    attempts = max(1, int(STEAM_BUY_CANCEL_VERIFY_ATTEMPTS))
+    for attempt in range(attempts):
+        latest = _verify_steam_buy_completed(
+            client,
+            market_hash_name=market_hash_name,
+            method="createbuyorder",
+            expected_total=expected_total,
+            wallet_before_balance=wallet_before_balance,
+            buy_order_id=buy_order_id,
+            attempts=1,
+            delay_seconds=0.0,
+        )
+        if latest.confirmed:
+            return SteamBuyOrderResolution(
+                outcome="purchased",
+                verification=latest,
+                cancel_payload=cancel_payload,
+                cancel_error=cancel_error,
+            )
+
+        order_is_absent = "no_active_matching_buy_order" in latest.verified_by
+        if order_is_absent or attempt + 1 >= attempts:
+            purchase_receipt, purchase_history_error = _find_official_steam_purchase_receipt(
+                client,
+                market_hash_name=market_hash_name,
+                expected_total=expected_total,
+                purchase_requested_at=purchase_requested_at,
+            )
+            if purchase_receipt is not None:
+                return SteamBuyOrderResolution(
+                    outcome="purchased",
+                    verification=_verification_from_purchase_receipt(latest, purchase_receipt),
+                    cancel_payload=cancel_payload,
+                    cancel_error=cancel_error,
+                )
+            if purchase_history_error:
+                latest.reason = "; ".join(
+                    reason for reason in (latest.reason, purchase_history_error) if reason
+                )
+            if order_is_absent and cancel_error is None and purchase_history_error is None:
+                return SteamBuyOrderResolution(
+                    outcome="cancelled",
+                    verification=latest,
+                    cancel_payload=cancel_payload,
+                )
+            if attempt + 1 >= attempts:
+                break
+        time.sleep(max(0.0, float(STEAM_BUY_CANCEL_VERIFY_DELAY_SECONDS)))
+
+    return SteamBuyOrderResolution(
+        outcome="uncertain",
+        verification=latest,
+        cancel_payload=cancel_payload,
+        cancel_error=cancel_error,
+    )
+
+
 def _extract_c5_sale_id(payload: dict[str, Any]) -> str | None:
     direct_value = payload.get("id") or payload.get("productId") or payload.get("saleId")
     if direct_value not in (None, ""):
@@ -1423,6 +1637,27 @@ def _c5_seller_order_product_id(row: dict[str, Any]) -> str | None:
     return str(value).strip() if value not in (None, "") else None
 
 
+def _c5_seller_order_asset_ids(row: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in ("assetId", "asset_id", "originalAssetId", "original_asset_id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    asset_info = row.get("assetInfo") if isinstance(row.get("assetInfo"), dict) else {}
+    for key in ("assetId", "asset_id", "originalAssetId", "original_asset_id"):
+        value = asset_info.get(key)
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+    order_asset = detail.get("orderAsset") if isinstance(detail.get("orderAsset"), dict) else {}
+    detail_asset_info = order_asset.get("assetInfo") if isinstance(order_asset.get("assetInfo"), dict) else {}
+    for key in ("assetId", "asset_id", "originalAssetId", "original_asset_id"):
+        value = detail_asset_info.get(key) or order_asset.get(key)
+        if value not in (None, ""):
+            values.add(str(value).strip())
+    return {value for value in values if value}
+
+
 def _c5_seller_order_status(row: dict[str, Any]) -> int | None:
     return safe_int(row.get("status") or row.get("orderStatus") or row.get("order_status"))
 
@@ -1441,14 +1676,19 @@ def _c5_seller_order_sold_net_price(
     config: StrategyConfig,
 ) -> tuple[float | None, str | None]:
     detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
-    for payload, source, keys in (
-        (detail, "seller_order_detail_get_money", ("getMoney", "get_money", "sellerGetMoney")),
-        (row, "seller_order_list_price", ("price", "getMoney", "get_money", "sellerPrice")),
-        (detail, "seller_order_detail_price", ("price",)),
-    ):
-        price = _first_float(payload, keys)
-        if price is not None and price > 0:
-            return price, source
+    detail_net = _first_float(detail, ("getMoney", "get_money", "sellerGetMoney"))
+    list_price = _first_float(row, ("price", "getMoney", "get_money", "sellerPrice"))
+    if detail_net is not None and detail_net > 0:
+        if list_price is not None and list_price > 0:
+            ratio = detail_net / list_price
+            if ratio < 0.5 or ratio > 1.2:
+                return list_price, "seller_order_list_price_detail_net_outlier"
+        return detail_net, "seller_order_detail_get_money"
+    if list_price is not None and list_price > 0:
+        return list_price, "seller_order_list_price"
+    detail_price = _first_float(detail, ("price",))
+    if detail_price is not None and detail_price > 0:
+        return detail_price, "seller_order_detail_price"
     gross = _first_float(detail, ("actualPay", "actual_pay", "salePrice", "sellPrice"))
     if gross is not None and gross > 0:
         return gross * float(config.profit_trade_c5_current_sale_net_factor), "estimated_from_seller_order_gross"
@@ -1462,22 +1702,30 @@ def _load_c5_seller_sold_order_lookup(
 ) -> C5SellerOrderLookup:
     fetcher = getattr(c5_client, "seller_order_list", None)
     if fetcher is None:
-        return C5SellerOrderLookup(sold_orders_by_product_id={}, covered_steam_ids=set(), errors=["C5 seller order API unavailable"])
+        return C5SellerOrderLookup(sold_orders_by_product_id={}, sold_orders_by_asset_id={}, covered_steam_ids=set(), errors=["C5 seller order API unavailable"])
 
     product_ids_by_steam: dict[str, set[str]] = {}
+    asset_ids_by_steam: dict[str, set[str]] = {}
     for row in rows:
         note = _read_note(row["note"])
         product_id = str(row["c5_product_id"] or note.get("c5ProductId") or "").strip()
         steam_id = str(row["a_steam_id"] or note.get("steamId") or "").strip()
+        asset_id = str(row["a_asset_id"] or note.get("assetId") or "").strip()
         if product_id and steam_id:
             product_ids_by_steam.setdefault(steam_id, set()).add(product_id)
+        if asset_id and steam_id:
+            asset_ids_by_steam.setdefault(steam_id, set()).add(asset_id)
 
     sold_orders: dict[str, dict[str, Any]] = {}
+    sold_orders_by_asset_id: dict[str, dict[str, Any]] = {}
     covered_steam_ids: set[str] = set()
     errors: list[str] = []
     detail_fetcher = getattr(c5_client, "seller_order_detail", None)
-    for steam_id, wanted_product_ids in product_ids_by_steam.items():
+    for steam_id in sorted(set(product_ids_by_steam) | set(asset_ids_by_steam)):
+        wanted_product_ids = product_ids_by_steam.get(steam_id, set())
+        wanted_asset_ids = asset_ids_by_steam.get(steam_id, set())
         found_for_steam: set[str] = set()
+        found_assets_for_steam: set[str] = set()
         for status in (10, 200):
             page = 1
             limit = 100
@@ -1502,7 +1750,10 @@ def _load_c5_seller_sold_order_lookup(
                     if not _is_c5_seller_order_sold(order_row):
                         continue
                     product_id = _c5_seller_order_product_id(order_row)
-                    if not product_id or product_id not in wanted_product_ids or product_id in sold_orders:
+                    order_asset_ids = _c5_seller_order_asset_ids(order_row)
+                    product_matches = bool(product_id and product_id in wanted_product_ids)
+                    asset_matches = order_asset_ids & wanted_asset_ids
+                    if not product_matches and not asset_matches:
                         continue
                     merged = dict(order_row)
                     order_id = _c5_seller_order_id(order_row)
@@ -1513,22 +1764,29 @@ def _load_c5_seller_sold_order_lookup(
                             merged["detailError"] = str(exc)
                         else:
                             merged["detail"] = detail
-                    sold_orders[product_id] = merged
-                    found_for_steam.add(product_id)
+                            order_asset_ids |= _c5_seller_order_asset_ids(merged)
+                    if product_matches and product_id and product_id not in sold_orders:
+                        sold_orders[product_id] = merged
+                        found_for_steam.add(product_id)
+                    for asset_id in order_asset_ids & wanted_asset_ids:
+                        if asset_id not in sold_orders_by_asset_id:
+                            sold_orders_by_asset_id[asset_id] = merged
+                        found_assets_for_steam.add(asset_id)
 
                 total = safe_int(payload.get("total")) if isinstance(payload, dict) else None
-                if wanted_product_ids.issubset(found_for_steam):
+                if wanted_product_ids.issubset(found_for_steam) and wanted_asset_ids.issubset(found_assets_for_steam):
                     break
                 if len(order_rows) < limit:
                     break
                 if total is not None and page * limit >= total:
                     break
                 page += 1
-        if wanted_product_ids.issubset(found_for_steam):
+        if wanted_product_ids.issubset(found_for_steam) and wanted_asset_ids.issubset(found_assets_for_steam):
             continue
 
     return C5SellerOrderLookup(
         sold_orders_by_product_id=sold_orders,
+        sold_orders_by_asset_id=sold_orders_by_asset_id,
         covered_steam_ids=covered_steam_ids,
         errors=errors,
     )
@@ -3257,6 +3515,7 @@ def execute_profit_trade_buy(
                 except Exception:
                     active_buy_orders_before = []
 
+            steam_buy_requested_at = utc_now_iso()
             db.update_profit_trade(trade_id, status="buying", step_key="steam_bought", step_index=3)
             try:
                 if buy_method == "createbuyorder":
@@ -3309,6 +3568,7 @@ def execute_profit_trade_buy(
                         {
                             **latest_note,
                             "steamBuyFailedAt": utc_now_iso(),
+                            "steamBuyRequestedAt": steam_buy_requested_at,
                             "steamBuyMethod": buy_method,
                             "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                             "steamBuyPrice": round(steam_buy_price, 2),
@@ -3345,6 +3605,7 @@ def execute_profit_trade_buy(
                 before_asset_ids=before_asset_ids,
                 steam_id=steam_id64,
                 c5_client=c5_client,
+                purchase_requested_at=steam_buy_requested_at,
             )
             if not verification.confirmed:
                 latest = db.get_profit_trade(trade_id) or row
@@ -3357,29 +3618,44 @@ def execute_profit_trade_buy(
                 buy_order_cancel_payload: dict[str, Any] | None = None
                 buy_order_cancel_error: str | None = None
                 if buy_method == "createbuyorder" and buy_order_id:
-                    if hasattr(client, "cancel_buy_order"):
-                        try:
-                            buy_order_cancel_payload = client.cancel_buy_order(buy_order_id=buy_order_id)
-                        except Exception as exc:
-                            buy_order_cancel_error = str(exc)
-                    else:
-                        buy_order_cancel_error = "Steam client cannot cancel buy orders"
+                    resolution = _cancel_and_resolve_steam_buy_order(
+                        client,
+                        market_hash_name=market_hash_name,
+                        expected_total=buy_target.total,
+                        wallet_before_balance=wallet_before_for_buy,
+                        buy_order_id=buy_order_id,
+                        purchase_requested_at=steam_buy_requested_at,
+                    )
+                    verification = resolution.verification
+                    buy_order_cancel_payload = resolution.cancel_payload
+                    buy_order_cancel_error = resolution.cancel_error
+                    reason = (
+                        "Steam buy request succeeded but purchase completion is not verified"
+                        if not verification.reason
+                        else f"Steam buy request succeeded but purchase completion is not verified: {verification.reason}"
+                    )
                     unverified_buy_order_attempts.append(
                         {
                             "steamBuyOrderId": buy_order_id,
                             "steamBuyPrice": round(steam_buy_price, 2),
                             "unverifiedAt": utc_now_iso(),
                             "reason": verification.reason,
-                            "cancelled": buy_order_cancel_error is None,
+                            "resolution": resolution.outcome,
+                            "cancelled": resolution.outcome == "cancelled",
                             "cancelError": buy_order_cancel_error,
                             "cancelPayload": buy_order_cancel_payload,
+                            "activeBuyOrdersAfterCancel": verification.active_buy_orders,
+                            "steamBuyVerifiedBy": verification.verified_by,
+                            "steamPurchaseReceipt": verification.purchase_receipt,
                         }
                     )
-                    if buy_order_cancel_error is None and buy_order_retry_budget > 1:
+                    if resolution.outcome == "purchased":
+                        break
+                    if resolution.outcome == "cancelled" and buy_order_retry_budget > 1:
                         buy_order_retry_budget -= 1
                         refresh_market_snapshot = True
                         continue
-                    if buy_order_cancel_error is None:
+                    if resolution.outcome == "cancelled":
                         if asset_id:
                             db.release_asset_reservation(
                                 asset_id=asset_id,
@@ -3403,6 +3679,7 @@ def execute_profit_trade_buy(
                                 {
                                     **latest_note,
                                     "steamBuyUnverifiedAt": utc_now_iso(),
+                                    "steamBuyRequestedAt": steam_buy_requested_at,
                                     "steamBuyMethod": buy_method,
                                     "steamListingId": None,
                                     "steamBuyOrderId": buy_order_id,
@@ -3413,12 +3690,14 @@ def execute_profit_trade_buy(
                                     "walletDelta": verification.wallet_delta,
                                     "activeBuyOrdersBefore": active_buy_orders_before,
                                     "activeBuyOrdersAfter": verification.active_buy_orders,
+                                    "activeBuyOrdersAfterCancel": verification.active_buy_orders,
                                     "steamBuyVerifiedBy": verification.verified_by,
                                     "beforeAssetIds": before_asset_ids,
                                     "inventoryAfterAssetIds": verification.inventory_after_asset_ids,
                                     "newInventoryAssetIds": verification.new_inventory_asset_ids,
                                     "steamBuyPayload": payload if isinstance(payload, dict) else None,
                                     "steamBuyOrderCancelledAt": utc_now_iso(),
+                                    "steamBuyOrderCancellationConfirmedAt": utc_now_iso(),
                                     "steamBuyOrderCancelPayload": buy_order_cancel_payload,
                                     "unverifiedBuyOrderAttempts": unverified_buy_order_attempts,
                                     "failedSteamListingIds": sorted(failed_listing_ids),
@@ -3442,6 +3721,7 @@ def execute_profit_trade_buy(
                         {
                             **latest_note,
                             "steamBuyUnverifiedAt": utc_now_iso(),
+                            "steamBuyRequestedAt": steam_buy_requested_at,
                             "steamBuyMethod": buy_method,
                             "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                             "steamBuyOrderId": buy_order_id or None,
@@ -3452,12 +3732,15 @@ def execute_profit_trade_buy(
                             "walletDelta": verification.wallet_delta,
                             "activeBuyOrdersBefore": active_buy_orders_before,
                             "activeBuyOrdersAfter": verification.active_buy_orders,
+                            "activeBuyOrdersAfterCancel": verification.active_buy_orders,
                             "steamBuyVerifiedBy": verification.verified_by,
                             "beforeAssetIds": before_asset_ids,
                             "inventoryAfterAssetIds": verification.inventory_after_asset_ids,
                             "newInventoryAssetIds": verification.new_inventory_asset_ids,
                             "steamBuyPayload": payload if isinstance(payload, dict) else None,
                             "steamBuyOrderCancelError": buy_order_cancel_error,
+                            "steamBuyOrderCancelPayload": buy_order_cancel_payload,
+                            "steamPurchaseReceipt": verification.purchase_receipt,
                             "unverifiedBuyOrderAttempts": unverified_buy_order_attempts,
                             "failedSteamListingIds": sorted(failed_listing_ids),
                             "staleSteamListingAttempts": stale_listing_attempts,
@@ -3470,6 +3753,12 @@ def execute_profit_trade_buy(
                 return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
             break
 
+        verified_b_asset_ids = [
+            str(value).strip()
+            for value in (verification.new_inventory_asset_ids or [])
+            if str(value or "").strip()
+        ]
+        verified_b_asset_id = verified_b_asset_ids[0] if len(set(verified_b_asset_ids)) == 1 else None
         hold_note = _build_note(
             {
                 "source": "profit_trade_buy",
@@ -3477,6 +3766,7 @@ def execute_profit_trade_buy(
                 "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                 "steamBuyOrderId": buy_order_id or None,
                 "steamBuyMethod": buy_method,
+                "steamBuyRequestedAt": steam_buy_requested_at,
                 "lockedAfterSteamBuy": True,
             }
         )
@@ -3497,8 +3787,10 @@ def execute_profit_trade_buy(
                     {
                         **latest_note,
                         "steamBuySucceededAt": utc_now_iso(),
+                        "steamBuyRequestedAt": steam_buy_requested_at,
                         "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                         "steamBuyOrderId": buy_order_id or None,
+                        "steamPurchaseReceipt": verification.purchase_receipt,
                         "walletInfo": payload.get("wallet_info") if isinstance(payload, dict) else None,
                     }
                 ),
@@ -3511,6 +3803,7 @@ def execute_profit_trade_buy(
             status="steam_bought",
             step_key="steam_bought",
             step_index=3,
+            b_asset_id=verified_b_asset_id,
             steam_listing_id=steam_buy_reference_id,
             steam_buy_price=steam_buy_price,
             steam_balance_discount=float(steam_cost_ratio),
@@ -3522,6 +3815,7 @@ def execute_profit_trade_buy(
                 {
                     **note,
                     "steamBuySucceededAt": utc_now_iso(),
+                    "steamBuyRequestedAt": steam_buy_requested_at,
                     "steamBuyMethod": buy_method,
                     "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                     "steamBuyOrderId": buy_order_id or None,
@@ -3542,6 +3836,7 @@ def execute_profit_trade_buy(
                     "beforeAssetIds": before_asset_ids,
                     "inventoryAfterAssetIds": verification.inventory_after_asset_ids,
                     "newInventoryAssetIds": verification.new_inventory_asset_ids,
+                    "steamPurchaseReceipt": verification.purchase_receipt,
                     "walletInfo": payload.get("wallet_info") if isinstance(payload, dict) else None,
                     "failedSteamListingIds": sorted(failed_listing_ids),
                     "staleSteamListingAttempts": stale_listing_attempts,
@@ -3711,6 +4006,15 @@ def refresh_profit_trade_sales(
     try:
         db.initialize()
         rows = db.list_profit_trades(status="c5_listed", limit=500)
+        manual_rows = [
+            row
+            for row in db.list_profit_trades(status="manual_required", limit=500)
+            if str(row["step_key"] or "") == "c5_listed"
+            and str(row["c5_product_id"] or _read_note(row["note"]).get("c5ProductId") or "").strip()
+        ]
+        if manual_rows:
+            seen_ids = {int(row["id"]) for row in rows}
+            rows.extend(row for row in manual_rows if int(row["id"]) not in seen_ids)
     finally:
         db.close()
     if not rows:
@@ -3750,6 +4054,7 @@ def refresh_profit_trade_sales(
             note = _read_note(row["note"])
             product_id = str(row["c5_product_id"] or note.get("c5ProductId") or "").strip()
             steam_id = str(row["a_steam_id"] or note.get("steamId") or "").strip()
+            asset_id = str(row["a_asset_id"] or note.get("assetId") or "").strip()
             if not product_id:
                 db.update_profit_trade(
                     trade_id,
@@ -3761,6 +4066,8 @@ def refresh_profit_trade_sales(
                 continue
 
             sold_order = seller_order_lookup.sold_orders_by_product_id.get(product_id)
+            if sold_order is None and asset_id:
+                sold_order = seller_order_lookup.sold_orders_by_asset_id.get(asset_id)
             if sold_order is not None:
                 c5_sold_net, source = _c5_seller_order_sold_net_price(sold_order, config=config)
                 steam_real_cost = safe_float(row["steam_real_cost"])
@@ -3839,7 +4146,46 @@ def refresh_profit_trade_sales(
                     continue
 
             if seller_order_lookup.covers(steam_id) and active_lookup.covers(steam_id):
-                reason = "C5 listed product is no longer active, but no matching seller sold order was found"
+                first_missing_value = (
+                    note.get("c5SaleSyncPendingFirstAt")
+                    or note.get("activeSaleMissingFirstAt")
+                    or note.get("settlementBlockedAt")
+                )
+                first_missing_at = _parse_iso(str(first_missing_value or ""))
+                if first_missing_at is not None and first_missing_at.tzinfo is None:
+                    first_missing_at = first_missing_at.replace(tzinfo=timezone.utc)
+                if first_missing_at is None:
+                    first_missing_at = now
+                pending_age_seconds = (now - first_missing_at.astimezone(timezone.utc)).total_seconds()
+                pending_count = safe_int(note.get("c5SaleSyncPendingProbeCount")) or 0
+                if pending_age_seconds < C5_SALE_SYNC_PENDING_MAX_SECONDS:
+                    reason = (
+                        "C5售出同步等待中：在售列表已无此商品，但卖家订单暂未返回匹配的 productId/assetId，程序会继续自动复查。"
+                    )
+                    db.update_profit_trade(
+                        trade_id,
+                        status="c5_listed",
+                        step_key="c5_listed",
+                        step_index=4,
+                        error=reason,
+                        completed_at=None,
+                        note=_build_note(
+                            {
+                                **note,
+                                "c5SaleSyncPendingFirstAt": first_missing_at.astimezone(timezone.utc).isoformat(),
+                                "c5SaleSyncPendingLastAt": utc_now_iso(),
+                                "c5SaleSyncPendingProbeCount": pending_count + 1,
+                                "c5SaleSyncPendingMaxSeconds": C5_SALE_SYNC_PENDING_MAX_SECONDS,
+                                "c5SaleSyncPendingReason": reason,
+                                "missingSellerOrderProductId": product_id,
+                                "activeSaleMissingProductId": product_id,
+                                "activeSaleMissingAssetId": asset_id or None,
+                            }
+                        ),
+                    )
+                    skipped_ids.append(trade_id)
+                    continue
+                reason = "C5 listed product has been missing for more than 3 hours, but no matching seller sold order was found"
                 db.update_profit_trade(
                     trade_id,
                     status="manual_required",
@@ -3849,8 +4195,13 @@ def refresh_profit_trade_sales(
                             **note,
                             "settlementBlockedAt": utc_now_iso(),
                             "settlementBlockedReason": reason,
+                            "c5SaleSyncPendingFirstAt": first_missing_at.astimezone(timezone.utc).isoformat(),
+                            "c5SaleSyncPendingLastAt": utc_now_iso(),
+                            "c5SaleSyncPendingProbeCount": pending_count + 1,
+                            "c5SaleSyncPendingMaxSeconds": C5_SALE_SYNC_PENDING_MAX_SECONDS,
                             "missingSellerOrderProductId": product_id,
                             "activeSaleMissingProductId": product_id,
+                            "activeSaleMissingAssetId": asset_id or None,
                         }
                     ),
                 )
@@ -3950,11 +4301,147 @@ def _manual_trade_recoverable_steam_buy_reason(row: Any) -> str | None:
     return "wallet delta plus local inventory proves Steam buy completed"
 
 
+def _restore_profit_trade_after_verified_steam_purchase(
+    db: Database,
+    row: Any,
+    config: StrategyConfig,
+    *,
+    source: str,
+    reason: str,
+    b_asset_id: str | None,
+    purchase_receipt: dict[str, Any] | None = None,
+    inventory_after_asset_ids: list[str] | None = None,
+) -> str | None:
+    trade_id = int(row["id"])
+    asset_id = str(row["a_asset_id"] or "").strip()
+    market_hash_name = str(row["market_hash_name"] or "").strip()
+    note = _read_note(row["note"])
+    steam_id = str(note.get("steamId") or row["a_steam_id"] or "").strip()
+    if not asset_id or not market_hash_name or not steam_id:
+        return "missing A asset, market_hash_name, or Steam id"
+    protected_reason = _profit_trade_protection_reason(
+        config,
+        asset_id=asset_id,
+        market_hash_name=market_hash_name,
+        steam_id=steam_id,
+    )
+    if protected_reason is None:
+        protected_reason = _profit_trade_type_block_reason(config, market_hash_name)
+    if protected_reason is not None:
+        return f"protected asset: {protected_reason}"
+
+    active_reservation = db.get_active_asset_reservation(asset_id)
+    if active_reservation is not None:
+        reservation_status = str(active_reservation["status"] or "").strip()
+        reservation_owner = str(active_reservation["owner"] or "").strip()
+        reservation_operation = active_reservation["operation_id"]
+        if reservation_status != "active" or reservation_owner != PROFIT_TRADE_OWNER:
+            return "A asset has incompatible reservation"
+        if reservation_operation is not None and int(reservation_operation) != trade_id:
+            return "A asset is reserved by another profit trade"
+    else:
+        reservation_id = db.reserve_asset(
+            asset_id=asset_id,
+            market_hash_name=market_hash_name,
+            owner=PROFIT_TRADE_OWNER,
+            purpose="sell_existing_a",
+            reserved_until=None,
+            operation_id=trade_id,
+            note=_build_note(
+                {
+                    "source": "profit_trade_recover_verified_buy",
+                    "tradeId": trade_id,
+                    "reason": reason,
+                    "recoveredAt": utc_now_iso(),
+                }
+            ),
+        )
+        if reservation_id is None:
+            return "failed to reserve A asset"
+
+    paid_total = safe_float((purchase_receipt or {}).get("paidTotal"))
+    steam_buy_price = paid_total or safe_float(row["steam_buy_price"])
+    steam_cost_ratio = safe_float(row["steam_balance_discount"])
+    if steam_cost_ratio is None:
+        steam_cost_ratio = _profit_trade_steam_cost_ratio(config)
+    steam_real_cost = (
+        float(steam_buy_price) * float(steam_cost_ratio)
+        if steam_buy_price is not None and steam_buy_price > 0
+        else safe_float(row["steam_real_cost"])
+    )
+    c5_expected_net = safe_float(row["c5_expected_net_price"])
+    expected_profit = (
+        c5_expected_net - steam_real_cost
+        if c5_expected_net is not None and steam_real_cost is not None
+        else safe_float(row["expected_profit"])
+    )
+    expected_roi = (
+        _profit_trade_transfer_roi(
+            c5_expected_net=c5_expected_net,
+            steam_buy_price=float(steam_buy_price),
+            steam_cost_ratio=float(steam_cost_ratio),
+        )
+        if c5_expected_net is not None and steam_buy_price is not None and steam_buy_price > 0
+        else safe_float(row["expected_roi"])
+    )
+    receipt_time = safe_int((purchase_receipt or {}).get("timePurchased"))
+    succeeded_at = (
+        datetime.fromtimestamp(receipt_time, tz=timezone.utc).isoformat()
+        if receipt_time is not None
+        else utc_now_iso()
+    )
+    resolved_b_asset_id = str(
+        b_asset_id
+        or (purchase_receipt or {}).get("newAssetId")
+        or ""
+    ).strip() or None
+    verified_by = [str(value) for value in (note.get("steamBuyVerifiedBy") or [])]
+    if source not in verified_by:
+        verified_by.append(source)
+    inventory_ids = [
+        str(value)
+        for value in (inventory_after_asset_ids or note.get("inventoryAfterAssetIds") or [])
+        if str(value or "").strip()
+    ]
+    db.update_profit_trade(
+        trade_id,
+        status="steam_bought",
+        step_key="steam_bought",
+        step_index=3,
+        b_asset_id=resolved_b_asset_id,
+        steam_buy_price=steam_buy_price,
+        steam_balance_discount=float(steam_cost_ratio),
+        steam_real_cost=steam_real_cost,
+        expected_profit=expected_profit,
+        expected_roi=expected_roi,
+        error=None,
+        note=_build_note(
+            {
+                **note,
+                "steamBuySucceededAt": succeeded_at,
+                "steamBuyRecoveredAt": utc_now_iso(),
+                "steamBuyRecoveredBy": source,
+                "steamBuyRecoverReason": reason,
+                "steamPurchaseReceipt": purchase_receipt,
+                "inventoryAfterAssetIds": inventory_ids,
+                "newInventoryAssetIds": [resolved_b_asset_id] if resolved_b_asset_id else [],
+                "steamBuyVerifiedBy": verified_by,
+                "orphanBuyRecoveredAt": utc_now_iso() if str(row["status"] or "") == "cancelled" else None,
+            }
+        ),
+    )
+    db.conn.execute("UPDATE profit_trades SET completed_at = NULL WHERE id = ?", (trade_id,))
+    db.conn.commit()
+    return None
+
+
 def recover_unverified_profit_trade_steam_buys(
     settings: Settings,
     *,
     config: StrategyConfig | None = None,
     limit: int = 1000,
+    steam_client: Any | None = None,
+    remote_audit: bool = False,
 ) -> dict[str, Any]:
     config = config or load_strategy_config(settings)
     recovered_ids: list[int] = []
@@ -3963,113 +4450,210 @@ def recover_unverified_profit_trade_steam_buys(
     db = Database(settings.db_path)
     try:
         db.initialize()
-        for row in db.list_profit_trades(status="manual_required", limit=limit):
+        rows = list(db.list_profit_trades(status="manual_required", limit=limit))
+        if remote_audit:
+            rows.extend(db.list_profit_trades(status="cancelled", limit=limit))
+        seen_ids: set[int] = set()
+        for row in rows:
             trade_id = int(row["id"])
-            reason = _manual_trade_recoverable_steam_buy_reason(row)
-            if reason is None:
+            if trade_id in seen_ids:
                 continue
-            asset_id = str(row["a_asset_id"] or "").strip()
-            market_hash_name = str(row["market_hash_name"] or "").strip()
+            seen_ids.add(trade_id)
             note = _read_note(row["note"])
-            steam_id = str(row["a_steam_id"] or note.get("steamId") or "").strip()
-            if not asset_id or not market_hash_name or not steam_id:
-                skipped_ids.append(trade_id)
-                errors.append(f"recover-buy {trade_id}: missing A asset, market_hash_name, or Steam id")
-                continue
-            protected_reason = _profit_trade_protection_reason(
-                config,
-                asset_id=asset_id,
-                market_hash_name=market_hash_name,
-                steam_id=steam_id,
-            )
-            if protected_reason is None:
-                protected_reason = _profit_trade_type_block_reason(config, market_hash_name)
-            if protected_reason is not None:
-                skipped_ids.append(trade_id)
-                errors.append(f"recover-buy {trade_id}: protected asset: {protected_reason}")
-                continue
-            active_reservation = db.get_active_asset_reservation(asset_id)
-            if active_reservation is not None:
-                reservation_status = str(active_reservation["status"] or "").strip()
-                reservation_owner = str(active_reservation["owner"] or "").strip()
-                reservation_operation = active_reservation["operation_id"]
-                if reservation_status != "active" or reservation_owner != PROFIT_TRADE_OWNER:
-                    skipped_ids.append(trade_id)
-                    errors.append(f"recover-buy {trade_id}: A asset has incompatible reservation")
-                    continue
-                if reservation_operation is not None and int(reservation_operation) != trade_id:
-                    skipped_ids.append(trade_id)
-                    errors.append(f"recover-buy {trade_id}: A asset is reserved by another profit trade")
-                    continue
-            inventory_asset_rows = db.list_assets(
-                market_hash_name=market_hash_name,
-                steam_id=steam_id,
-            )
-            inventory_after_asset_ids = [str(asset["asset_id"]) for asset in inventory_asset_rows]
-            before_asset_ids = [str(value) for value in (note.get("beforeAssetIds") or []) if str(value or "").strip()]
-            if before_asset_ids:
-                before_set = set(before_asset_ids)
-                candidates = [asset_id_value for asset_id_value in inventory_after_asset_ids if asset_id_value not in before_set]
-            else:
-                candidates = [asset_id_value for asset_id_value in inventory_after_asset_ids if asset_id_value != asset_id]
-            candidates = sorted(set(candidates))
-            if len(candidates) != 1:
-                skipped_ids.append(trade_id)
-                errors.append(
-                    f"recover-buy {trade_id}: expected exactly one B candidate, got {len(candidates)}"
+            status = str(row["status"] or "").strip()
+            tracked_buy_order_id = str(note.get("steamBuyOrderId") or "").strip()
+            tracked_create_buy_order = (
+                str(note.get("steamBuyMethod") or "").strip() == "createbuyorder"
+                and bool(tracked_buy_order_id)
+                and not str(row["b_asset_id"] or "").strip()
+                and not str(row["c5_product_id"] or "").strip()
+                and (
+                    status == "manual_required"
+                    or not (
+                        note.get("steamBuyOrderCancellationConfirmedAt")
+                        or note.get("orphanBuyOrderCancellationConfirmedAt")
+                    )
                 )
-                continue
-            b_asset_id = candidates[0]
-            if active_reservation is None:
-                reservation_id = db.reserve_asset(
-                    asset_id=asset_id,
+            )
+            reason = _manual_trade_recoverable_steam_buy_reason(row)
+            local_error: str | None = None
+            if reason is not None:
+                asset_id = str(row["a_asset_id"] or "").strip()
+                market_hash_name = str(row["market_hash_name"] or "").strip()
+                steam_id = str(note.get("steamId") or row["a_steam_id"] or "").strip()
+                inventory_asset_rows = db.list_assets(
                     market_hash_name=market_hash_name,
-                    owner=PROFIT_TRADE_OWNER,
-                    purpose="sell_existing_a",
-                    reserved_until=None,
-                    operation_id=trade_id,
-                    note=_build_note(
-                        {
-                            "source": "profit_trade_recover_unverified_buy",
-                            "tradeId": trade_id,
-                            "reason": reason,
-                            "recoveredAt": utc_now_iso(),
-                        }
-                    ),
+                    steam_id=steam_id,
                 )
-                if reservation_id is None:
+                inventory_after_asset_ids = [str(asset["asset_id"]) for asset in inventory_asset_rows]
+                before_asset_ids = [
+                    str(value)
+                    for value in (note.get("beforeAssetIds") or [])
+                    if str(value or "").strip()
+                ]
+                if before_asset_ids:
+                    before_set = set(before_asset_ids)
+                    candidates = [value for value in inventory_after_asset_ids if value not in before_set]
+                else:
+                    candidates = [value for value in inventory_after_asset_ids if value != asset_id]
+                candidates = sorted(set(candidates))
+                if len(candidates) == 1:
+                    local_error = _restore_profit_trade_after_verified_steam_purchase(
+                        db,
+                        row,
+                        config,
+                        source="local_inventory_reconciliation",
+                        reason=reason,
+                        b_asset_id=candidates[0],
+                        inventory_after_asset_ids=inventory_after_asset_ids,
+                    )
+                    if local_error is None:
+                        recovered_ids.append(trade_id)
+                        continue
+                else:
+                    local_error = f"expected exactly one B candidate, got {len(candidates)}"
+
+            if not remote_audit or not tracked_create_buy_order:
+                if local_error:
                     skipped_ids.append(trade_id)
-                    errors.append(f"recover-buy {trade_id}: failed to reserve A asset")
+                    errors.append(f"recover-buy {trade_id}: {local_error}")
+                continue
+
+            market_hash_name = str(row["market_hash_name"] or "").strip()
+            steam_buy_price = safe_float(row["steam_buy_price"])
+            if not market_hash_name or steam_buy_price is None or steam_buy_price <= 0:
+                skipped_ids.append(trade_id)
+                errors.append(f"recover-buy {trade_id}: missing market hash name or Steam buy price")
+                continue
+            try:
+                client = _build_steam_client_for_profit_trade(
+                    settings,
+                    row,
+                    steam_client=steam_client,
+                )
+                purchase_requested_at = str(
+                    note.get("steamBuyRequestedAt")
+                    or note.get("steamBuyUnverifiedAt")
+                    or row["created_at"]
+                    or ""
+                ).strip() or None
+                purchase_receipt, purchase_history_error = _find_official_steam_purchase_receipt(
+                    client,
+                    market_hash_name=market_hash_name,
+                    expected_total=int(round(steam_buy_price * 100.0)),
+                    purchase_requested_at=purchase_requested_at,
+                )
+                if purchase_receipt is not None:
+                    restore_error = _restore_profit_trade_after_verified_steam_purchase(
+                        db,
+                        row,
+                        config,
+                        source="market_history_event_type_4",
+                        reason="official Steam purchase history proves the tracked buy order filled",
+                        b_asset_id=str(purchase_receipt.get("newAssetId") or "").strip() or None,
+                        purchase_receipt=purchase_receipt,
+                    )
+                    if restore_error is not None:
+                        raise RuntimeError(restore_error)
+                    recovered_ids.append(trade_id)
                     continue
-            db.update_profit_trade(
-                trade_id,
-                status="steam_bought",
-                step_key="steam_bought",
-                step_index=3,
-                b_asset_id=b_asset_id,
-                error=None,
-                note=_build_note(
-                    {
-                        **note,
-                        "steamBuyRecoveredAt": utc_now_iso(),
-                        "steamBuyRecoveredBy": "local_inventory_reconciliation",
-                        "steamBuyRecoverReason": reason,
-                        "beforeAssetIds": before_asset_ids or [asset_id],
-                        "inventoryAfterAssetIds": inventory_after_asset_ids,
-                        "newInventoryAssetIds": candidates,
-                        "steamBuyVerifiedBy": sorted(set([
-                            *[str(value) for value in (note.get("steamBuyVerifiedBy") or [])],
-                            "local_inventory_reconciliation",
-                        ])),
-                    }
-                ),
-            )
-            db.conn.execute(
-                "UPDATE profit_trades SET completed_at = NULL WHERE id = ?",
-                (trade_id,),
-            )
-            db.conn.commit()
-            recovered_ids.append(trade_id)
+                if purchase_history_error:
+                    raise RuntimeError(purchase_history_error)
+
+                listings_payload = client.my_listings(start=0, count=100)
+                active_orders = _matching_active_steam_buy_orders(
+                    listings_payload if isinstance(listings_payload, dict) else {},
+                    market_hash_name=market_hash_name,
+                    buy_order_id=tracked_buy_order_id,
+                )
+                if status == "cancelled" and active_orders:
+                    resolution = _cancel_and_resolve_steam_buy_order(
+                        client,
+                        market_hash_name=market_hash_name,
+                        expected_total=int(round(steam_buy_price * 100.0)),
+                        wallet_before_balance=safe_float(note.get("walletBalanceBefore")),
+                        buy_order_id=tracked_buy_order_id,
+                        purchase_requested_at=purchase_requested_at,
+                    )
+                    if resolution.outcome == "purchased":
+                        receipt = resolution.verification.purchase_receipt
+                        restore_error = _restore_profit_trade_after_verified_steam_purchase(
+                            db,
+                            row,
+                            config,
+                            source=(
+                                "market_history_event_type_4"
+                                if receipt is not None
+                                else "wallet_and_order_state_reconciliation"
+                            ),
+                            reason="legacy hidden buy order filled during reconciliation",
+                            b_asset_id=(resolution.verification.new_inventory_asset_ids or [None])[0],
+                            purchase_receipt=receipt,
+                        )
+                        if restore_error is not None:
+                            raise RuntimeError(restore_error)
+                        recovered_ids.append(trade_id)
+                        continue
+                    if resolution.outcome == "cancelled":
+                        db.update_profit_trade(
+                            trade_id,
+                            note=_build_note(
+                                {
+                                    **note,
+                                    "orphanBuyAuditAt": utc_now_iso(),
+                                    "orphanBuyOrderCancellationConfirmedAt": utc_now_iso(),
+                                    "orphanBuyOrderCancelPayload": resolution.cancel_payload,
+                                }
+                            ),
+                        )
+                        continue
+                    asset_id = str(row["a_asset_id"] or "").strip()
+                    if asset_id and db.get_active_asset_reservation(asset_id) is None:
+                        db.reserve_asset(
+                            asset_id=asset_id,
+                            market_hash_name=market_hash_name,
+                            owner=PROFIT_TRADE_OWNER,
+                            purpose="sell_existing_a",
+                            reserved_until=None,
+                            operation_id=trade_id,
+                            note=_build_note({"source": "orphan_buy_order_tracking", "tradeId": trade_id}),
+                        )
+                    db.update_profit_trade(
+                        trade_id,
+                        status="manual_required",
+                        error="Tracked Steam buy order is still active or its terminal state is uncertain; cannot safely hide",
+                        note=_build_note(
+                            {
+                                **note,
+                                "orphanBuyAuditAt": utc_now_iso(),
+                                "activeBuyOrdersAfterCancel": resolution.verification.active_buy_orders,
+                                "steamBuyOrderCancelError": resolution.cancel_error,
+                            }
+                        ),
+                    )
+                    skipped_ids.append(trade_id)
+                    errors.append(f"recover-buy {trade_id}: tracked buy order terminal state is uncertain")
+                    continue
+                if status == "cancelled":
+                    db.update_profit_trade(
+                        trade_id,
+                        note=_build_note(
+                            {
+                                **note,
+                                "orphanBuyAuditAt": utc_now_iso(),
+                                "orphanBuyOrderActive": False,
+                                "orphanBuyOrderCancellationConfirmedAt": utc_now_iso(),
+                            }
+                        ),
+                    )
+            except Exception as exc:
+                skipped_ids.append(trade_id)
+                errors.append(f"recover-buy {trade_id}: {exc}")
+                continue
+
+            if local_error:
+                skipped_ids.append(trade_id)
+                errors.append(f"recover-buy {trade_id}: {local_error}")
     finally:
         db.close()
     return {"ok": True, "recoveredTradeIds": recovered_ids, "skippedTradeIds": skipped_ids, "errors": errors}
@@ -4078,6 +4662,7 @@ def dismiss_profit_trade(
     trade_id: int,
     *,
     reason: str = "user dismissed manual review trade",
+    steam_client: Any | None = None,
 ) -> dict[str, Any]:
     db = Database(settings.db_path)
     try:
@@ -4090,6 +4675,83 @@ def dismiss_profit_trade(
             raise RuntimeError("completed profit trade cannot be dismissed")
         if status in {"steam_bought", "listing_c5", "c5_listed"}:
             raise RuntimeError(f"profit trade with live follow-up state cannot be dismissed: {status}")
+        note = _read_note(row["note"])
+        tracked_buy_order_id = str(note.get("steamBuyOrderId") or "").strip()
+        if note.get("steamBuyUnverifiedAt") and not tracked_buy_order_id:
+            raise RuntimeError(
+                "unverified Steam buy has no buy-order id; cannot safely hide without confirming its terminal state"
+            )
+        dismiss_buy_order_resolution: SteamBuyOrderResolution | None = None
+        if tracked_buy_order_id:
+            if str(note.get("steamBuyMethod") or "").strip() != "createbuyorder":
+                raise RuntimeError("tracked Steam order is not a createbuyorder; cannot safely hide")
+            steam_buy_price = safe_float(row["steam_buy_price"]) or safe_float(note.get("steamBuyPrice"))
+            if steam_buy_price is None or steam_buy_price <= 0:
+                raise RuntimeError("tracked Steam buy order is missing its expected price; cannot safely hide")
+            client = _build_steam_client_for_profit_trade(
+                settings,
+                row,
+                steam_client=steam_client,
+            )
+            purchase_requested_at = str(
+                note.get("steamBuyRequestedAt")
+                or note.get("steamBuyUnverifiedAt")
+                or row["created_at"]
+                or ""
+            ).strip() or None
+            dismiss_buy_order_resolution = _cancel_and_resolve_steam_buy_order(
+                client,
+                market_hash_name=str(row["market_hash_name"] or "").strip(),
+                expected_total=int(round(steam_buy_price * 100.0)),
+                wallet_before_balance=safe_float(note.get("walletBalanceBefore")),
+                buy_order_id=tracked_buy_order_id,
+                purchase_requested_at=purchase_requested_at,
+            )
+            if dismiss_buy_order_resolution.outcome == "purchased":
+                verification = dismiss_buy_order_resolution.verification
+                receipt = verification.purchase_receipt
+                restore_error = _restore_profit_trade_after_verified_steam_purchase(
+                    db,
+                    row,
+                    load_strategy_config(settings),
+                    source=(
+                        "market_history_event_type_4"
+                        if receipt is not None
+                        else "wallet_and_order_state_reconciliation"
+                    ),
+                    reason="purchase completed while user requested safe buy-order cancellation",
+                    b_asset_id=(verification.new_inventory_asset_ids or [None])[0],
+                    purchase_receipt=receipt,
+                )
+                if restore_error is not None:
+                    raise RuntimeError(restore_error)
+                updated = db.get_profit_trade(trade_id)
+                return {
+                    "ok": False,
+                    "changed": True,
+                    "dismissed": False,
+                    "message": "Steam buy completed; the trade was restored and was not hidden",
+                    "trade": _trade_row_to_dict(updated),
+                }
+            if dismiss_buy_order_resolution.outcome != "cancelled":
+                db.update_profit_trade(
+                    trade_id,
+                    status="manual_required",
+                    error="Tracked Steam buy order is still active or its terminal state is uncertain; cannot safely hide",
+                    note=_build_note(
+                        {
+                            **note,
+                            "dismissAttemptedAt": utc_now_iso(),
+                            "dismissBuyOrderResolution": dismiss_buy_order_resolution.outcome,
+                            "activeBuyOrdersAfterCancel": dismiss_buy_order_resolution.verification.active_buy_orders,
+                            "steamBuyOrderCancelError": dismiss_buy_order_resolution.cancel_error,
+                            "steamBuyOrderCancelPayload": dismiss_buy_order_resolution.cancel_payload,
+                        }
+                    ),
+                )
+                raise RuntimeError(
+                    "Tracked Steam buy order is still active or uncertain; cannot safely hide"
+                )
         asset_id = str(row["a_asset_id"] or "").strip()
         if asset_id:
             db.release_asset_reservation(
@@ -4103,7 +4765,6 @@ def dismiss_profit_trade(
                     }
                 ),
             )
-        note = _read_note(row["note"])
         db.update_profit_trade(
             trade_id,
             status="cancelled",
@@ -4114,11 +4775,31 @@ def dismiss_profit_trade(
                     "dismissedAt": utc_now_iso(),
                     "dismissedReason": reason,
                     "cancelSource": "profit_trade_dismiss",
+                    "dismissBuyOrderResolution": (
+                        dismiss_buy_order_resolution.outcome
+                        if dismiss_buy_order_resolution is not None
+                        else None
+                    ),
+                    "steamBuyOrderCancellationConfirmedAt": (
+                        utc_now_iso()
+                        if dismiss_buy_order_resolution is not None
+                        else None
+                    ),
+                    "steamBuyOrderCancelPayload": (
+                        dismiss_buy_order_resolution.cancel_payload
+                        if dismiss_buy_order_resolution is not None
+                        else None
+                    ),
                 }
             ),
         )
         updated = db.get_profit_trade(trade_id)
-        return {"ok": True, "changed": True, "trade": _trade_row_to_dict(updated)}
+        return {
+            "ok": True,
+            "changed": True,
+            "dismissed": True,
+            "trade": _trade_row_to_dict(updated),
+        }
     finally:
         db.close()
 
@@ -4727,7 +5408,12 @@ def run_profit_trade_once(
         errors.append(f"refresh-listings: {exc}")
 
     try:
-        recover_result = recover_unverified_profit_trade_steam_buys(settings, config=config)
+        recover_result = recover_unverified_profit_trade_steam_buys(
+            settings,
+            config=config,
+            steam_client=steam_client,
+            remote_audit=True,
+        )
         skipped_trade_ids.extend(int(value) for value in recover_result.get("skippedTradeIds", []))
         errors.extend(str(value) for value in recover_result.get("errors", []))
     except Exception as exc:
@@ -4934,6 +5620,14 @@ def _step_progress(step_index: int) -> int:
     return int(round((bounded / max_index) * 100))
 
 
+def _profit_trade_steam_bought_at(note: dict[str, Any]) -> tuple[str | None, str | None]:
+    for key in ("steamBuySucceededAt", "steamBuyUnverifiedAt", "steamBuyRecoveredAt"):
+        value = str(note.get(key) or "").strip()
+        if value:
+            return value, key
+    return None, None
+
+
 def _trade_row_to_dict(row: Any) -> dict[str, Any]:
     step_index = int(row["step_index"] or 0)
     status = str(row["status"] or "candidate")
@@ -4942,6 +5636,7 @@ def _trade_row_to_dict(row: Any) -> dict[str, Any]:
     realized_roi = safe_float(row["realized_roi"])
     market_hash_name = str(row["market_hash_name"] or "")
     name = str(note.get("name") or market_hash_name)
+    steam_bought_at, steam_bought_at_source = _profit_trade_steam_bought_at(note)
     return {
         "id": int(row["id"]),
         "tradeNo": row["trade_no"],
@@ -4971,6 +5666,8 @@ def _trade_row_to_dict(row: Any) -> dict[str, Any]:
         "realizedRoiPct": round(realized_roi * 100, 2) if realized_roi is not None else None,
         "error": row["error"],
         "note": note,
+        "steamBoughtAt": steam_bought_at,
+        "steamBoughtAtSource": steam_bought_at_source,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "completedAt": row["completed_at"],

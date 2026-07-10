@@ -34,6 +34,8 @@ type ProfitTrade = {
   realizedRoiPct?: number | null;
   error?: string | null;
   note?: Record<string, unknown> | null;
+  steamBoughtAt?: string | null;
+  steamBoughtAtSource?: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt?: string | null;
@@ -47,8 +49,8 @@ type ProfitDashboard = {
     allowRepriceExecution: boolean;
     balanceDiscount?: number;
     balanceDiscountPct?: number;
-    minRoiPct: number;
-    minItemValue: number;
+    minRoiPct?: number;
+    minItemValue?: number;
     maxBuyPerCycle: number;
     dailySteamBudget?: number;
     scanMaxItems: number;
@@ -101,10 +103,10 @@ const fallbackDashboard: ProfitDashboard = {
     enabled: false,
     allowRealExecution: false,
     allowRepriceExecution: false,
-    balanceDiscount: 0.69,
-    balanceDiscountPct: 69,
-    minRoiPct: 7,
-    minItemValue: 5,
+    balanceDiscount: undefined,
+    balanceDiscountPct: undefined,
+    minRoiPct: undefined,
+    minItemValue: undefined,
     maxBuyPerCycle: 1,
     dailySteamBudget: 1000,
     scanMaxItems: 80,
@@ -170,10 +172,62 @@ const autoRunInFlight = ref(false);
 const lastRunAt = ref<number | null>(null);
 const lastRunResult = ref("");
 const nowMs = ref(Date.now());
+const completedDateFrom = ref("");
+const completedDateTo = ref("");
+const completedPage = ref(1);
+const completedPageSize = 10;
 
 const sortedTrades = computed(() => [...dashboard.value.trades].sort((a, b) => b.id - a.id));
 const activeTrades = computed(() => sortedTrades.value.filter((trade) => trade.status !== "completed"));
 const completedTrades = computed(() => sortedTrades.value.filter((trade) => trade.status === "completed"));
+const completedHasDateFilter = computed(() => completedDateFrom.value !== "" || completedDateTo.value !== "");
+const completedFilteredTrades = computed(() => {
+  const from = parseDateStart(completedDateFrom.value);
+  const to = parseDateEnd(completedDateTo.value);
+  const hasFilter = from !== null || to !== null;
+  return completedTrades.value.filter((trade) => {
+    const time = completedTradePurchaseTimeMs(trade);
+    if (time === null) return !hasFilter;
+    if (from !== null && time < from) return false;
+    if (to !== null && time > to) return false;
+    return true;
+  });
+});
+const completedTotalProfit = computed(() => completedTrades.value.reduce(
+  (total, trade) => total + (Number(trade.realizedProfit) || 0),
+  0,
+));
+const completedFilteredProfit = computed(() => completedFilteredTrades.value.reduce(
+  (total, trade) => total + (Number(trade.realizedProfit) || 0),
+  0,
+));
+const completedTotalSteamBuy = computed(() => completedTrades.value.reduce(
+  (total, trade) => total + (Number(trade.steamBuyPrice) || 0),
+  0,
+));
+const completedFilteredSteamBuy = computed(() => completedFilteredTrades.value.reduce(
+  (total, trade) => total + (Number(trade.steamBuyPrice) || 0),
+  0,
+));
+const completedProfitSummaryLabel = computed(() => (
+  completedHasDateFilter.value ? "当前筛选总收益" : "总收益"
+));
+const completedSteamBuySummaryLabel = computed(() => (
+  completedHasDateFilter.value ? "筛选已结算 Steam买入" : "已结算 Steam买入总额"
+));
+const completedTotalPages = computed(() => Math.max(1, Math.ceil(completedFilteredTrades.value.length / completedPageSize)));
+const completedCurrentPage = computed(() => Math.min(Math.max(1, completedPage.value), completedTotalPages.value));
+const completedPagedTrades = computed(() => {
+  const start = (completedCurrentPage.value - 1) * completedPageSize;
+  return completedFilteredTrades.value.slice(start, start + completedPageSize);
+});
+const completedPageRangeLabel = computed(() => {
+  const total = completedFilteredTrades.value.length;
+  if (total === 0) return "0 / 0";
+  const start = (completedCurrentPage.value - 1) * completedPageSize + 1;
+  const end = Math.min(start + completedPageSize - 1, total);
+  return `${start}-${end} / ${total}`;
+});
 const protectedAssetCount = computed(() => dashboard.value.config.protectedAssetIds?.length ?? 0);
 const protectedNameCount = computed(() => dashboard.value.config.protectedMarketHashNames?.length ?? 0);
 const protectedSteamCount = computed(() => dashboard.value.config.protectedSteamIds?.length ?? 0);
@@ -241,6 +295,51 @@ function formatDateTime(value: number | string | null | undefined): string {
   });
 }
 
+function parseDateStart(value: string): number | null {
+  if (!value) return null;
+  const date = new Date(`${value}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+
+function parseDateEnd(value: string): number | null {
+  if (!value) return null;
+  const date = new Date(`${value}T23:59:59.999`);
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+
+function completedTradePurchaseTimeMs(trade: ProfitTrade): number | null {
+  const raw = trade.steamBoughtAt;
+  if (!raw) return null;
+  const time = new Date(raw).getTime();
+  return Number.isNaN(time) ? null : time;
+}
+
+function resetCompletedPage(): void {
+  completedPage.value = 1;
+}
+
+function setCompletedDatePreset(days: number | "all"): void {
+  if (days === "all") {
+    completedDateFrom.value = "";
+    completedDateTo.value = "";
+    resetCompletedPage();
+    return;
+  }
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - Math.max(0, days - 1));
+  completedDateFrom.value = start.toISOString().slice(0, 10);
+  completedDateTo.value = end.toISOString().slice(0, 10);
+  resetCompletedPage();
+}
+
+function goCompletedPage(direction: -1 | 1): void {
+  completedPage.value = Math.min(
+    completedTotalPages.value,
+    Math.max(1, completedCurrentPage.value + direction),
+  );
+}
+
 function noteText(trade: ProfitTrade, key: string): string {
   const value = trade.note?.[key];
   if (value === null || value === undefined || value === "") return "-";
@@ -287,6 +386,23 @@ function isStickerSlab(trade: ProfitTrade): boolean {
   const hash = trade.marketHashName.toLowerCase();
   const name = String(trade.name || "");
   return hash.startsWith("sticker slab |") || name.includes("印花板");
+}
+
+function canManualSettle(trade: ProfitTrade): boolean {
+  return trade.status === "c5_listed" || (
+    trade.status === "manual_required"
+    && trade.stepIndex >= 4
+    && Number(trade.steamBuyPrice) > 0
+  );
+}
+
+function hasTrackedSteamBuyOrder(trade: ProfitTrade): boolean {
+  const buyOrderId = String(trade.note?.steamBuyOrderId ?? "").trim();
+  return buyOrderId !== "" || Boolean(trade.note?.steamBuyUnverifiedAt);
+}
+
+function dismissActionLabel(trade: ProfitTrade): string {
+  return hasTrackedSteamBuyOrder(trade) ? "撤销求购并关闭" : "已知晓并隐藏";
 }
 
 function statusLabel(status: string): string {
@@ -473,20 +589,23 @@ async function manualSettleTrade(trade: ProfitTrade): Promise<void> {
 async function dismissTrade(trade: ProfitTrade): Promise<void> {
   message.value = "";
   try {
-    await fetchJson("/api/profit-trade/dismiss", {
+    const result = (await fetchJson("/api/profit-trade/dismiss", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         tradeId: trade.id,
         reason: "user acknowledged and hid this trade",
       }),
-    });
+    })) as { ok?: boolean; dismissed?: boolean; message?: string };
     apiOnline.value = true;
-    message.value = `${trade.tradeNo} 已隐藏`;
+    message.value = result.dismissed === false
+      ? `${trade.tradeNo} 未隐藏：${result.message ?? "Steam 求购已成交，流水已恢复"}`
+      : `${trade.tradeNo} ${hasTrackedSteamBuyOrder(trade) ? "求购已确认撤销并关闭" : "已隐藏"}`;
     await loadDashboard();
   } catch (error) {
     apiOnline.value = true;
-    message.value = `${trade.tradeNo} 隐藏失败：${error instanceof Error ? error.message : String(error)}`;
+    message.value = `${trade.tradeNo} 安全关闭失败：${error instanceof Error ? error.message : String(error)}`;
+    await loadDashboard();
   }
 }
 
@@ -898,7 +1017,7 @@ onUnmounted(() => {
         <strong>{{ dashboard.summary.failedCount }}</strong>
       </article>
       <article class="profit-metric">
-        <span>已结算收益</span>
+        <span>全部已结算收益</span>
         <strong>{{ formatMoney(dashboard.summary.realizedProfit) }}</strong>
       </article>
       <article class="profit-metric">
@@ -957,7 +1076,7 @@ onUnmounted(() => {
           </div>
           <div>
             <dt>做T余额折扣</dt>
-            <dd>{{ formatPct(dashboard.config.balanceDiscountPct ?? 69) }}</dd>
+            <dd>{{ formatPct(dashboard.config.balanceDiscountPct) }}</dd>
           </div>
           <div>
             <dt>每日余额</dt>
@@ -1010,7 +1129,7 @@ onUnmounted(() => {
         </dl>
         <div class="formula-panel">
           <strong>做T收益公式</strong>
-          <span>真实成本 = Steam买入价 × 做T余额折扣（当前 {{ formatPct(dashboard.config.balanceDiscountPct ?? 69) }}）</span>
+          <span>真实成本 = Steam买入价 × 做T余额折扣（当前 {{ formatPct(dashboard.config.balanceDiscountPct) }}）</span>
           <span>预计ROI = C5预计到手 ÷ Steam买入价 - 做T余额折扣；结算ROI = C5实际到手 ÷ Steam买入价 - 该笔流水余额折扣</span>
           <small>最低通过ROI：{{ formatPct(dashboard.config.minRoiPct) }}。已结算流水按单笔记录的余额折扣计算，不会被当前配置改写。</small>
         </div>
@@ -1178,7 +1297,7 @@ onUnmounted(() => {
                 type="button"
                 @click="dismissTrade(trade)"
               >
-                已知晓并隐藏
+                {{ dismissActionLabel(trade) }}
               </button>
               <button
                 v-if="trade.aAssetId"
@@ -1219,7 +1338,7 @@ onUnmounted(() => {
               >
                 上架C5
               </button>
-              <div v-if="trade.status === 'c5_listed'" class="manual-settle-row">
+              <div v-if="canManualSettle(trade)" class="manual-settle-row">
                 <input
                   v-model.trim="manualSettleInputs[trade.id]"
                   type="number"
@@ -1311,15 +1430,88 @@ onUnmounted(() => {
 
         <section class="completed-zone">
           <div class="panel-title-row">
-            <h2>已完结收益</h2>
-            <span class="soft-label">{{ completedTrades.length }} 笔</span>
+            <h2>已完结收益（按 Steam 购买时间）</h2>
+            <span class="soft-label">
+              {{ completedFilteredTrades.length }} / {{ completedTrades.length }} 笔
+            </span>
+          </div>
+          <p class="completed-filter-note">
+            日期按买入 B 的 Steam 购买时间筛选；这里只统计已经完成收益结算的做T流水，不代表该时间段全部 Steam 钱包购买记录。
+          </p>
+          <div class="completed-toolbar">
+            <label>
+              <span>开始日期</span>
+              <input
+                v-model="completedDateFrom"
+                type="date"
+                @change="resetCompletedPage"
+              >
+            </label>
+            <label>
+              <span>结束日期</span>
+              <input
+                v-model="completedDateTo"
+                type="date"
+                @change="resetCompletedPage"
+              >
+            </label>
+            <div class="completed-filter-actions">
+              <button class="mini-action" type="button" @click="setCompletedDatePreset(1)">
+                今天
+              </button>
+              <button class="mini-action" type="button" @click="setCompletedDatePreset(7)">
+                近7天
+              </button>
+              <button class="mini-action" type="button" @click="setCompletedDatePreset('all')">
+                全部
+              </button>
+            </div>
+            <dl class="completed-profit-summary">
+              <div>
+                <dt>{{ completedProfitSummaryLabel }}</dt>
+                <dd :class="signedClass(completedFilteredProfit)">{{ formatMoney(completedFilteredProfit) }}</dd>
+                <small v-if="completedHasDateFilter">
+                  全部累计：{{ formatMoney(completedTotalProfit) }}
+                </small>
+              </div>
+              <div>
+                <dt>{{ completedSteamBuySummaryLabel }}</dt>
+                <dd>{{ formatMoney(completedFilteredSteamBuy) }}</dd>
+                <small v-if="completedHasDateFilter">
+                  全部累计：{{ formatMoney(completedTotalSteamBuy) }}
+                </small>
+              </div>
+            </dl>
+            <div class="completed-pagination">
+              <button
+                class="mini-action"
+                type="button"
+                :disabled="completedCurrentPage <= 1"
+                @click="goCompletedPage(-1)"
+              >
+                上一页
+              </button>
+              <span>{{ completedPageRangeLabel }}｜第 {{ completedCurrentPage }} / {{ completedTotalPages }} 页</span>
+              <button
+                class="mini-action"
+                type="button"
+                :disabled="completedCurrentPage >= completedTotalPages"
+                @click="goCompletedPage(1)"
+              >
+                下一页
+              </button>
+            </div>
           </div>
           <article v-if="completedTrades.length === 0" class="panel empty-state">
             <strong>暂无完结流水</strong>
             <span>手动完结或 C5 售出结算后，会在这里单独归档。</span>
           </article>
+          <article v-else-if="completedFilteredTrades.length === 0" class="panel empty-state">
+            <strong>当前时间范围没有完结收益</strong>
+            <span>调整开始日期或结束日期后再查看。</span>
+          </article>
           <article
-            v-for="trade in completedTrades"
+            v-for="trade in completedPagedTrades"
             v-else
             :key="`completed-${trade.id}`"
             class="completed-trade-row"
@@ -1328,6 +1520,8 @@ onUnmounted(() => {
               <strong>{{ trade.name || trade.marketHashName }}</strong>
               <span>{{ trade.tradeNo }}</span>
               <span>Steam余额账号：{{ steamAccountLabel(trade) }}</span>
+              <span>Steam购买时间：{{ formatDateTime(trade.steamBoughtAt) }}</span>
+              <span>结算时间：{{ formatDateTime(trade.completedAt || trade.updatedAt) }}</span>
               <span>买前余额：{{ formatMoney(noteNumber(trade, "walletBalanceBefore")) }}</span>
               <span>B assetId：{{ trade.bAssetId || "-" }}</span>
               <span v-if="duplicateBuyText(trade)">
@@ -1938,6 +2132,107 @@ onUnmounted(() => {
   gap: 8px;
 }
 
+.completed-filter-note {
+  margin: 0 0 8px;
+  color: #687487;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.completed-toolbar {
+  border: 1px solid #dce2e8;
+  border-radius: 8px;
+  padding: 10px;
+  background: #ffffff;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(150px, 190px)) minmax(190px, auto) minmax(220px, auto) minmax(260px, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.completed-toolbar label {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  color: #687487;
+  font-size: 12px;
+}
+
+.completed-toolbar input {
+  width: 100%;
+  min-height: 32px;
+  border: 1px solid #cfd8e2;
+  border-radius: 8px;
+  padding: 4px 8px;
+  color: #172033;
+  background: #fbfcfd;
+}
+
+.completed-filter-actions,
+.completed-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.completed-profit-summary {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(150px, max-content));
+  gap: 8px;
+}
+
+.completed-profit-summary div {
+  min-height: 48px;
+  border: 1px solid #edf1f5;
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #fbfcfd;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+}
+
+.completed-profit-summary dt {
+  color: #687487;
+  font-size: 12px;
+}
+
+.completed-profit-summary dd {
+  margin: 0;
+  color: #172033;
+  font-weight: 700;
+}
+
+.completed-profit-summary small {
+  color: #687487;
+  font-size: 11px;
+}
+
+.completed-profit-summary dd.positive {
+  color: #1f684e;
+}
+
+.completed-profit-summary dd.negative {
+  color: #b64a3e;
+}
+
+.completed-pagination {
+  justify-content: flex-end;
+}
+
+.completed-pagination span {
+  color: #526071;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.completed-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .completed-trade-row {
   border: 1px solid #dce2e8;
   border-radius: 8px;
@@ -2012,6 +2307,15 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
   }
 
+  .completed-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .completed-filter-actions,
+  .completed-pagination {
+    justify-content: flex-start;
+  }
+
   .completed-trade-row dl {
     grid-template-columns: repeat(2, minmax(74px, auto) minmax(88px, 1fr));
   }
@@ -2041,6 +2345,10 @@ onUnmounted(() => {
 
   .execution-status-item.wide {
     grid-column: auto;
+  }
+
+  .completed-toolbar {
+    grid-template-columns: 1fr;
   }
 
   .completed-trade-row dl {

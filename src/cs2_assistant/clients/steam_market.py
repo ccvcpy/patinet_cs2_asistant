@@ -948,6 +948,136 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload
 
+    def find_purchase_receipt(
+        self,
+        *,
+        market_hash_name: str,
+        expected_total: float | None = None,
+        earliest_time: int | float | None = None,
+        total_tolerance: float = 0.02,
+        count: int = 100,
+        max_pages: int = 2,
+    ) -> dict[str, Any] | None:
+        """Find an official Steam Market purchase event (event_type=4).
+
+        This is intentionally a narrow reconciliation helper.  It matches the
+        exact market hash name and, when supplied, the paid total and earliest
+        event time so an unrelated historical purchase cannot prove a current
+        profit-trade buy.
+        """
+
+        target_name = str(market_hash_name or "").strip()
+        if not target_name:
+            return None
+        expected_total_cents = (
+            int(round(float(expected_total) * 100.0))
+            if expected_total is not None
+            else None
+        )
+        tolerance_cents = max(0, int(round(float(total_tolerance) * 100.0)))
+        earliest = int(float(earliest_time)) if earliest_time is not None else None
+
+        def purchase_asset_row(
+            assets: Any,
+            purchase_asset: dict[str, Any],
+        ) -> dict[str, Any]:
+            if not isinstance(assets, dict):
+                return {}
+            app_id = str(purchase_asset.get("appid") or "730")
+            app_assets = assets.get(app_id) or assets.get(_safe_int(app_id)) or {}
+            if not isinstance(app_assets, dict):
+                return {}
+            asset_ids = {
+                str(value)
+                for value in (purchase_asset.get("id"), purchase_asset.get("new_id"))
+                if value not in (None, "")
+            }
+            preferred_contexts = [
+                str(value)
+                for value in (
+                    purchase_asset.get("new_contextid"),
+                    "2",
+                    purchase_asset.get("contextid"),
+                )
+                if value not in (None, "")
+            ]
+            context_items = list(app_assets.items())
+            context_items.sort(
+                key=lambda item: (
+                    preferred_contexts.index(str(item[0]))
+                    if str(item[0]) in preferred_contexts
+                    else len(preferred_contexts)
+                )
+            )
+            for _, rows in context_items:
+                if not isinstance(rows, dict):
+                    continue
+                for key, row in rows.items():
+                    if not isinstance(row, dict):
+                        continue
+                    row_asset_id = str(row.get("id") or key or "").strip()
+                    if row_asset_id in asset_ids:
+                        return row
+            return {}
+
+        start = 0
+        page_size = max(1, int(count))
+        for _ in range(max(1, int(max_pages))):
+            payload = self.market_history(start=start, count=page_size)
+            events = payload.get("events") or []
+            purchases = payload.get("purchases") or {}
+            assets = payload.get("assets") or {}
+            if not isinstance(events, list) or not events:
+                return None
+            for event in events:
+                if not isinstance(event, dict) or int(event.get("event_type") or 0) != 4:
+                    continue
+                event_time = _safe_int(event.get("time_event"))
+                if earliest is not None and (event_time is None or event_time < earliest):
+                    continue
+                listing_id = str(event.get("listingid") or "").strip()
+                purchase_id = str(event.get("purchaseid") or "").strip()
+                purchase: dict[str, Any] = {}
+                if isinstance(purchases, dict):
+                    candidate = purchases.get(f"{listing_id}_{purchase_id}") or purchases.get(listing_id)
+                    if isinstance(candidate, dict):
+                        purchase = candidate
+                paid_amount_cents = _safe_int(purchase.get("paid_amount")) or 0
+                paid_fee_cents = _safe_int(purchase.get("paid_fee")) or 0
+                paid_total_cents = paid_amount_cents + paid_fee_cents
+                if (
+                    expected_total_cents is not None
+                    and abs(paid_total_cents - expected_total_cents) > tolerance_cents
+                ):
+                    continue
+                purchase_asset = purchase.get("asset") if isinstance(purchase.get("asset"), dict) else {}
+                asset_row = purchase_asset_row(assets, purchase_asset)
+                receipt_name = str(
+                    asset_row.get("market_hash_name")
+                    or purchase.get("market_hash_name")
+                    or purchase_asset.get("market_hash_name")
+                    or ""
+                ).strip()
+                if receipt_name != target_name:
+                    continue
+                return {
+                    "listingId": listing_id,
+                    "purchaseId": purchase_id,
+                    "timePurchased": event_time,
+                    "paidAmount": round(paid_amount_cents / 100.0, 2),
+                    "paidFee": round(paid_fee_cents / 100.0, 2),
+                    "paidTotal": round(paid_total_cents / 100.0, 2),
+                    "currencyId": purchase.get("currencyid"),
+                    "marketHashName": receipt_name,
+                    "assetId": str(purchase_asset.get("id") or asset_row.get("id") or "") or None,
+                    "newAssetId": str(purchase_asset.get("new_id") or "") or None,
+                }
+            start += page_size
+            total = _safe_int(payload.get("total_count"))
+            if total is not None and start >= total:
+                return None
+        return None
+
     def find_sale_receipt(
         self,
         listing_id: str,
@@ -984,7 +1114,7 @@ class SteamMarketClient:
                 return {
                     "listingId": listing_id,
                     "purchaseId": purchase_id,
-                    "timeSold": event.get("time_event"),
+                    "timeSold": purchase.get("time_sold") or event.get("time_event"),
                     "receivedAmount": received_value,
                     "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
                 }
@@ -1039,7 +1169,7 @@ class SteamMarketClient:
                 return {
                     "listingId": listing_id,
                     "purchaseId": purchase_id,
-                    "timeSold": event.get("time_event"),
+                    "timeSold": purchase.get("time_sold") or event.get("time_event"),
                     "receivedAmount": received_value,
                     "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
                 }

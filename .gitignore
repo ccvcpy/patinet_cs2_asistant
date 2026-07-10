@@ -4,6 +4,7 @@ __pycache__/
 *.db
 data/
 logs/
+profit-trade-api.*.log
 .venv/
 
 .claude/

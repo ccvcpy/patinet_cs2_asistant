@@ -53,7 +53,7 @@ def load_strategy_config(settings: Settings) -> StrategyConfig:
     if not path.exists():
         return StrategyConfig()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return StrategyConfig()
     if not isinstance(data, dict):

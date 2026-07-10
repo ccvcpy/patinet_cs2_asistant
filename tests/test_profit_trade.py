@@ -150,6 +150,15 @@ class FakeStaleListingThenNextSteamBuyClient(FakeSteamBuyClient):
         return {"wallet_info": {"success": 1}}
 
 
+class FakeRemovedListingThenNextSteamBuyClient(FakeStaleListingThenNextSteamBuyClient):
+    def buy_listing(self, **kwargs: object) -> dict:
+        self.buy_calls.append(dict(kwargs))
+        if kwargs.get("listing_id") == "stale-listing":
+            raise SteamMarketError('"购买您的物品时出现问题。该物品可能已被移除。请刷新页面并重试。"')
+        self._wallet_balance -= int(kwargs.get("total") or self.total) / 100.0
+        return {"wallet_info": {"success": 1}}
+
+
 class FakeStaleListingOnlyThenBuyOrderClient(FakeSteamBuyClient):
     def search_listings(self, **kwargs: object) -> dict:
         self.search_listing_calls.append(dict(kwargs))
@@ -203,11 +212,23 @@ class FakeStickerListingSteamBuyClient(FakeSteamBuyClient):
             }
         }
 class FakePendingBuyOrderClient(FakeCommoditySteamBuyClient):
+    def __init__(self, *, total: int = 10000, wallet_balance: float = 1000.0) -> None:
+        super().__init__(total=total, wallet_balance=wallet_balance)
+        self.buy_order_active = False
+
     def create_buy_order(self, **kwargs: object) -> dict:
         self.create_buy_order_calls.append(dict(kwargs))
+        self.buy_order_active = True
         return {"success": 1, "buy_orderid": "buy-order-1"}
 
+    def cancel_buy_order(self, **kwargs: object) -> dict:
+        self.cancel_buy_order_calls.append(dict(kwargs))
+        self.buy_order_active = False
+        return {"success": 1}
+
     def my_listings(self, **kwargs: object) -> dict:
+        if not self.buy_order_active:
+            return {"buy_orders": []}
         return {
             "buy_orders": [
                 {
@@ -221,10 +242,48 @@ class FakePendingBuyOrderClient(FakeCommoditySteamBuyClient):
         }
 
 
+class FakeCancelResponseButOrderRemainsActiveClient(FakePendingBuyOrderClient):
+    def cancel_buy_order(self, **kwargs: object) -> dict:
+        self.cancel_buy_order_calls.append(dict(kwargs))
+        return {"success": 1}
+
+
+class FakeBuyOrderFillsDuringCancelClient(FakePendingBuyOrderClient):
+    def cancel_buy_order(self, **kwargs: object) -> dict:
+        self.cancel_buy_order_calls.append(dict(kwargs))
+        self.buy_order_active = False
+        self._wallet_balance -= self.total / 100.0
+        return {"success": 1}
+
+
+class FakeHistoricalPurchaseClient(FakePendingBuyOrderClient):
+    steam_id64 = "steam-a"
+    account_id = "account-a"
+
+    def __init__(self, *, total: int = 10000, wallet_balance: float = 900.0) -> None:
+        super().__init__(total=total, wallet_balance=wallet_balance)
+        self.purchase_receipt_calls: list[dict] = []
+
+    def find_purchase_receipt(self, **kwargs: object) -> dict:
+        self.purchase_receipt_calls.append(dict(kwargs))
+        return {
+            "listingId": "history-listing-1",
+            "purchaseId": "history-purchase-1",
+            "timePurchased": 1783636423,
+            "paidAmount": 95.0,
+            "paidFee": 5.0,
+            "paidTotal": 100.0,
+            "marketHashName": "AK-47 | Redline (Field-Tested)",
+            "assetId": "history-old-asset",
+            "newAssetId": "asset-b-history",
+        }
+
+
 
 class FakeFilledButListingStaleBuyOrderClient(FakePendingBuyOrderClient):
     def create_buy_order(self, **kwargs: object) -> dict:
         self.create_buy_order_calls.append(dict(kwargs))
+        self.buy_order_active = True
         self._wallet_balance -= int(kwargs.get("price_total") or self.total) / 100.0
         return {"success": 1, "buy_orderid": "buy-order-1"}
 
@@ -906,6 +965,45 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual(report.created_trade_ids[0], payload["trades"][0]["id"])
         self.assertEqual("AK-47 红线（略有磨损）", payload["trades"][0]["name"])
 
+    def test_dashboard_exposes_steam_purchase_time_for_date_filtering(self) -> None:
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            self.config,
+            inventory_payload=self.inventory_payload,
+            market_service=FakeProfitMarketService(),
+            record=True,
+        )
+        trade_id = report.created_trade_ids[0]
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(trade["note"])
+            note["steamBuySucceededAt"] = "2026-07-03T01:02:03+00:00"
+            db.update_profit_trade(
+                trade_id,
+                note=profit_trade_module._build_note(note),
+            )
+        finally:
+            db.close()
+
+        payload = build_profit_trade_dashboard_payload(self.settings)
+        trade = next(row for row in payload["trades"] if row["id"] == trade_id)
+
+        self.assertEqual("2026-07-03T01:02:03+00:00", trade["steamBoughtAt"])
+        self.assertEqual("steamBuySucceededAt", trade["steamBoughtAtSource"])
+
+    def test_steam_purchase_time_falls_back_to_unverified_request_time(self) -> None:
+        bought_at, source = profit_trade_module._profit_trade_steam_bought_at(
+            {
+                "steamBuyUnverifiedAt": "2026-07-08T06:00:49+00:00",
+                "steamBuyRecoveredAt": "2026-07-08T07:05:03+00:00",
+            }
+        )
+
+        self.assertEqual("2026-07-08T06:00:49+00:00", bought_at)
+        self.assertEqual("steamBuyUnverifiedAt", source)
+
     def test_lock_profit_trade_reserves_asset_and_moves_progress(self) -> None:
         report = scan_profit_trade_opportunities(
             self.settings,
@@ -1116,6 +1214,110 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         finally:
             db.close()
 
+    def test_recover_cancelled_legacy_buy_order_from_official_purchase_history(self) -> None:
+        trade_id = self._create_locked_trade()
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.release_asset_reservation(
+                asset_id="asset-a",
+                owner="profit_trade",
+                reason="simulate legacy unsafe dismiss",
+            )
+            db.update_profit_trade(
+                trade_id,
+                status="cancelled",
+                step_key="steam_bought",
+                step_index=3,
+                steam_listing_id="buy-order-old",
+                steam_buy_price=100.0,
+                error="user dismissed old unverified order",
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "steamBuyMethod": "createbuyorder",
+                        "steamBuyOrderId": "buy-order-old",
+                        "steamBuyUnverifiedAt": "2026-07-08T09:37:22+00:00",
+                        "steamId": "steam-a",
+                        "steamAccountId": "account-a",
+                        "beforeAssetIds": ["asset-a"],
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        client = FakeHistoricalPurchaseClient(total=10000)
+        result = recover_unverified_profit_trade_steam_buys(
+            self.settings,
+            config=self.config,
+            steam_client=client,
+            remote_audit=True,
+        )
+
+        self.assertEqual([trade_id], result["recoveredTradeIds"])
+        self.assertEqual(1, len(client.purchase_receipt_calls))
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            self.assertEqual("steam_bought", trade["status"])
+            self.assertEqual("asset-b-history", trade["b_asset_id"])
+            self.assertIsNone(trade["error"])
+            note = profit_trade_module._read_note(trade["note"])
+            self.assertEqual("market_history_event_type_4", note["steamBuyRecoveredBy"])
+            self.assertEqual("history-purchase-1", note["steamPurchaseReceipt"]["purchaseId"])
+            self.assertIsNotNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_remote_recovery_skips_cancelled_order_with_confirmed_cancellation(self) -> None:
+        trade_id = self._create_locked_trade()
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.release_asset_reservation(
+                asset_id="asset-a",
+                owner="profit_trade",
+                reason="simulate confirmed cancellation",
+            )
+            db.update_profit_trade(
+                trade_id,
+                status="cancelled",
+                step_key="steam_bought",
+                step_index=3,
+                steam_listing_id="buy-order-confirmed",
+                steam_buy_price=100.0,
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "steamBuyMethod": "createbuyorder",
+                        "steamBuyOrderId": "buy-order-confirmed",
+                        "steamBuyUnverifiedAt": "2026-07-10T01:00:00+00:00",
+                        "steamBuyOrderCancellationConfirmedAt": "2026-07-10T01:00:02+00:00",
+                        "steamId": "steam-a",
+                        "steamAccountId": "account-a",
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        client = FakeHistoricalPurchaseClient(total=10000)
+        result = recover_unverified_profit_trade_steam_buys(
+            self.settings,
+            config=self.config,
+            steam_client=client,
+            remote_audit=True,
+        )
+
+        self.assertEqual([], result["recoveredTradeIds"])
+        self.assertEqual([], client.purchase_receipt_calls)
+
     def test_dashboard_recovers_legacy_unverified_createbuyorder_before_render(self) -> None:
         trade_id = self._create_legacy_unverified_createbuyorder_trade()
 
@@ -1225,6 +1427,29 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual(["stale-listing"], note["failedSteamListingIds"])
         self.assertEqual("stale-listing", note["staleSteamListingAttempts"][0]["listingId"])
 
+    def test_buy_step_retries_next_listing_when_first_listing_was_removed(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeRemovedListingThenNextSteamBuyClient(total=10000)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("steam_bought", result["trade"]["status"])
+        self.assertEqual("fresh-listing", result["trade"]["steamListingId"])
+        self.assertEqual(["stale-listing", "fresh-listing"], [call["listing_id"] for call in client.buy_calls])
+        note = result["trade"]["note"]
+        self.assertEqual("buylisting", note["steamBuyMethod"])
+        self.assertEqual(["stale-listing"], note["failedSteamListingIds"])
+        self.assertIn("可能已被移除", note["staleSteamListingAttempts"][0]["error"])
+
     def test_buy_step_falls_back_to_createbuyorder_after_excluding_stale_listing(self) -> None:
         trade_id = self._create_locked_trade()
         client = FakeStaleListingOnlyThenBuyOrderClient(total=10000)
@@ -1326,6 +1551,56 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             self.assertIsNone(db.get_active_asset_reservation("asset-a"))
         finally:
             db.close()
+
+    def test_buy_step_stops_retrying_when_cancel_response_does_not_remove_order(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeCancelResponseButOrderRemainsActiveClient(total=10000)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("manual_required", result["trade"]["status"])
+        self.assertEqual(1, len(client.create_buy_order_calls))
+        self.assertEqual(1, len(client.cancel_buy_order_calls))
+        note = result["trade"]["note"]
+        self.assertEqual("uncertain", note["unverifiedBuyOrderAttempts"][0]["resolution"])
+        self.assertTrue(note["activeBuyOrdersAfterCancel"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNotNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_buy_step_recovers_fill_that_happens_while_cancelling_order(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeBuyOrderFillsDuringCancelClient(total=10000)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("steam_bought", result["trade"]["status"])
+        self.assertEqual(1, len(client.create_buy_order_calls))
+        self.assertEqual(1, len(client.cancel_buy_order_calls))
+        note = result["trade"]["note"]
+        self.assertIn("wallet_balance_delta", note["steamBuyVerifiedBy"])
+        self.assertEqual("purchased", note["unverifiedBuyOrderAttempts"][0]["resolution"])
     def test_buy_step_accepts_inventory_new_asset_even_when_buy_order_still_listed(self) -> None:
         trade_id = self._create_locked_trade()
         client = FakeFilledButListingStaleBuyOrderClient(total=10000)
@@ -1811,8 +2086,134 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         try:
             db.initialize()
             trade = db.get_profit_trade(trade_id)
+            self.assertEqual("c5_listed", trade["status"])
+            self.assertIn("productId/assetId", trade["error"])
+            note = profit_trade_module._read_note(trade["note"])
+            self.assertEqual("c5-product-1", note["missingSellerOrderProductId"])
+            self.assertEqual(1, note["c5SaleSyncPendingProbeCount"])
+        finally:
+            db.close()
+
+    def test_refresh_sales_escalates_missing_listing_to_manual_after_sync_window(self) -> None:
+        trade_id = self._create_locked_trade()
+        execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=FakeSteamBuyClient(total=10000),
+        )
+        execute_profit_trade_list_c5(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            c5_client=FakeC5SaleClient(active_product_ids=["c5-product-1"]),
+        )
+        first_missing_at = datetime.now(timezone.utc) - timedelta(hours=3, minutes=1)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(trade["note"])
+            db.update_profit_trade(
+                trade_id,
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "c5SaleSyncPendingFirstAt": first_missing_at.isoformat(),
+                        "c5SaleSyncPendingProbeCount": 2,
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        result = refresh_profit_trade_sales(
+            self.settings,
+            profit_config(
+                listing_check_interval_minutes=0,
+                profit_trade_c5_current_sale_net_factor=0.99,
+            ),
+            c5_client=FakeC5SaleClient(active_product_ids=[]),
+        )
+
+        self.assertEqual([], result["settledTradeIds"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
             self.assertEqual("manual_required", trade["status"])
-            self.assertIn("no matching seller sold order", trade["error"])
+            self.assertIn("more than 3 hours", trade["error"])
+            note = profit_trade_module._read_note(trade["note"])
+            self.assertEqual(3, note["c5SaleSyncPendingProbeCount"])
+        finally:
+            db.close()
+
+    def test_refresh_sales_rechecks_manual_required_c5_listed_trade(self) -> None:
+        trade_id = self._create_locked_trade()
+        execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=FakeSteamBuyClient(total=10000),
+        )
+        execute_profit_trade_list_c5(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            c5_client=FakeC5SaleClient(active_product_ids=["c5-product-1"]),
+        )
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(trade["note"])
+            db.update_profit_trade(
+                trade_id,
+                status="manual_required",
+                error="legacy manual state before sale sync retry",
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "settlementBlockedAt": datetime.now(timezone.utc).isoformat(),
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        c5_client = FakeC5SaleClient(active_product_ids=[])
+        c5_client.seller_orders = {
+            "steam-a": [
+                {
+                    "orderId": "seller-order-1",
+                    "productId": "c5-product-1",
+                    "price": 97.91,
+                    "status": 10,
+                    "statusName": "success",
+                }
+            ]
+        }
+        c5_client.seller_order_details = {
+            "seller-order-1": {"orderId": "seller-order-1", "getMoney": 97.91, "actualPay": 98.9}
+        }
+
+        second_result = refresh_profit_trade_sales(
+            self.settings,
+            profit_config(
+                listing_check_interval_minutes=0,
+                profit_trade_c5_current_sale_net_factor=0.99,
+            ),
+            c5_client=c5_client,
+        )
+
+        self.assertEqual([trade_id], second_result["settledTradeIds"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            self.assertEqual("completed", trade["status"])
+            self.assertAlmostEqual(97.91, trade["c5_sold_net_price"])
+            self.assertIsNone(trade["error"])
         finally:
             db.close()
 
@@ -1874,6 +2275,116 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             note = profit_trade_module._read_note(trade["note"])
             self.assertEqual("seller-order-1", note["c5SellerOrderId"])
             self.assertEqual("seller_order_detail_get_money", note["c5SoldNetPriceSource"])
+        finally:
+            db.close()
+
+    def test_refresh_sales_matches_seller_order_by_asset_id_when_product_id_differs(self) -> None:
+        trade_id = self._create_locked_trade()
+        execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=FakeSteamBuyClient(total=10000),
+        )
+        execute_profit_trade_list_c5(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            c5_client=FakeC5SaleClient(active_product_ids=["c5-product-1"]),
+        )
+        c5_client = FakeC5SaleClient(active_product_ids=[])
+        c5_client.seller_orders = {
+            "steam-a": [
+                {
+                    "orderId": "seller-order-asset",
+                    "productId": "different-product-id",
+                    "price": 97.91,
+                    "status": 10,
+                    "statusName": "success",
+                    "marketHashName": "AK-47 | Redline (Field-Tested)",
+                    "assetInfo": {
+                        "assetId": "asset-a",
+                        "originalAssetId": "asset-a",
+                    },
+                }
+            ]
+        }
+        c5_client.seller_order_details = {
+            "seller-order-asset": {"orderId": "seller-order-asset", "getMoney": 97.91}
+        }
+
+        result = refresh_profit_trade_sales(
+            self.settings,
+            profit_config(
+                listing_check_interval_minutes=0,
+                profit_trade_c5_current_sale_net_factor=0.99,
+            ),
+            c5_client=c5_client,
+        )
+
+        self.assertEqual([trade_id], result["settledTradeIds"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            self.assertEqual("completed", trade["status"])
+            self.assertAlmostEqual(97.91, trade["c5_sold_net_price"])
+            note = profit_trade_module._read_note(trade["note"])
+            self.assertEqual("seller-order-asset", note["c5SellerOrderId"])
+            self.assertEqual("different-product-id", note["c5SellerOrderProductId"])
+        finally:
+            db.close()
+
+    def test_refresh_sales_uses_seller_order_list_price_when_detail_net_is_outlier(self) -> None:
+        trade_id = self._create_locked_trade()
+        execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=FakeSteamBuyClient(total=2136),
+        )
+        execute_profit_trade_list_c5(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            c5_client=FakeC5SaleClient(active_product_ids=["c5-product-1"]),
+        )
+        c5_client = FakeC5SaleClient(active_product_ids=[])
+        c5_client.seller_orders = {
+            "steam-a": [
+                {
+                    "orderId": "seller-order-1",
+                    "productId": "c5-product-1",
+                    "price": 15.9,
+                    "status": 10,
+                    "statusName": "success",
+                }
+            ]
+        }
+        c5_client.seller_order_details = {
+            "seller-order-1": {"orderId": "seller-order-1", "getMoney": 2.42, "actualPay": 2.58}
+        }
+
+        result = refresh_profit_trade_sales(
+            self.settings,
+            profit_config(
+                listing_check_interval_minutes=0,
+                profit_trade_c5_current_sale_net_factor=0.99,
+            ),
+            c5_client=c5_client,
+        )
+
+        self.assertEqual([trade_id], result["settledTradeIds"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            self.assertEqual("completed", trade["status"])
+            self.assertAlmostEqual(15.9, trade["c5_sold_net_price"])
+            self.assertAlmostEqual(15.9 - 14.7384, trade["realized_profit"])
+            self.assertAlmostEqual(15.9 / 21.36 - 0.69, trade["realized_roi"])
+            note = profit_trade_module._read_note(trade["note"])
+            self.assertEqual("seller_order_list_price_detail_net_outlier", note["c5SoldNetPriceSource"])
         finally:
             db.close()
 
@@ -2461,6 +2972,155 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual("cancelled", result["trade"]["status"])
         dashboard = build_profit_trade_dashboard_payload(self.settings)
         self.assertNotIn(trade_id, [trade["id"] for trade in dashboard["trades"]])
+
+    def test_dismiss_tracked_buy_order_cancels_and_confirms_before_hiding(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakePendingBuyOrderClient(total=10000)
+        client.create_buy_order(price_total=10000)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.update_profit_trade(
+                trade_id,
+                status="manual_required",
+                step_key="steam_bought",
+                step_index=3,
+                steam_listing_id="buy-order-1",
+                steam_buy_price=100.0,
+                error="unverified Steam buy order",
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "steamBuyMethod": "createbuyorder",
+                        "steamBuyOrderId": "buy-order-1",
+                        "steamBuyUnverifiedAt": "2026-07-10T01:00:00+00:00",
+                        "steamId": "steam-a",
+                        "walletBalanceBefore": 1000.0,
+                        "beforeAssetIds": ["asset-a"],
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        result = dismiss_profit_trade(
+            self.settings,
+            trade_id,
+            reason="user requested safe close",
+            steam_client=client,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(1, len(client.cancel_buy_order_calls))
+        note = result["trade"]["note"]
+        self.assertEqual("cancelled", note["dismissBuyOrderResolution"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_dismiss_tracked_buy_order_refuses_to_hide_when_order_remains_active(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeCancelResponseButOrderRemainsActiveClient(total=10000)
+        client.create_buy_order(price_total=10000)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.update_profit_trade(
+                trade_id,
+                status="manual_required",
+                step_key="steam_bought",
+                step_index=3,
+                steam_listing_id="buy-order-1",
+                steam_buy_price=100.0,
+                error="unverified Steam buy order",
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "steamBuyMethod": "createbuyorder",
+                        "steamBuyOrderId": "buy-order-1",
+                        "steamBuyUnverifiedAt": "2026-07-10T01:00:00+00:00",
+                        "steamId": "steam-a",
+                        "walletBalanceBefore": 1000.0,
+                        "beforeAssetIds": ["asset-a"],
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        with self.assertRaisesRegex(RuntimeError, "still active|cannot safely hide"):
+            dismiss_profit_trade(
+                self.settings,
+                trade_id,
+                reason="user requested safe close",
+                steam_client=client,
+            )
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            self.assertEqual("manual_required", trade["status"])
+            self.assertIsNotNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_dismiss_tracked_buy_order_restores_trade_when_cancel_races_with_fill(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeBuyOrderFillsDuringCancelClient(total=10000)
+        client.create_buy_order(price_total=10000)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.update_profit_trade(
+                trade_id,
+                status="manual_required",
+                step_key="steam_bought",
+                step_index=3,
+                steam_listing_id="buy-order-1",
+                steam_buy_price=100.0,
+                error="unverified Steam buy order",
+                note=profit_trade_module._build_note(
+                    {
+                        **note,
+                        "steamBuyMethod": "createbuyorder",
+                        "steamBuyOrderId": "buy-order-1",
+                        "steamBuyUnverifiedAt": "2026-07-10T01:00:00+00:00",
+                        "steamId": "steam-a",
+                        "walletBalanceBefore": 1000.0,
+                        "beforeAssetIds": ["asset-a"],
+                    }
+                ),
+            )
+        finally:
+            db.close()
+
+        result = dismiss_profit_trade(
+            self.settings,
+            trade_id,
+            reason="user requested safe close",
+            steam_client=client,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["dismissed"])
+        self.assertEqual("steam_bought", result["trade"]["status"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNotNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
 
     def test_dismiss_profit_trade_blocks_live_c5_listed_trade(self) -> None:
         trade_id = self._create_c5_listed_trade(listed_hours_ago=1.0)

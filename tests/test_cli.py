@@ -721,7 +721,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
 
         text = output.getvalue()
         self.assertIn("口径:\n", text)
-        self.assertIn("  - 主表按 Steam 官方卖出时间对账本时间段钱包入账。", text)
+        self.assertIn("  - 主表优先按 Steam 官方卖出时间归期；官方时间缺失时，按程序确认卖出时间归期。", text)
         self.assertIn("本期历史补仓", text)
         self.assertIn("本期历史未闭环", text)
         self.assertNotIn("口径: 按 C5 补仓完成时间统计", text)
@@ -885,6 +885,64 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertEqual(1, report["steamSoldInRange"]["summary"]["count"])
         self.assertEqual(173.8, report["steamSoldInRange"]["summary"]["steamNet"])
         self.assertEqual(["Revolution Case"], [row["marketHashName"] for row in report["steamSoldInRange"]["items"]])
+
+    def test_guadao_discount_report_uses_program_sold_time_when_official_time_is_missing(self) -> None:
+        closed_sell_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=1.79,
+            asset_id="asset-missing-time-closed",
+            note=json.dumps({"steamListPrice": 1.79, "steamSellerNetPrice": 1.56}),
+        )
+        self.db.update_pool_operation(closed_sell_id, status="sold", actual_price=1.79)
+        self._set_completed_at(closed_sell_id, "2026-07-08T22:58:11+00:00")
+        rebuy_id = self.db.add_pool_operation(
+            market_hash_name="Kilowatt Case",
+            strategy="guadao",
+            operation_type="rebuy_on_c5",
+            expected_price=1.06,
+            note=json.dumps({"sourceSellOperationId": closed_sell_id, "steamListPrice": 1.79}),
+        )
+        self.db.update_pool_operation(rebuy_id, status="completed", actual_price=1.06)
+        self._set_completed_at(rebuy_id, "2026-07-09T00:00:00+00:00")
+
+        unclosed_sell_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy="guadao",
+            operation_type="sell_on_steam",
+            expected_price=2.50,
+            asset_id="asset-missing-time-unclosed",
+            note=json.dumps({"steamListPrice": 2.50, "steamSellerNetPrice": 2.18}),
+        )
+        self.db.update_pool_operation(unclosed_sell_id, status="sold", actual_price=2.50)
+        self._set_completed_at(unclosed_sell_id, "2026-07-08T23:10:00+00:00")
+
+        report = _build_guadao_discount_report(
+            self.db,
+            start_utc="2026-07-08T00:00:00+00:00",
+            end_utc="2026-07-09T23:59:59+00:00",
+            steam_net_factor=0.869,
+        )
+
+        self.assertEqual(2, report["steamSoldInRange"]["summary"]["count"])
+        self.assertEqual(1, report["steamSoldReconciliation"]["closed"]["count"])
+        self.assertEqual(1.56, report["steamSoldReconciliation"]["closed"]["steamNet"])
+        self.assertEqual(1, report["steamSoldReconciliation"]["unclosed"]["count"])
+        self.assertEqual(2.18, report["steamSoldReconciliation"]["unclosed"]["steamNet"])
+        self.assertEqual(2, report["steamSoldMissingSoldAt"]["summary"]["count"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_guadao_discount_report(
+                report,
+                start_local=datetime(2026, 7, 8, tzinfo=timezone.utc),
+                end_local=datetime(2026, 7, 9, 23, 59, 59, tzinfo=timezone.utc),
+                show_detail=False,
+            )
+        text = output.getvalue()
+        self.assertIn("程序时间归期", text)
+        self.assertIn("程序确认卖出时间计入上方本期已闭环或本期未闭环", text)
 
     def test_guadao_discount_report_counts_only_confirmed_c5_success_for_new_orders(self) -> None:
         self._add_closed_cycle(

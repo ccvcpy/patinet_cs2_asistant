@@ -2473,7 +2473,7 @@ def _build_sold_steam_time_summary(
     detail_rows: list[dict[str, Any]] = []
     latest_rebuys = _load_latest_rebuys_by_source_id(db)
     for sell in sold_rows:
-        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        sold_at = _sell_steam_sold_at(sell)
         if sold_at is None:
             continue
         if start_dt is not None and sold_at < start_dt:
@@ -2598,7 +2598,7 @@ def _build_sold_steam_reconciliation_summary(
     ignored = _empty_guadao_report_summary()
 
     for sell in sold_rows:
-        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        sold_at = _sell_steam_sold_at(sell)
         if sold_at is None:
             continue
         if start_dt is not None and sold_at < start_dt:
@@ -2660,7 +2660,7 @@ def _build_historical_unclosed_sold_steam_summary(
     summary = _empty_guadao_report_summary()
 
     for sell in sold_rows:
-        sold_at = _sell_steam_sold_at(sell, allow_completed_fallback=False)
+        sold_at = _sell_steam_sold_at(sell)
         if sold_at is None:
             continue
         if start_dt is not None and sold_at >= start_dt:
@@ -2774,11 +2774,7 @@ def _build_guadao_discount_report(
         _add_guadao_report_row(summary, detail)
         item_summary = item_summaries.setdefault(item_name, _empty_guadao_report_summary())
         _add_guadao_report_row(item_summary, detail)
-        sell_sold_at = (
-            _sell_steam_sold_at(sell, allow_completed_fallback=False)
-            if sell is not None
-            else None
-        )
+        sell_sold_at = _sell_steam_sold_at(sell) if sell is not None else None
         if (
             sell_sold_at is not None
             and (
@@ -3018,7 +3014,7 @@ def _print_guadao_discount_report(
     )
     _print_guadao_notes(
         [
-            "主表按 Steam 官方卖出时间对账本时间段钱包入账。",
+            "主表优先按 Steam 官方卖出时间归期；官方时间缺失时，按程序确认卖出时间归期。",
             "本期已闭环 = 本期 Steam 卖出，且截至结束时间已成功 C5 补仓。",
             "本期未闭环 = 本期 Steam 卖出，但截至结束时间仍未成功 C5 补仓。",
             "本期历史补仓 = 历史 Steam 卖出，本期完成 C5 补仓；不计入本期 Steam 入账。",
@@ -3052,11 +3048,14 @@ def _print_guadao_discount_report(
     missing_sold_at = report.get("steamSoldMissingSoldAt", {}).get("summary", _empty_guadao_report_summary())
     if missing_sold_at["count"]:
         _print_guadao_summary_table(
-            "成交时间缺失:",
-            [("缺少Steam时间", missing_sold_at, False)],
+            "程序时间归期（已计入主表）:",
+            [("缺官方时间", missing_sold_at, False)],
         )
         _print_guadao_explanation(
-            ["这些流水缺少 Steam 官方成交时间，不能直接用于本时间段钱包入账对账。"]
+            [
+                "这些流水缺少 Steam 官方成交时间，已按程序确认卖出时间计入上方本期已闭环或本期未闭环。",
+                "该分组仅用于提示时间来源，不要与主表重复相加。",
+            ]
         )
     if not report["items"]:
         print("本时间段没有已完成 C5 补仓的挂刀闭环。")

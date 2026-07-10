@@ -1330,6 +1330,7 @@ class Database:
             "realized_roi",
             "error",
             "note",
+            "completed_at",
         }
         parts: list[str] = []
         params: list[Any] = []
@@ -1343,7 +1344,7 @@ class Database:
         parts.append("updated_at = ?")
         params.append(utc_now_iso())
         status = fields.get("status")
-        if status in {"completed", "failed", "manual_required", "cancelled"}:
+        if status in {"completed", "failed", "manual_required", "cancelled"} and "completed_at" not in fields:
             parts.append("completed_at = ?")
             params.append(utc_now_iso())
         params.append(trade_id)
