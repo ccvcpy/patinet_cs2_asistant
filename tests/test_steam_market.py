@@ -11,10 +11,18 @@ from cs2_assistant.clients.steam_market import SteamListing, SteamMarketClient, 
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict[str, object], *, status_code: int = 200, text: str = "") -> None:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        status_code: int = 200,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
         self.text = text
+        self.headers = dict(headers or {})
 
     def json(self) -> dict[str, object]:
         return self._payload
@@ -32,6 +40,105 @@ class _FakeResponse:
 
 
 class SteamMarketClientTests(unittest.TestCase):
+    def test_request_telemetry_captures_429_without_changing_relogin_or_retry(self) -> None:
+        events: list[dict[str, object]] = []
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            telemetry_callback=events.append,
+            telemetry_context={"source": "profit_trade", "trade_no": "PT-429"},
+        )
+        client._try_account_relogin = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("429 must not trigger relogin")
+        )
+        calls = 0
+
+        def fake_request(**kwargs: object) -> _FakeResponse:
+            nonlocal calls
+            calls += 1
+            return _FakeResponse(
+                {"success": False},
+                status_code=429,
+                headers={"Retry-After": "7"},
+            )
+
+        client._session.request = fake_request  # type: ignore[method-assign]
+
+        with self.assertRaises(SteamMarketError) as caught:
+            client.search_listings(
+                app_id=730,
+                market_hash_name="USP-S | Tropical Breeze (Factory New)",
+            )
+
+        self.assertEqual(1, calls)
+        self.assertEqual(429, caught.exception.status_code)
+        self.assertEqual("7", caught.exception.retry_after)
+        request_events = [event for event in events if event.get("operation") == "search_listings"]
+        self.assertEqual(2, len(request_events))
+        self.assertEqual("DEBUG", request_events[0]["level"])
+        failure = request_events[1]
+        self.assertEqual("ERROR", failure["level"])
+        self.assertEqual(429, failure["status_code"])
+        self.assertEqual("7", failure["retry_after"])
+        self.assertEqual("PT-429", failure["trade_no"])
+        self.assertEqual("profit_trade", failure["source"])
+        self.assertEqual("POST", failure["method"])
+        self.assertNotIn("session-1", str(request_events))
+
+    def test_telemetry_callback_failure_does_not_change_steam_request(self) -> None:
+        def broken_callback(event: dict[str, object]) -> None:
+            raise RuntimeError("logging is unavailable")
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            telemetry_callback=broken_callback,
+            telemetry_context={"source": "profit_trade"},
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": True, "rgCompactSellOrders": []}
+        )
+
+        payload = client.order_book(app_id=730, market_hash_name="Kilowatt Case")
+
+        self.assertTrue(payload["success"])
+
+    def test_get_transport_retry_count_remains_three_with_telemetry(self) -> None:
+        events: list[dict[str, object]] = []
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            telemetry_callback=events.append,
+            telemetry_context={"source": "profit_trade"},
+        )
+        outcomes: list[object] = [
+            requests.Timeout("first timeout"),
+            requests.ConnectionError("second connection failure"),
+            _FakeResponse({"success": True}),
+        ]
+
+        def fake_request(**kwargs: object) -> _FakeResponse:
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            assert isinstance(outcome, _FakeResponse)
+            return outcome
+
+        client._session.request = fake_request  # type: ignore[method-assign]
+        with patch("cs2_assistant.clients.steam_market.time.sleep") as sleep_mock:
+            response = client._request("GET", "/market/mylistings")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], outcomes)
+        self.assertEqual(2, sleep_mock.call_count)
+        starts = [
+            event
+            for event in events
+            if event.get("operation") == "my_listings"
+            and (event.get("safe_context") or {}).get("phase") == "start"  # type: ignore[union-attr]
+        ]
+        self.assertEqual([1, 2, 3], [event["attempt"] for event in starts])
+
     def test_confirm_all_refuses_unscoped_confirmation(self) -> None:
         client = SteamMarketClient(
             cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",

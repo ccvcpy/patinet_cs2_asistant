@@ -2,11 +2,46 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from cs2_assistant.models import CatalogItem, MarketState, POOL_STATUS_HOLDING
 from cs2_assistant.utils import ensure_parent_dir, utc_now_iso
+
+
+PROFIT_TRADE_OBSERVABILITY_TABLES = frozenset(
+    {
+        "profit_trade_roi_watch",
+        "profit_trade_roi_observations",
+        "profit_trade_state_events",
+        "profit_trade_acknowledgements",
+    }
+)
+
+
+def _emit_profit_trade_local_event(
+    *,
+    component: str,
+    operation: str,
+    message: str,
+    **fields: Any,
+) -> None:
+    """Best-effort Profit Trade event emission after a committed DB change."""
+
+    try:
+        from cs2_assistant.services.profit_trade_logging import get_profit_trade_event_logger
+
+        get_profit_trade_event_logger().emit(
+            provider="local",
+            component=component,
+            operation=operation,
+            message=message,
+            **fields,
+        )
+    except Exception:
+        # Observability must never make a committed trading transition fail.
+        return
 
 
 class Database:
@@ -19,7 +54,39 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
+    def _backup_before_profit_trade_observability_upgrade(self) -> Path | None:
+        """Back up an existing legacy DB once before adding observability tables."""
+
+        if str(self.path) == ":memory:" or not self.path.exists():
+            return None
+        existing_tables = {
+            str(row[0])
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "profit_trades" not in existing_tables:
+            return None
+        if PROFIT_TRADE_OBSERVABILITY_TABLES.issubset(existing_tables):
+            return None
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        suffix = self.path.suffix or ".db"
+        base_name = f"{self.path.stem}.pre-profit-trade-observability-{timestamp}"
+        backup_path = self.path.with_name(f"{base_name}{suffix}")
+        counter = 1
+        while backup_path.exists():
+            backup_path = self.path.with_name(f"{base_name}-{counter}{suffix}")
+            counter += 1
+        backup_conn = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup_conn)
+        finally:
+            backup_conn.close()
+        return backup_path
+
     def initialize(self) -> None:
+        self._backup_before_profit_trade_observability_upgrade()
         self.conn.executescript(
             """
             PRAGMA foreign_keys = ON;
@@ -234,6 +301,106 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_profit_trades_asset
             ON profit_trades(a_asset_id, status);
+
+            CREATE TABLE IF NOT EXISTS profit_trade_roi_watch (
+                market_hash_name TEXT PRIMARY KEY,
+                name_cn TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                steam_buy_price REAL,
+                steam_price_source TEXT,
+                c5_listing_price REAL,
+                c5_price_source TEXT,
+                c5_expected_net_price REAL,
+                balance_discount REAL,
+                expected_profit REAL,
+                expected_roi REAL,
+                min_roi REAL,
+                manual_review_roi REAL,
+                inventory_count INTEGER,
+                tradable_count INTEGER,
+                c5_recent_sold_net_price REAL,
+                c5_recent_sold_count INTEGER,
+                c5_current_sell_price REAL,
+                c5_on_sale_count INTEGER,
+                c5_purchase_max_price REAL,
+                c5_purchase_count INTEGER,
+                risk_status TEXT,
+                risk_reason TEXT,
+                execution_status TEXT NOT NULL,
+                execution_reason TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                exited_at TEXT,
+                exit_reason TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trade_roi_watch_active_roi
+            ON profit_trade_roi_watch(active, expected_roi DESC, last_observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS profit_trade_roi_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT NOT NULL,
+                market_hash_name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                steam_buy_price REAL,
+                c5_listing_price REAL,
+                c5_expected_net_price REAL,
+                balance_discount REAL,
+                expected_profit REAL,
+                expected_roi REAL,
+                min_roi REAL,
+                manual_review_roi REAL,
+                inventory_count INTEGER,
+                tradable_count INTEGER,
+                risk_status TEXT,
+                risk_reason TEXT,
+                execution_status TEXT,
+                execution_reason TEXT,
+                exit_reason TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trade_roi_observations_name_time
+            ON profit_trade_roi_observations(market_hash_name, observed_at DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trade_roi_observations_scan
+            ON profit_trade_roi_observations(scan_id, id);
+
+            CREATE TABLE IF NOT EXISTS profit_trade_state_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                status_from TEXT,
+                status_to TEXT NOT NULL,
+                step_key_from TEXT,
+                step_key_to TEXT NOT NULL,
+                step_index_from INTEGER,
+                step_index_to INTEGER NOT NULL,
+                reason TEXT,
+                log_event_id TEXT,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (trade_id) REFERENCES profit_trades(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trade_state_events_trade_time
+            ON profit_trade_state_events(trade_id, created_at, id);
+
+            CREATE TABLE IF NOT EXISTS profit_trade_acknowledgements (
+                trade_id INTEGER PRIMARY KEY,
+                acknowledged INTEGER NOT NULL DEFAULT 1,
+                reason TEXT,
+                acknowledged_at TEXT,
+                restored_at TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (trade_id) REFERENCES profit_trades(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profit_trade_acknowledgements_state
+            ON profit_trade_acknowledgements(acknowledged, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -862,7 +1029,7 @@ class Database:
                 steam_id = excluded.steam_id,
                 tradable = excluded.tradable,
                 status = CASE
-                    WHEN inventory_assets.status IN ('listed', 'sold', 'listing_pending', 'listing_failed') THEN inventory_assets.status
+                    WHEN inventory_assets.status IN ('listed', 'sold', 'listing_pending') THEN inventory_assets.status
                     ELSE excluded.status
                 END,
                 last_seen_at = excluded.last_seen_at
@@ -1245,70 +1412,104 @@ class Database:
         note: str | None = None,
     ) -> int:
         now = utc_now_iso()
-        cursor = self.conn.execute(
-            """
-            INSERT INTO profit_trades (
-                trade_no,
-                market_hash_name,
-                status,
-                step_key,
-                step_index,
-                a_asset_id,
-                a_steam_id,
-                b_asset_id,
-                steam_listing_id,
-                c5_product_id,
-                steam_buy_price,
-                steam_balance_discount,
-                steam_real_cost,
-                c5_listing_price,
-                c5_expected_net_price,
-                c5_sold_net_price,
-                expected_profit,
-                realized_profit,
-                expected_roi,
-                realized_roi,
-                error,
-                note,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade_no,
-                market_hash_name,
-                status,
-                step_key,
-                step_index,
-                a_asset_id,
-                a_steam_id,
-                b_asset_id,
-                steam_listing_id,
-                c5_product_id,
-                steam_buy_price,
-                steam_balance_discount,
-                steam_real_cost,
-                c5_listing_price,
-                c5_expected_net_price,
-                c5_sold_net_price,
-                expected_profit,
-                realized_profit,
-                expected_roi,
-                realized_roi,
-                error,
-                note,
-                now,
-                now,
-            ),
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO profit_trades (
+                    trade_no,
+                    market_hash_name,
+                    status,
+                    step_key,
+                    step_index,
+                    a_asset_id,
+                    a_steam_id,
+                    b_asset_id,
+                    steam_listing_id,
+                    c5_product_id,
+                    steam_buy_price,
+                    steam_balance_discount,
+                    steam_real_cost,
+                    c5_listing_price,
+                    c5_expected_net_price,
+                    c5_sold_net_price,
+                    expected_profit,
+                    realized_profit,
+                    expected_roi,
+                    realized_roi,
+                    error,
+                    note,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_no,
+                    market_hash_name,
+                    status,
+                    step_key,
+                    step_index,
+                    a_asset_id,
+                    a_steam_id,
+                    b_asset_id,
+                    steam_listing_id,
+                    c5_product_id,
+                    steam_buy_price,
+                    steam_balance_discount,
+                    steam_real_cost,
+                    c5_listing_price,
+                    c5_expected_net_price,
+                    c5_sold_net_price,
+                    expected_profit,
+                    realized_profit,
+                    expected_roi,
+                    realized_roi,
+                    error,
+                    note,
+                    now,
+                    now,
+                ),
+            )
+            trade_id = int(cursor.lastrowid)
+            self.conn.execute(
+                """
+                INSERT INTO profit_trade_state_events (
+                    trade_id,
+                    event_type,
+                    status_from,
+                    status_to,
+                    step_key_from,
+                    step_key_to,
+                    step_index_from,
+                    step_index_to,
+                    reason,
+                    context_json,
+                    created_at
+                ) VALUES (?, 'created', NULL, ?, NULL, ?, NULL, ?, ?, '{}', ?)
+                """,
+                (trade_id, status, step_key, int(step_index), error, now),
+            )
+        _emit_profit_trade_local_event(
+            component="profit_trade_state_machine",
+            operation="trade_created",
+            message="Profit Trade record created",
+            trade_id=trade_id,
+            trade_no=trade_no,
+            market_hash_name=market_hash_name,
+            asset_id=a_asset_id,
+            state_to=status,
+            step_to=step_key,
+            safe_context={"step_index": int(step_index), "reason": error},
         )
-        self.conn.commit()
-        return int(cursor.lastrowid)
+        return trade_id
 
     def update_profit_trade(
         self,
         trade_id: int,
         **fields: Any,
     ) -> None:
+        event_reason = fields.pop("_event_reason", None)
+        event_context = fields.pop("_event_context", None)
+        log_event_id = fields.pop("_log_event_id", None)
         allowed = {
             "status",
             "step_key",
@@ -1341,18 +1542,89 @@ class Database:
             params.append(value)
         if not parts:
             return
+        current = self.get_profit_trade(trade_id)
+        if current is None:
+            return
+        now = utc_now_iso()
         parts.append("updated_at = ?")
-        params.append(utc_now_iso())
+        params.append(now)
         status = fields.get("status")
         if status in {"completed", "failed", "manual_required", "cancelled"} and "completed_at" not in fields:
             parts.append("completed_at = ?")
-            params.append(utc_now_iso())
+            params.append(now)
         params.append(trade_id)
-        self.conn.execute(
-            f"UPDATE profit_trades SET {', '.join(parts)} WHERE id = ?",
-            tuple(params),
+        status_from = str(current["status"] or "")
+        status_to = str(fields.get("status", current["status"]) or "")
+        step_key_from = str(current["step_key"] or "")
+        step_key_to = str(fields.get("step_key", current["step_key"]) or "")
+        step_index_from = int(current["step_index"] or 0)
+        step_index_to = int(fields.get("step_index", current["step_index"]) or 0)
+        state_changed = (
+            status_from != status_to
+            or step_key_from != step_key_to
+            or step_index_from != step_index_to
         )
-        self.conn.commit()
+        if event_reason is None:
+            event_reason = fields.get("error")
+        if not isinstance(event_context, dict):
+            event_context = {}
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE profit_trades SET {', '.join(parts)} WHERE id = ?",
+                tuple(params),
+            )
+            if state_changed:
+                self.conn.execute(
+                    """
+                    INSERT INTO profit_trade_state_events (
+                        trade_id,
+                        event_type,
+                        status_from,
+                        status_to,
+                        step_key_from,
+                        step_key_to,
+                        step_index_from,
+                        step_index_to,
+                        reason,
+                        log_event_id,
+                        context_json,
+                        created_at
+                    ) VALUES (?, 'transition', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        status_from,
+                        status_to,
+                        step_key_from,
+                        step_key_to,
+                        step_index_from,
+                        step_index_to,
+                        str(event_reason) if event_reason is not None else None,
+                        str(log_event_id) if log_event_id is not None else None,
+                        json.dumps(event_context, ensure_ascii=False),
+                        now,
+                    ),
+                )
+        if state_changed:
+            _emit_profit_trade_local_event(
+                component="profit_trade_state_machine",
+                operation="state_transition",
+                message="Profit Trade state changed",
+                trade_id=trade_id,
+                trade_no=str(current["trade_no"] or "") or None,
+                market_hash_name=str(current["market_hash_name"] or "") or None,
+                asset_id=str(current["a_asset_id"] or "") or None,
+                state_from=status_from,
+                state_to=status_to,
+                step_from=step_key_from,
+                step_to=step_key_to,
+                safe_context={
+                    "step_index_from": step_index_from,
+                    "step_index_to": step_index_to,
+                    "reason": event_reason,
+                    "context": event_context,
+                },
+            )
 
     def get_profit_trade(self, trade_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
@@ -1387,6 +1659,782 @@ class Database:
         sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
         params.append(limit)
         return self.conn.execute(sql, tuple(params)).fetchall()
+
+    # ------------------------------------------------------------------
+    # Profit Trade observability
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _profit_trade_roi_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        keys = set(row.keys())
+        is_active = bool(row["active"]) if "active" in keys else None
+        execution_status_code = str(row["execution_status"] or "watch_only")
+        if is_active is False:
+            execution_status = "exited"
+        elif execution_status_code == "executable":
+            execution_status = "executable"
+        elif execution_status_code == "manual_review":
+            execution_status = "manual_review"
+        elif execution_status_code in {"c5_risk_blocked", "ai_audit_blocked"}:
+            execution_status = "blocked"
+        else:
+            execution_status = "observe_only"
+        return {
+            "id": int(row["id"]) if "id" in keys and row["id"] is not None else None,
+            "scanId": row["scan_id"] if "scan_id" in keys else None,
+            "marketHashName": row["market_hash_name"],
+            "name": row["name_cn"] if "name_cn" in keys else None,
+            "active": is_active,
+            "eventType": row["event_type"] if "event_type" in keys else None,
+            "steamBuyPrice": row["steam_buy_price"],
+            "steamPriceSource": row["steam_price_source"] if "steam_price_source" in keys else None,
+            "c5ListingPrice": row["c5_listing_price"],
+            "c5PriceSource": row["c5_price_source"] if "c5_price_source" in keys else None,
+            "c5ExpectedNetPrice": row["c5_expected_net_price"],
+            "balanceDiscount": row["balance_discount"],
+            "expectedProfit": row["expected_profit"],
+            "expectedRoi": row["expected_roi"],
+            "expectedRoiPct": (
+                float(row["expected_roi"]) * 100.0
+                if row["expected_roi"] is not None
+                else None
+            ),
+            "minRoi": row["min_roi"],
+            "manualReviewRoi": row["manual_review_roi"],
+            "inventoryCount": row["inventory_count"],
+            "tradableCount": row["tradable_count"],
+            "c5RecentSoldNetPrice": (
+                row["c5_recent_sold_net_price"] if "c5_recent_sold_net_price" in keys else None
+            ),
+            "c5RecentSoldCount": (
+                row["c5_recent_sold_count"] if "c5_recent_sold_count" in keys else None
+            ),
+            "c5CurrentSellPrice": (
+                row["c5_current_sell_price"] if "c5_current_sell_price" in keys else None
+            ),
+            "c5OnSaleCount": row["c5_on_sale_count"] if "c5_on_sale_count" in keys else None,
+            "c5PurchaseMaxPrice": (
+                row["c5_purchase_max_price"] if "c5_purchase_max_price" in keys else None
+            ),
+            "c5PurchaseCount": row["c5_purchase_count"] if "c5_purchase_count" in keys else None,
+            "riskStatus": row["risk_status"],
+            "riskReason": row["risk_reason"],
+            "executionStatus": execution_status,
+            "executionStatusCode": execution_status_code,
+            "executionReason": row["execution_reason"],
+            "firstSeenAt": row["first_seen_at"] if "first_seen_at" in keys else None,
+            "lastObservedAt": row["last_observed_at"] if "last_observed_at" in keys else None,
+            "observedAt": row["observed_at"] if "observed_at" in keys else None,
+            "updatedAt": row["updated_at"] if "updated_at" in keys else None,
+            "exitedAt": row["exited_at"] if "exited_at" in keys else None,
+            "exitReason": row["exit_reason"] if "exit_reason" in keys else None,
+        }
+
+    def record_profit_trade_roi_scan(
+        self,
+        observations: list[dict[str, Any]],
+        *,
+        scan_id: str,
+        observed_at: str | None = None,
+        exit_reasons: dict[str, str] | None = None,
+        exit_observations: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        """Persist one successfully completed scan and retire stale watch rows.
+
+        Callers must not call this method for a globally failed scan.  That
+        boundary is intentional: retiring rows and writing the matching exit
+        observations happen in the same transaction as all current upserts.
+        """
+
+        timestamp = observed_at or utc_now_iso()
+        normalized: list[dict[str, Any]] = []
+        active_names: set[str] = set()
+        for raw in observations:
+            market_hash_name = str(raw.get("market_hash_name") or "").strip()
+            try:
+                expected_roi = float(raw.get("expected_roi"))
+            except (TypeError, ValueError):
+                continue
+            if not market_hash_name or expected_roi <= 0:
+                continue
+            row = {
+                "market_hash_name": market_hash_name,
+                "name_cn": raw.get("name_cn"),
+                "steam_buy_price": raw.get("steam_buy_price"),
+                "steam_price_source": raw.get("steam_price_source"),
+                "c5_listing_price": raw.get("c5_listing_price"),
+                "c5_price_source": raw.get("c5_price_source"),
+                "c5_expected_net_price": raw.get("c5_expected_net_price"),
+                "balance_discount": raw.get("balance_discount"),
+                "expected_profit": raw.get("expected_profit"),
+                "expected_roi": expected_roi,
+                "min_roi": raw.get("min_roi"),
+                "manual_review_roi": raw.get("manual_review_roi"),
+                "inventory_count": raw.get("inventory_count"),
+                "tradable_count": raw.get("tradable_count"),
+                "c5_recent_sold_net_price": raw.get("c5_recent_sold_net_price"),
+                "c5_recent_sold_count": raw.get("c5_recent_sold_count"),
+                "c5_current_sell_price": raw.get("c5_current_sell_price"),
+                "c5_on_sale_count": raw.get("c5_on_sale_count"),
+                "c5_purchase_max_price": raw.get("c5_purchase_max_price"),
+                "c5_purchase_count": raw.get("c5_purchase_count"),
+                "risk_status": str(raw.get("risk_status") or "unknown"),
+                "risk_reason": raw.get("risk_reason"),
+                "execution_status": str(raw.get("execution_status") or "watch_only"),
+                "execution_reason": raw.get("execution_reason"),
+                "raw_json": json.dumps(raw.get("raw") or {}, ensure_ascii=False),
+            }
+            normalized.append(row)
+            active_names.add(market_hash_name)
+
+        exit_reasons = exit_reasons or {}
+        exit_observations = exit_observations or {}
+        inserted = 0
+        updated = 0
+        exited = 0
+        with self.conn:
+            for row in normalized:
+                existing = self.conn.execute(
+                    "SELECT active FROM profit_trade_roi_watch WHERE market_hash_name = ?",
+                    (row["market_hash_name"],),
+                ).fetchone()
+                event_type = "entered" if existing is None or not bool(existing["active"]) else "observed"
+                self.conn.execute(
+                    """
+                    INSERT INTO profit_trade_roi_watch (
+                        market_hash_name,
+                        name_cn,
+                        active,
+                        steam_buy_price,
+                        steam_price_source,
+                        c5_listing_price,
+                        c5_price_source,
+                        c5_expected_net_price,
+                        balance_discount,
+                        expected_profit,
+                        expected_roi,
+                        min_roi,
+                        manual_review_roi,
+                        inventory_count,
+                        tradable_count,
+                        c5_recent_sold_net_price,
+                        c5_recent_sold_count,
+                        c5_current_sell_price,
+                        c5_on_sale_count,
+                        c5_purchase_max_price,
+                        c5_purchase_count,
+                        risk_status,
+                        risk_reason,
+                        execution_status,
+                        execution_reason,
+                        first_seen_at,
+                        last_observed_at,
+                        updated_at,
+                        exited_at,
+                        exit_reason,
+                        raw_json
+                    ) VALUES (
+                        :market_hash_name,
+                        :name_cn,
+                        1,
+                        :steam_buy_price,
+                        :steam_price_source,
+                        :c5_listing_price,
+                        :c5_price_source,
+                        :c5_expected_net_price,
+                        :balance_discount,
+                        :expected_profit,
+                        :expected_roi,
+                        :min_roi,
+                        :manual_review_roi,
+                        :inventory_count,
+                        :tradable_count,
+                        :c5_recent_sold_net_price,
+                        :c5_recent_sold_count,
+                        :c5_current_sell_price,
+                        :c5_on_sale_count,
+                        :c5_purchase_max_price,
+                        :c5_purchase_count,
+                        :risk_status,
+                        :risk_reason,
+                        :execution_status,
+                        :execution_reason,
+                        :timestamp,
+                        :timestamp,
+                        :timestamp,
+                        NULL,
+                        NULL,
+                        :raw_json
+                    )
+                    ON CONFLICT(market_hash_name) DO UPDATE SET
+                        name_cn = excluded.name_cn,
+                        active = 1,
+                        steam_buy_price = excluded.steam_buy_price,
+                        steam_price_source = excluded.steam_price_source,
+                        c5_listing_price = excluded.c5_listing_price,
+                        c5_price_source = excluded.c5_price_source,
+                        c5_expected_net_price = excluded.c5_expected_net_price,
+                        balance_discount = excluded.balance_discount,
+                        expected_profit = excluded.expected_profit,
+                        expected_roi = excluded.expected_roi,
+                        min_roi = excluded.min_roi,
+                        manual_review_roi = excluded.manual_review_roi,
+                        inventory_count = excluded.inventory_count,
+                        tradable_count = excluded.tradable_count,
+                        c5_recent_sold_net_price = excluded.c5_recent_sold_net_price,
+                        c5_recent_sold_count = excluded.c5_recent_sold_count,
+                        c5_current_sell_price = excluded.c5_current_sell_price,
+                        c5_on_sale_count = excluded.c5_on_sale_count,
+                        c5_purchase_max_price = excluded.c5_purchase_max_price,
+                        c5_purchase_count = excluded.c5_purchase_count,
+                        risk_status = excluded.risk_status,
+                        risk_reason = excluded.risk_reason,
+                        execution_status = excluded.execution_status,
+                        execution_reason = excluded.execution_reason,
+                        last_observed_at = excluded.last_observed_at,
+                        updated_at = excluded.updated_at,
+                        exited_at = NULL,
+                        exit_reason = NULL,
+                        raw_json = excluded.raw_json
+                    """,
+                    {**row, "timestamp": timestamp},
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO profit_trade_roi_observations (
+                        scan_id,
+                        market_hash_name,
+                        event_type,
+                        observed_at,
+                        steam_buy_price,
+                        c5_listing_price,
+                        c5_expected_net_price,
+                        balance_discount,
+                        expected_profit,
+                        expected_roi,
+                        min_roi,
+                        manual_review_roi,
+                        inventory_count,
+                        tradable_count,
+                        risk_status,
+                        risk_reason,
+                        execution_status,
+                        execution_reason,
+                        raw_json
+                    ) VALUES (
+                        :scan_id,
+                        :market_hash_name,
+                        :event_type,
+                        :timestamp,
+                        :steam_buy_price,
+                        :c5_listing_price,
+                        :c5_expected_net_price,
+                        :balance_discount,
+                        :expected_profit,
+                        :expected_roi,
+                        :min_roi,
+                        :manual_review_roi,
+                        :inventory_count,
+                        :tradable_count,
+                        :risk_status,
+                        :risk_reason,
+                        :execution_status,
+                        :execution_reason,
+                        :raw_json
+                    )
+                    """,
+                    {
+                        **row,
+                        "scan_id": scan_id,
+                        "event_type": event_type,
+                        "timestamp": timestamp,
+                    },
+                )
+                if existing is None:
+                    inserted += 1
+                else:
+                    updated += 1
+
+            active_rows = self.conn.execute(
+                "SELECT * FROM profit_trade_roi_watch WHERE active = 1"
+            ).fetchall()
+            for watch_row in active_rows:
+                market_hash_name = str(watch_row["market_hash_name"])
+                if market_hash_name in active_names:
+                    continue
+                reason = str(
+                    exit_reasons.get(market_hash_name)
+                    or "not profitable or unavailable in the latest completed scan"
+                )
+                snapshot = exit_observations.get(market_hash_name) or {}
+
+                def exit_value(key: str, column: str) -> Any:
+                    value = snapshot.get(key)
+                    return watch_row[column] if value is None else value
+
+                exit_values = {
+                    "steam_buy_price": exit_value("steam_buy_price", "steam_buy_price"),
+                    "c5_listing_price": exit_value("c5_listing_price", "c5_listing_price"),
+                    "c5_expected_net_price": exit_value(
+                        "c5_expected_net_price", "c5_expected_net_price"
+                    ),
+                    "balance_discount": exit_value("balance_discount", "balance_discount"),
+                    "expected_profit": exit_value("expected_profit", "expected_profit"),
+                    "expected_roi": exit_value("expected_roi", "expected_roi"),
+                    "min_roi": exit_value("min_roi", "min_roi"),
+                    "manual_review_roi": exit_value("manual_review_roi", "manual_review_roi"),
+                    "inventory_count": exit_value("inventory_count", "inventory_count"),
+                    "tradable_count": exit_value("tradable_count", "tradable_count"),
+                    "risk_status": exit_value("risk_status", "risk_status"),
+                    "risk_reason": exit_value("risk_reason", "risk_reason"),
+                    "execution_status": exit_value("execution_status", "execution_status"),
+                    "execution_reason": exit_value("execution_reason", "execution_reason"),
+                    "raw_json": (
+                        json.dumps(snapshot.get("raw") or {}, ensure_ascii=False)
+                        if snapshot
+                        else watch_row["raw_json"]
+                    ),
+                }
+                self.conn.execute(
+                    """
+                    UPDATE profit_trade_roi_watch
+                    SET active = 0,
+                        steam_buy_price = ?,
+                        c5_listing_price = ?,
+                        c5_expected_net_price = ?,
+                        balance_discount = ?,
+                        expected_profit = ?,
+                        expected_roi = ?,
+                        min_roi = ?,
+                        manual_review_roi = ?,
+                        inventory_count = ?,
+                        tradable_count = ?,
+                        risk_status = ?,
+                        risk_reason = ?,
+                        execution_status = ?,
+                        execution_reason = ?,
+                        updated_at = ?,
+                        exited_at = ?,
+                        exit_reason = ?,
+                        raw_json = ?
+                    WHERE market_hash_name = ?
+                    """,
+                    (
+                        exit_values["steam_buy_price"],
+                        exit_values["c5_listing_price"],
+                        exit_values["c5_expected_net_price"],
+                        exit_values["balance_discount"],
+                        exit_values["expected_profit"],
+                        exit_values["expected_roi"],
+                        exit_values["min_roi"],
+                        exit_values["manual_review_roi"],
+                        exit_values["inventory_count"],
+                        exit_values["tradable_count"],
+                        exit_values["risk_status"],
+                        exit_values["risk_reason"],
+                        exit_values["execution_status"],
+                        exit_values["execution_reason"],
+                        timestamp,
+                        timestamp,
+                        reason,
+                        exit_values["raw_json"],
+                        market_hash_name,
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO profit_trade_roi_observations (
+                        scan_id,
+                        market_hash_name,
+                        event_type,
+                        observed_at,
+                        steam_buy_price,
+                        c5_listing_price,
+                        c5_expected_net_price,
+                        balance_discount,
+                        expected_profit,
+                        expected_roi,
+                        min_roi,
+                        manual_review_roi,
+                        inventory_count,
+                        tradable_count,
+                        risk_status,
+                        risk_reason,
+                        execution_status,
+                        execution_reason,
+                        exit_reason,
+                        raw_json
+                    ) VALUES (?, ?, 'exited', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        market_hash_name,
+                        timestamp,
+                        exit_values["steam_buy_price"],
+                        exit_values["c5_listing_price"],
+                        exit_values["c5_expected_net_price"],
+                        exit_values["balance_discount"],
+                        exit_values["expected_profit"],
+                        exit_values["expected_roi"],
+                        exit_values["min_roi"],
+                        exit_values["manual_review_roi"],
+                        exit_values["inventory_count"],
+                        exit_values["tradable_count"],
+                        exit_values["risk_status"],
+                        exit_values["risk_reason"],
+                        exit_values["execution_status"],
+                        exit_values["execution_reason"],
+                        reason,
+                        exit_values["raw_json"],
+                    ),
+                )
+                exited += 1
+        return {"inserted": inserted, "updated": updated, "exited": exited}
+
+    def list_profit_trade_roi_watch(
+        self,
+        *,
+        active: bool | None = True,
+        keyword: str | None = None,
+        execution_status: str | None = None,
+        sort: str = "roi_desc",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        page = max(1, int(page))
+        page_size = min(200, max(1, int(page_size)))
+        where: list[str] = []
+        params: list[Any] = []
+        if active is not None:
+            where.append("active = ?")
+            params.append(1 if active else 0)
+        if keyword:
+            where.append("(market_hash_name LIKE ? OR COALESCE(name_cn, '') LIKE ?)")
+            pattern = f"%{keyword.strip()}%"
+            params.extend([pattern, pattern])
+        if execution_status:
+            where.append("execution_status = ?")
+            params.append(execution_status)
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        total = int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM profit_trade_roi_watch{where_sql}",
+                tuple(params),
+            ).fetchone()[0]
+        )
+        order_by = {
+            "roi_asc": "expected_roi ASC, last_observed_at DESC",
+            "updated_desc": "last_observed_at DESC, market_hash_name ASC",
+            "price_desc": "c5_listing_price DESC, expected_roi DESC",
+        }.get(sort, "expected_roi DESC, last_observed_at DESC")
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM profit_trade_roi_watch
+            {where_sql}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+        return {
+            "items": [self._profit_trade_roi_row_to_dict(row) for row in rows],
+            "total": total,
+            "page": page,
+            "pageSize": page_size,
+        }
+
+    def list_profit_trade_roi_history(
+        self,
+        market_hash_name: str,
+        *,
+        from_time: str | None = None,
+        to_time: str | None = None,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        page = max(1, int(page))
+        page_size = min(500, max(1, int(page_size)))
+        where = ["market_hash_name = ?"]
+        params: list[Any] = [market_hash_name]
+        if from_time:
+            where.append("julianday(observed_at) >= julianday(?)")
+            params.append(from_time)
+        if to_time:
+            where.append("julianday(observed_at) <= julianday(?)")
+            params.append(to_time)
+        where_sql = " AND ".join(where)
+        total = int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM profit_trade_roi_observations WHERE {where_sql}",
+                tuple(params),
+            ).fetchone()[0]
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM profit_trade_roi_observations
+            WHERE {where_sql}
+            ORDER BY observed_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+        return {
+            "items": [self._profit_trade_roi_row_to_dict(row) for row in rows],
+            "total": total,
+            "page": page,
+            "pageSize": page_size,
+        }
+
+    def list_profit_trade_state_events(self, trade_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM profit_trade_state_events
+            WHERE trade_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (trade_id,),
+        ).fetchall()
+        if not rows:
+            trade = self.get_profit_trade(trade_id)
+            if trade is None:
+                return []
+            return [
+                {
+                    "id": None,
+                    "tradeId": trade_id,
+                    "eventType": "historical_snapshot",
+                    "statusFrom": None,
+                    "statusTo": trade["status"],
+                    "stepKeyFrom": None,
+                    "stepKeyTo": trade["step_key"],
+                    "stepIndexFrom": None,
+                    "stepIndexTo": int(trade["step_index"] or 0),
+                    "reason": trade["error"],
+                    "logEventId": None,
+                    "context": {},
+                    "createdAt": trade["updated_at"],
+                    "isSnapshot": True,
+                }
+            ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                context = json.loads(str(row["context_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                context = {}
+            result.append(
+                {
+                    "id": int(row["id"]),
+                    "tradeId": int(row["trade_id"]),
+                    "eventType": row["event_type"],
+                    "statusFrom": row["status_from"],
+                    "statusTo": row["status_to"],
+                    "stepKeyFrom": row["step_key_from"],
+                    "stepKeyTo": row["step_key_to"],
+                    "stepIndexFrom": row["step_index_from"],
+                    "stepIndexTo": int(row["step_index_to"]),
+                    "reason": row["reason"],
+                    "logEventId": row["log_event_id"],
+                    "context": context if isinstance(context, dict) else {},
+                    "createdAt": row["created_at"],
+                    "isSnapshot": False,
+                }
+            )
+        return result
+
+    def list_profit_trade_interruptions(
+        self,
+        *,
+        statuses: tuple[str, ...] = ("cancelled", "failed", "manual_required"),
+        step_key: str | None = None,
+        acknowledged: str = "exclude",
+        keyword: str | None = None,
+        from_time: str | None = None,
+        to_time: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        page = max(1, int(page))
+        page_size = min(200, max(1, int(page_size)))
+        clean_statuses = tuple(str(value).strip() for value in statuses if str(value).strip())
+        if not clean_statuses:
+            return {"items": [], "total": 0, "page": page, "pageSize": page_size}
+        where = [f"t.status IN ({', '.join('?' for _ in clean_statuses)})"]
+        params: list[Any] = list(clean_statuses)
+        if step_key:
+            where.append("t.step_key = ?")
+            params.append(step_key)
+        if acknowledged == "only":
+            where.append("COALESCE(a.acknowledged, 0) = 1")
+        elif acknowledged == "exclude":
+            where.append("COALESCE(a.acknowledged, 0) = 0")
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            where.append(
+                "(t.trade_no LIKE ? OR t.market_hash_name LIKE ? "
+                "OR COALESCE(i.name_cn, '') LIKE ? OR COALESCE(t.error, '') LIKE ? "
+                "OR COALESCE(t.note, '') LIKE ?)"
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+        interrupted_time = "COALESCE(t.completed_at, t.updated_at)"
+        if from_time:
+            where.append(f"julianday({interrupted_time}) >= julianday(?)")
+            params.append(from_time)
+        if to_time:
+            where.append(f"julianday({interrupted_time}) <= julianday(?)")
+            params.append(to_time)
+        where_sql = " AND ".join(where)
+        join_sql = (
+            "LEFT JOIN profit_trade_acknowledgements a ON a.trade_id = t.id "
+            "LEFT JOIN items i ON i.market_hash_name = t.market_hash_name"
+        )
+        total = int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM profit_trades t {join_sql} WHERE {where_sql}",
+                tuple(params),
+            ).fetchone()[0]
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                t.*,
+                COALESCE(a.acknowledged, 0) AS acknowledged,
+                a.reason AS acknowledgement_reason,
+                a.acknowledged_at,
+                a.restored_at,
+                a.updated_at AS acknowledgement_updated_at
+            FROM profit_trades t
+            {join_sql}
+            WHERE {where_sql}
+            ORDER BY {interrupted_time} DESC, t.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "page": page,
+            "pageSize": page_size,
+        }
+
+    def get_profit_trade_interruption_summary(
+        self,
+        *,
+        statuses: tuple[str, ...] = ("cancelled", "failed", "manual_required"),
+        acknowledged: str = "exclude",
+        keyword: str | None = None,
+        from_time: str | None = None,
+        to_time: str | None = None,
+    ) -> dict[str, Any]:
+        clean_statuses = tuple(str(value).strip() for value in statuses if str(value).strip())
+        if not clean_statuses:
+            return {"total": 0, "stepCounts": []}
+        where = [f"t.status IN ({', '.join('?' for _ in clean_statuses)})"]
+        params: list[Any] = list(clean_statuses)
+        if acknowledged == "only":
+            where.append("COALESCE(a.acknowledged, 0) = 1")
+        elif acknowledged == "exclude":
+            where.append("COALESCE(a.acknowledged, 0) = 0")
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            where.append(
+                "(t.trade_no LIKE ? OR t.market_hash_name LIKE ? "
+                "OR COALESCE(i.name_cn, '') LIKE ? OR COALESCE(t.error, '') LIKE ? "
+                "OR COALESCE(t.note, '') LIKE ?)"
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+        interrupted_time = "COALESCE(t.completed_at, t.updated_at)"
+        if from_time:
+            where.append(f"julianday({interrupted_time}) >= julianday(?)")
+            params.append(from_time)
+        if to_time:
+            where.append(f"julianday({interrupted_time}) <= julianday(?)")
+            params.append(to_time)
+        rows = self.conn.execute(
+            f"""
+            SELECT t.step_key, t.step_index, COUNT(*) AS count
+            FROM profit_trades t
+            LEFT JOIN profit_trade_acknowledgements a ON a.trade_id = t.id
+            LEFT JOIN items i ON i.market_hash_name = t.market_hash_name
+            WHERE {' AND '.join(where)}
+            GROUP BY t.step_key, t.step_index
+            ORDER BY t.step_index ASC, t.step_key ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        step_counts = [
+            {
+                "stepKey": row["step_key"],
+                "stepIndex": int(row["step_index"] or 0),
+                "count": int(row["count"]),
+            }
+            for row in rows
+        ]
+        return {"total": sum(item["count"] for item in step_counts), "stepCounts": step_counts}
+
+    def set_profit_trade_acknowledgement(
+        self,
+        trade_id: int,
+        *,
+        acknowledged: bool,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if self.get_profit_trade(trade_id) is None:
+            raise ValueError(f"profit trade not found: {trade_id}")
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO profit_trade_acknowledgements (
+                    trade_id,
+                    acknowledged,
+                    reason,
+                    acknowledged_at,
+                    restored_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_id) DO UPDATE SET
+                    acknowledged = excluded.acknowledged,
+                    reason = excluded.reason,
+                    acknowledged_at = excluded.acknowledged_at,
+                    restored_at = excluded.restored_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    trade_id,
+                    1 if acknowledged else 0,
+                    reason,
+                    now if acknowledged else None,
+                    None if acknowledged else now,
+                    now,
+                ),
+            )
+        trade = self.get_profit_trade(trade_id)
+        _emit_profit_trade_local_event(
+            component="profit_trade_interruptions",
+            operation="acknowledged" if acknowledged else "acknowledgement_restored",
+            message=(
+                "Profit Trade interruption acknowledged"
+                if acknowledged
+                else "Profit Trade interruption acknowledgement restored"
+            ),
+            trade_id=trade_id,
+            trade_no=str(trade["trade_no"] or "") if trade is not None else None,
+            market_hash_name=str(trade["market_hash_name"] or "") if trade is not None else None,
+            safe_context={"acknowledged": bool(acknowledged), "reason": reason},
+        )
+        return {
+            "tradeId": trade_id,
+            "acknowledged": bool(acknowledged),
+            "reason": reason,
+            "acknowledgedAt": now if acknowledged else None,
+            "restoredAt": None if acknowledged else now,
+            "updatedAt": now,
+        }
 
     # ------------------------------------------------------------------
     # Strategy evaluations

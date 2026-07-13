@@ -2182,7 +2182,6 @@ def _empty_guadao_report_summary() -> dict[str, Any]:
         "steamNet": 0.0,
         "cash": 0.0,
         "totalDiscountRatio": None,
-        "faceDiscountRatio": None,
     }
 
 
@@ -2201,7 +2200,6 @@ def _finalize_guadao_report_summary(summary: dict[str, Any]) -> dict[str, Any]:
     summary["steamNet"] = round(steam_net, 2)
     summary["cash"] = round(cash, 2)
     summary["totalDiscountRatio"] = cash / steam_net if steam_net > 0 else None
-    summary["faceDiscountRatio"] = cash / steam_gross if steam_gross > 0 else None
     return summary
 
 
@@ -2324,7 +2322,6 @@ def _apply_rebuy_cash_to_sell_report_row(row: dict[str, Any], cash: float | None
         return
     row["cash"] = cash
     row["totalDiscountRatio"] = cash / row["steamNet"] if row["steamNet"] > 0 else None
-    row["faceDiscountRatio"] = cash / row["steamGross"] if row["steamGross"] > 0 else None
 
 
 def _load_balance_insufficient_rebuy_source_ids(
@@ -2764,7 +2761,6 @@ def _build_guadao_discount_report(
             "steamNet": steam_net,
             "cash": cash,
             "totalDiscountRatio": cash / steam_net if steam_net > 0 else None,
-            "faceDiscountRatio": cash / steam_gross if steam_gross > 0 else None,
             "sellOperationId": source_id,
             "rebuyOperationId": int(rebuy["id"]),
             "assetId": str(sell["asset_id"] or "") if sell is not None else "",
@@ -2832,6 +2828,46 @@ def _build_guadao_discount_report(
             market_hash_name=market_hash_name,
         ),
     }
+
+
+def build_guadao_report_api_payload(
+    settings: Settings,
+    date_from: str,
+    date_to: str | None = None,
+    market_hash_name: str | None = None,
+    include_details: bool = False,
+) -> dict[str, Any]:
+    """Build the shared guadao report payload used by both CLI and Web API."""
+    start_local = _parse_report_boundary(date_from, is_end=False)
+    end_local = (
+        _parse_report_boundary(date_to, is_end=True)
+        if date_to
+        else datetime.now(CN_TZ)
+    )
+    if end_local < start_local:
+        raise ValueError("结束时间不能早于开始时间")
+
+    db = _open_db(settings)
+    try:
+        report = _build_guadao_discount_report(
+            db,
+            start_utc=_to_utc_iso(start_local),
+            end_utc=_to_utc_iso(end_local),
+            steam_net_factor=load_strategy_config(settings).steam_net_factor,
+            market_hash_name=market_hash_name,
+        )
+    finally:
+        db.close()
+
+    payload = {
+        "startLocal": start_local.isoformat(timespec="seconds"),
+        "endLocal": end_local.isoformat(timespec="seconds"),
+        "detailsIncluded": include_details,
+        **report,
+    }
+    if not include_details:
+        payload["details"] = []
+    return payload
 
 
 def _fmt_cny(value: float | None) -> str:
@@ -2913,7 +2949,6 @@ def _print_guadao_summary_table(
     for label, summary, c5_missing in rows:
         cash = "-" if c5_missing else _fmt_cny(summary.get("cash"))
         total_ratio = "-" if c5_missing else _fmt_pct(summary.get("totalDiscountRatio"))
-        face_ratio = "-" if c5_missing else _fmt_pct(summary.get("faceDiscountRatio"))
         table_rows.append(
             [
                 label,
@@ -2922,14 +2957,13 @@ def _print_guadao_summary_table(
                 _fmt_cny(summary.get("steamNet")),
                 cash,
                 total_ratio,
-                face_ratio,
             ]
         )
     _print_display_table(
-        ["项目", "笔数", "Steam面值", "Steam到手", "C5金额", "总折比", "面值折比"],
+        ["项目", "笔数", "Steam面值", "Steam到手", "C5金额", "总折比"],
         table_rows,
-        widths=[18, 6, 14, 14, 14, 9, 9],
-        aligns=["left", "right", "right", "right", "right", "right", "right"],
+        widths=[18, 6, 14, 14, 14, 9],
+        aligns=["left", "right", "right", "right", "right", "right"],
     )
 
 
@@ -2942,7 +2976,7 @@ def _print_guadao_item_table(rows: list[dict[str, Any]]) -> None:
         ),
     )
     _print_display_table(
-        ["饰品", "笔数", "Steam到手", "C5现金", "总折比", "面值折比"],
+        ["饰品", "笔数", "Steam到手", "C5现金", "总折比"],
         [
             [
                 row["marketHashName"],
@@ -2950,12 +2984,11 @@ def _print_guadao_item_table(rows: list[dict[str, Any]]) -> None:
                 _fmt_cny(row["steamNet"]),
                 _fmt_cny(row["cash"]),
                 _fmt_pct(row["totalDiscountRatio"]),
-                _fmt_pct(row["faceDiscountRatio"]),
             ]
             for row in rows
         ],
-        widths=[item_width, 6, 14, 14, 9, 9],
-        aligns=["left", "right", "right", "right", "right", "right"],
+        widths=[item_width, 6, 14, 14, 9],
+        aligns=["left", "right", "right", "right", "right"],
         indent="",
     )
 
@@ -3019,7 +3052,7 @@ def _print_guadao_discount_report(
             "本期未闭环 = 本期 Steam 卖出，但截至结束时间仍未成功 C5 补仓。",
             "本期历史补仓 = 历史 Steam 卖出，本期完成 C5 补仓；不计入本期 Steam 入账。",
             "本期历史未闭环 = 本期开始前已卖出，且截至结束时间仍未成功 C5 补仓。",
-            "总折比 = C5金额 / Steam税后到手；面值折比 = C5金额 / Steam税前售价。",
+            "总折比 = C5金额 / Steam税后到手。",
         ]
     )
     reconciliation = report.get("steamSoldReconciliation", {})
@@ -3073,36 +3106,19 @@ def _print_guadao_discount_report(
 
 def cmd_pool_guadao_report(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
-    config = load_strategy_config(settings)
-    start_local = _parse_report_boundary(args.date_from, is_end=False)
-    end_local = (
-        _parse_report_boundary(args.date_to, is_end=True)
-        if args.date_to
-        else datetime.now(CN_TZ)
+    payload = build_guadao_report_api_payload(
+        settings,
+        args.date_from,
+        args.date_to,
+        args.market_hash_name,
+        args.detail or args.dump_json,
     )
-    if end_local < start_local:
-        raise ValueError("--to 不能早于 --from")
-
-    db = _open_db(settings)
-    try:
-        report = _build_guadao_discount_report(
-            db,
-            start_utc=_to_utc_iso(start_local),
-            end_utc=_to_utc_iso(end_local),
-            steam_net_factor=config.steam_net_factor,
-            market_hash_name=args.market_hash_name,
-        )
-    finally:
-        db.close()
+    start_local = datetime.fromisoformat(payload["startLocal"])
+    end_local = datetime.fromisoformat(payload["endLocal"])
+    report = {key: value for key, value in payload.items() if key not in {"startLocal", "endLocal", "detailsIncluded"}}
 
     if args.dump_json:
-        _print_json(
-            {
-                "startLocal": start_local.isoformat(timespec="seconds"),
-                "endLocal": end_local.isoformat(timespec="seconds"),
-                **report,
-            }
-        )
+        _print_json(payload)
         return 0
 
     _print_guadao_discount_report(
@@ -4167,7 +4183,12 @@ def cmd_profit_trade_serve_api(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
     from cs2_assistant.services.web_api import run_profit_trade_api_server
 
-    run_profit_trade_api_server(settings, host=args.host, port=args.port)
+    run_profit_trade_api_server(
+        settings,
+        host=args.host,
+        port=args.port,
+        guadao_report_builder=build_guadao_report_api_payload,
+    )
     return 0
 
 
@@ -4556,8 +4577,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="查看执行器挂刀余额折扣报表",
         description=(
             "按日期范围统计执行器挂刀闭环流水。\n\n"
-            "总折比 = C5补仓现金 / Steam税后到手余额。\n"
-            "面值折比 = C5补仓现金 / Steam税前售价。"
+            "总折比 = C5补仓现金 / Steam税后到手余额。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )

@@ -7,9 +7,10 @@ import json
 import re
 import struct
 import time
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, unquote
 
 import requests
@@ -20,9 +21,51 @@ from cs2_assistant.config import PROJECT_ROOT
 
 
 class SteamMarketError(RuntimeError):
-    def __init__(self, message: str, *, payload: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        retry_after: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.payload = payload
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+SteamTelemetryCallback = Callable[[dict[str, Any]], None]
+
+_STEAM_TELEMETRY_CONTEXT_FIELDS = {
+    "source",
+    "run_id",
+    "trade_id",
+    "trade_no",
+    "market_hash_name",
+    "asset_id",
+    "account_id",
+    "steam_id64",
+}
+_STEAM_SENSITIVE_ERROR_RE = re.compile(
+    r"(?i)(sessionid|cookie|authorization|password|api[-_ ]?key|app[-_ ]?key|"
+    r"identity[-_ ]?secret|device[-_ ]?secret|shared[-_ ]?secret|steam[-_ ]?guard|"
+    r"style[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|token)"
+    r"(\s*[=:]\s*)([^&;\s,}\]]+|\"[^\"]*\"|'[^']*')"
+)
+_STEAM_TRADE_URL_RE = re.compile(
+    r"https?://steamcommunity\.com/tradeoffer/new/\?[^\s\"']+",
+    re.IGNORECASE,
+)
+
+
+def _safe_steam_telemetry_error(exc: BaseException) -> str:
+    text = _STEAM_TRADE_URL_RE.sub("<redacted:trade_url>", str(exc))
+    text = _STEAM_SENSITIVE_ERROR_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        text,
+    )
+    return text if len(text) <= 1000 else f"{text[:1000]}...<truncated>"
 
 
 def _parse_cookie_string(raw: str) -> dict[str, str]:
@@ -316,6 +359,8 @@ class SteamMarketClient:
         account_id: str | None = None,
         base_url: str = "https://steamcommunity.com",
         timeout: int = 30,
+        telemetry_callback: SteamTelemetryCallback | None = None,
+        telemetry_context: Mapping[str, Any] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity_secret = _normalize_identity_secret(identity_secret) if identity_secret else identity_secret
@@ -323,6 +368,13 @@ class SteamMarketClient:
         self.timeout = timeout
         self.account_id = str(account_id or "").strip() or None
         self._account_store = AccountStore(PROJECT_ROOT / "config") if self.account_id else None
+        self._telemetry_callback = telemetry_callback
+        self._telemetry_context = {
+            key: value
+            for key, value in dict(telemetry_context or {}).items()
+            if key in _STEAM_TELEMETRY_CONTEXT_FIELDS
+        }
+        self._telemetry_client_instance_id = f"steam_{uuid.uuid4().hex}"
 
         self._session = requests.Session()
         self._session.headers.update(
@@ -378,6 +430,139 @@ class SteamMarketClient:
             self.device_id = account.device_id
         return True
 
+    @staticmethod
+    def _telemetry_operation(path: str) -> str:
+        normalized = str(path or "").lower()
+        if "/market/buylisting/" in normalized:
+            return "buy_listing"
+        if "/market/createbuyorder" in normalized:
+            return "create_buy_order"
+        if "/market/cancelbuyorder" in normalized:
+            return "cancel_buy_order"
+        if normalized.startswith("/market/listings/"):
+            return "search_listings"
+        if "/market/orderbook" in normalized:
+            return "order_book"
+        if "/market/priceoverview" in normalized:
+            return "price_overview"
+        if "/market/pricehistory" in normalized:
+            return "price_history"
+        if "/market/mylistings" in normalized:
+            return "my_listings"
+        if "/market/myhistory" in normalized:
+            return "market_history"
+        if "/market/sellitem" in normalized:
+            return "sell_item"
+        if "/market/removelisting" in normalized:
+            return "remove_listing"
+        if "/mobileconf/multiajaxop" in normalized:
+            return "confirm_market_action"
+        if "/mobileconf/getlist" in normalized:
+            return "list_confirmations"
+        if "/tradeoffers/privacy" in normalized:
+            return "get_trade_url"
+        if normalized.rstrip("/") == "/market":
+            return "wallet_balance"
+        return "steam_http_request"
+
+    def _emit_telemetry(
+        self,
+        *,
+        level: str,
+        operation: str,
+        message: str,
+        **fields: Any,
+    ) -> None:
+        callback = self._telemetry_callback
+        if callback is None:
+            return
+        event = dict(self._telemetry_context)
+        event.update(
+            {
+                "level": level,
+                "provider": "steam",
+                "component": "steam_market",
+                "operation": operation,
+                "message": message,
+                "client_instance_id": self._telemetry_client_instance_id,
+            }
+        )
+        if self.account_id:
+            event["account_id"] = self.account_id
+        steam_id64 = str(getattr(self, "steam_id64", "") or "").strip()
+        if steam_id64:
+            event["steam_id64"] = steam_id64
+        event.update({key: value for key, value in fields.items() if value is not None})
+        try:
+            callback(event)
+        except Exception:
+            # Telemetry is diagnostic only and must never change a Steam action.
+            return
+
+    def _request_with_telemetry(
+        self,
+        *,
+        method: str,
+        path: str,
+        attempt: int,
+        request: Callable[[], requests.Response],
+        safe_context: Mapping[str, Any] | None = None,
+    ) -> requests.Response:
+        request_id = f"steam_req_{uuid.uuid4().hex}"
+        operation = self._telemetry_operation(path)
+        context = dict(safe_context or {})
+        started = time.perf_counter()
+        self._emit_telemetry(
+            level="DEBUG",
+            operation=operation,
+            message="Steam request started",
+            request_id=request_id,
+            attempt=int(attempt),
+            method=str(method).upper(),
+            endpoint=path,
+            safe_context={"phase": "start", **context},
+        )
+        try:
+            response = request()
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+            self._emit_telemetry(
+                level="ERROR",
+                operation=operation,
+                message="Steam request failed before receiving a response",
+                request_id=request_id,
+                attempt=int(attempt),
+                method=str(method).upper(),
+                endpoint=path,
+                elapsed_ms=elapsed_ms,
+                exception_type=type(exc).__name__,
+                safe_context={
+                    "phase": "failure",
+                    "error": _safe_steam_telemetry_error(exc),
+                    **context,
+                },
+            )
+            raise
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        response_headers = getattr(response, "headers", {}) or {}
+        retry_after = response_headers.get("Retry-After") if hasattr(response_headers, "get") else None
+        failed = status_code >= 400
+        self._emit_telemetry(
+            level="ERROR" if failed else "INFO",
+            operation=operation,
+            message="Steam request returned an HTTP error" if failed else "Steam request succeeded",
+            request_id=request_id,
+            attempt=int(attempt),
+            method=str(method).upper(),
+            endpoint=path,
+            status_code=status_code,
+            elapsed_ms=elapsed_ms,
+            retry_after=retry_after,
+            safe_context={"phase": "failure" if failed else "success", **context},
+        )
+        return response
+
     def _request(
         self,
         method: str,
@@ -397,14 +582,19 @@ class SteamMarketClient:
             response = None
             for attempt in range(attempts):
                 try:
-                    response = self._session.request(
+                    response = self._request_with_telemetry(
                         method=method,
-                        url=url,
-                        params=params,
-                        data=data,
-                        files=files,
-                        headers=merged_headers,
-                        timeout=self.timeout,
+                        path=path,
+                        attempt=attempt + 1,
+                        request=lambda: self._session.request(
+                            method=method,
+                            url=url,
+                            params=params,
+                            data=data,
+                            files=files,
+                            headers=merged_headers,
+                            timeout=self.timeout,
+                        ),
                     )
                     break
                 except (requests.Timeout, requests.ConnectionError) as exc:
@@ -415,18 +605,38 @@ class SteamMarketClient:
             if response is None:
                 raise last_exc or SteamMarketError("Steam request failed without response")
             if response.status_code in (400, 401) and _allow_retry and self._try_account_relogin():
-                response = self._session.request(
+                response = self._request_with_telemetry(
                     method=method,
-                    url=url,
-                    params=params,
-                    data=data,
-                    files=files,
-                    headers=merged_headers,
-                    timeout=self.timeout,
+                    path=path,
+                    attempt=attempts + 1,
+                    request=lambda: self._session.request(
+                        method=method,
+                        url=url,
+                        params=params,
+                        data=data,
+                        files=files,
+                        headers=merged_headers,
+                        timeout=self.timeout,
+                    ),
+                    safe_context={"after_relogin": True},
                 )
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise SteamMarketError(f"Steam request failed: {method} {path}: {exc}") from exc
+            error_response = getattr(exc, "response", None)
+            request_response = locals().get("response")
+            status_code = getattr(error_response, "status_code", None)
+            if status_code is None:
+                status_code = getattr(request_response, "status_code", None)
+            response_headers = getattr(error_response, "headers", {}) or {}
+            retry_after = response_headers.get("Retry-After") if hasattr(response_headers, "get") else None
+            if retry_after is None:
+                request_headers = getattr(request_response, "headers", {}) or {}
+                retry_after = request_headers.get("Retry-After") if hasattr(request_headers, "get") else None
+            raise SteamMarketError(
+                f"Steam request failed: {method} {path}: {exc}",
+                status_code=int(status_code) if status_code is not None else None,
+                retry_after=str(retry_after) if retry_after is not None else None,
+            ) from exc
         return response
 
     def get_trade_url(self) -> str:
@@ -590,22 +800,29 @@ class SteamMarketClient:
                 "save_my_address": "0",
             }
             files = [(key, (None, str(value))) for key, value in data.items()]
-            response = self._session.post(
-                f"{self.base_url}/market/buylisting/{listing_id}",
-                files=files,
-                headers={
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Origin": self.base_url,
-                    "Referer": referer,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-                    ),
-                },
-                timeout=self.timeout,
-                allow_redirects=False,
+            request_path = f"/market/buylisting/{listing_id}"
+            response = self._request_with_telemetry(
+                method="POST",
+                path=request_path,
+                attempt=1 if confirmation == "0" else 2,
+                request=lambda: self._session.post(
+                    f"{self.base_url}{request_path}",
+                    files=files,
+                    headers={
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "Accept-Language": "zh-CN,zh;q=0.9",
+                        "Origin": self.base_url,
+                        "Referer": referer,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                        ),
+                    },
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                ),
+                safe_context={"confirmation_round": confirmation != "0"},
             )
             try:
                 payload = response.json()
@@ -676,24 +893,31 @@ class SteamMarketClient:
                 "confirmation": confirmation,
                 "save_my_address": "0",
             }
-            response = self._session.post(
-                f"{self.base_url}/market/createbuyorder/",
-                data=data,
-                headers={
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Origin": self.base_url,
-                    "Referer": (
-                        f"{self.base_url}/market/listings/{app_id}/"
-                        f"{quote(market_hash_name, safe='')}"
-                    ),
-                    "X-Requested-With": "XMLHttpRequest",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-                    ),
-                },
-                timeout=self.timeout,
-                allow_redirects=False,
+            request_path = "/market/createbuyorder/"
+            response = self._request_with_telemetry(
+                method="POST",
+                path=request_path,
+                attempt=1 if confirmation == "0" else 2,
+                request=lambda: self._session.post(
+                    f"{self.base_url}{request_path}",
+                    data=data,
+                    headers={
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "Origin": self.base_url,
+                        "Referer": (
+                            f"{self.base_url}/market/listings/{app_id}/"
+                            f"{quote(market_hash_name, safe='')}"
+                        ),
+                        "X-Requested-With": "XMLHttpRequest",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                        ),
+                    },
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                ),
+                safe_context={"confirmation_round": confirmation != "0"},
             )
             try:
                 payload = response.json()
@@ -738,24 +962,30 @@ class SteamMarketClient:
         buy_order_id = str(buy_order_id or "").strip()
         if not buy_order_id:
             raise SteamMarketError("buy_order_id is required")
-        response = self._session.post(
-            f"{self.base_url}/market/cancelbuyorder/",
-            data={
-                "sessionid": self.sessionid,
-                "buy_orderid": buy_order_id,
-            },
-            headers={
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Origin": self.base_url,
-                "Referer": f"{self.base_url}/market/",
-                "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-                ),
-            },
-            timeout=self.timeout,
-            allow_redirects=False,
+        request_path = "/market/cancelbuyorder/"
+        response = self._request_with_telemetry(
+            method="POST",
+            path=request_path,
+            attempt=1,
+            request=lambda: self._session.post(
+                f"{self.base_url}{request_path}",
+                data={
+                    "sessionid": self.sessionid,
+                    "buy_orderid": buy_order_id,
+                },
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Origin": self.base_url,
+                    "Referer": f"{self.base_url}/market/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                    ),
+                },
+                timeout=self.timeout,
+                allow_redirects=False,
+            ),
         )
         try:
             payload = response.json()
@@ -1290,7 +1520,17 @@ class SteamMarketClient:
             multipart.append(("cid[]", (None, str(conf.get("id")))))
             multipart.append(("ck[]", (None, str(conf.get("nonce")))))
         url = f"{self.base_url}/mobileconf/multiajaxop"
-        response = self._session.post(url, params=params, files=multipart, timeout=self.timeout)
+        response = self._request_with_telemetry(
+            method="POST",
+            path="/mobileconf/multiajaxop",
+            attempt=1,
+            request=lambda: self._session.post(
+                url,
+                params=params,
+                files=multipart,
+                timeout=self.timeout,
+            ),
+        )
         response.raise_for_status()
         try:
             payload = response.json()

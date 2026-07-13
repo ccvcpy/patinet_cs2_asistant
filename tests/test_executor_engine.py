@@ -328,6 +328,43 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         )
         self.assertIsNone(asset)
 
+    def test_live_inventory_refresh_recovers_orphan_listing_failed_asset(self) -> None:
+        self.db.set_asset_status("asset-old", "listing_failed")
+
+        self.db.upsert_inventory_assets(
+            [
+                {
+                    "assetId": "asset-old",
+                    "marketHashName": "Revolution Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                }
+            ]
+        )
+
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("available", asset["status"])
+        self.assertEqual(1, asset["tradable"])
+
+    def test_live_inventory_refresh_preserves_active_listing_states(self) -> None:
+        for status in ("listed", "sold", "listing_pending"):
+            with self.subTest(status=status):
+                self.db.set_asset_status("asset-old", status)
+                self.db.upsert_inventory_assets(
+                    [
+                        {
+                            "assetId": "asset-old",
+                            "marketHashName": "Revolution Case",
+                            "steamId": self.engine.steam_client.steam_id64,
+                            "ifTradable": True,
+                        }
+                    ]
+                )
+                asset = self.db.get_asset("asset-old")
+                assert asset is not None
+                self.assertEqual(status, asset["status"])
+
     def test_transfer_sell_asset_skips_profit_trade_reserved_asset(self) -> None:
         reserved_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
         self.db.reserve_asset(
@@ -1338,6 +1375,73 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertAlmostEqual(0.62, float(kwargs["guadao_max_listing_ratio"]), places=6)
         self.assertAlmostEqual(0.869, float(kwargs["steam_net_factor"]), places=6)
 
+    def test_failed_c5_delivery_replacement_keeps_original_buy_price_and_dynamic_ratio(self) -> None:
+        original_id = self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=1.55,
+            note=(
+                '{"sourceSellOperationId": 1, "steamListPrice": 3.00, '
+                '"listingRatioAtOpen": 0.62, "maxRebuyRatioAtOpen": 0.62, '
+                '"guadaoMaxListingRatioAtOpen": 0.69, "steamNetFactorAtOpen": 0.869, '
+                '"c5FinalStatus": "c5_failed"}'
+            ),
+        )
+        self.db.update_pool_operation(original_id, status="c5_failed", actual_price=1.60)
+        original = self.db.conn.execute(
+            "SELECT * FROM pool_operations WHERE id = ?",
+            (original_id,),
+        ).fetchone()
+        assert original is not None
+
+        created = self.engine._create_replacement_rebuy_for_failed_op(
+            original,
+            json.loads(original["note"]),
+        )
+
+        self.assertEqual(1, created)
+        replacement = self.db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=10)[0]
+        replacement_note = json.loads(replacement["note"])
+        self.assertEqual(1.60, replacement["expected_price"])
+        self.assertEqual(1.60, replacement_note["replacementMaxPrice"])
+        self.assertEqual("original_failed_order_price", replacement_note["replacementPricePolicy"])
+        self.assertFalse(replacement_note["forceRebuyReplacement"])
+        self.assertAlmostEqual(0.62, float(replacement_note["maxRebuyRatioAtOpen"]), places=6)
+
+        result = RebuyResult(True, False, "ok", actual_price=1.58)
+        with patch("cs2_assistant.services.executor_engine.execute_rebuy", return_value=result) as rebuy_mock:
+            rebought = self.engine._execute_rebuys()
+
+        self.assertEqual(1, rebought)
+        kwargs = rebuy_mock.call_args.kwargs
+        self.assertAlmostEqual(1.60, float(kwargs["max_price_override"]), places=6)
+        self.assertAlmostEqual(0.62, float(kwargs["guadao_max_listing_ratio"]), places=6)
+        self.assertFalse(kwargs["use_live_price_as_max"])
+
+    def test_legacy_forced_replacement_uses_expected_price_as_safe_cap(self) -> None:
+        self.db.add_pool_operation(
+            market_hash_name="Revolution Case",
+            strategy=STRATEGY_GUADAO,
+            operation_type=OP_REBUY_C5,
+            expected_price=1.60,
+            note=(
+                '{"replacementForRebuyOperationId": 9, "forceRebuyReplacement": true, '
+                '"steamListPrice": 3.00, "maxRebuyRatioAtOpen": 0.62, '
+                '"guadaoMaxListingRatioAtOpen": 0.69, "steamNetFactorAtOpen": 0.869}'
+            ),
+        )
+        result = RebuyResult(True, False, "ok", actual_price=1.58)
+
+        with patch("cs2_assistant.services.executor_engine.execute_rebuy", return_value=result) as rebuy_mock:
+            rebought = self.engine._execute_rebuys()
+
+        self.assertEqual(1, rebought)
+        kwargs = rebuy_mock.call_args.kwargs
+        self.assertAlmostEqual(1.60, float(kwargs["max_price_override"]), places=6)
+        self.assertAlmostEqual(0.62, float(kwargs["guadao_max_listing_ratio"]), places=6)
+        self.assertFalse(kwargs["use_live_price_as_max"])
+
     def test_no_matching_rebuy_timeout_does_not_stop_executor(self) -> None:
         op_id = self.db.add_pool_operation(
             market_hash_name="Revolution Case",
@@ -1610,6 +1714,48 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         assert asset is not None
         self.assertEqual("listed", asset["status"])
         self.assertEqual(1, self.engine.steam_client.confirm_calls)
+
+    def test_nontransient_listing_failure_is_recorded_and_retried_after_cooldown(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.62,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+        sell_attempts = 0
+
+        def raise_listing_failure(**kwargs: object) -> dict[str, object]:
+            nonlocal sell_attempts
+            sell_attempts += 1
+            raise SteamMarketError("nontransient sellitem failure")
+
+        self.engine._sell_item_with_retry = raise_listing_failure  # type: ignore[method-assign]
+        report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+
+        with patch("builtins.print"):
+            first_listed = self.engine._execute_guadao_listings(
+                report,
+                {"Revolution Case": POOL_STATUS_HOLDING},
+            )
+            second_listed = self.engine._execute_guadao_listings(
+                report,
+                {"Revolution Case": POOL_STATUS_HOLDING},
+            )
+
+        self.assertEqual(0, first_listed)
+        self.assertEqual(0, second_listed)
+        self.assertEqual(1, sell_attempts)
+        asset = self.db.get_asset("asset-old")
+        assert asset is not None
+        self.assertEqual("available", asset["status"])
+        deferred = self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="deferred", limit=10)
+        self.assertEqual(1, len(deferred))
+        deferred_note = json.loads(deferred[0]["note"])
+        self.assertEqual("sellitem_failure", deferred_note["deferReason"])
+        self.assertIn("nontransient sellitem failure", deferred_note["deferMessage"])
+        self.assertIsNotNone(self.engine._active_listing_defer_state("asset-old"))
 
     def test_listing_confirm_failure_is_not_silent(self) -> None:
         self.engine.config.dry_run = False

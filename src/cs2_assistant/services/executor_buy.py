@@ -60,6 +60,7 @@ def execute_rebuy(
     guadao_max_listing_ratio: float | None = None,
     trade_url: str | None = None,
     use_live_price_as_max: bool = False,
+    max_price_override: float | None = None,
 ) -> RebuyResult:
     try:
         live_price = fetch_c5_price(client, market_hash_name, app_id)
@@ -89,7 +90,9 @@ def execute_rebuy(
         listing_ratio_now = live_price / (steam_reference_price * steam_net_factor)
 
     pricing_steam_list_price = expected_steam_list_price
-    if use_live_price_as_max:
+    if max_price_override is not None and float(max_price_override) > 0:
+        max_price = float(max_price_override)
+    elif use_live_price_as_max:
         max_price = float(live_price) * (1.0 + float(tolerance_pct) / 100.0)
     elif (
         guadao_max_listing_ratio is not None

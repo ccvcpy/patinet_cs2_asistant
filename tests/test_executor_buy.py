@@ -157,6 +157,55 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         call = client.quick_buy_calls[0]
         self.assertAlmostEqual(1.30 * 1.01, float(call["max_price"]), places=6)
 
+    def test_execute_rebuy_uses_exact_replacement_price_cap_with_frozen_ratio_guard(self) -> None:
+        class KilowattC5Client(FakeC5Client):
+            def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
+                return {market_hash_names[0]: {"price": 1.58}}
+
+        client = KilowattC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.60,
+            expected_steam_list_price=3.00,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            guadao_max_listing_ratio=0.62,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+            max_price_override=1.60,
+        )
+
+        self.assertTrue(result.success)
+        call = client.quick_buy_calls[0]
+        self.assertAlmostEqual(1.60, float(call["max_price"]), places=6)
+
+    def test_replacement_price_cap_does_not_bypass_frozen_dynamic_ratio(self) -> None:
+        class KilowattC5Client(FakeC5Client):
+            def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
+                return {market_hash_names[0]: {"price": 1.90}}
+
+        client = KilowattC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=2.00,
+            expected_steam_list_price=3.00,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            guadao_max_listing_ratio=0.62,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+            max_price_override=2.00,
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual("ratio_no_longer_profitable", result.reason)
+        self.assertAlmostEqual(2.00, float(result.max_price), places=6)
+        self.assertEqual([], client.quick_buy_calls)
+
     def test_execute_rebuy_treats_c5_price_network_error_as_retryable(self) -> None:
         class NetworkErrorC5Client(FakeC5Client):
             def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:

@@ -467,6 +467,10 @@ onMounted(loadReport);
   max-width: 1280px;
 }
 
+.case-monitor-page > * {
+  min-width: 0;
+}
+
 .case-monitor-page .metrics-grid.compact {
   grid-template-columns: repeat(4, minmax(160px, 1fr));
 }
@@ -715,4 +719,11 @@ onMounted(loadReport);
     grid-template-columns: 1fr;
   }
 }
+
+/* FOLIO compact data theme */
+.case-report-meta input{border-color:var(--folio-line);border-radius:11px;color:var(--folio-ink);background:#fff}.case-report-meta input:focus{border-color:var(--folio-green);box-shadow:0 0 0 3px rgba(35,106,76,.1)}
+.case-filter-panel{padding:12px}.segmented-control{gap:6px}.segment-button{min-height:36px;border-color:var(--folio-line);border-radius:10px;color:#59645d;background:var(--folio-surface-soft);font-size:12px;font-weight:600}.segment-button:hover{color:var(--folio-green-dark);background:#eff4f0}.segment-button.active{border-color:#b8d2c1;color:var(--folio-green-dark);background:var(--folio-green-soft);box-shadow:inset 0 0 0 1px rgba(35,106,76,.08)}
+.recommendation-list{gap:7px}.case-recommendation-row{border-color:var(--folio-line);border-radius:13px;color:var(--folio-ink);background:#fff;box-shadow:0 4px 18px rgba(34,49,41,.025);transition:.16s ease}.case-recommendation-row:hover{border-color:#cbd8cf;background:#fbfcfb;transform:translateY(-1px)}.case-recommendation-row.active{border-color:#b7d1c0;background:#f3f8f5}.case-recommendation-row .rank{color:#fff;background:var(--folio-green);box-shadow:0 5px 12px rgba(35,106,76,.16)}.case-recommendation-row .item-name small{color:var(--folio-muted)}
+.focus-heading>strong{color:var(--folio-green);letter-spacing:-.045em}.case-focus-grid>div,.price-source-grid>div,.threshold-card{border-color:#e8ece7;border-radius:12px;background:var(--folio-surface-soft)}.threshold-card em{color:var(--folio-muted)}
+.ratio-timeline{border-color:var(--folio-line);background:#eef2ee}.bar-track{background:#edf1ed}.timeline-segment,.bar-fill{filter:saturate(.72)}
 </style>

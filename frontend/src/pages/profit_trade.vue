@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import ProfitTradeRoiWatch from "../components/ProfitTradeRoiWatch.vue";
 
 type ProfitStep = {
   key: string;
@@ -454,14 +455,13 @@ async function loadDashboard(): Promise<void> {
     dashboard.value = (await fetchJson("/api/profit-trade/dashboard")) as ProfitDashboard;
     dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
     apiOnline.value = true;
+    window.dispatchEvent(new CustomEvent("profit-trade:dashboard-status", {
+      detail: { allowRealExecution: dashboard.value.config.allowRealExecution },
+    }));
   } catch {
     apiOnline.value = false;
-    try {
-      dashboard.value = (await fetchJson("/profit_trade_dashboard.json")) as ProfitDashboard;
-      dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
-    } catch {
-      dashboard.value = fallbackDashboard;
-    }
+    dashboard.value = fallbackDashboard;
+    message.value = "API未连接：无法读取当前真实状态，页面不会使用静态运营数据替代。";
   } finally {
     loading.value = false;
   }
@@ -643,6 +643,7 @@ async function scanOpportunities(): Promise<void> {
     const opportunities = payload.report?.opportunityCount ?? 0;
     message.value = `扫描完成：机会 ${opportunities} 个，写入候选 ${created} 笔`;
     await loadDashboard();
+    window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
   } catch (error) {
     apiOnline.value = false;
     message.value = "API未连接或扫描失败";
@@ -680,6 +681,7 @@ async function runOnce(): Promise<void> {
     saveLastRunState();
     message.value = `执行完成：${summary}`;
     await loadDashboard();
+    window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
   } catch (error) {
     apiOnline.value = false;
     const summary = `失败：${error instanceof Error ? error.message : String(error)}`;
@@ -810,6 +812,7 @@ function saveAutoRunState(): void {
   if (typeof window === "undefined") return;
   if (!autoRunActive.value || !autoRunNextAt.value) {
     window.localStorage.removeItem(autoRunStorageKey);
+    window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: false } }));
     return;
   }
   window.localStorage.setItem(
@@ -819,6 +822,11 @@ function saveAutoRunState(): void {
       nextAt: autoRunNextAt.value,
     }),
   );
+  window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
+}
+
+function handleSharedConfigChange(): void {
+  void loadDashboard();
 }
 
 function saveLastRunState(): void {
@@ -886,6 +894,7 @@ async function startAutoRun(): Promise<void> {
   autoRunNextAt.value = null;
   nowMs.value = Date.now();
   message.value = "循环执行已开启：正在立刻执行第一轮";
+  window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
   await runScheduledOnce();
 }
 
@@ -945,10 +954,12 @@ onMounted(() => {
   restoreLastRun();
   void loadDashboard();
   restoreAutoRun();
+  window.addEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 
 onUnmounted(() => {
   clearAutoRunTimers();
+  window.removeEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 </script>
 
@@ -1059,6 +1070,8 @@ onUnmounted(() => {
 
     <p v-if="message" class="inline-status">{{ message }}</p>
 
+    <ProfitTradeRoiWatch />
+
     <section class="profit-layout">
       <article class="panel profit-settings">
         <div class="panel-title-row">
@@ -1083,8 +1096,8 @@ onUnmounted(() => {
             <dd>{{ formatMoney(dashboard.config.dailySteamBudget) }}</dd>
           </div>
           <div>
-            <dt>扫描上限</dt>
-            <dd>{{ dashboard.config.scanMaxItems }}</dd>
+            <dt>扫描范围</dt>
+            <dd>全部符合前置条件的品类</dd>
           </div>
           <div>
             <dt>A锁定</dt>
@@ -2355,4 +2368,15 @@ onUnmounted(() => {
     grid-template-columns: minmax(74px, auto) minmax(88px, 1fr);
   }
 }
+
+/* FOLIO compact data theme */
+.api-pill,.status-badge,.roi-badge,.roi-basis-badge,.type-badge{min-height:28px;border-color:var(--folio-line);color:var(--folio-muted);background:var(--folio-surface-soft);font-size:11px;font-weight:700}.api-pill.online,.roi-badge{border-color:#c8dfd0;color:var(--folio-green);background:var(--folio-green-soft)}.api-pill.offline,.status-badge.attention{border-color:#ebceca;color:var(--folio-red);background:var(--folio-red-soft)}.type-badge.warning{border-color:#e7d9bb;color:var(--folio-amber);background:var(--folio-amber-soft)}.secondary-button.active{border-color:#bfd7c7;color:var(--folio-green-dark);background:var(--folio-green-soft)}
+.profit-summary-grid,.execution-status-grid{gap:8px}.profit-metric,.execution-status-item{border-color:var(--folio-line);border-radius:14px;background:#fff;box-shadow:var(--folio-shadow)}.profit-metric{min-height:88px;padding:14px}.profit-metric span,.execution-status-item span{color:var(--folio-muted);font-size:11px}.profit-metric strong,.execution-status-item strong{color:var(--folio-ink)}.profit-metric.danger,.execution-status-item.offline{border-color:#ebceca;background:var(--folio-red-soft)}.execution-status-item.online{border-color:#c8dfd0;background:#f3f8f5}.execution-status-item.running{border-color:#cad9df;background:var(--folio-blue-soft)}
+.inline-status,.trade-warning{border-color:#e7d9bb;border-radius:11px;color:#805b1c;background:var(--folio-amber-soft)}.profit-layout{gap:14px}.settings-list div,.protection-panel{border-color:#edf0ed}.settings-list dt,.budget-form label,.protection-form label,.protection-group>span,.trade-no,.trade-hash,.trade-detail-grid dt,.completed-filter-note,.completed-toolbar label,.completed-profit-summary dt,.completed-profit-summary small,.completed-trade-row span,.completed-trade-row dt{color:var(--folio-muted)}.settings-list dd,.formula-panel strong,.protection-panel h3,.trade-head h2,.trade-detail-grid dd,.completed-profit-summary dd,.completed-trade-row strong,.completed-trade-row dd{color:var(--folio-ink)}
+.formula-panel,.trade-detail-grid dl,.completed-profit-summary div{border-color:#e8ece7;border-radius:12px;background:var(--folio-surface-soft)}.formula-panel small{color:var(--folio-red)}.status-toggle{border-color:var(--folio-line);border-radius:12px;color:var(--folio-muted);background:var(--folio-surface-soft)}.status-toggle strong{color:var(--folio-red)}.status-toggle.active{border-color:#bfd7c7;color:var(--folio-green);background:var(--folio-green-soft)}.status-toggle.active strong{color:var(--folio-green)}
+.protection-input-row input,.manual-settle-row input,.completed-toolbar input{border-color:#dfe4df;border-radius:11px;color:var(--folio-ink);background:#fff}.protection-input-row input:focus,.manual-settle-row input:focus,.completed-toolbar input:focus{border-color:var(--folio-green);box-shadow:0 0 0 3px rgba(35,106,76,.1)}.protection-group{border-color:var(--folio-line);border-radius:12px}.protection-chip{border-color:var(--folio-line);border-radius:10px;color:var(--folio-ink);background:var(--folio-surface-soft)}.protection-chip:hover{border-color:#c7d8cc;background:var(--folio-green-soft)}
+.profit-trade-card,.completed-toolbar,.completed-trade-row{border-color:var(--folio-line);border-radius:15px;background:#fff;box-shadow:var(--folio-shadow)}.profit-trade-card.attention{border-color:#e8c6c2}.roi-basis-badge{border-color:var(--folio-line);color:var(--folio-muted);background:var(--folio-surface-soft)}.mini-action{border-color:var(--folio-line);color:#405048;background:#f1f4f0}.mini-action:hover{color:var(--folio-green-dark);background:var(--folio-green-soft)}.protect-action{border-color:#e4d5b6;color:var(--folio-amber);background:var(--folio-amber-soft)}.dismiss-action{color:#566159;background:#f1f4f0}.danger-button{border-color:#e6c5c1;color:var(--folio-red);background:var(--folio-red-soft)}
+.progress-track{height:8px;background:#e9eee9}.progress-track span{background:var(--folio-green)}.step-row span{border-color:#d8dfd9;color:var(--folio-muted);background:#fff}.step-row li.done span,.step-row li.current span{border-color:var(--folio-green);background:var(--folio-green)}.step-row li.done,.step-row li.current{color:var(--folio-green)}.step-row li.attention span{border-color:var(--folio-red);background:var(--folio-red)}.step-row li.attention,.trade-error{color:var(--folio-red)}.trade-error{border-color:#ebceca;border-radius:11px;background:var(--folio-red-soft)}
+.completed-profit-summary dd.positive,.completed-trade-row dd.positive{color:var(--folio-green)}.completed-profit-summary dd.negative,.completed-trade-row dd.negative{color:var(--folio-red)}
+.trade-stack,.completed-zone{min-width:0}.completed-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.completed-profit-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.completed-filter-actions,.completed-pagination{justify-content:flex-start}
 </style>

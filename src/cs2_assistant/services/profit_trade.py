@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,8 @@ from cs2_assistant.db import Database
 from cs2_assistant.models import MarketState, StrategyConfig
 from cs2_assistant.services.market import MarketService
 from cs2_assistant.services.pricing import summarize_orderbook_prices
+from cs2_assistant.services.profit_trade_logging import get_profit_trade_event_logger
+from cs2_assistant.services.public_payload import sanitize_public_payload
 from cs2_assistant.services.strategy import load_strategy_config, save_strategy_config
 from cs2_assistant.services.t_yield_scan import (
     fetch_all_c5_inventories,
@@ -44,6 +48,11 @@ STEAM_BUY_VERIFY_ATTEMPTS = 8
 STEAM_BUY_VERIFY_DELAY_SECONDS = 2.0
 # Project policy: keep three failed createbuyorder attempts unless the user explicitly changes it.
 STEAM_BUY_LISTING_RETRY_ATTEMPTS = 3
+# Independent pre-purchase protection for Steam's listings route. This does not
+# consume or change the three concrete buy attempts above.
+STEAM_SEARCH_LISTINGS_429_ATTEMPTS = 3
+STEAM_SEARCH_LISTINGS_429_FALLBACK_DELAY_SECONDS = 2.0
+STEAM_SEARCH_LISTINGS_429_MAX_DELAY_SECONDS = 15.0
 STEAM_BUY_CANCEL_VERIFY_ATTEMPTS = 3
 STEAM_BUY_CANCEL_VERIFY_DELAY_SECONDS = 0.35
 STEAM_BUY_FAILED_LISTING_TTL_SECONDS = 300.0
@@ -51,8 +60,52 @@ C5_SALE_SYNC_PENDING_MAX_SECONDS = 3 * 60 * 60
 _STEAM_BUY_FAILED_LISTING_BLACKLIST: dict[tuple[str, str], float] = {}
 
 
-def _build_profit_trade_market_service(settings: Settings) -> MarketService:
+def _profit_trade_telemetry_context(
+    row: Any | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    if row is not None:
+        note = _read_note(row["note"])
+        context.update(
+            {
+                "trade_id": int(row["id"]),
+                "trade_no": str(row["trade_no"] or "").strip() or None,
+                "market_hash_name": str(row["market_hash_name"] or "").strip() or None,
+                "asset_id": str(row["a_asset_id"] or note.get("assetId") or "").strip() or None,
+                "account_id": str(note.get("steamAccountId") or "").strip() or None,
+                "steam_id64": str(row["a_steam_id"] or note.get("steamId") or "").strip() or None,
+            }
+        )
+    context.update(overrides)
+    return {key: value for key, value in context.items() if value not in (None, "")}
+
+
+def _profit_trade_telemetry_callback(**context: Any) -> Any:
+    return get_profit_trade_event_logger().bind_telemetry(**context)
+
+
+def _build_profit_trade_c5_client(
+    settings: Settings,
+    **telemetry_context: Any,
+) -> C5GameClient:
+    if not settings.c5_api_key:
+        raise RuntimeError("missing C5GAME_API_KEY / C5_API_KEY")
+    return C5GameClient(
+        str(settings.c5_api_key),
+        settings.c5_base_url,
+        telemetry_callback=_profit_trade_telemetry_callback(**telemetry_context),
+    )
+
+
+def _build_profit_trade_market_service(
+    settings: Settings,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+) -> MarketService:
     """ProfitTrade execution only trusts Steam orderbook and C5 batch prices."""
+    context = dict(telemetry_context or {})
+    callback = _profit_trade_telemetry_callback(**context)
     store = AccountStore(PROJECT_ROOT / "config")
     usable_accounts: list[Account] = []
     for account in store.list_accounts():
@@ -73,6 +126,7 @@ def _build_profit_trade_market_service(settings: Settings) -> MarketService:
                 device_id=account.device_id,
                 account_id=account.id,
                 base_url=settings.steam_market_base_url,
+                telemetry_callback=callback,
             )
             break
         except Exception:
@@ -84,6 +138,7 @@ def _build_profit_trade_market_service(settings: Settings) -> MarketService:
                 identity_secret=settings.steam_identity_secret,
                 device_id=settings.steam_device_id,
                 base_url=settings.steam_market_base_url,
+                telemetry_callback=callback,
             )
         except Exception:
             pass
@@ -91,7 +146,7 @@ def _build_profit_trade_market_service(settings: Settings) -> MarketService:
     return MarketService(
         steamdt_client=None,
         csqaq_client=None,
-        c5_client=C5GameClient(settings.c5_api_key, settings.c5_base_url)
+        c5_client=_build_profit_trade_c5_client(settings, **context)
         if settings.c5_api_key
         else None,
         steam_market_client=steam_market_client,
@@ -198,6 +253,74 @@ class ProfitTradeOpportunity:
             "liquidityStatus": self.liquidity_status,
             "auditStatus": self.audit_status,
             "auditReason": self.audit_reason,
+        }
+
+
+@dataclass(slots=True)
+class ProfitTradeMarketEvaluation:
+    market_hash_name: str
+    name: str
+    steam_buy_price: float
+    steam_price_source: str
+    c5_listing_price: float
+    c5_price_source: str
+    c5_expected_net_price: float
+    balance_discount: float
+    steam_real_cost: float
+    expected_profit: float
+    expected_roi: float
+    inventory_count: int
+    tradable_count: int
+    c5_recent_sold_net_price: float | None
+    c5_recent_sold_count: int | None
+    c5_current_sell_price: float | None
+    c5_on_sale_count: int | None
+    c5_purchase_max_price: float | None
+    c5_purchase_count: int | None
+    risk_status: str
+    risk_reason: str
+    execution_status: str
+    execution_reason: str
+    audit_status: str = "passed"
+    audit_reason: str = "rule_based"
+
+    def to_watch_record(
+        self,
+        config: StrategyConfig,
+        *,
+        execution_status: str | None = None,
+        execution_reason: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "market_hash_name": self.market_hash_name,
+            "name_cn": self.name,
+            "steam_buy_price": self.steam_buy_price,
+            "steam_price_source": self.steam_price_source,
+            "c5_listing_price": self.c5_listing_price,
+            "c5_price_source": self.c5_price_source,
+            "c5_expected_net_price": self.c5_expected_net_price,
+            "balance_discount": self.balance_discount,
+            "expected_profit": self.expected_profit,
+            "expected_roi": self.expected_roi,
+            "min_roi": float(config.profit_trade_min_roi),
+            "manual_review_roi": float(config.profit_trade_manual_review_roi),
+            "inventory_count": self.inventory_count,
+            "tradable_count": self.tradable_count,
+            "c5_recent_sold_net_price": self.c5_recent_sold_net_price,
+            "c5_recent_sold_count": self.c5_recent_sold_count,
+            "c5_current_sell_price": self.c5_current_sell_price,
+            "c5_on_sale_count": self.c5_on_sale_count,
+            "c5_purchase_max_price": self.c5_purchase_max_price,
+            "c5_purchase_count": self.c5_purchase_count,
+            "risk_status": self.risk_status,
+            "risk_reason": self.risk_reason,
+            "execution_status": execution_status or self.execution_status,
+            "execution_reason": execution_reason or self.execution_reason,
+            "raw": {
+                "auditStatus": self.audit_status,
+                "auditReason": self.audit_reason,
+                "steamRealCost": self.steam_real_cost,
+            },
         }
 
 
@@ -350,6 +473,24 @@ def _record_profit_trade_run(settings: Settings, report: "ProfitTradeRunReport")
         _write_profit_trade_last_run(settings, report)
     except OSError:
         pass
+    summary = _summarize_profit_trade_run(report)
+    get_profit_trade_event_logger().emit(
+        level="ERROR" if report.errors else "INFO",
+        provider="local",
+        component="profit_trade_runner",
+        operation="run_completed",
+        message=str(summary.get("summary") or "Profit Trade run completed"),
+        run_id=str(report.generated_at),
+        safe_context={
+            "enabled": report.enabled,
+            "allow_real_execution": report.allow_real_execution,
+            "bought_trade_ids": list(report.bought_trade_ids),
+            "listed_trade_ids": list(report.listed_trade_ids),
+            "settled_trade_ids": list(report.settled_trade_ids),
+            "skipped_trade_ids": list(report.skipped_trade_ids),
+            "errors": list(report.errors),
+        },
+    )
     return report
 
 
@@ -417,7 +558,11 @@ def _build_note(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _build_steam_client(settings: Settings) -> SteamMarketClient:
+def _build_steam_client(
+    settings: Settings,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+) -> SteamMarketClient:
     store = AccountStore(PROJECT_ROOT / "config")
     current = store.get_current()
     cookies = (current.cookies if current else None) or settings.steam_cookies
@@ -433,10 +578,16 @@ def _build_steam_client(settings: Settings) -> SteamMarketClient:
         device_id=device_id,
         account_id=current.id if current else None,
         base_url=settings.steam_market_base_url,
+        telemetry_callback=_profit_trade_telemetry_callback(**dict(telemetry_context or {})),
     )
 
 
-def _build_steam_client_for_account(settings: Settings, account: Account) -> SteamMarketClient:
+def _build_steam_client_for_account(
+    settings: Settings,
+    account: Account,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+) -> SteamMarketClient:
     return SteamMarketClient(
         cookies=account.cookies,
         steam_id64=account.steam_id64,
@@ -444,6 +595,7 @@ def _build_steam_client_for_account(settings: Settings, account: Account) -> Ste
         device_id=account.device_id,
         account_id=account.id,
         base_url=settings.steam_market_base_url,
+        telemetry_callback=_profit_trade_telemetry_callback(**dict(telemetry_context or {})),
     )
 
 
@@ -454,6 +606,7 @@ def _build_steam_client_for_profit_trade(
     steam_client: Any | None = None,
 ) -> Any:
     note = _read_note(row["note"])
+    telemetry_context = _profit_trade_telemetry_context(row)
     target_account_id = str(note.get("steamAccountId") or "").strip()
     target_steam_id = str(note.get("steamId") or row["a_steam_id"] or "").strip()
     if steam_client is not None:
@@ -483,7 +636,11 @@ def _build_steam_client_for_profit_trade(
             f"cannot build Steam client for tracked buy order: "
             f"accountId={target_account_id or '-'}, steamId={target_steam_id or '-'}"
         )
-    return _build_steam_client_for_account(settings, selected)
+    return _build_steam_client_for_account(
+        settings,
+        selected,
+        telemetry_context=telemetry_context,
+    )
 
 
 def _select_steam_buy_account(
@@ -492,6 +649,7 @@ def _select_steam_buy_account(
     required_balance: float,
     preferred_steam_id: str | None = None,
     account_store: AccountStore | None = None,
+    telemetry_context: dict[str, Any] | None = None,
 ) -> SteamBuyAccountSelection:
     store = account_store or AccountStore(PROJECT_ROOT / "config")
     candidates: list[tuple[float, str, Account, SteamMarketClient, dict[str, Any]]] = []
@@ -501,7 +659,15 @@ def _select_steam_buy_account(
         if not account.cookies or not account.steam_id64:
             continue
         try:
-            client = _build_steam_client_for_account(settings, account)
+            client = (
+                _build_steam_client_for_account(
+                    settings,
+                    account,
+                    telemetry_context=telemetry_context,
+                )
+                if telemetry_context
+                else _build_steam_client_for_account(settings, account)
+            )
             wallet = client.wallet_balance()
             balance = safe_float(wallet.get("balance")) or 0.0
         except Exception as exc:
@@ -517,7 +683,11 @@ def _select_steam_buy_account(
         return SteamBuyAccountSelection(account=account, client=client, wallet_balance=balance, wallet=wallet)
 
     if settings.steam_cookies:
-        client = _build_steam_client(settings)
+        client = (
+            _build_steam_client(settings, telemetry_context=telemetry_context)
+            if telemetry_context
+            else _build_steam_client(settings)
+        )
         wallet = client.wallet_balance()
         balance = safe_float(wallet.get("balance")) or 0.0
         if balance + 1e-9 >= required_balance:
@@ -927,6 +1097,175 @@ def _pick_lowest_steam_orderbook_buy_target(payload: dict[str, Any]) -> SteamBuy
     )
 
 
+class _SearchListings429Exhausted(RuntimeError):
+    def __init__(
+        self,
+        *,
+        last_error: SteamMarketError,
+        attempts: int,
+        events: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(
+            f"Steam listings search remained rate limited after {attempts} attempts (HTTP 429)"
+        )
+        self.last_error = last_error
+        self.attempts = attempts
+        self.events = list(events)
+
+
+def _steam_retry_after_delay_seconds(
+    exc: SteamMarketError,
+    *,
+    failure_number: int,
+    now: datetime | None = None,
+) -> tuple[float, str]:
+    raw_retry_after = str(getattr(exc, "retry_after", "") or "").strip()
+    delay: float | None = None
+    if raw_retry_after:
+        try:
+            delay = float(raw_retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(raw_retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                current = now or datetime.now(timezone.utc)
+                delay = (retry_at.astimezone(timezone.utc) - current.astimezone(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+    if delay is not None:
+        return (
+            min(
+                max(0.0, delay),
+                max(0.0, float(STEAM_SEARCH_LISTINGS_429_MAX_DELAY_SECONDS)),
+            ),
+            "retry_after",
+        )
+    fallback = max(0.0, float(STEAM_SEARCH_LISTINGS_429_FALLBACK_DELAY_SECONDS)) * max(
+        1,
+        int(failure_number),
+    )
+    return (
+        min(
+            fallback,
+            max(0.0, float(STEAM_SEARCH_LISTINGS_429_MAX_DELAY_SECONDS)),
+        ),
+        "incremental_fallback",
+    )
+
+
+def _search_profit_trade_listings_with_429_retry(
+    *,
+    settings: Settings,
+    config: StrategyConfig,
+    client: Any,
+    market_hash_name: str,
+    orderbook_payload: dict[str, Any],
+    orderbook_buy_target: SteamBuyTarget,
+    telemetry_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], SteamBuyTarget, list[dict[str, Any]]]:
+    attempts = max(1, int(STEAM_SEARCH_LISTINGS_429_ATTEMPTS))
+    rate_limit_events: list[dict[str, Any]] = []
+    event_logger = get_profit_trade_event_logger()
+    current_orderbook_payload = orderbook_payload
+    current_orderbook_target = orderbook_buy_target
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            try:
+                current_orderbook_payload = client.order_book(
+                    app_id=settings.app_id,
+                    market_hash_name=market_hash_name,
+                )
+            except SteamMarketError as exc:
+                raise RuntimeError(
+                    f"Steam orderbook refresh failed after listings HTTP 429: {exc}"
+                ) from exc
+            refreshed_target = _pick_lowest_steam_orderbook_buy_target(current_orderbook_payload)
+            if refreshed_target is None:
+                raise RuntimeError(
+                    "Steam orderbook returned no buyable sell order after listings HTTP 429"
+                )
+            current_orderbook_target = refreshed_target
+        try:
+            listings_payload = client.search_listings(
+                app_id=settings.app_id,
+                market_hash_name=market_hash_name,
+                start=0,
+                count=10,
+                currency=config.steam_currency,
+                country=config.steam_country,
+                language=config.steam_language,
+            )
+        except SteamMarketError as exc:
+            if getattr(exc, "status_code", None) != 429:
+                raise
+            wait_seconds, delay_source = _steam_retry_after_delay_seconds(
+                exc,
+                failure_number=attempt,
+            )
+            event = {
+                "attempt": attempt,
+                "maxAttempts": attempts,
+                "failedAt": utc_now_iso(),
+                "statusCode": 429,
+                "retryAfter": getattr(exc, "retry_after", None),
+                "waitSeconds": round(wait_seconds, 3),
+                "delaySource": delay_source,
+            }
+            rate_limit_events.append(event)
+            exhausted = attempt >= attempts
+            event_logger.emit(
+                level="ERROR" if exhausted else "WARN",
+                provider="local",
+                component="profit_trade_buy",
+                operation=(
+                    "search_listings_429_exhausted"
+                    if exhausted
+                    else "search_listings_429_retry_scheduled"
+                ),
+                message=(
+                    "Steam listings search remained rate limited; no purchase request was sent"
+                    if exhausted
+                    else "Steam listings search was rate limited; waiting before a safe retry"
+                ),
+                **telemetry_context,
+                safe_context=event,
+            )
+            if exhausted:
+                raise _SearchListings429Exhausted(
+                    last_error=exc,
+                    attempts=attempts,
+                    events=rate_limit_events,
+                ) from exc
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            continue
+        if rate_limit_events:
+            event_logger.emit(
+                level="INFO",
+                provider="local",
+                component="profit_trade_buy",
+                operation="search_listings_429_recovered",
+                message="Steam listings search recovered after HTTP 429",
+                **telemetry_context,
+                safe_context={
+                    "attempt": attempt,
+                    "rateLimitCount": len(rate_limit_events),
+                    "orderbookRefreshed": True,
+                    "purchaseRequestSent": False,
+                },
+            )
+        return (
+            listings_payload,
+            current_orderbook_payload,
+            current_orderbook_target,
+            rate_limit_events,
+        )
+
+    raise RuntimeError("Steam listings 429 retry loop ended without a result")
+
+
 def _steam_market_should_use_buy_order(market_hash_name: str) -> bool:
     name = str(market_hash_name or "").strip()
     if not name:
@@ -1284,7 +1623,10 @@ def _fetch_c5_inventory_asset_ids_for_steam_buy(
     if c5_client is None:
         if not settings.c5_api_key:
             return [], "missing C5GAME_API_KEY / C5_API_KEY for inventory verification"
-        c5_client = C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+        c5_client = _build_profit_trade_c5_client(
+            settings,
+            steam_id64=target_steam_id,
+        )
     try:
         payload = c5_client.inventory(target_steam_id, app_id=settings.app_id)
     except Exception as exc:
@@ -2136,6 +2478,30 @@ def _pick_sell_asset(
     return None
 
 
+def _watch_eligible_market_hash_names(
+    config: StrategyConfig,
+    inventory_items: list[dict[str, Any]],
+) -> set[str]:
+    """Return types with a real, tradable, unprotected C5 asset.
+
+    Observation does not reserve the asset and does not require sale tokens.
+    Those remain execution-only gates in ``_pick_sell_asset``.
+    """
+
+    result: set[str] = set()
+    for item in inventory_items:
+        market_hash_name = str(item.get("marketHashName") or "").strip()
+        if not market_hash_name:
+            continue
+        if not _inventory_item_key(item):
+            continue
+        if _inventory_item_protection_reason(config, item):
+            continue
+        if _is_tradable_c5_item(item):
+            result.add(market_hash_name)
+    return result
+
+
 def _state_price_is_usable_for_profit_trade(state: MarketState) -> bool:
     return (
         state.steam_sell_price is not None
@@ -2145,14 +2511,13 @@ def _state_price_is_usable_for_profit_trade(state: MarketState) -> bool:
     )
 
 
-def _build_opportunity(
+def _build_market_evaluation(
     *,
     config: StrategyConfig,
     item_type: dict[str, Any],
     state: MarketState,
-    sell_item: dict[str, Any],
     c5_risk: C5RecentSaleRisk | None = None,
-) -> ProfitTradeOpportunity | None:
+) -> ProfitTradeMarketEvaluation | None:
     if not _state_price_is_usable_for_profit_trade(state):
         return None
     c5_listing_price = safe_float(state.c5_sell_price)
@@ -2220,55 +2585,55 @@ def _build_opportunity(
     if expected_roi is None:
         return None
     manual_review_roi = float(config.profit_trade_manual_review_roi)
+    risk_status = (
+        evaluated_risk.status
+        if config.profit_trade_require_c5_recent_sales
+        else evaluated_depth.status
+    )
+    risk_reason = (
+        evaluated_risk.reason
+        if config.profit_trade_require_c5_recent_sales
+        else evaluated_depth.reason
+    )
+    execution_status = "executable"
+    execution_reason = "all automatic execution gates passed"
+    audit_status = "passed"
+    audit_reason = "rule_based"
     if manual_review_roi > 0 and expected_roi > manual_review_roi:
-        return ProfitTradeOpportunity(
-            market_hash_name=str(item_type["market_hash_name"]),
-            name=str(state.name_cn or item_type.get("name_cn") or item_type["market_hash_name"]),
-            asset_id=_inventory_item_key(sell_item),
-            steam_id=str(sell_item.get("steamId") or "").strip() or None,
-            token=str(sell_item.get("token") or "").strip() or None,
-            style_token=str(sell_item.get("styleToken") or sell_item.get("style_token") or "").strip() or None,
-            steam_buy_price=float(steam_buy_price),
-            steam_price_source=state.steam_price_source or "unknown",
-            c5_listing_price=float(c5_listing_price),
-            c5_price_source=state.c5_price_source or "unknown",
-            c5_expected_net_price=float(c5_expected_net),
-            steam_real_cost=float(steam_real_cost),
-            expected_profit=float(expected_profit),
-            expected_roi=float(expected_roi),
-            inventory_count=int(item_type["inventory_count"]),
-            tradable_count=int(item_type["tradable_count"]),
-            c5_recent_sold_net_price=evaluated_risk.recent_sold_net_price,
-            c5_recent_sold_count=evaluated_risk.recent_sold_count,
-            c5_current_sell_price=evaluated_depth.current_sell_price,
-            c5_on_sale_count=evaluated_depth.on_sale_count,
-            c5_purchase_max_price=evaluated_depth.purchase_max_price,
-            c5_purchase_count=evaluated_depth.purchase_count,
-            liquidity_status=evaluated_depth.status if config.profit_trade_require_c5_market_depth else evaluated_risk.status,
-            audit_status="manual_required",
-            audit_reason=f"ROI {expected_roi * 100:.2f}% > manual review threshold {manual_review_roi * 100:.2f}%",
+        audit_status = "manual_required"
+        audit_reason = (
+            f"ROI {expected_roi * 100:.2f}% > manual review threshold "
+            f"{manual_review_roi * 100:.2f}%"
         )
-    if config.profit_trade_require_c5_market_depth and evaluated_depth.status != "passed":
-        return None
-    if config.profit_trade_require_c5_recent_sales and evaluated_risk.status != "passed":
-        return None
-    if expected_roi < float(config.profit_trade_min_roi):
-        return None
-    if config.profit_trade_ai_audit_enabled:
-        return None
+        execution_status = "manual_review"
+        execution_reason = audit_reason
+    elif config.profit_trade_require_c5_market_depth and evaluated_depth.status != "passed":
+        execution_status = "c5_risk_blocked"
+        execution_reason = evaluated_depth.reason
+        risk_status = evaluated_depth.status
+        risk_reason = evaluated_depth.reason
+    elif config.profit_trade_require_c5_recent_sales and evaluated_risk.status != "passed":
+        execution_status = "c5_risk_blocked"
+        execution_reason = evaluated_risk.reason
+    elif expected_roi < float(config.profit_trade_min_roi):
+        execution_status = "below_min_roi"
+        execution_reason = (
+            f"ROI {expected_roi * 100:.2f}% < automatic threshold "
+            f"{float(config.profit_trade_min_roi) * 100:.2f}%"
+        )
+    elif config.profit_trade_ai_audit_enabled:
+        execution_status = "ai_audit_blocked"
+        execution_reason = "AI audit is enabled but no AI auditor is configured"
 
-    return ProfitTradeOpportunity(
+    return ProfitTradeMarketEvaluation(
         market_hash_name=str(item_type["market_hash_name"]),
         name=str(state.name_cn or item_type.get("name_cn") or item_type["market_hash_name"]),
-        asset_id=_inventory_item_key(sell_item),
-        steam_id=str(sell_item.get("steamId") or "").strip() or None,
-        token=str(sell_item.get("token") or "").strip() or None,
-        style_token=str(sell_item.get("styleToken") or sell_item.get("style_token") or "").strip() or None,
         steam_buy_price=float(steam_buy_price),
         steam_price_source=state.steam_price_source or "unknown",
         c5_listing_price=float(c5_listing_price),
         c5_price_source=state.c5_price_source or "unknown",
         c5_expected_net_price=float(c5_expected_net),
+        balance_discount=float(steam_cost_ratio),
         steam_real_cost=float(steam_real_cost),
         expected_profit=float(expected_profit),
         expected_roi=float(expected_roi),
@@ -2280,10 +2645,150 @@ def _build_opportunity(
         c5_on_sale_count=evaluated_depth.on_sale_count,
         c5_purchase_max_price=evaluated_depth.purchase_max_price,
         c5_purchase_count=evaluated_depth.purchase_count,
-        liquidity_status=evaluated_risk.status
-        if config.profit_trade_require_c5_recent_sales
-        else evaluated_depth.status,
+        risk_status=risk_status,
+        risk_reason=risk_reason,
+        execution_status=execution_status,
+        execution_reason=execution_reason,
+        audit_status=audit_status,
+        audit_reason=audit_reason,
     )
+
+
+def _refresh_profit_trade_c5_evaluation_after_429(
+    *,
+    settings: Settings,
+    config: StrategyConfig,
+    c5_client: Any,
+    market_hash_name: str,
+    name: str,
+    steam_buy_price: float,
+) -> ProfitTradeMarketEvaluation:
+    price_fetcher = getattr(c5_client, "price_batch", None)
+    if price_fetcher is None:
+        raise RuntimeError("C5 client cannot refresh batch price after Steam listings HTTP 429")
+    try:
+        price_payload = price_fetcher([market_hash_name], app_id=settings.app_id)
+    except Exception as exc:
+        raise RuntimeError(f"C5 batch price refresh failed after Steam listings HTTP 429: {exc}") from exc
+    price_row = (
+        price_payload.get(market_hash_name)
+        if isinstance(price_payload, dict)
+        else None
+    )
+    if not isinstance(price_row, dict):
+        raise RuntimeError("C5 batch price refresh returned no matching item after Steam listings HTTP 429")
+    c5_sell_price = _first_float(
+        price_row,
+        ("price", "sellPrice", "salePrice", "lowestSellPrice", "minSellPrice"),
+    )
+    if c5_sell_price is None or c5_sell_price <= 0:
+        raise RuntimeError("C5 batch price refresh returned no usable sell price after Steam listings HTTP 429")
+    batch_on_sale_count = _first_int(
+        price_row,
+        ("count", "onSaleCount", "sellCount", "listingCount", "saleCount"),
+    )
+    statistics_map = _fetch_c5_recent_sale_risks(
+        c5_client,
+        app_id=settings.app_id,
+        market_hash_names=[market_hash_name],
+    )
+    statistics = statistics_map.get(market_hash_name)
+    c5_risk = C5RecentSaleRisk(
+        recent_sold_net_price=statistics.recent_sold_net_price if statistics else None,
+        recent_sold_count=statistics.recent_sold_count if statistics else None,
+        status=statistics.status if statistics else "raw",
+        reason=statistics.reason if statistics else "C5 batch price refreshed without statistics",
+        raw={
+            "priceBatch": price_row,
+            "statistics": statistics.raw if statistics else {},
+        },
+        current_sell_price=float(c5_sell_price),
+        on_sale_count=(
+            batch_on_sale_count
+            if batch_on_sale_count is not None
+            else (statistics.on_sale_count if statistics else None)
+        ),
+        purchase_max_price=statistics.purchase_max_price if statistics else None,
+        purchase_count=statistics.purchase_count if statistics else None,
+    )
+    evaluation = _build_market_evaluation(
+        config=config,
+        item_type={
+            "market_hash_name": market_hash_name,
+            "name_cn": name or market_hash_name,
+            "inventory_count": 1,
+            "tradable_count": 1,
+            "reference_price": float(c5_sell_price),
+        },
+        state=MarketState(
+            market_hash_name=market_hash_name,
+            name_cn=name or market_hash_name,
+            c5_sell_price=float(c5_sell_price),
+            c5_sell_count=c5_risk.on_sale_count,
+            c5_price_source="c5_batch",
+            steam_sell_price=float(steam_buy_price),
+            steam_price_source="steam_orderbook",
+        ),
+        c5_risk=c5_risk,
+    )
+    if evaluation is None:
+        raise RuntimeError("C5/Steam market evaluation is no longer usable after listings HTTP 429")
+    return evaluation
+
+
+def _opportunity_from_market_evaluation(
+    evaluation: ProfitTradeMarketEvaluation,
+    *,
+    sell_item: dict[str, Any],
+) -> ProfitTradeOpportunity:
+    return ProfitTradeOpportunity(
+        market_hash_name=evaluation.market_hash_name,
+        name=evaluation.name,
+        asset_id=_inventory_item_key(sell_item),
+        steam_id=str(sell_item.get("steamId") or "").strip() or None,
+        token=str(sell_item.get("token") or "").strip() or None,
+        style_token=str(sell_item.get("styleToken") or sell_item.get("style_token") or "").strip() or None,
+        steam_buy_price=evaluation.steam_buy_price,
+        steam_price_source=evaluation.steam_price_source,
+        c5_listing_price=evaluation.c5_listing_price,
+        c5_price_source=evaluation.c5_price_source,
+        c5_expected_net_price=evaluation.c5_expected_net_price,
+        steam_real_cost=evaluation.steam_real_cost,
+        expected_profit=evaluation.expected_profit,
+        expected_roi=evaluation.expected_roi,
+        inventory_count=evaluation.inventory_count,
+        tradable_count=evaluation.tradable_count,
+        c5_recent_sold_net_price=evaluation.c5_recent_sold_net_price,
+        c5_recent_sold_count=evaluation.c5_recent_sold_count,
+        c5_current_sell_price=evaluation.c5_current_sell_price,
+        c5_on_sale_count=evaluation.c5_on_sale_count,
+        c5_purchase_max_price=evaluation.c5_purchase_max_price,
+        c5_purchase_count=evaluation.c5_purchase_count,
+        liquidity_status=evaluation.risk_status,
+        audit_status=evaluation.audit_status,
+        audit_reason=evaluation.audit_reason,
+    )
+
+
+def _build_opportunity(
+    *,
+    config: StrategyConfig,
+    item_type: dict[str, Any],
+    state: MarketState,
+    sell_item: dict[str, Any],
+    c5_risk: C5RecentSaleRisk | None = None,
+) -> ProfitTradeOpportunity | None:
+    evaluation = _build_market_evaluation(
+        config=config,
+        item_type=item_type,
+        state=state,
+        c5_risk=c5_risk,
+    )
+    if evaluation is None:
+        return None
+    if evaluation.execution_status not in {"executable", "manual_review"}:
+        return None
+    return _opportunity_from_market_evaluation(evaluation, sell_item=sell_item)
 
 
 def _trade_no() -> str:
@@ -2596,6 +3101,33 @@ def _cancel_locked_trade_before_steam_buy_by_id(settings: Settings, trade_id: in
         db.close()
 
 
+def _record_search_listings_failure_before_purchase(
+    db: Database,
+    trade_id: int,
+    *,
+    error: Exception,
+) -> None:
+    """Persist explicit negative evidence before propagating listing-search failure."""
+
+    row = db.get_profit_trade(trade_id)
+    if row is None:
+        return
+    note = _read_note(row["note"])
+    db.update_profit_trade(
+        trade_id,
+        note=_build_note(
+            {
+                **note,
+                "purchaseRequestSent": False,
+                "listingIdObtained": False,
+                "purchaseRequestEvidence": "search_listings_failed_before_steam_buy",
+                "searchListingsFailedAt": utc_now_iso(),
+                "searchListingsError": str(error),
+            }
+        ),
+    )
+
+
 def _cancel_stale_pre_buy_manual_trades(db: Database) -> None:
     for row in db.list_profit_trades(status="manual_required", limit=1000):
         if not _trade_is_before_steam_buy(row):
@@ -2853,6 +3385,22 @@ def scan_profit_trade_opportunities(
 
     db = Database(settings.db_path)
     db.initialize()
+    scan_id = f"PTSCAN-{uuid.uuid4().hex}"
+    scan_observed_at = utc_now_iso()
+    event_logger = get_profit_trade_event_logger()
+    event_logger.emit(
+        provider="local",
+        component="profit_trade_scan",
+        operation="run_started",
+        message="Profit Trade scan started",
+        run_id=scan_id,
+        safe_context={
+            "record": bool(record),
+            "lock_asset": bool(lock_asset),
+            "result_limit": int(limit),
+            "evaluation_scope": "all eligible item types",
+        },
+    )
     created_trade_ids: list[int] = []
     locked_trade_ids: list[int] = []
     notes: list[str] = []
@@ -2870,7 +3418,10 @@ def scan_profit_trade_opportunities(
         _mark_manual_review_pre_buy_trades(db, config)
         _cancel_c5_risk_failed_pre_buy_trades(db, config)
         if inventory_payload is None:
-            c5_client = c5_client or C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+            c5_client = c5_client or _build_profit_trade_c5_client(
+                settings,
+                run_id=scan_id,
+            )
             inventory_payload = fetch_all_c5_inventories(
                 c5_client,
                 settings,
@@ -2882,10 +3433,12 @@ def scan_profit_trade_opportunities(
         ]
         db.upsert_inventory_assets(inventory_items)
         all_inventory_types = summarize_inventory_types(inventory_items)
+        watch_eligible_names = _watch_eligible_market_hash_names(config, inventory_items)
         inventory_types = [
             item_type
             for item_type in all_inventory_types
             if int(item_type.get("tradable_count") or 0) > 0
+            and str(item_type.get("market_hash_name") or "") in watch_eligible_names
             and (
                 safe_float(item_type.get("reference_price")) is None
                 or float(safe_float(item_type.get("reference_price")) or 0) >= float(config.profit_trade_min_item_value)
@@ -2897,19 +3450,29 @@ def scan_profit_trade_opportunities(
                 str(item_type.get("market_hash_name") or ""),
             )
         )
-        max_items = int(scan_max_items or config.profit_trade_scan_max_items)
-        max_items = max(limit, max(1, max_items))
-        if len(inventory_types) > max_items:
-            notes.append(
-                f"Prefiltered {len(inventory_types)} tradable item types to top {max_items} by C5 reference price."
-            )
-            inventory_types = inventory_types[:max_items]
+        # Evaluate every item type that passed the tradable/value prefilters.
+        # Cutting this list by C5 reference price can hide a lower-priced item
+        # with a valid ROI before its Steam orderbook is ever checked. Keep the
+        # legacy scan_max_items argument/API field compatible, but do not use it
+        # as an evaluation cap. ``limit`` still controls how many opportunities
+        # are returned/recorded after every eligible type has been evaluated.
         if market_service is None:
-            market_service = _build_profit_trade_market_service(settings)
+            market_service = _build_profit_trade_market_service(
+                settings,
+                telemetry_context={"run_id": scan_id},
+            )
         states = market_service.refresh_items(inventory_types) if inventory_types else []
+        if inventory_types and not states:
+            raise RuntimeError(
+                "Profit Trade market refresh returned no states for a non-empty eligible inventory; "
+                "ROI watch was left unchanged"
+            )
         state_map = {state.market_hash_name: state for state in states}
         if c5_client is None and settings.c5_api_key:
-            c5_client = C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+            c5_client = _build_profit_trade_c5_client(
+                settings,
+                run_id=scan_id,
+            )
         c5_risks = (
             _fetch_c5_recent_sale_risks(
                 c5_client,
@@ -2921,36 +3484,142 @@ def scan_profit_trade_opportunities(
         )
 
         opportunities: list[ProfitTradeOpportunity] = []
+        watch_observations: list[dict[str, Any]] = []
+        watch_exit_reasons: dict[str, str] = {}
+        watch_exit_observations: dict[str, dict[str, Any]] = {}
         missing_price_count = 0
         skipped_count = 0
         for item_type in inventory_types:
-            state = state_map.get(str(item_type["market_hash_name"]))
+            market_hash_name = str(item_type["market_hash_name"])
+            state = state_map.get(market_hash_name)
             if state is None or not _state_price_is_usable_for_profit_trade(state):
                 missing_price_count += 1
+                watch_exit_reasons[market_hash_name] = "Steam orderbook or C5 batch price is unavailable"
+                event_logger.emit(
+                    level="WARN",
+                    provider="local",
+                    component="profit_trade_scan",
+                    operation="item_price_unavailable",
+                    message="Profit Trade item evaluation has no usable Steam/C5 price pair",
+                    run_id=scan_id,
+                    market_hash_name=market_hash_name,
+                    safe_context={"reason": watch_exit_reasons[market_hash_name]},
+                )
+                continue
+            evaluation = _build_market_evaluation(
+                config=config,
+                item_type=item_type,
+                state=state,
+                c5_risk=c5_risks.get(market_hash_name),
+            )
+            if evaluation is None:
+                skipped_count += 1
+                watch_exit_reasons[market_hash_name] = "price or minimum-item-value evaluation is not usable"
+                event_logger.emit(
+                    level="DEBUG",
+                    provider="local",
+                    component="profit_trade_scan",
+                    operation="item_evaluation_skipped",
+                    message="Profit Trade item evaluation was skipped",
+                    run_id=scan_id,
+                    market_hash_name=market_hash_name,
+                    safe_context={"reason": watch_exit_reasons[market_hash_name]},
+                )
                 continue
             sell_item = _pick_sell_asset(
                 db,
                 config,
                 inventory_items,
-                market_hash_name=str(item_type["market_hash_name"]),
+                market_hash_name=market_hash_name,
+            )
+            if evaluation.expected_roi > 0:
+                watch_execution_status = evaluation.execution_status
+                watch_execution_reason = evaluation.execution_reason
+                if sell_item is None and watch_execution_status == "executable":
+                    watch_execution_status = "asset_unavailable"
+                    watch_execution_reason = (
+                        "no unreserved executable asset with the required C5 sale tokens is currently available"
+                    )
+                watch_observations.append(
+                    evaluation.to_watch_record(
+                        config,
+                        execution_status=watch_execution_status,
+                        execution_reason=watch_execution_reason,
+                    )
+                )
+            else:
+                watch_exit_reasons[market_hash_name] = (
+                    f"ROI is not positive: {evaluation.expected_roi * 100:.2f}%"
+                )
+                watch_exit_observations[market_hash_name] = evaluation.to_watch_record(config)
+            event_logger.emit(
+                level="INFO" if evaluation.expected_roi > 0 else "DEBUG",
+                provider="local",
+                component="profit_trade_scan",
+                operation="item_evaluated",
+                message="Profit Trade item evaluation completed",
+                run_id=scan_id,
+                market_hash_name=market_hash_name,
+                asset_id=_inventory_item_key(sell_item) if sell_item is not None else None,
+                safe_context={
+                    "steam_buy_price": evaluation.steam_buy_price,
+                    "steam_price_source": evaluation.steam_price_source,
+                    "c5_listing_price": evaluation.c5_listing_price,
+                    "c5_price_source": evaluation.c5_price_source,
+                    "c5_expected_net_price": evaluation.c5_expected_net_price,
+                    "balance_discount": evaluation.balance_discount,
+                    "expected_profit": evaluation.expected_profit,
+                    "expected_roi": evaluation.expected_roi,
+                    "min_roi": float(config.profit_trade_min_roi),
+                    "manual_review_roi": float(config.profit_trade_manual_review_roi),
+                    "risk_status": evaluation.risk_status,
+                    "risk_reason": evaluation.risk_reason,
+                    "execution_status": evaluation.execution_status,
+                    "execution_reason": evaluation.execution_reason,
+                    "has_executable_asset": sell_item is not None,
+                },
             )
             if sell_item is None:
                 skipped_count += 1
                 continue
-            opportunity = _build_opportunity(
-                config=config,
-                item_type=item_type,
-                state=state,
-                sell_item=sell_item,
-                c5_risk=c5_risks.get(str(item_type["market_hash_name"])),
-            )
-            if opportunity is None:
+            if evaluation.execution_status not in {"executable", "manual_review"}:
                 skipped_count += 1
                 continue
+            opportunity = _opportunity_from_market_evaluation(
+                evaluation,
+                sell_item=sell_item,
+            )
             opportunities.append(opportunity)
 
         opportunities.sort(key=lambda item: (-item.expected_roi, -item.c5_listing_price, item.market_hash_name))
         opportunities = opportunities[:limit]
+        watch_result = db.record_profit_trade_roi_scan(
+            watch_observations,
+            scan_id=scan_id,
+            observed_at=scan_observed_at,
+            exit_reasons=watch_exit_reasons,
+            exit_observations=watch_exit_observations,
+        )
+        notes.append(
+            "ROI watch updated: "
+            f"active={len(watch_observations)}, entered={watch_result['inserted']}, "
+            f"refreshed={watch_result['updated']}, exited={watch_result['exited']}."
+        )
+        event_logger.emit(
+            provider="local",
+            component="profit_trade_scan",
+            operation="run_completed",
+            message="Profit Trade scan completed",
+            run_id=scan_id,
+            safe_context={
+                "inventory_count": len(inventory_items),
+                "evaluated_count": len(inventory_types),
+                "opportunity_count": len(opportunities),
+                "missing_price_count": missing_price_count,
+                "skipped_count": skipped_count,
+                "roi_watch": watch_result,
+            },
+        )
         if config.profit_trade_ai_audit_enabled:
             notes.append("AI audit enabled but no AI auditor is configured; opportunities are blocked.")
         if config.profit_trade_require_c5_market_depth:
@@ -3142,11 +3811,20 @@ def execute_profit_trade_buy(
             return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
 
         note = _read_note(row["note"])
+        telemetry_context = _profit_trade_telemetry_context(row)
         a_steam_id = str(row["a_steam_id"] or note.get("steamId") or "").strip()
         selected_account: Account | None = None
         selected_wallet: dict[str, Any] = {}
         selected_wallet_balance: float | None = None
-        client = steam_client or _build_steam_client(settings)
+        client = steam_client or _build_steam_client(
+            settings,
+            telemetry_context=telemetry_context,
+        )
+        if c5_client is None and settings.c5_api_key:
+            c5_client = _build_profit_trade_c5_client(
+                settings,
+                **telemetry_context,
+            )
         try:
             orderbook_payload = client.order_book(
                 app_id=settings.app_id,
@@ -3164,6 +3842,7 @@ def execute_profit_trade_buy(
                 settings,
                 required_balance=orderbook_buy_target.total_price,
                 preferred_steam_id=a_steam_id,
+                telemetry_context=telemetry_context,
             )
             selected_account = selection.account
             selected_wallet = selection.wallet
@@ -3187,6 +3866,7 @@ def execute_profit_trade_buy(
                     settings,
                     required_balance=orderbook_buy_target.total_price,
                     preferred_steam_id=a_steam_id,
+                    telemetry_context=telemetry_context,
                 )
                 selected_account = selection.account
                 selected_wallet = selection.wallet
@@ -3202,6 +3882,9 @@ def execute_profit_trade_buy(
         listing_retry_budget = max(1, int(STEAM_BUY_LISTING_RETRY_ATTEMPTS))
         buy_order_retry_budget = max(1, int(STEAM_BUY_LISTING_RETRY_ATTEMPTS))
         unverified_buy_order_attempts: list[dict[str, Any]] = []
+        search_listings_429_events: list[dict[str, Any]] = []
+        c5_evaluation_after_429: ProfitTradeMarketEvaluation | None = None
+        c5_evaluated_429_count = 0
         refresh_market_snapshot = False
 
         while True:
@@ -3219,16 +3902,72 @@ def execute_profit_trade_buy(
             refresh_market_snapshot = True
 
             try:
-                listings_payload = client.search_listings(
-                    app_id=settings.app_id,
+                (
+                    listings_payload,
+                    orderbook_payload,
+                    orderbook_buy_target,
+                    rate_limit_events,
+                ) = _search_profit_trade_listings_with_429_retry(
+                    settings=settings,
+                    config=config,
+                    client=client,
                     market_hash_name=market_hash_name,
-                    start=0,
-                    count=10,
-                    currency=config.steam_currency,
-                    country=config.steam_country,
-                    language=config.steam_language,
+                    orderbook_payload=orderbook_payload,
+                    orderbook_buy_target=orderbook_buy_target,
+                    telemetry_context=telemetry_context,
                 )
+                search_listings_429_events.extend(rate_limit_events)
+            except _SearchListings429Exhausted as exc:
+                earlier_purchase_request_sent = bool(
+                    stale_listing_attempts or unverified_buy_order_attempts
+                )
+                reason = (
+                    f"Steam listings 查询连续 {exc.attempts} 次受到 HTTP 429 限流；"
+                    "已停止且没有发送新的 Steam 购买请求"
+                )
+                _cancel_pre_steam_buy_trade(
+                    db,
+                    row,
+                    reason=reason,
+                    source="profit_trade_search_listings_429_exhausted",
+                    extra_note={
+                        "purchaseRequestSent": earlier_purchase_request_sent,
+                        "listingIdObtained": False,
+                        "purchaseRequestEvidence": (
+                            "search_listings_429_exhausted_after_confirmed_failed_purchase_attempt"
+                            if earlier_purchase_request_sent
+                            else "search_listings_429_exhausted_before_steam_buy"
+                        ),
+                        "searchListingsFailedAt": utc_now_iso(),
+                        "searchListingsError": str(exc.last_error),
+                        "searchListings429Count": len(search_listings_429_events) + len(exc.events),
+                        "searchListings429Events": [*search_listings_429_events, *exc.events],
+                        "searchListings429Exhausted": True,
+                    },
+                )
+                updated = db.get_profit_trade(trade_id)
+                return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
             except SteamMarketError as exc:
+                _record_search_listings_failure_before_purchase(
+                    db,
+                    trade_id,
+                    error=exc,
+                )
+                get_profit_trade_event_logger().emit(
+                    level="WARN",
+                    provider="local",
+                    component="profit_trade_buy",
+                    operation="purchase_request_not_sent",
+                    message="Steam purchase request was not sent because listing search failed",
+                    **telemetry_context,
+                    exception_type=type(exc).__name__,
+                    safe_context={
+                        "failed_operation": "search_listings",
+                        "listing_id_obtained": False,
+                        "purchase_request_sent": False,
+                        "error": str(exc),
+                    },
+                )
                 raise RuntimeError(f"Steam listings search failed: {exc}") from exc
             use_buy_order = _steam_market_should_use_buy_order(market_hash_name)
             buy_method = "createbuyorder" if use_buy_order else "buylisting"
@@ -3255,28 +3994,75 @@ def execute_profit_trade_buy(
                     settings,
                     required_balance=buy_target.total_price,
                     preferred_steam_id=a_steam_id,
+                    telemetry_context=telemetry_context,
                 )
                 selected_account = selection.account
                 selected_wallet = selection.wallet
                 selected_wallet_balance = selection.wallet_balance
                 client = selection.client
+                market_refresh_operation = "order_book"
                 try:
                     orderbook_payload = client.order_book(
                         app_id=settings.app_id,
                         market_hash_name=market_hash_name,
                     )
-                    listings_payload = client.search_listings(
-                        app_id=settings.app_id,
+                    orderbook_buy_target = _pick_lowest_steam_orderbook_buy_target(orderbook_payload)
+                    if orderbook_buy_target is None:
+                        raise RuntimeError("Steam orderbook returned no buyable sell order for selected account")
+                    market_refresh_operation = "search_listings"
+                    (
+                        listings_payload,
+                        orderbook_payload,
+                        orderbook_buy_target,
+                        rate_limit_events,
+                    ) = _search_profit_trade_listings_with_429_retry(
+                        settings=settings,
+                        config=config,
+                        client=client,
                         market_hash_name=market_hash_name,
-                        start=0,
-                        count=10,
-                        currency=config.steam_currency,
-                        country=config.steam_country,
-                        language=config.steam_language,
+                        orderbook_payload=orderbook_payload,
+                        orderbook_buy_target=orderbook_buy_target,
+                        telemetry_context=telemetry_context,
                     )
+                    search_listings_429_events.extend(rate_limit_events)
+                except _SearchListings429Exhausted as exc:
+                    earlier_purchase_request_sent = bool(
+                        stale_listing_attempts or unverified_buy_order_attempts
+                    )
+                    reason = (
+                        f"Steam listings 查询连续 {exc.attempts} 次受到 HTTP 429 限流；"
+                        "已停止且没有发送新的 Steam 购买请求"
+                    )
+                    _cancel_pre_steam_buy_trade(
+                        db,
+                        row,
+                        reason=reason,
+                        source="profit_trade_search_listings_429_exhausted",
+                        extra_note={
+                            "purchaseRequestSent": earlier_purchase_request_sent,
+                            "listingIdObtained": False,
+                            "purchaseRequestEvidence": (
+                                "search_listings_429_exhausted_after_confirmed_failed_purchase_attempt"
+                                if earlier_purchase_request_sent
+                                else "search_listings_429_exhausted_before_steam_buy"
+                            ),
+                            "searchListingsFailedAt": utc_now_iso(),
+                            "searchListingsError": str(exc.last_error),
+                            "searchListings429Count": len(search_listings_429_events) + len(exc.events),
+                            "searchListings429Events": [*search_listings_429_events, *exc.events],
+                            "searchListings429Exhausted": True,
+                        },
+                    )
+                    updated = db.get_profit_trade(trade_id)
+                    return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
                 except SteamMarketError as exc:
+                    if market_refresh_operation == "search_listings":
+                        _record_search_listings_failure_before_purchase(
+                            db,
+                            trade_id,
+                            error=exc,
+                        )
                     raise RuntimeError(f"Steam buy market refresh failed for selected account: {exc}") from exc
-                orderbook_buy_target = _pick_lowest_steam_orderbook_buy_target(orderbook_payload)
                 use_buy_order = _steam_market_should_use_buy_order(market_hash_name)
                 buy_target = None if use_buy_order else _pick_lowest_steam_listing_buy_target(
                     listings_payload,
@@ -3291,7 +4077,67 @@ def execute_profit_trade_buy(
                 if orderbook_buy_target is None or buy_target is None:
                     raise RuntimeError("Steam buy market refresh returned no buyable listing")
 
+            steam_buy_price = buy_target.total_price
+            if len(search_listings_429_events) > c5_evaluated_429_count:
+                if c5_client is None:
+                    reason = (
+                        "C5 market refresh is unavailable after Steam listings HTTP 429; "
+                        "purchase was stopped safely"
+                    )
+                    _cancel_pre_steam_buy_trade(
+                        db,
+                        row,
+                        reason=reason,
+                        source="profit_trade_buy_429_c5_refresh_guard",
+                        extra_note={
+                            "purchaseRequestSent": False,
+                            "listingIdObtained": bool(getattr(buy_target, "listing_id", "")),
+                            "purchaseRequestEvidence": "c5_refresh_unavailable_after_search_listings_429",
+                            "searchListings429Count": len(search_listings_429_events),
+                            "searchListings429Events": search_listings_429_events,
+                        },
+                    )
+                    updated = db.get_profit_trade(trade_id)
+                    return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
+                try:
+                    c5_evaluation_after_429 = _refresh_profit_trade_c5_evaluation_after_429(
+                        settings=settings,
+                        config=config,
+                        c5_client=c5_client,
+                        market_hash_name=market_hash_name,
+                        name=str(note.get("name") or market_hash_name),
+                        steam_buy_price=steam_buy_price,
+                    )
+                except RuntimeError as exc:
+                    reason = f"C5 market refresh failed after Steam listings HTTP 429: {exc}"
+                    _cancel_pre_steam_buy_trade(
+                        db,
+                        row,
+                        reason=reason,
+                        source="profit_trade_buy_429_c5_refresh_guard",
+                        extra_note={
+                            "purchaseRequestSent": False,
+                            "listingIdObtained": bool(getattr(buy_target, "listing_id", "")),
+                            "purchaseRequestEvidence": "c5_refresh_failed_after_search_listings_429",
+                            "searchListings429Count": len(search_listings_429_events),
+                            "searchListings429Events": search_listings_429_events,
+                        },
+                    )
+                    updated = db.get_profit_trade(trade_id)
+                    return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
+                c5_evaluated_429_count = len(search_listings_429_events)
+
             current_c5_risk_reason = _trade_c5_risk_block_reason(config, row)
+            if (
+                c5_evaluation_after_429 is not None
+                and c5_evaluation_after_429.execution_status == "c5_risk_blocked"
+            ):
+                current_c5_risk_reason = (
+                    f"C5 risk no longer passes after Steam listings HTTP 429: "
+                    f"{c5_evaluation_after_429.execution_reason}"
+                )
+            elif c5_evaluation_after_429 is not None:
+                current_c5_risk_reason = None
             if current_c5_risk_reason is not None:
                 _cancel_pre_steam_buy_trade(
                     db,
@@ -3303,11 +4149,25 @@ def execute_profit_trade_buy(
                         "steamBuyMethod": buy_method,
                         "failedSteamListingIds": sorted(failed_listing_ids),
                         "staleSteamListingAttempts": stale_listing_attempts,
+                        "searchListings429Count": len(search_listings_429_events),
+                        "searchListings429Events": search_listings_429_events,
+                        "c5RiskAfterSearchListings429": (
+                            c5_evaluation_after_429.risk_reason
+                            if c5_evaluation_after_429 is not None
+                            else None
+                        ),
                     },
+                    update_fields=(
+                        {
+                            "c5_listing_price": c5_evaluation_after_429.c5_listing_price,
+                            "c5_expected_net_price": c5_evaluation_after_429.c5_expected_net_price,
+                        }
+                        if c5_evaluation_after_429 is not None
+                        else None
+                    ),
                 )
                 updated = db.get_profit_trade(trade_id)
                 return {"ok": False, "changed": True, "trade": _trade_row_to_dict(updated)}
-            steam_buy_price = buy_target.total_price
             original_steam_buy_price = safe_float(row["steam_buy_price"])
             if (
                 orderbook_buy_target is not None
@@ -3334,10 +4194,20 @@ def execute_profit_trade_buy(
                         "walletBalanceBefore": selected_wallet_balance,
                         "failedSteamListingIds": sorted(failed_listing_ids),
                         "staleSteamListingAttempts": stale_listing_attempts,
+                        "searchListings429Count": len(search_listings_429_events),
+                        "searchListings429Events": search_listings_429_events,
                     },
                     update_fields={
                         "steam_listing_id": buy_target.listing_id,
                         "steam_buy_price": steam_buy_price,
+                        **(
+                            {
+                                "c5_listing_price": c5_evaluation_after_429.c5_listing_price,
+                                "c5_expected_net_price": c5_evaluation_after_429.c5_expected_net_price,
+                            }
+                            if c5_evaluation_after_429 is not None
+                            else {}
+                        ),
                     },
                 )
                 updated = db.get_profit_trade(trade_id)
@@ -3367,10 +4237,20 @@ def execute_profit_trade_buy(
                         "walletBalanceBefore": selected_wallet_balance,
                         "failedSteamListingIds": sorted(failed_listing_ids),
                         "staleSteamListingAttempts": stale_listing_attempts,
+                        "searchListings429Count": len(search_listings_429_events),
+                        "searchListings429Events": search_listings_429_events,
                     },
                     update_fields={
                         "steam_listing_id": buy_target.listing_id,
                         "steam_buy_price": steam_buy_price,
+                        **(
+                            {
+                                "c5_listing_price": c5_evaluation_after_429.c5_listing_price,
+                                "c5_expected_net_price": c5_evaluation_after_429.c5_expected_net_price,
+                            }
+                            if c5_evaluation_after_429 is not None
+                            else {}
+                        ),
                     },
                 )
                 updated = db.get_profit_trade(trade_id)
@@ -3378,8 +4258,16 @@ def execute_profit_trade_buy(
 
             steam_cost_ratio = _profit_trade_steam_cost_ratio(config)
             steam_real_cost = steam_buy_price * steam_cost_ratio
-            c5_expected_net = safe_float(row["c5_expected_net_price"])
-            c5_listing_price = safe_float(row["c5_listing_price"])
+            c5_expected_net = (
+                c5_evaluation_after_429.c5_expected_net_price
+                if c5_evaluation_after_429 is not None
+                else safe_float(row["c5_expected_net_price"])
+            )
+            c5_listing_price = (
+                c5_evaluation_after_429.c5_listing_price
+                if c5_evaluation_after_429 is not None
+                else safe_float(row["c5_listing_price"])
+            )
             if c5_expected_net is None and c5_listing_price is not None:
                 c5_expected_net = c5_listing_price * float(config.profit_trade_c5_current_sale_net_factor)
             if c5_expected_net is None or c5_expected_net <= 0 or steam_real_cost <= 0:
@@ -3436,6 +4324,8 @@ def execute_profit_trade_buy(
                     steam_buy_price=steam_buy_price,
                     steam_balance_discount=float(steam_cost_ratio),
                     steam_real_cost=steam_real_cost,
+                    c5_listing_price=c5_listing_price,
+                    c5_expected_net_price=c5_expected_net,
                     expected_profit=expected_profit,
                     expected_roi=expected_roi,
                     note=_build_note(
@@ -3447,6 +4337,9 @@ def execute_profit_trade_buy(
                             "steamBuyMethod": buy_method,
                             "failedSteamListingIds": sorted(failed_listing_ids),
                             "staleSteamListingAttempts": stale_listing_attempts,
+                            "searchListings429Count": len(search_listings_429_events),
+                            "searchListings429Events": search_listings_429_events,
+                            "searchListings429Recovered": bool(search_listings_429_events),
                         }
                     ),
                 )
@@ -3474,12 +4367,17 @@ def execute_profit_trade_buy(
                         "expectedRoi": round(expected_roi, 4),
                         "failedSteamListingIds": sorted(failed_listing_ids),
                         "staleSteamListingAttempts": stale_listing_attempts,
+                        "searchListings429Count": len(search_listings_429_events),
+                        "searchListings429Events": search_listings_429_events,
+                        "searchListings429Recovered": bool(search_listings_429_events),
                     },
                     update_fields={
                         "steam_listing_id": None,
                         "steam_buy_price": steam_buy_price,
                         "steam_balance_discount": float(steam_cost_ratio),
                         "steam_real_cost": steam_real_cost,
+                        "c5_listing_price": c5_listing_price,
+                        "c5_expected_net_price": c5_expected_net,
                         "expected_profit": expected_profit,
                         "expected_roi": expected_roi,
                     },
@@ -3570,6 +4468,7 @@ def execute_profit_trade_buy(
                             "steamBuyFailedAt": utc_now_iso(),
                             "steamBuyRequestedAt": steam_buy_requested_at,
                             "steamBuyMethod": buy_method,
+                            "purchaseRequestSent": True,
                             "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                             "steamBuyPrice": round(steam_buy_price, 2),
                             "steamAccountId": selected_account.id if selected_account else getattr(client, "account_id", None),
@@ -3578,6 +4477,9 @@ def execute_profit_trade_buy(
                             "activeBuyOrdersBefore": active_buy_orders_before,
                             "failedSteamListingIds": sorted(failed_listing_ids),
                             "staleSteamListingAttempts": stale_listing_attempts,
+                            "searchListings429Count": len(search_listings_429_events),
+                            "searchListings429Events": search_listings_429_events,
+                            "searchListings429Recovered": bool(search_listings_429_events),
                             "steamBuyListingSnapshot": _compact_steam_listing_snapshot(listings_payload, buy_target),
                             "steamBuyOrderbookSnapshot": _compact_steam_orderbook_snapshot(orderbook_payload),
                         }
@@ -3681,6 +4583,7 @@ def execute_profit_trade_buy(
                                     "steamBuyUnverifiedAt": utc_now_iso(),
                                     "steamBuyRequestedAt": steam_buy_requested_at,
                                     "steamBuyMethod": buy_method,
+                                    "purchaseRequestSent": True,
                                     "steamListingId": None,
                                     "steamBuyOrderId": buy_order_id,
                                     "steamBuyPrice": round(steam_buy_price, 2),
@@ -3702,6 +4605,9 @@ def execute_profit_trade_buy(
                                     "unverifiedBuyOrderAttempts": unverified_buy_order_attempts,
                                     "failedSteamListingIds": sorted(failed_listing_ids),
                                     "staleSteamListingAttempts": stale_listing_attempts,
+                                    "searchListings429Count": len(search_listings_429_events),
+                                    "searchListings429Events": search_listings_429_events,
+                                    "searchListings429Recovered": bool(search_listings_429_events),
                                     "cancelReason": reason,
                                     "cancelSource": "profit_trade_buy_order_unverified_cancel",
                                     "steamBuyListingSnapshot": _compact_steam_listing_snapshot(listings_payload, buy_target),
@@ -3723,6 +4629,7 @@ def execute_profit_trade_buy(
                             "steamBuyUnverifiedAt": utc_now_iso(),
                             "steamBuyRequestedAt": steam_buy_requested_at,
                             "steamBuyMethod": buy_method,
+                            "purchaseRequestSent": True,
                             "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                             "steamBuyOrderId": buy_order_id or None,
                             "steamBuyPrice": round(steam_buy_price, 2),
@@ -3744,6 +4651,9 @@ def execute_profit_trade_buy(
                             "unverifiedBuyOrderAttempts": unverified_buy_order_attempts,
                             "failedSteamListingIds": sorted(failed_listing_ids),
                             "staleSteamListingAttempts": stale_listing_attempts,
+                            "searchListings429Count": len(search_listings_429_events),
+                            "searchListings429Events": search_listings_429_events,
+                            "searchListings429Recovered": bool(search_listings_429_events),
                             "steamBuyListingSnapshot": _compact_steam_listing_snapshot(listings_payload, buy_target),
                             "steamBuyOrderbookSnapshot": _compact_steam_orderbook_snapshot(orderbook_payload),
                         }
@@ -3788,10 +4698,14 @@ def execute_profit_trade_buy(
                         **latest_note,
                         "steamBuySucceededAt": utc_now_iso(),
                         "steamBuyRequestedAt": steam_buy_requested_at,
+                        "purchaseRequestSent": True,
                         "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                         "steamBuyOrderId": buy_order_id or None,
                         "steamPurchaseReceipt": verification.purchase_receipt,
                         "walletInfo": payload.get("wallet_info") if isinstance(payload, dict) else None,
+                        "searchListings429Count": len(search_listings_429_events),
+                        "searchListings429Events": search_listings_429_events,
+                        "searchListings429Recovered": bool(search_listings_429_events),
                     }
                 ),
             )
@@ -3808,6 +4722,8 @@ def execute_profit_trade_buy(
             steam_buy_price=steam_buy_price,
             steam_balance_discount=float(steam_cost_ratio),
             steam_real_cost=steam_real_cost,
+            c5_listing_price=c5_listing_price,
+            c5_expected_net_price=c5_expected_net,
             expected_profit=expected_profit,
             expected_roi=expected_roi,
             error=None,
@@ -3817,6 +4733,7 @@ def execute_profit_trade_buy(
                     "steamBuySucceededAt": utc_now_iso(),
                     "steamBuyRequestedAt": steam_buy_requested_at,
                     "steamBuyMethod": buy_method,
+                    "purchaseRequestSent": True,
                     "steamListingId": buy_target.listing_id if buy_method == "buylisting" else None,
                     "steamBuyOrderId": buy_order_id or None,
                     "subtotal": buy_target.subtotal,
@@ -3841,6 +4758,16 @@ def execute_profit_trade_buy(
                     "failedSteamListingIds": sorted(failed_listing_ids),
                     "staleSteamListingAttempts": stale_listing_attempts,
                     "unverifiedBuyOrderAttempts": unverified_buy_order_attempts,
+                    "searchListings429Count": len(search_listings_429_events),
+                    "searchListings429Events": search_listings_429_events,
+                    "searchListings429Recovered": bool(search_listings_429_events),
+                    "c5ListingPrice": round(c5_listing_price, 2),
+                    "c5ExpectedNetPrice": round(c5_expected_net, 2),
+                    "c5RiskAfterSearchListings429": (
+                        c5_evaluation_after_429.risk_reason
+                        if c5_evaluation_after_429 is not None
+                        else None
+                    ),
                     "steamBuyListingSnapshot": _compact_steam_listing_snapshot(listings_payload, buy_target),
                     "steamBuyOrderbookSnapshot": _compact_steam_orderbook_snapshot(orderbook_payload),
                 }
@@ -3918,7 +4845,10 @@ def execute_profit_trade_list_c5(
         if c5_client is None:
             if not settings.c5_api_key:
                 raise RuntimeError("missing C5GAME_API_KEY / C5_API_KEY")
-            c5_client = C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+            c5_client = _build_profit_trade_c5_client(
+                settings,
+                **_profit_trade_telemetry_context(row),
+            )
 
         db.update_profit_trade(trade_id, status="listing_c5", step_key="c5_listed", step_index=4)
         try:
@@ -4015,6 +4945,19 @@ def refresh_profit_trade_sales(
         if manual_rows:
             seen_ids = {int(row["id"]) for row in rows}
             rows.extend(row for row in manual_rows if int(row["id"]) not in seen_ids)
+    except Exception as exc:
+        event_logger.emit(
+            level="ERROR",
+            provider="local",
+            component="profit_trade_scan",
+            operation="run_failed",
+            message="Profit Trade scan failed",
+            run_id=scan_id,
+            exception_type=type(exc).__name__,
+            stack_trace=traceback.format_exc(),
+            safe_context={"error": str(exc)},
+        )
+        raise
     finally:
         db.close()
     if not rows:
@@ -4028,7 +4971,10 @@ def refresh_profit_trade_sales(
     if c5_client is None:
         if not settings.c5_api_key:
             raise RuntimeError("missing C5GAME_API_KEY / C5_API_KEY")
-        c5_client = C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+        c5_client = _build_profit_trade_c5_client(
+            settings,
+            run_id=f"PTSALE-{uuid.uuid4().hex}",
+        )
 
     steam_ids = sorted(
         {
@@ -4870,7 +5816,10 @@ def refresh_profit_trade_listings(
         return {"ok": True, "repricedTradeIds": [], "skippedTradeIds": [], "errors": ["profitTrade reprice is disabled"]}
     if not settings.c5_api_key and c5_client is None:
         raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY 环境变量。")
-    c5_client = c5_client or C5GameClient(str(settings.c5_api_key), settings.c5_base_url)
+    c5_client = c5_client or _build_profit_trade_c5_client(
+        settings,
+        run_id=f"PTREPRICE-{uuid.uuid4().hex}",
+    )
     db = Database(settings.db_path)
     repriced_ids: list[int] = []
     skipped_ids: list[int] = []
@@ -5628,6 +6577,83 @@ def _profit_trade_steam_bought_at(note: dict[str, Any]) -> tuple[str | None, str
     return None, None
 
 
+def _profit_trade_has_purchase_request_evidence(row: Any, note: dict[str, Any]) -> bool:
+    if note.get("purchaseRequestSent") is True:
+        return True
+    if int(row["step_index"] or 0) > 2:
+        return True
+    if str(row["b_asset_id"] or "").strip() or str(row["c5_product_id"] or "").strip():
+        return True
+    evidence_keys = (
+        "steamBuyRequestedAt",
+        "steamBuySucceededAt",
+        "steamBuyUnverifiedAt",
+        "steamBuyOrderId",
+        "steamBuyPayload",
+        "steamPurchaseReceipt",
+        "steamBuyVerifiedBy",
+        "newInventoryAssetIds",
+    )
+    if any(note.get(key) for key in evidence_keys):
+        return True
+    wallet_delta = safe_float(note.get("walletDelta"))
+    return wallet_delta is not None and abs(wallet_delta) > 1e-9
+
+
+def _profit_trade_purchase_request_projection(
+    row: Any,
+    note: dict[str, Any],
+) -> tuple[bool | None, bool | None]:
+    """Project strict request/listing evidence without rewriting historical note."""
+
+    has_purchase_evidence = _profit_trade_has_purchase_request_evidence(row, note)
+    explicit_request = note.get("purchaseRequestSent")
+    explicit_listing = note.get("listingIdObtained")
+    if has_purchase_evidence:
+        purchase_request_sent: bool | None = True
+    elif isinstance(explicit_request, bool):
+        purchase_request_sent = explicit_request
+    else:
+        status = str(row["status"] or "").strip()
+        step_index = int(row["step_index"] or 0)
+        cancel_source = str(note.get("cancelSource") or "").strip().lower()
+        reason = " ".join(
+            value
+            for value in (
+                str(row["error"] or "").strip(),
+                str(note.get("cancelReason") or "").strip(),
+            )
+            if value
+        ).lower()
+        explicit_pre_buy_source = "pre_buy" in cancel_source or "pre-buy" in cancel_source
+        search_listings_failed = (
+            "search_listings" in reason or "listings search failed" in reason
+        ) and "before steam buy" in reason
+        can_infer_not_sent = (
+            status in {"cancelled", "failed", "manual_required"}
+            and step_index <= 2
+            and (explicit_pre_buy_source or search_listings_failed)
+        )
+        purchase_request_sent = False if can_infer_not_sent else None
+
+    if isinstance(explicit_listing, bool):
+        listing_id_obtained: bool | None = explicit_listing
+    else:
+        reason = " ".join(
+            value
+            for value in (
+                str(row["error"] or "").strip(),
+                str(note.get("cancelReason") or "").strip(),
+            )
+            if value
+        ).lower()
+        search_listings_failed = (
+            "search_listings" in reason or "listings search failed" in reason
+        ) and "before steam buy" in reason
+        listing_id_obtained = False if not has_purchase_evidence and search_listings_failed else None
+    return purchase_request_sent, listing_id_obtained
+
+
 def _trade_row_to_dict(row: Any) -> dict[str, Any]:
     step_index = int(row["step_index"] or 0)
     status = str(row["status"] or "candidate")
@@ -5637,7 +6663,16 @@ def _trade_row_to_dict(row: Any) -> dict[str, Any]:
     market_hash_name = str(row["market_hash_name"] or "")
     name = str(note.get("name") or market_hash_name)
     steam_bought_at, steam_bought_at_source = _profit_trade_steam_bought_at(note)
-    return {
+    purchase_request_sent, listing_id_obtained = _profit_trade_purchase_request_projection(
+        row,
+        note,
+    )
+    public_note = dict(note)
+    if purchase_request_sent is not None:
+        public_note["purchaseRequestSent"] = purchase_request_sent
+    if listing_id_obtained is not None:
+        public_note["listingIdObtained"] = listing_id_obtained
+    payload = {
         "id": int(row["id"]),
         "tradeNo": row["trade_no"],
         "marketHashName": market_hash_name,
@@ -5665,13 +6700,18 @@ def _trade_row_to_dict(row: Any) -> dict[str, Any]:
         "realizedRoi": realized_roi,
         "realizedRoiPct": round(realized_roi * 100, 2) if realized_roi is not None else None,
         "error": row["error"],
-        "note": note,
+        "note": public_note,
+        "cancelSource": note.get("cancelSource"),
+        "cancelReason": note.get("cancelReason"),
+        "purchaseRequestSent": purchase_request_sent,
+        "listingIdObtained": listing_id_obtained,
         "steamBoughtAt": steam_bought_at,
         "steamBoughtAtSource": steam_bought_at_source,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "completedAt": row["completed_at"],
     }
+    return sanitize_public_payload(payload)
 
 
 def _hydrate_trade_names(db: Database, trades: list[dict[str, Any]]) -> None:
@@ -5765,23 +6805,278 @@ def build_profit_trade_dashboard_payload(
         if trade["status"] not in TERMINAL_PROFIT_TRADE_STATUSES
     )
     daily_budget = max(0.0, float(config.profit_trade_daily_steam_budget))
+    return sanitize_public_payload(
+        {
+            "generatedAt": utc_now_iso(),
+            "config": _config_payload(config),
+            "steps": PROFIT_TRADE_STEPS,
+            "summary": {
+                "activeCount": active_count,
+                "completedCount": completed_count,
+                "failedCount": failed_count,
+                "reservedAssetCount": len(reservations),
+                "expectedProfit": round(expected_profit, 2),
+                "realizedProfit": round(realized_profit, 2),
+                "dailySteamSpent": round(daily_steam_spent, 2),
+                "dailySteamRemaining": round(max(0.0, daily_budget - daily_steam_spent), 2),
+            },
+            "trades": trades,
+            "reservations": reservations,
+            "lastRun": _read_profit_trade_last_run(settings),
+        }
+    )
+
+
+def build_profit_trade_roi_watch_payload(
+    settings: Settings,
+    *,
+    active: bool | None = True,
+    keyword: str | None = None,
+    execution_status: str | None = None,
+    sort: str = "roi_desc",
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    db = Database(settings.db_path)
+    try:
+        db.initialize()
+        payload = db.list_profit_trade_roi_watch(
+            active=active,
+            keyword=keyword,
+            execution_status=execution_status,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
+    finally:
+        db.close()
+    return sanitize_public_payload({"generatedAt": utc_now_iso(), **payload})
+
+
+def build_profit_trade_roi_history_payload(
+    settings: Settings,
+    market_hash_name: str,
+    *,
+    from_time: str | None = None,
+    to_time: str | None = None,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    normalized_name = str(market_hash_name or "").strip()
+    if not normalized_name:
+        raise ValueError("market_hash_name is required")
+    db = Database(settings.db_path)
+    try:
+        db.initialize()
+        payload = db.list_profit_trade_roi_history(
+            normalized_name,
+            from_time=from_time,
+            to_time=to_time,
+            page=page,
+            page_size=page_size,
+        )
+    finally:
+        db.close()
+    return sanitize_public_payload(
+        {
+            "generatedAt": utc_now_iso(),
+            "marketHashName": normalized_name,
+            **payload,
+        }
+    )
+
+
+def build_profit_trade_interruptions_payload(
+    settings: Settings,
+    *,
+    statuses: tuple[str, ...] = ("cancelled", "failed", "manual_required"),
+    step_key: str | None = None,
+    acknowledged: str = "exclude",
+    keyword: str | None = None,
+    from_time: str | None = None,
+    to_time: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict[str, Any]:
+    allowed_statuses = {"cancelled", "failed", "manual_required"}
+    normalized_statuses = tuple(str(value).strip() for value in statuses if str(value).strip())
+    invalid_statuses = sorted(set(normalized_statuses) - allowed_statuses)
+    if not normalized_statuses or invalid_statuses:
+        detail = ", ".join(invalid_statuses) if invalid_statuses else "empty status list"
+        raise ValueError(f"invalid Profit Trade interruption status filter: {detail}")
+    if acknowledged not in {"exclude", "include", "only"}:
+        raise ValueError("acknowledged must be exclude, include, or only")
+    db = Database(settings.db_path)
+    try:
+        db.initialize()
+        payload = db.list_profit_trade_interruptions(
+            statuses=normalized_statuses,
+            step_key=step_key,
+            acknowledged=acknowledged,
+            keyword=keyword,
+            from_time=from_time,
+            to_time=to_time,
+            page=page,
+            page_size=page_size,
+        )
+        items: list[dict[str, Any]] = []
+        for row in payload["items"]:
+            trade = _trade_row_to_dict(row)
+            trade.update(
+                {
+                    "acknowledged": bool(row.get("acknowledged")),
+                    "acknowledgementReason": row.get("acknowledgement_reason"),
+                    "acknowledgedAt": row.get("acknowledged_at"),
+                    "acknowledgementRestoredAt": row.get("restored_at"),
+                }
+            )
+            items.append(trade)
+        _hydrate_trade_names(db, items)
+        summary = db.get_profit_trade_interruption_summary(
+            statuses=normalized_statuses,
+            acknowledged=acknowledged,
+            keyword=keyword,
+            from_time=from_time,
+            to_time=to_time,
+        )
+    finally:
+        db.close()
+    return sanitize_public_payload(
+        {
+            "generatedAt": utc_now_iso(),
+            "steps": PROFIT_TRADE_STEPS,
+            "summary": summary,
+            "stepCounts": summary["stepCounts"],
+            "items": items,
+            "total": payload["total"],
+            "page": payload["page"],
+            "pageSize": payload["pageSize"],
+        }
+    )
+
+
+def build_profit_trade_interruption_timeline_payload(
+    settings: Settings,
+    trade_id: int,
+) -> dict[str, Any]:
+    db = Database(settings.db_path)
+    try:
+        db.initialize()
+        row = db.get_profit_trade(int(trade_id))
+        if row is None:
+            raise RuntimeError(f"profit trade not found: {trade_id}")
+        trade = _trade_row_to_dict(row)
+        _hydrate_trade_names(db, [trade])
+        acknowledgement = db.conn.execute(
+            "SELECT * FROM profit_trade_acknowledgements WHERE trade_id = ?",
+            (int(trade_id),),
+        ).fetchone()
+        trade["acknowledged"] = bool(acknowledgement["acknowledged"]) if acknowledgement else False
+        trade["acknowledgementReason"] = acknowledgement["reason"] if acknowledgement else None
+        trade["acknowledgedAt"] = acknowledgement["acknowledged_at"] if acknowledgement else None
+        trade["acknowledgementRestoredAt"] = acknowledgement["restored_at"] if acknowledgement else None
+        events = db.list_profit_trade_state_events(int(trade_id))
+    finally:
+        db.close()
+    return sanitize_public_payload(
+        {
+            "generatedAt": utc_now_iso(),
+            "steps": PROFIT_TRADE_STEPS,
+            "trade": trade,
+            "events": events,
+        }
+    )
+
+
+def profit_trade_interruption_acknowledgement_safety(row: Any) -> dict[str, Any]:
+    status = str(row["status"] or "").strip()
+    if status not in {"cancelled", "failed", "manual_required"}:
+        return {
+            "allowed": False,
+            "requiresRemoteResolution": False,
+            "reason": f"profit trade is not an interruptible terminal record: {status}",
+        }
+    note = _read_note(row["note"])
+    has_purchase_evidence = bool(
+        str(row["b_asset_id"] or "").strip()
+        or str(row["c5_product_id"] or "").strip()
+        or note.get("steamBuySucceededAt")
+        or note.get("steamPurchaseReceipt")
+    )
+    tracked_buy_order_id = str(note.get("steamBuyOrderId") or "").strip()
+    cancellation_confirmed = bool(
+        note.get("steamBuyOrderCancellationConfirmedAt")
+        or note.get("orphanBuyOrderCancellationConfirmedAt")
+    )
+    if tracked_buy_order_id and not has_purchase_evidence and not cancellation_confirmed:
+        return {
+            "allowed": False,
+            "requiresRemoteResolution": True,
+            "reason": (
+                "tracked Steam buy order has no confirmed terminal state; "
+                "resolve it before acknowledging"
+            ),
+            "steamBuyOrderId": tracked_buy_order_id,
+        }
+    if note.get("steamBuyUnverifiedAt") and not has_purchase_evidence and not tracked_buy_order_id:
+        return {
+            "allowed": False,
+            "requiresRemoteResolution": True,
+            "reason": (
+                "unverified Steam buy has no order id and no purchase evidence; "
+                "manual terminal-state verification is required"
+            ),
+        }
     return {
-        "generatedAt": utc_now_iso(),
-        "config": _config_payload(config),
-        "steps": PROFIT_TRADE_STEPS,
-        "summary": {
-            "activeCount": active_count,
-            "completedCount": completed_count,
-            "failedCount": failed_count,
-            "reservedAssetCount": len(reservations),
-            "expectedProfit": round(expected_profit, 2),
-            "realizedProfit": round(realized_profit, 2),
-            "dailySteamSpent": round(daily_steam_spent, 2),
-            "dailySteamRemaining": round(max(0.0, daily_budget - daily_steam_spent), 2),
-        },
-        "trades": trades,
-        "reservations": reservations,
-        "lastRun": _read_profit_trade_last_run(settings),
+        "allowed": True,
+        "requiresRemoteResolution": False,
+        "reason": "local evidence contains no unresolved Steam buy order",
+    }
+
+
+def set_profit_trade_interruption_acknowledged(
+    settings: Settings,
+    trade_id: int,
+    *,
+    acknowledged: bool,
+    reason: str | None = None,
+    remote_terminal_confirmed: bool = False,
+) -> dict[str, Any]:
+    db = Database(settings.db_path)
+    try:
+        db.initialize()
+        row = db.get_profit_trade(int(trade_id))
+        if row is None:
+            raise RuntimeError(f"profit trade not found: {trade_id}")
+        safety = profit_trade_interruption_acknowledgement_safety(row)
+        remote_override_allowed = bool(
+            remote_terminal_confirmed and safety.get("requiresRemoteResolution")
+        )
+        if acknowledged and not safety["allowed"] and not remote_override_allowed:
+            return {
+                "ok": False,
+                "changed": False,
+                "conflict": True,
+                "requiresRemoteResolution": bool(safety["requiresRemoteResolution"]),
+                "message": safety["reason"],
+                "safety": safety,
+                "trade": _trade_row_to_dict(row),
+            }
+        result = db.set_profit_trade_acknowledgement(
+            int(trade_id),
+            acknowledged=bool(acknowledged),
+            reason=reason,
+        )
+        updated = db.get_profit_trade(int(trade_id))
+    finally:
+        db.close()
+    return {
+        "ok": True,
+        "changed": True,
+        "conflict": False,
+        "requiresRemoteResolution": False,
+        "acknowledgement": result,
+        "trade": _trade_row_to_dict(updated),
     }
 
 

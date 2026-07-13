@@ -387,17 +387,25 @@
 
 后续补仓优先使用该流水自己的 `maxRebuyRatioAtOpen` 和 `steamNetFactorAtOpen`。老流水没有冻结字段时，才兼容回退到当前配置。
 
+C5 补仓订单最终交付失败后创建替换补仓时：
+
+- 禁止再按当前 C5 实时价格强制追价。
+- 替换单最高补仓价冻结为原失败补仓单的 `actual_price`，缺失时回退 `expected_price`。
+- 替换单仍必须使用本单冻结的 `maxRebuyRatioAtOpen`；它是硬上限内的本单动态挂刀比例，不是当前全局 `guadaoMaxListingRatio`。
+- 原失败单价格上限和本单动态比例上限必须同时满足；任一不满足都保持 `pending`，等待后续价格回落。
+- 历史遗留的 `forceRebuyReplacement=true` 替换单执行时要按原 `expected_price` 安全迁移，不能继续强制追当前价。
+
 ### 7.4.1 profitTrade / notify 做T收益公式
 
-`profitTrade` 和 `notify t-profit` 的收益率必须使用同一套做T口径：
+`profitTrade` 和 `notify t-profit` 的收益率必须使用同一套做T公式结构；其中 Profit Trade 使用自己独立配置的 `profitTrade.balanceDiscount` 作为余额折扣：
 
 - 面折比 = `C5挂价 / Steam买入价`
 - C5预计到手折比 = `面折比 * 0.99`
-- ROI / transfer_real_ratio = `C5预计到手折比 - guadaoMaxListingRatio`
-- 真实成本金额 = `Steam买入价 * guadaoMaxListingRatio`
+- ROI / transfer_real_ratio = `C5预计到手折比 - profitTrade.balanceDiscount`
+- 真实成本金额 = `Steam买入价 * profitTrade.balanceDiscount`
 - 预计收益金额 = `C5挂价 * 0.99 - 真实成本金额`
 
-不要再用 `expected_profit / steam_real_cost` 当做T ROI；它会比 notify 口径偏高。也不要把 `common.balanceDiscount` 当作 profitTrade 成本比例，profitTrade 的成本比例应跟当前挂刀执行器的 `guadaoMaxListingRatio` 对齐。
+不要再用 `expected_profit / steam_real_cost` 当做T ROI；它会比 notify 口径偏高。不要把 `common.balanceDiscount` 当作 Profit Trade 成本比例，也不要让 Profit Trade 自动跟随挂刀执行器的 `guadaoBalance.guadaoMaxListingRatio`。这三个配置项彼此独立；Profit Trade 只认 `profitTrade.balanceDiscount`，除非用户再次明确要求变更口径。
 
 做T买 B 的 Steam 账号选择规则：
 
@@ -422,6 +430,50 @@ profitTrade 已上架 C5 后的改价规则：
 - 每次降价前仍要重新读取 C5 当前最低在售价、检查在售深度，并重新计算降价后的 ROI。
 - 降价后的 ROI 低于 `profitTrade.minRoi` 时不能自动改价，要转人工处理。
 - ROI 超过 `profitTrade.manualReviewRoi` 时视为价格源异常，必须 ServerChan 提醒并停止自动改价。
+
+### 7.4.2 Profit Trade 全量评估与 ROI 观察池
+
+`profitTrade.scanMaxItems` 已经不再是实际扫描上限：
+
+- 配置、CLI 和 API 暂时保留该字段，只用于兼容旧调用方。
+- 通过可交易、保护规则和 `profitTrade.minItemValue` 等前置过滤的所有品类，都必须读取 Steam orderbook、计算 ROI 并执行 C5 风控。
+- 禁止在读取 Steam orderbook 前按 C5 参考价截取前 N 个品类，否则会漏掉低价格但高 ROI 的机会。
+- `limit` 只控制最终返回或写入多少个通过条件的执行机会，不得减少参与评估的品类。
+
+`ROI > 0` 观察池和可执行机会必须分开：
+
+- 观察池用于保存最新行情和价格/ROI 历史，不创建正常 `profit_trades` 流水，不锁 A，不买 B，也不上架 C5。
+- `ROI > 0` 但低于 `profitTrade.minRoi`、C5 风控失败或 ROI 超过人工审核阈值的品类，可以显示在观察池，但必须明确标记为仅观察或已阻断。
+- 真正执行仍必须通过最低 ROI、C5 风控、保护规则、审计和资产锁等全部门槛。
+- 最新完整扫描确认 ROI 不再大于 0 或不再满足观察条件时，可以退出当前观察池；历史观察不能删除。
+- 整轮扫描或行情读取异常时，不能把所有旧观察项误判为退出。
+
+### 7.4.3 Profit Trade 前端、中断追踪与独立日志
+
+Profit Trade 前端使用 Vue Router 4 和 hash history，固定三个子路由：
+
+- `#/profit-trade/overview`：S1 总览，保留原执行控制、进行中流水和已完结收益，并展示 ROI 观察池。
+- `#/profit-trade/interruptions`：S2 中断追踪，展示取消、失败和需人工处理的未完整结算尝试。
+- `#/profit-trade/logs`：S3 实时日志。
+
+旧 `#profit-trade` 必须兼容跳转到总览。页面业务状态只认后端 API 和持久化数据；API 离线时显示离线/空状态，禁止把 `frontend/public/profit_trade_dashboard.json` 或其他静态快照当成当前运营状态兜底。
+
+中断追踪规则：
+
+- 复用 `profit_trades` 的真实状态和步骤，并用状态事件补充时间线，不另造交易状态机。
+- “知晓并隐藏”只改变默认问题列表显示；不得删除流水、状态事件或日志，并且必须支持恢复到默认列表。
+- 存在未确认终态的 Steam buy order、无订单 ID 的不确定买入或其他成交证据冲突时，不能直接知晓隐藏；必须先走安全撤单/终态确认，无法确认时返回冲突并保留记录。
+
+Profit Trade 日志规则：
+
+- 日志只接收明确标记为 `source=profit_trade` 的事件；不能根据 Steam/C5 endpoint 事后猜测 caller。
+- 日志范围包括 Profit Trade 自己发起的 Steam、C5 和 local 状态机/扫描活动，不包含挂刀执行器、C5 扫货或其他执行器日志。
+- 挂刀执行器以后使用独立日志；Profit Trade 页面不得读取或混合展示挂刀日志。
+- 结构化日志按 UTC 自然日写入 `logs/profit_trade/YYYY-MM-DD.jsonl`，闭日压缩为 `.jsonl.gz`，默认保留 90 天。
+- Cookie、sessionid、密码、API key、Steam Guard/identity/device secret、C5 app-key、trade URL、token/styleToken 和完整认证请求体不得落盘；错误响应只能保存脱敏且限长的摘要。
+- 日志写入、压缩、查询或实时广播失败不得改变真实交易结果。
+- 429 日志要记录请求来源、账号、operation、request ID、状态码、耗时、`Retry-After` 和近期 Profit Trade Steam 请求频率；这只增强可观测性，不改变现有请求重试、relogin 或买入状态机。
+- `429` 不等于 cookie 失效，也不能仅凭 Profit Trade 自身日志证明是挂刀执行器造成的。只有以后拿到独立挂刀日志，才能按 UTC 时间、账号和请求频率进行交叉分析。
 
 ### 7.5 Steam Guard 确认与撤单安全
 

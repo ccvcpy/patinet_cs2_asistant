@@ -1,4 +1,5 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import ProfitTradeRoiWatch from "../components/ProfitTradeRoiWatch.vue";
 const fallbackDashboard = {
     generatedAt: "",
     config: {
@@ -337,16 +338,14 @@ async function loadDashboard() {
         dashboard.value = (await fetchJson("/api/profit-trade/dashboard"));
         dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
         apiOnline.value = true;
+        window.dispatchEvent(new CustomEvent("profit-trade:dashboard-status", {
+            detail: { allowRealExecution: dashboard.value.config.allowRealExecution },
+        }));
     }
     catch {
         apiOnline.value = false;
-        try {
-            dashboard.value = (await fetchJson("/profit_trade_dashboard.json"));
-            dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
-        }
-        catch {
-            dashboard.value = fallbackDashboard;
-        }
+        dashboard.value = fallbackDashboard;
+        message.value = "API未连接：无法读取当前真实状态，页面不会使用静态运营数据替代。";
     }
     finally {
         loading.value = false;
@@ -523,6 +522,7 @@ async function scanOpportunities() {
         const opportunities = payload.report?.opportunityCount ?? 0;
         message.value = `扫描完成：机会 ${opportunities} 个，写入候选 ${created} 笔`;
         await loadDashboard();
+        window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
     }
     catch (error) {
         apiOnline.value = false;
@@ -553,6 +553,7 @@ async function runOnce() {
         saveLastRunState();
         message.value = `执行完成：${summary}`;
         await loadDashboard();
+        window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
     }
     catch (error) {
         apiOnline.value = false;
@@ -679,12 +680,17 @@ function saveAutoRunState() {
         return;
     if (!autoRunActive.value || !autoRunNextAt.value) {
         window.localStorage.removeItem(autoRunStorageKey);
+        window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: false } }));
         return;
     }
     window.localStorage.setItem(autoRunStorageKey, JSON.stringify({
         enabled: true,
         nextAt: autoRunNextAt.value,
     }));
+    window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
+}
+function handleSharedConfigChange() {
+    void loadDashboard();
 }
 function saveLastRunState() {
     if (typeof window === "undefined")
@@ -748,6 +754,7 @@ async function startAutoRun() {
     autoRunNextAt.value = null;
     nowMs.value = Date.now();
     message.value = "循环执行已开启：正在立刻执行第一轮";
+    window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
     await runScheduledOnce();
 }
 function stopAutoRun() {
@@ -809,9 +816,11 @@ onMounted(() => {
     restoreLastRun();
     void loadDashboard();
     restoreAutoRun();
+    window.addEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 onUnmounted(() => {
     clearAutoRunTimers();
+    window.removeEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
 const __VLS_ctx = {};
@@ -919,6 +928,126 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['wide']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['api-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-basis-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['type-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['api-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['online']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['api-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['offline']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['type-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['warning']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-summary-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
+/** @type {__VLS_StyleScopedClasses['danger']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['offline']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['online']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['running']} */ ;
+/** @type {__VLS_StyleScopedClasses['inline-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-warning']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-layout']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['budget-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-no']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-hash']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-filter-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['formula-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['formula-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['formula-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-toggle']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-toggle']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-toggle']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-toggle']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-settle-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-settle-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-trade-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-trade-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-basis-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['dismiss-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['danger-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['done']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['current']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['done']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['current']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['step-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['positive']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['positive']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['negative']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['negative']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-stack']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-zone']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-filter-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
@@ -1082,6 +1211,10 @@ if (__VLS_ctx.message) {
     });
     (__VLS_ctx.message);
 }
+/** @type {[typeof ProfitTradeRoiWatch, ]} */ ;
+// @ts-ignore
+const __VLS_0 = __VLS_asFunctionalComponent(ProfitTradeRoiWatch, new ProfitTradeRoiWatch({}));
+const __VLS_1 = __VLS_0({}, ...__VLS_functionalComponentArgsRest(__VLS_0));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "profit-layout" },
 });
@@ -1118,7 +1251,6 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-(__VLS_ctx.dashboard.config.scanMaxItems);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
@@ -1905,6 +2037,7 @@ var __VLS_dollars;
 const __VLS_self = (await import('vue')).defineComponent({
     setup() {
         return {
+            ProfitTradeRoiWatch: ProfitTradeRoiWatch,
             dashboard: dashboard,
             loading: loading,
             apiOnline: apiOnline,

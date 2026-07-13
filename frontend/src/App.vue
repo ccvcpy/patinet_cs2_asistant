@@ -1,42 +1,37 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import AccountProfitPage from "./pages/account_profit.vue";
-import SteamBalancesPage from "./pages/steam_balances.vue";
-import GuadaoReportPage from "./pages/guadao_report.vue";
-import CaseRatioMonitorPage from "./pages/case_ratio_monitor.vue";
-import ProfitTradePage from "./pages/profit_trade.vue";
+import { RouterLink, RouterView } from "vue-router";
+import FolioIcon, { type FolioIconName } from "./components/FolioIcon.vue";
 
-const pages = [
-  { key: "account", label: "挂刀余额核对", component: AccountProfitPage },
-  { key: "steam", label: "Steam余额统计", component: SteamBalancesPage },
-  { key: "guadao", label: "挂刀报表", component: GuadaoReportPage },
-  { key: "case-ratio", label: "箱子挂刀比", component: CaseRatioMonitorPage },
-  { key: "profit-trade", label: "搬砖做T", component: ProfitTradePage },
-] as const;
-
-type PageKey = (typeof pages)[number]["key"];
-
-const activePage = ref<PageKey>("profit-trade");
-const activeComponent = computed(
-  () => pages.find((page) => page.key === activePage.value)?.component ?? AccountProfitPage,
-);
+const pages: ReadonlyArray<{
+  to: string;
+  match?: string;
+  label: string;
+  icon: FolioIconName;
+}> = [
+  { to: "/account", label: "挂刀余额核对", icon: "account" as FolioIconName },
+  { to: "/steam", label: "Steam余额统计", icon: "wallet" as FolioIconName },
+  { to: "/guadao", label: "挂刀报表", icon: "report" as FolioIconName },
+  { to: "/case-ratio", label: "箱子挂刀比", icon: "case" as FolioIconName },
+  { to: "/profit-trade/overview", match: "/profit-trade", label: "搬砖做T", icon: "scan" as FolioIconName },
+  { to: "/c5-sweeper", label: "C5扫货", icon: "price" as FolioIconName },
+];
 </script>
 
 <template>
   <div class="app-shell">
-    <nav class="top-nav" aria-label="Primary">
-      <button
+    <nav class="top-nav" aria-label="主导航">
+      <RouterLink
         v-for="page in pages"
-        :key="page.key"
-        type="button"
+        :key="page.to"
+        :to="page.to"
         class="nav-tab"
-        :class="{ active: activePage === page.key }"
-        @click="activePage = page.key"
+        :class="{ active: page.match ? $route.path.startsWith(page.match) : $route.path === page.to }"
       >
+        <FolioIcon :name="page.icon" :size="16" />
         {{ page.label }}
-      </button>
+      </RouterLink>
     </nav>
 
-    <component :is="activeComponent" />
+    <RouterView />
   </div>
 </template>

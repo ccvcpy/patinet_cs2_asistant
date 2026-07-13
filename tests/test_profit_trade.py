@@ -19,6 +19,7 @@ from cs2_assistant.models import MarketState, StrategyConfig
 import cs2_assistant.services.profit_trade as profit_trade_module
 from cs2_assistant.services.profit_trade import (
     build_profit_trade_dashboard_payload,
+    build_profit_trade_interruptions_payload,
     dismiss_profit_trade,
     execute_profit_trade_buy,
     execute_profit_trade_list_c5,
@@ -185,6 +186,51 @@ class FakeOrderbookFailClient(FakeSteamBuyClient):
     def order_book(self, **kwargs: object) -> dict:
         self.order_book_calls.append(dict(kwargs))
         raise RuntimeError("orderbook unavailable")
+
+
+class FakeSearchListingsFailClient(FakeSteamBuyClient):
+    def search_listings(self, **kwargs: object) -> dict:
+        self.search_listing_calls.append(dict(kwargs))
+        raise SteamMarketError("429 Too Many Requests while searching listings")
+
+
+class FakeSearchListings429Client(FakeSteamBuyClient):
+    def __init__(
+        self,
+        *,
+        failures: int = 1,
+        total: int = 10000,
+        total_after_first_429: int | None = None,
+    ) -> None:
+        super().__init__(total=total)
+        self.failures_remaining = failures
+        self.total_after_first_429 = total_after_first_429
+
+    def search_listings(self, **kwargs: object) -> dict:
+        self.search_listing_calls.append(dict(kwargs))
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            if self.total_after_first_429 is not None:
+                self.total = self.total_after_first_429
+            raise SteamMarketError(
+                "Steam listings search returned HTTP 429 Too Many Requests",
+                status_code=429,
+                retry_after="0",
+            )
+        return {
+            "listinginfo": {
+                "listing-after-429": {
+                    "listingid": "listing-after-429",
+                    "converted_price": self.total - 500,
+                    "converted_fee": 500,
+                    "converted_total": self.total,
+                    "converted_currencyid": 23,
+                    "description": {
+                        "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                    },
+                }
+            }
+        }
 
 
 class FakeCommoditySteamBuyClient(FakeSteamBuyClient):
@@ -414,6 +460,50 @@ class FakeC5SaleClient:
         return {"successList": kwargs.get("data_list") or []}
 
 
+class FakeC5PreBuyRefreshClient(FakeC5SaleClient):
+    def __init__(
+        self,
+        *,
+        price: float = 90.0,
+        on_sale_count: int = 10,
+        purchase_max_price: float = 80.0,
+        purchase_count: int = 10,
+    ) -> None:
+        super().__init__()
+        self.price = price
+        self.on_sale_count = on_sale_count
+        self.purchase_max_price = purchase_max_price
+        self.purchase_count = purchase_count
+        self.price_batch_calls: list[dict[str, object]] = []
+        self.statistics_calls: list[dict[str, object]] = []
+
+    def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict:
+        self.price_batch_calls.append(
+            {"market_hash_names": list(market_hash_names), "app_id": app_id}
+        )
+        return {
+            name: {
+                "price": self.price,
+                "count": self.on_sale_count,
+            }
+            for name in market_hash_names
+        }
+
+    def price_statistics_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict:
+        self.statistics_calls.append(
+            {"market_hash_names": list(market_hash_names), "app_id": app_id}
+        )
+        return {
+            name: {
+                "currentSellPrice": self.price,
+                "onSaleCount": self.on_sale_count,
+                "purchaseMaxPrice": self.purchase_max_price,
+                "purchaseCount": self.purchase_count,
+            }
+            for name in market_hash_names
+        }
+
+
 class FakeServerChan:
     messages: list[tuple[str, str]] = []
 
@@ -547,6 +637,41 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertAlmostEqual(20.1, opportunity.expected_profit)
         self.assertAlmostEqual(89.1 / 100.0 - 0.69, opportunity.expected_roi)
         self.assertEqual("disabled", opportunity.liquidity_status)
+
+    def test_scan_evaluates_all_eligible_item_types_regardless_of_legacy_scan_cap(self) -> None:
+        inventory_payload = {
+            "source": "fixture",
+            "list": [
+                {
+                    "assetId": "asset-high",
+                    "marketHashName": "AK-47 | Redline (Field-Tested)",
+                    "name": "High reference price",
+                    "steamId": "steam-a",
+                    "ifTradable": True,
+                    "price": 100.0,
+                },
+                {
+                    "assetId": "asset-low",
+                    "marketHashName": "USP-S | Tropical Breeze (Factory New)",
+                    "name": "Low reference price",
+                    "steamId": "steam-a",
+                    "ifTradable": True,
+                    "price": 50.0,
+                },
+            ],
+        }
+
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            self.config,
+            inventory_payload=inventory_payload,
+            market_service=FakeProfitMarketService(),
+            scan_max_items=1,
+            limit=20,
+        )
+
+        self.assertEqual(2, report.evaluated_count)
+        self.assertFalse(any("Prefiltered" in note for note in report.notes))
 
     def test_profit_trade_uses_own_balance_discount_not_guadao_ratio(self) -> None:
         report = scan_profit_trade_opportunities(
@@ -1788,6 +1913,173 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         finally:
             db.close()
 
+    def test_buy_step_waits_and_retries_search_listings_429_then_buys_once(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(failures=1)
+        c5_client = FakeC5PreBuyRefreshClient()
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+            c5_client=c5_client,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("steam_bought", result["trade"]["status"])
+        self.assertEqual(2, len(client.search_listing_calls))
+        self.assertEqual(2, len(client.order_book_calls))
+        self.assertEqual(1, len(client.buy_calls))
+        self.assertEqual([], client.create_buy_order_calls)
+        self.assertEqual(1, len(c5_client.price_batch_calls))
+        self.assertEqual(1, len(c5_client.statistics_calls))
+        note = result["trade"]["note"]
+        self.assertEqual(1, note["searchListings429Count"])
+        self.assertIs(note["searchListings429Recovered"], True)
+        self.assertIs(note["purchaseRequestSent"], True)
+
+    def test_search_listings_429_uses_incremental_fallback_without_retry_after(self) -> None:
+        first_delay, first_source = profit_trade_module._steam_retry_after_delay_seconds(
+            SteamMarketError("HTTP 429", status_code=429),
+            failure_number=1,
+        )
+        second_delay, second_source = profit_trade_module._steam_retry_after_delay_seconds(
+            SteamMarketError("HTTP 429", status_code=429),
+            failure_number=2,
+        )
+
+        self.assertEqual(2.0, first_delay)
+        self.assertEqual(4.0, second_delay)
+        self.assertEqual("incremental_fallback", first_source)
+        self.assertEqual("incremental_fallback", second_source)
+
+    def test_buy_step_cancels_into_interruption_after_search_listings_429_limit(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(failures=99)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(3, len(client.search_listing_calls))
+        self.assertEqual(3, len(client.order_book_calls))
+        self.assertEqual([], client.buy_calls)
+        self.assertEqual([], client.create_buy_order_calls)
+        note = result["trade"]["note"]
+        self.assertEqual("profit_trade_search_listings_429_exhausted", note["cancelSource"])
+        self.assertIn("HTTP 429", note["cancelReason"])
+        self.assertEqual(3, note["searchListings429Count"])
+        self.assertIs(note["purchaseRequestSent"], False)
+        self.assertIs(note["listingIdObtained"], False)
+        self.assertEqual(
+            "search_listings_429_exhausted_before_steam_buy",
+            note["purchaseRequestEvidence"],
+        )
+        interruptions = build_profit_trade_interruptions_payload(self.settings)
+        self.assertIn(trade_id, [item["id"] for item in interruptions["items"]])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_buy_step_cancels_when_price_rises_above_tolerance_after_429(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(
+            failures=1,
+            total=10000,
+            total_after_first_429=10300,
+        )
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=1.0,
+            ),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertIn("Steam buy price moved too much", result["trade"]["note"]["cancelReason"])
+        self.assertEqual(2, len(client.search_listing_calls))
+        self.assertEqual([], client.buy_calls)
+
+    def test_buy_step_cancels_when_roi_falls_below_minimum_after_429(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(
+            failures=1,
+            total=10000,
+            total_after_first_429=12000,
+        )
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertIn("ROI no longer meets threshold", result["trade"]["note"]["cancelReason"])
+        self.assertEqual(2, len(client.search_listing_calls))
+        self.assertEqual([], client.buy_calls)
+
+    def test_buy_step_rechecks_c5_risk_after_search_listings_429(self) -> None:
+        trade_id = self._create_locked_trade()
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            db.update_profit_trade(
+                trade_id,
+                note=profit_trade_module._build_note({**note, "liquidityStatus": "passed"}),
+            )
+        finally:
+            db.close()
+        client = FakeSearchListings429Client(failures=1)
+        c5_client = FakeC5PreBuyRefreshClient(purchase_count=0)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_require_c5_market_depth=True,
+                profit_trade_c5_min_on_sale_count=3,
+                profit_trade_c5_min_purchase_count=1,
+                profit_trade_c5_min_purchase_sell_ratio=0.7,
+            ),
+            steam_client=client,
+            c5_client=c5_client,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertIn("C5 risk no longer passes", result["trade"]["note"]["cancelReason"])
+        self.assertIn("purchase count", result["trade"]["note"]["cancelReason"])
+        self.assertEqual([], client.buy_calls)
+
     def test_buy_step_releases_lock_when_orderbook_price_moves_too_much(self) -> None:
         trade_id = self._create_locked_trade()
         client = FakeSteamBuyClient(total=10300)
@@ -2027,6 +2319,36 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             self.assertIsNone(db.get_active_asset_reservation("asset-a"))
         finally:
             db.close()
+
+    def test_run_once_persists_not_sent_evidence_when_search_listings_fails(self) -> None:
+        trade_id = self._create_locked_trade()
+        steam_client = FakeSearchListingsFailClient(total=10000)
+
+        report = run_profit_trade_once(
+            self.settings,
+            profit_config(profit_trade_allow_real_execution=True, profit_trade_max_buy_per_cycle=1),
+            inventory_payload={"source": "fixture", "list": []},
+            market_service=FakeProfitMarketService(),
+            steam_client=steam_client,
+            c5_client=FakeC5SaleClient(),
+        )
+
+        self.assertEqual([], report.bought_trade_ids)
+        self.assertEqual([], steam_client.buy_calls)
+        self.assertEqual([], steam_client.create_buy_order_calls)
+        self.assertTrue(any("listings search failed" in error.lower() for error in report.errors))
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(trade["note"])
+        finally:
+            db.close()
+        self.assertEqual("cancelled", trade["status"])
+        self.assertEqual("profit_trade_pre_buy_cancel", note["cancelSource"])
+        self.assertIs(note["purchaseRequestSent"], False)
+        self.assertIs(note["listingIdObtained"], False)
+        self.assertEqual("search_listings_failed_before_steam_buy", note["purchaseRequestEvidence"])
 
     def test_run_once_respects_daily_steam_budget_before_buying_locked_trade(self) -> None:
         trade_id = self._create_locked_trade()

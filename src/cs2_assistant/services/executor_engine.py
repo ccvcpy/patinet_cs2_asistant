@@ -1248,7 +1248,7 @@ class ExecutionEngine:
             return None
         return state
 
-    def _record_listing_transient_defer(
+    def _record_listing_defer(
         self,
         *,
         candidate: StrategyCandidate,
@@ -1257,17 +1257,19 @@ class ExecutionEngine:
         account: Account | None,
         steam_id64: str | None,
         error: Exception,
+        reason: str,
+        cooldown_seconds: float = STEAM_LISTING_TRANSIENT_COOLDOWN_SECONDS,
     ) -> ListingDeferState:
         previous = self._latest_listing_defer_state(asset_id)
         defer_count = (previous.defer_count if previous is not None else 0) + 1
         now = _now_utc()
-        deferred_until = now + timedelta(seconds=STEAM_LISTING_TRANSIENT_COOLDOWN_SECONDS)
+        deferred_until = now + timedelta(seconds=max(1.0, float(cooldown_seconds)))
         note = _build_note(
             {
                 "assetId": asset_id,
                 "marketHashName": candidate.market_hash_name,
                 "steamListPrice": price,
-                "deferReason": "transient_sellitem_failure",
+                "deferReason": reason,
                 "deferMessage": str(error),
                 "deferCount": defer_count,
                 "deferredAt": now.isoformat(),
@@ -1293,6 +1295,26 @@ class ExecutionEngine:
             op_id=op_id,
             deferred_until=deferred_until,
             defer_count=defer_count,
+            reason=reason,
+        )
+
+    def _record_listing_transient_defer(
+        self,
+        *,
+        candidate: StrategyCandidate,
+        asset_id: str,
+        price: float,
+        account: Account | None,
+        steam_id64: str | None,
+        error: Exception,
+    ) -> ListingDeferState:
+        return self._record_listing_defer(
+            candidate=candidate,
+            asset_id=asset_id,
+            price=price,
+            account=account,
+            steam_id64=steam_id64,
+            error=error,
             reason="transient_sellitem_failure",
         )
 
@@ -2501,11 +2523,22 @@ class ExecutionEngine:
                             f"原因: {exc}"
                         )
                         continue
-                    self.db.set_asset_status(asset_id, "listing_failed")
+                    defer_state = self._record_listing_defer(
+                        candidate=candidate,
+                        asset_id=str(asset_id),
+                        price=decision.list_price,
+                        account=selected_account,
+                        steam_id64=selected_steam_id64,
+                        error=exc,
+                        reason="sellitem_failure",
+                    )
+                    local_asset_retry_at = defer_state.deferred_until.astimezone(timezone(timedelta(hours=8)))
                     print(
-                        f"[上架失败] {candidate.market_hash_name} | "
+                        f"[上架失败冷却] {candidate.market_hash_name} | "
                         f"asset={asset_id} | "
                         f"Steam挂价 CNY {decision.list_price:.2f} | "
+                        f"该资产冷却到 {local_asset_retry_at.strftime('%Y-%m-%d %H:%M:%S')} 后可重试，"
+                        "不会永久停留在 listing_failed | "
                         f"原因: {exc}"
                     )
                     continue
@@ -4253,7 +4286,8 @@ class ExecutionEngine:
         if failed_status is None:
             failed_status = C5_DELIVERY_FAILED if replacement_reason == "c5_delivery_failed" else "failed"
         if force_rebuy_replacement is None:
-            force_rebuy_replacement = replacement_reason == "c5_delivery_failed"
+            force_rebuy_replacement = False
+        expected_price = safe_float(op["actual_price"]) or safe_float(op["expected_price"]) or 0.01
         replacement_note = {
             "replacementForRebuyOperationId": int(op["id"]),
             "replacementForC5OrderId": order_id,
@@ -4272,8 +4306,15 @@ class ExecutionEngine:
             "steamAccountName": note.get("steamAccountName"),
             "steamId64": note.get("steamId64"),
             "createdBy": created_by,
+            **(
+                {
+                    "replacementMaxPrice": expected_price,
+                    "replacementPricePolicy": "original_failed_order_price",
+                }
+                if replacement_reason == "c5_delivery_failed"
+                else {}
+            ),
         }
-        expected_price = safe_float(op["actual_price"]) or safe_float(op["expected_price"]) or 0.01
         replacement_id = self.db.add_pool_operation(
             market_hash_name=op["market_hash_name"],
             strategy=STRATEGY_GUADAO,
@@ -4483,7 +4524,17 @@ class ExecutionEngine:
             if inferred_account_fields:
                 note = {**note, **inferred_account_fields}
                 self.db.update_pool_operation(op["id"], note=_build_note(note))
-            force_rebuy_replacement = bool(note.get("forceRebuyReplacement"))
+            is_replacement = safe_int(note.get("replacementForRebuyOperationId")) is not None
+            replacement_max_price = safe_float(note.get("replacementMaxPrice"))
+            if is_replacement and note.get("forceRebuyReplacement") and replacement_max_price is None:
+                replacement_max_price = safe_float(expected_price)
+                note = {
+                    **note,
+                    "forceRebuyReplacement": False,
+                    "replacementMaxPrice": replacement_max_price,
+                    "replacementPricePolicy": "original_failed_order_price_legacy_migration",
+                }
+                self.db.update_pool_operation(op["id"], note=_build_note(note))
             expected_steam_list = note.get("steamListPrice")
             rebuy_max_listing_ratio = self._rebuy_max_listing_ratio_for_note(note)
             rebuy_steam_net_factor = safe_float(note.get("steamNetFactorAtOpen")) or self.config.steam_net_factor
@@ -4505,11 +4556,10 @@ class ExecutionEngine:
                 tolerance_pct=self.config.price_tolerance_pct,
                 dry_run=self.config.dry_run,
                 steam_net_factor=rebuy_steam_net_factor,
-                guadao_max_listing_ratio=None
-                if force_rebuy_replacement
-                else rebuy_max_listing_ratio,
+                guadao_max_listing_ratio=rebuy_max_listing_ratio,
                 trade_url=trade_url,
-                use_live_price_as_max=force_rebuy_replacement,
+                use_live_price_as_max=False,
+                max_price_override=replacement_max_price,
             )
             if result.reason in (
                 "steam_crashed",
@@ -4605,7 +4655,7 @@ class ExecutionEngine:
                     ),
                 )
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
-                prefix = "[补仓替换]" if force_rebuy_replacement else "[补仓]"
+                prefix = "[补仓替换]" if is_replacement else "[补仓]"
                 print(
                     f"{prefix} {op['market_hash_name']} | "
                     f"账号={_steam_account_log_label(note) or '-'} | "

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+import time
+import uuid
+from typing import Any, Callable, Mapping
 
 import requests
 
@@ -11,15 +13,185 @@ class C5GameError(RuntimeError):
     pass
 
 
+C5TelemetryCallback = Callable[[dict[str, Any]], None]
+
+_C5_TELEMETRY_CONTEXT_FIELDS = {
+    "source",
+    "run_id",
+    "trade_id",
+    "trade_no",
+    "market_hash_name",
+    "asset_id",
+    "account_id",
+    "steam_id64",
+}
+_C5_SENSITIVE_ERROR_RE = re.compile(
+    r"(?i)(app[-_ ]?key|api[-_ ]?key|authorization|cookie|sessionid|password|"
+    r"identity[-_ ]?secret|device[-_ ]?secret|shared[-_ ]?secret|steam[-_ ]?guard|"
+    r"style[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|token|trade[-_ ]?url)"
+    r"(\s*[=:]\s*)([^&;\s,}\]]+|\"[^\"]*\"|'[^']*')"
+)
+_C5_TRADE_URL_RE = re.compile(
+    r"https?://steamcommunity\.com/tradeoffer/new/\?[^\s\"']+",
+    re.IGNORECASE,
+)
+
+
 def _redact_app_key(text: str) -> str:
     return re.sub(r"(app-key=)[^&\s]+", r"\1<redacted>", text)
 
 
+def _safe_c5_telemetry_error(exc: BaseException) -> str:
+    text = _C5_TRADE_URL_RE.sub("<redacted:trade_url>", str(exc))
+    text = _C5_SENSITIVE_ERROR_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        text,
+    )
+    return text if len(text) <= 1000 else f"{text[:1000]}...<truncated>"
+
+
 class C5GameClient:
-    def __init__(self, api_key: str, base_url: str = "https://openapi.c5game.com", timeout: int = 30):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://openapi.c5game.com",
+        timeout: int = 30,
+        *,
+        telemetry_callback: C5TelemetryCallback | None = None,
+        telemetry_context: Mapping[str, Any] | None = None,
+    ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._telemetry_callback = telemetry_callback
+        self._telemetry_context = {
+            key: value
+            for key, value in dict(telemetry_context or {}).items()
+            if key in _C5_TELEMETRY_CONTEXT_FIELDS
+        }
+        self._telemetry_client_instance_id = f"c5_{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _telemetry_operation(path: str) -> str:
+        normalized = str(path or "").lower()
+        mappings = (
+            ("/account/v1/steaminfo", "steam_info"),
+            ("/inventory/", "inventory"),
+            ("/product/price/batch", "price_batch"),
+            ("/item/stat/hash/name", "price_statistics_batch"),
+            ("/purchase/v1/max-price", "purchase_max_price"),
+            ("/sale/v1/search", "sale_search"),
+            ("/sale/v1/modify", "sale_modify"),
+            ("/sale/v2/create", "sale_create"),
+            ("/sale/v1/cancel", "sale_cancel"),
+            ("/goods/v1/search", "goods_search"),
+            ("/trade/v2/normal-buy", "normal_buy"),
+            ("/trade/v2/quick-buy", "quick_buy"),
+            ("/market/v2/products/search", "market_products_search"),
+            ("/market/v2/products/list", "market_products_list"),
+            ("/trade/v1/batch/buy", "batch_buy"),
+            ("/order/v2/buyer/status", "buyer_order_status"),
+            ("/order/v2/buy/detail", "buyer_order_detail"),
+            ("/order/v1/list", "seller_order_list"),
+            ("/order/v1/detail", "seller_order_detail"),
+        )
+        for marker, operation in mappings:
+            if marker in normalized:
+                return operation
+        return "c5_http_request"
+
+    def _emit_telemetry(
+        self,
+        *,
+        level: str,
+        operation: str,
+        message: str,
+        **fields: Any,
+    ) -> None:
+        callback = self._telemetry_callback
+        if callback is None:
+            return
+        event = dict(self._telemetry_context)
+        event.update(
+            {
+                "level": level,
+                "provider": "c5",
+                "component": "c5game",
+                "operation": operation,
+                "message": message,
+                "client_instance_id": self._telemetry_client_instance_id,
+            }
+        )
+        event.update({key: value for key, value in fields.items() if value is not None})
+        try:
+            callback(event)
+        except Exception:
+            # Telemetry is diagnostic only and must never change a C5 action.
+            return
+
+    def _request_with_telemetry(
+        self,
+        *,
+        method: str,
+        path: str,
+        request: Callable[[], requests.Response],
+    ) -> requests.Response:
+        request_id = f"c5_req_{uuid.uuid4().hex}"
+        operation = self._telemetry_operation(path)
+        started = time.perf_counter()
+        self._emit_telemetry(
+            level="DEBUG",
+            operation=operation,
+            message="C5 request started",
+            request_id=request_id,
+            attempt=1,
+            method=str(method).upper(),
+            endpoint=path,
+            safe_context={"phase": "start"},
+        )
+        try:
+            response = request()
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+            self._emit_telemetry(
+                level="ERROR",
+                operation=operation,
+                message="C5 request failed before receiving a response",
+                request_id=request_id,
+                attempt=1,
+                method=str(method).upper(),
+                endpoint=path,
+                elapsed_ms=elapsed_ms,
+                exception_type=type(exc).__name__,
+                safe_context={
+                    "phase": "failure",
+                    "error": _safe_c5_telemetry_error(exc),
+                },
+            )
+            raise
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        response_headers = getattr(response, "headers", {}) or {}
+        retry_after = response_headers.get("Retry-After") if hasattr(response_headers, "get") else None
+        failed = status_code >= 400
+        self._emit_telemetry(
+            level="ERROR" if failed else "INFO",
+            operation=operation,
+            message="C5 request returned an HTTP error" if failed else "C5 request succeeded",
+            request_id=request_id,
+            attempt=1,
+            method=str(method).upper(),
+            endpoint=path,
+            status_code=status_code,
+            elapsed_ms=elapsed_ms,
+            retry_after=retry_after,
+            safe_context={"phase": "failure" if failed else "success"},
+        )
+        try:
+            setattr(response, "_profit_trade_telemetry_request_id", request_id)
+        except Exception:
+            pass
+        return response
 
     def _request(
         self,
@@ -39,13 +211,17 @@ class C5GameClient:
             headers["Content-Type"] = "application/json"
 
         try:
-            response = requests.request(
+            response = self._request_with_telemetry(
                 method=method,
-                url=f"{self.base_url}{path}",
-                params=merged_params,
-                json=json_body,
-                headers=headers,
-                timeout=self.timeout,
+                path=path,
+                request=lambda: requests.request(
+                    method=method,
+                    url=f"{self.base_url}{path}",
+                    params=merged_params,
+                    json=json_body,
+                    headers=headers,
+                    timeout=self.timeout,
+                ),
             )
             response.raise_for_status()
         except requests.RequestException as exc:
@@ -54,9 +230,35 @@ class C5GameClient:
         try:
             payload = response.json()
         except ValueError as exc:
+            self._emit_telemetry(
+                level="ERROR",
+                operation=self._telemetry_operation(path),
+                message="C5 response was not valid JSON",
+                request_id=getattr(response, "_profit_trade_telemetry_request_id", None),
+                attempt=1,
+                method=str(method).upper(),
+                endpoint=path,
+                status_code=int(getattr(response, "status_code", 0) or 0),
+                exception_type=type(exc).__name__,
+                safe_context={"phase": "response_parse", "error": _safe_c5_telemetry_error(exc)},
+            )
             raise C5GameError(f"C5 returned invalid JSON: {response.text}") from exc
 
         if payload.get("success") is not True:
+            safe_message = _safe_c5_telemetry_error(
+                RuntimeError(str(payload.get("message") or payload.get("error") or "C5 business request failed"))
+            )
+            self._emit_telemetry(
+                level="ERROR",
+                operation=self._telemetry_operation(path),
+                message="C5 response reported a business failure",
+                request_id=getattr(response, "_profit_trade_telemetry_request_id", None),
+                attempt=1,
+                method=str(method).upper(),
+                endpoint=path,
+                status_code=int(getattr(response, "status_code", 0) or 0),
+                safe_context={"phase": "business_failure", "error": safe_message},
+            )
             raise C5GameError(json.dumps(payload, ensure_ascii=False))
         return payload.get("data")
 
@@ -244,6 +446,65 @@ class C5GameClient:
         if low_price is not None:
             body["lowPrice"] = low_price
         data = self._request("POST", "/merchant/trade/v2/quick-buy", json_body=body)
+        return dict(data or {})
+
+    def market_products_search(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        price_max: float,
+        delivery: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        """Search current C5 listings eligible for one batch-buy request."""
+        data = self._request(
+            "POST",
+            "/merchant/market/v2/products/search",
+            json_body={
+                "appId": app_id,
+                "marketHashName": market_hash_name,
+                "priceMax": price_max,
+                "delivery": delivery,
+                "acceptBargain": False,
+                "pageSize": page_size,
+            },
+        )
+        return dict(data or {})
+
+    def market_products_list(
+        self,
+        *,
+        item_id: str,
+        delivery: int,
+        page_num: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        """Read one concrete page of C5 listings for a catalog item."""
+        data = self._request(
+            "POST",
+            "/merchant/market/v2/products/list",
+            json_body={
+                "itemId": item_id,
+                "delivery": delivery,
+                "pageNum": page_num,
+                "pageSize": page_size,
+            },
+        )
+        return dict(data or {})
+
+    def batch_buy(
+        self,
+        *,
+        product_list: list[dict[str, Any]],
+        trade_url: str,
+    ) -> dict[str, Any]:
+        """Submit multiple concrete C5 listings in one purchase request."""
+        data = self._request(
+            "POST",
+            "/merchant/trade/v1/batch/buy",
+            json_body={"productList": product_list, "tradeUrl": trade_url},
+        )
         return dict(data or {})
 
     def buyer_order_status(

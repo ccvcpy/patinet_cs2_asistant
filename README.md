@@ -136,8 +136,12 @@ data/strategy_config.json
   "profitTrade": {
     "enabled": true,
     "allowRealExecution": false,
-    "minRoi": 0.07,
-    "minItemValue": 50
+    "allowRepriceExecution": false,
+    "balanceDiscount": 0.69,
+    "minRoi": 0.08,
+    "minItemValue": 5.0,
+    "dailySteamBudget": 600.0,
+    "scanMaxItems": 80
   },
   "legacyTransfer": {
     "transferMinRealRatio": 9999
@@ -156,6 +160,8 @@ data/strategy_config.json
 - `maxListPerCycle`
 - `profitTrade.enabled`
 - `profitTrade.allowRealExecution`
+- `profitTrade.balanceDiscount`
+- `profitTrade.minRoi`
 
 `guadaoItemScope` 当前只按以下两类理解：
 
@@ -388,13 +394,13 @@ python .\main.py profit-trade config --disallow-real-execution
 ```powershell
 python .\main.py profit-trade scan --limit 20
 python .\main.py profit-trade scan --limit 20 --record
-python .\main.py profit-trade scan --limit 1 --scan-max-items 5 --dump-json
+python .\main.py profit-trade scan --limit 1 --dump-json
 python .\main.py profit-trade run-once
 ```
 
 扫描默认只读取数据，不买、不卖、不锁。`--record` 会把机会写入 `profit_trades` 候选流水；再次记录扫描会先取消旧的买 B 前候选，再写入新候选，避免复用已经过期的 ROI。`--lock` 会写入流水并短时间锁定 A 资产，但仍然不会买 B 或上架 C5。
 
-扫描会先用 C5 库存参考价和 `profitTrade.minItemValue` 预筛，再只对 `profitTrade.scanMaxItems` 内的高价值可交易品种读取 Steam 官方 `orderbook`，避免全量库存逐个取价拖慢前端/API。
+扫描会先按可交易状态、保护规则和 `profitTrade.minItemValue` 做前置过滤，随后对所有剩余品类读取 Steam 官方 `orderbook`、计算 ROI 并执行 C5 风控。`profitTrade.scanMaxItems` 和 `--scan-max-items` 暂时只为旧配置、CLI 和 API 调用兼容保留，不再截断实际参与评估的品类；`limit` 只限制最终返回或写入多少个通过条件的执行机会。
 
 手动锁定一笔候选流水：
 
@@ -405,19 +411,21 @@ python .\main.py profit-trade list-c5 123
 python .\main.py profit-trade refresh-sales
 ```
 
-`buy` 只处理 `locked` 流水：执行前重新读取 Steam `orderbook`，用当前卖家最低价走 `createbuyorder`，按实际付款价复算 ROI。买 B 前如果 A 锁已过期、价格移动超出容忍范围，或 ROI 低于 `profitTrade.minRoi`，不会买入，并会释放短期 A 锁、取消该笔买 B 前流水；只有 Steam 买入已触发或 C5 上架状态不确定时，才进入人工处理。
+`buy` 只处理 `locked` 流水：执行前重新读取 Steam `orderbook` 并按实际付款价复算 ROI。普通非 commodity 饰品会先查询具体 listing，再用 `buylisting` 购买；箱子等 commodity 可以使用 `createbuyorder`，但提交求购请求不等于已经买到，必须结合求购单、钱包、库存和资产变化确认真实成交。买 B 前如果 A 锁已过期、价格移动超出容忍范围，或 ROI 低于 `profitTrade.minRoi`，不会使用旧价格继续购买。
 
 profitTrade 的 ROI 口径和 notify 做T提醒保持一致：
 
 ```text
 面折比 = C5挂价 / Steam买入价
 C5预计到手折比 = 面折比 * 0.99
-ROI = C5预计到手折比 - guadaoMaxListingRatio
-真实成本 = Steam买入价 * guadaoMaxListingRatio
+ROI = C5预计到手折比 - profitTrade.balanceDiscount
+真实成本 = Steam买入价 * profitTrade.balanceDiscount
 预计收益 = C5挂价 * 0.99 - 真实成本
 ```
 
-买 B 的 Steam 账号选择规则是：优先用 A 资产所属 Steam 账号；如果这个账号余额不足，再从其他本地账号里选择“可用余额足够且余额最小”的账号。余额是否足够按 Steam 实际付款价判断，收益核算仍按 `guadaoMaxListingRatio`。
+Profit Trade 只使用自己独立的 `profitTrade.balanceDiscount`，不读取 `common.balanceDiscount`，也不自动跟随挂刀执行器的 `guadaoBalance.guadaoMaxListingRatio`。
+
+买 B 的 Steam 账号选择规则是：优先用 A 资产所属 Steam 账号；如果这个账号余额不足，再从其他本地账号里选择“可用余额足够且余额最小”的账号。余额是否足够按 Steam 实际付款价判断，收益核算按该笔冻结的 `profitTrade.balanceDiscount`。
 
 `list-c5` 只处理 `steam_bought` 流水：C5 `sale_create` 成功后才把 A 资产锁从 `active` 转成 `consumed`。这意味着 A 已经被 profitTrade 长期占用，不能再被挂刀或旧 `legacyTransfer` 选中。
 
@@ -441,7 +449,27 @@ cd frontend
 npm run dev
 ```
 
-前端 `搬砖做T` 页会通过 `/api/profit-trade/dashboard` 读取后端状态，并通过 `/api/profit-trade/config` 分别开关 `profitTrade.enabled` 与 `profitTrade.allowRealExecution`。如果 API 没启动，页面只读取 `frontend/public/profit_trade_dashboard.json` 静态快照。
+前端通过 Vue Router 4 的 hash 路由拆成三个 Profit Trade 子页：
+
+- `#/profit-trade/overview`（S1）：保留执行控制、进行中流水和已完结收益，并增加 `ROI > 0` 观察池。
+- `#/profit-trade/interruptions`（S2）：查看取消、失败和需人工处理的中断流水及七步时间线。
+- `#/profit-trade/logs`（S3）：查看 Profit Trade 实时结构化日志。
+
+旧地址 `#profit-trade` 会兼容跳转到 S1。页面通过 `/api/profit-trade/dashboard` 和 `/api/profit-trade/config` 读取、修改真实后端状态；如果 API 没启动，只显示离线和空状态，不会读取 `frontend/public/profit_trade_dashboard.json` 或其他静态快照冒充当前运营数据。
+
+S1 的观察池和执行机会不是一回事：只要最新完整评估的 ROI 大于 0，就可以保存到观察池并查看价格/ROI 历史；低于 `profitTrade.minRoi`、C5 风控失败或超过人工审核阈值时只能观察，不能创建执行流水、锁 A、买 B 或上架 C5。最新评估不再满足观察条件时会退出当前池，但历史仍保留；整轮扫描失败不会清空旧观察结果。
+
+S2 默认展示 `cancelled`、`failed` 和 `manual_required`。点击“知晓并隐藏”只会从默认问题列表折叠该记录，不会删除 `profit_trades` 流水、状态时间线或日志，并且可以恢复。如果记录关联未确认终态的 Steam buy order 或存在不确定成交证据，后端会先要求安全解决远端订单；无法确认时返回冲突，不能直接隐藏。
+
+S3 只展示明确标记为 `source=profit_trade` 的事件，包括 Profit Trade 自己发起的 Steam、C5 和 local 扫描/状态机活动。它不读取挂刀执行器、C5 扫货或其他执行器日志。结构化日志按 UTC 自然日写入：
+
+```text
+logs/profit_trade/YYYY-MM-DD.jsonl
+```
+
+闭日文件压缩为 `.jsonl.gz`，默认保留 90 天；支持时间和交易字段筛选、SSE 实时显示、JSONL 导出和可读 `.log` 下载。Cookie、sessionid、密码、API key、Steam Guard/identity/device secret、C5 app-key、trade URL、token/styleToken 和完整认证请求体不会落盘。
+
+日志会记录 Profit Trade Steam 请求的 operation、账号、request ID、状态码、耗时、`Retry-After` 和近期请求频率，因此能帮助分析 429。但这次可观测性更新没有修改 Steam 原有请求重试、relogin 或买入重试规则；429 也不等于 cookie 失效。Profit Trade 日志只能证明自身发起了哪些请求，不能单独证明 429 是挂刀执行器造成的；需要将来独立的挂刀日志按 UTC 时间和账号交叉对照。
 
 当前安全边界：
 

@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cs2_assistant.cli import (
     _build_pool_inventory_report,
+    build_guadao_report_api_payload,
     build_parser,
     _build_guadao_discount_report,
     _build_market_price_gap_rows,
@@ -32,6 +33,7 @@ from cs2_assistant.cli import (
     cmd_pool_case_monitor_report,
     cmd_pool_case_monitor_run,
 )
+from cs2_assistant.config import Settings
 from cs2_assistant.db import Database
 from cs2_assistant.models import (
     MarketState,
@@ -692,8 +694,40 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertEqual(190.0, report["steamSoldReconciliation"]["closed"]["cash"])
         self.assertAlmostEqual(190.0 / 260.7, report["steamSoldReconciliation"]["closed"]["totalDiscountRatio"])
         self.assertAlmostEqual(190.0 / 260.7, report["summary"]["totalDiscountRatio"])
-        self.assertAlmostEqual(190.0 / 300.0, report["summary"]["faceDiscountRatio"])
+        self.assertNotIn("faceDiscountRatio", report["summary"])
+        self.assertNotIn("faceDiscountRatio", report["steamSoldInRange"]["summary"])
+        self.assertNotIn("faceDiscountRatio", report["steamSoldReconciliation"]["closed"])
+        self.assertTrue(all("faceDiscountRatio" not in row for row in report["items"]))
+        self.assertTrue(all("faceDiscountRatio" not in row for row in report["details"]))
         self.assertEqual(["Kilowatt Case", "Revolution Case"], sorted(row["marketHashName"] for row in report["items"]))
+
+    def test_guadao_report_api_payload_uses_shared_report_and_controls_details(self) -> None:
+        rebuy_id = self._add_closed_cycle("Kilowatt Case", steam_price=100.0, cash=60.0)
+        self._set_completed_at(rebuy_id, "2026-01-01T01:00:00+00:00")
+        settings = Settings(db_path=self.db_path)
+
+        compact = build_guadao_report_api_payload(
+            settings,
+            "2026-01-01T00:00",
+            "2026-01-02T00:00",
+            None,
+            False,
+        )
+        detailed = build_guadao_report_api_payload(
+            settings,
+            "2026-01-01T00:00",
+            "2026-01-02T00:00",
+            None,
+            True,
+        )
+
+        self.assertEqual(1, compact["summary"]["count"])
+        self.assertEqual([], compact["details"])
+        self.assertFalse(compact["detailsIncluded"])
+        self.assertEqual(1, len(detailed["details"]))
+        self.assertTrue(detailed["detailsIncluded"])
+        self.assertEqual("2026-01-01T00:00:00+08:00", compact["startLocal"])
+        self.assertEqual("2026-01-02T00:00:59+08:00", compact["endLocal"])
 
     def test_display_padding_uses_terminal_width_for_chinese(self) -> None:
         self.assertEqual(4, _display_width("项目"))
@@ -726,6 +760,7 @@ class GuadaoDiscountReportTestCase(unittest.TestCase):
         self.assertIn("本期历史未闭环", text)
         self.assertNotIn("口径: 按 C5 补仓完成时间统计", text)
         self.assertNotIn("概览:", text)
+        self.assertNotIn("面值折比", text)
         self.assertIn("Rio 2022 Legends Sticker Capsule", text)
         self.assertIn("CNY 6.00", text)
 
