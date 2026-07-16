@@ -30,6 +30,7 @@ const timelineError = ref("");
 const acknowledgeReason = ref("");
 const actionBusy = ref(false);
 const actionMessage = ref("");
+const listingsCircuit = ref({ status: "closed", isBlocking: false });
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 function stepCount(index) {
     return Number(stepCounts.value.find(item => Number(item.stepIndex) === index)?.count) || 0;
@@ -90,6 +91,11 @@ function evidenceLabel(trade, field) {
         return resolved ? "已发送" : "未发送";
     return resolved ? "已取得" : "未取得";
 }
+function isListings429Interruption(trade) {
+    const source = String(trade.cancelSource || trade.note?.cancelSource || "").toLowerCase();
+    const detail = `${reason(trade)} ${String(trade.note?.searchListingsError || "")}`.toLowerCase();
+    return source.includes("search_listings_429") || source.includes("listings_circuit") || detail.includes("429");
+}
 async function responseError(response) {
     try {
         const payload = await response.json();
@@ -121,6 +127,7 @@ async function load() {
         rows.value = Array.isArray(payload.items) ? payload.items : [];
         total.value = Number(payload.total) || 0;
         stepCounts.value = payload.summary?.stepCounts || payload.stepCounts || [];
+        listingsCircuit.value = payload.listingsCircuit || { status: "closed", isBlocking: false };
         const queryTradeNo = typeof route.query.tradeNo === "string" ? route.query.tradeNo : "";
         const nextSelected = rows.value.find(item => item.tradeNo === queryTradeNo)
             || rows.value.find(item => item.id === selected.value?.id) || rows.value[0] || null;
@@ -161,6 +168,7 @@ async function selectTrade(trade) {
         const payload = await response.json();
         selected.value = payload.trade || trade;
         timeline.value = Array.isArray(payload.events) ? payload.events : [];
+        listingsCircuit.value = payload.listingsCircuit || listingsCircuit.value;
     }
     catch (cause) {
         timeline.value = [];
@@ -219,6 +227,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['filter-bar']} */ ;
 /** @type {__VLS_StyleScopedClasses['filter-bar']} */ ;
 /** @type {__VLS_StyleScopedClasses['filter-bar']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-list']} */ ;
@@ -261,6 +276,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-heading']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-heading']} */ ;
 /** @type {__VLS_StyleScopedClasses['timeline']} */ ;
@@ -276,8 +293,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['acknowledge']} */ ;
 /** @type {__VLS_StyleScopedClasses['acknowledge']} */ ;
 /** @type {__VLS_StyleScopedClasses['acknowledge']} */ ;
-// CSS variable injection
-// CSS variable injection end
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
     ...{ class: "interruptions-page" },
 });
@@ -402,6 +419,27 @@ if (__VLS_ctx.actionMessage) {
         ...{ class: "action-message global-message" },
     });
     (__VLS_ctx.actionMessage);
+}
+if (__VLS_ctx.listingsCircuit.isBlocking) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "interruption-circuit" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.listingsCircuit.triggerAccountName || __VLS_ctx.listingsCircuit.triggerAccountId || "-");
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.listingsCircuit.consecutive429Count || 0);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.time(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "master-detail" },
@@ -597,6 +635,19 @@ else {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
     (__VLS_ctx.evidenceLabel(__VLS_ctx.selected, "purchaseRequestSent"));
+    if (__VLS_ctx.isListings429Interruption(__VLS_ctx.selected)) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+            ...{ class: "listings-evidence" },
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        if (__VLS_ctx.listingsCircuit.isBlocking) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            (__VLS_ctx.time(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
+        }
+        else {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        }
+    }
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
         ...{ class: "timeline" },
     });
@@ -701,6 +752,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['page-error']} */ ;
 /** @type {__VLS_StyleScopedClasses['action-message']} */ ;
 /** @type {__VLS_StyleScopedClasses['global-message']} */ ;
+/** @type {__VLS_StyleScopedClasses['interruption-circuit']} */ ;
 /** @type {__VLS_StyleScopedClasses['master-detail']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
@@ -718,6 +770,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['log-link']} */ ;
 /** @type {__VLS_StyleScopedClasses['process']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['timeline']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-heading']} */ ;
 /** @type {__VLS_StyleScopedClasses['page-error']} */ ;
@@ -752,6 +805,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             acknowledgeReason: acknowledgeReason,
             actionBusy: actionBusy,
             actionMessage: actionMessage,
+            listingsCircuit: listingsCircuit,
             totalPages: totalPages,
             stepCount: stepCount,
             statusLabel: statusLabel,
@@ -762,6 +816,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             reason: reason,
             note: note,
             evidenceLabel: evidenceLabel,
+            isListings429Interruption: isListings429Interruption,
             load: load,
             search: search,
             reset: reset,

@@ -20,6 +20,8 @@ import cs2_assistant.services.profit_trade as profit_trade_module
 from cs2_assistant.services.profit_trade import (
     build_profit_trade_dashboard_payload,
     build_profit_trade_interruptions_payload,
+    build_profit_trade_roi_watch_payload,
+    create_manual_profit_trade_record,
     dismiss_profit_trade,
     execute_profit_trade_buy,
     execute_profit_trade_list_c5,
@@ -31,8 +33,10 @@ from cs2_assistant.services.profit_trade import (
     run_profit_trade_once,
     scan_profit_trade_opportunities,
     update_profit_trade_protection,
+    update_manual_profit_trade_record,
 )
 from cs2_assistant.services.strategy import save_strategy_config
+from cs2_assistant.services.steam_request_scheduler import SteamRequestGuardRejected
 from cs2_assistant.db import Database
 
 
@@ -397,6 +401,9 @@ class FakeAccountStore:
     def list_accounts(self) -> list[Account]:
         return list(self._accounts)
 
+    def get_current(self) -> Account | None:
+        return self._accounts[0] if self._accounts else None
+
 
 class FakeC5SaleClient:
     def __init__(self, *, active_product_ids: list[str] | None = None) -> None:
@@ -581,6 +588,34 @@ class ProfitTradeAccountSelectionTestCase(unittest.TestCase):
 
         self.assertIsNotNone(selected.account)
         self.assertEqual("b", selected.account.id)
+
+    def test_reserved_balance_is_not_spendable_for_account_selection(self) -> None:
+        self._install_wallets({"a": 500.0, "b": 260.0, "c": 1000.0})
+
+        selected = profit_trade_module._select_steam_buy_account(
+            self.settings,
+            required_balance=250.0,
+            preferred_steam_id="steam-a",
+            account_store=FakeAccountStore(self.accounts),
+            account_reserved_balances={"steam-a": 300.0},
+        )
+
+        self.assertIsNotNone(selected.account)
+        self.assertEqual("b", selected.account.id)
+        self.assertEqual(0.0, selected.reserved_balance)
+        self.assertEqual(260.0, selected.spendable_balance)
+
+    def test_reserved_balance_config_round_trips(self) -> None:
+        config = profit_config(
+            profit_trade_account_reserved_balances={"steam-a": 300.0}
+        )
+
+        restored = StrategyConfig.from_dict(config.to_dict())
+
+        self.assertEqual(
+            {"steam-a": 300.0},
+            restored.profit_trade_account_reserved_balances,
+        )
 
 
 class ProfitTradeScanTestCase(unittest.TestCase):
@@ -1546,6 +1581,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual("fresh-listing", result["trade"]["steamListingId"])
         self.assertEqual(["stale-listing", "fresh-listing"], [call["listing_id"] for call in client.buy_calls])
         self.assertEqual(2, len(client.search_listing_calls))
+        self.assertTrue(all(call.get("bounded_retry") is False for call in client.search_listing_calls))
         self.assertEqual(0, len(client.create_buy_order_calls))
         note = result["trade"]["note"]
         self.assertEqual("buylisting", note["steamBuyMethod"])
@@ -1932,6 +1968,10 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual("steam_bought", result["trade"]["status"])
         self.assertEqual(2, len(client.search_listing_calls))
+        self.assertEqual(
+            [False, True],
+            [call.get("bounded_retry") for call in client.search_listing_calls],
+        )
         self.assertEqual(2, len(client.order_book_calls))
         self.assertEqual(1, len(client.buy_calls))
         self.assertEqual([], client.create_buy_order_calls)
@@ -1956,6 +1996,15 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual(4.0, second_delay)
         self.assertEqual("incremental_fallback", first_source)
         self.assertEqual("incremental_fallback", second_source)
+
+    def test_search_listings_429_honors_full_server_retry_after(self) -> None:
+        delay, source = profit_trade_module._steam_retry_after_delay_seconds(
+            SteamMarketError("HTTP 429", status_code=429, retry_after="120"),
+            failure_number=1,
+        )
+
+        self.assertEqual(120.0, delay)
+        self.assertEqual("retry_after", source)
 
     def test_buy_step_cancels_into_interruption_after_search_listings_429_limit(self) -> None:
         trade_id = self._create_locked_trade()
@@ -1987,6 +2036,215 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         )
         interruptions = build_profit_trade_interruptions_payload(self.settings)
         self.assertIn(trade_id, [item["id"] for item in interruptions["items"]])
+        circuit = interruptions["listingsCircuit"]
+        self.assertEqual("open", circuit["status"])
+        self.assertTrue(circuit["isBlocking"])
+        self.assertEqual(600, circuit["probeIntervalSeconds"])
+        self.assertEqual(3, circuit["consecutive429Count"])
+        self.assertEqual(trade_id, circuit["triggerTradeId"])
+        self.assertEqual("account-a", circuit["triggerAccountId"])
+        self.assertEqual("steam-a", circuit["triggerSteamId"])
+        self.assertIn("listingsCircuit", note)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_open_listings_circuit_keeps_roi_watch_but_blocks_new_trade_and_lock(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                profit_trade_module.PROFIT_TRADE_LISTINGS_CIRCUIT_KEY,
+                {
+                    "status": "open",
+                    "reason": "test HTTP 429 cooldown",
+                    "first429At": now.isoformat(),
+                    "last429At": now.isoformat(),
+                    "cooldownUntil": (now + timedelta(minutes=10)).isoformat(),
+                    "nextProbeAt": (now + timedelta(minutes=10)).isoformat(),
+                    "consecutive429Count": 3,
+                },
+            )
+        finally:
+            db.close()
+
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            self.config,
+            inventory_payload=self.inventory_payload,
+            market_service=FakeProfitMarketService(),
+            record=True,
+            lock_asset=True,
+        )
+
+        self.assertEqual(1, report.opportunity_count)
+        self.assertEqual([], report.created_trade_ids)
+        self.assertEqual([], report.locked_trade_ids)
+        watch = build_profit_trade_roi_watch_payload(self.settings)
+        self.assertEqual("open", watch["listingsCircuit"]["status"])
+        self.assertEqual("listings_cooldown", watch["items"][0]["executionStatus"])
+        self.assertIn("下次探测", watch["items"][0]["executionReason"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+            self.assertEqual([], db.list_profit_trades(limit=20))
+        finally:
+            db.close()
+
+    def test_half_open_listings_probe_uses_one_request_then_reopens_ten_minute_cooldown(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                profit_trade_module.PROFIT_TRADE_LISTINGS_CIRCUIT_KEY,
+                {
+                    "status": "open",
+                    "reason": "test HTTP 429 cooldown",
+                    "first429At": (now - timedelta(minutes=20)).isoformat(),
+                    "last429At": (now - timedelta(minutes=10)).isoformat(),
+                    "cooldownUntil": (now - timedelta(seconds=1)).isoformat(),
+                    "nextProbeAt": (now - timedelta(seconds=1)).isoformat(),
+                    "consecutive429Count": 6,
+                },
+            )
+        finally:
+            db.close()
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(failures=99)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(1, len(client.search_listing_calls))
+        self.assertEqual([], client.buy_calls)
+        dashboard = build_profit_trade_dashboard_payload(self.settings)
+        circuit = dashboard["listingsCircuit"]
+        self.assertEqual("open", circuit["status"])
+        self.assertEqual(7, circuit["consecutive429Count"])
+        self.assertEqual(1, circuit["cooldownProbeCount"])
+        self.assertEqual(600, circuit["probeIntervalSeconds"])
+
+    def test_successful_half_open_probe_closes_circuit_and_continues_buy(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                profit_trade_module.PROFIT_TRADE_LISTINGS_CIRCUIT_KEY,
+                {
+                    "status": "open",
+                    "reason": "test HTTP 429 cooldown",
+                    "first429At": (now - timedelta(minutes=10)).isoformat(),
+                    "last429At": (now - timedelta(minutes=10)).isoformat(),
+                    "cooldownUntil": (now - timedelta(seconds=1)).isoformat(),
+                    "nextProbeAt": (now - timedelta(seconds=1)).isoformat(),
+                    "consecutive429Count": 3,
+                },
+            )
+        finally:
+            db.close()
+        trade_id = self._create_locked_trade()
+        client = FakeSteamBuyClient()
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(
+                profit_trade_allow_real_execution=True,
+                profit_trade_steam_buy_price_tolerance_pct=50.0,
+            ),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("steam_bought", result["trade"]["status"])
+        self.assertEqual(1, len(client.search_listing_calls))
+        self.assertEqual(1, len(client.buy_calls))
+        dashboard = build_profit_trade_dashboard_payload(self.settings)
+        circuit = dashboard["listingsCircuit"]
+        self.assertEqual("closed", circuit["status"])
+        self.assertFalse(circuit["isBlocking"])
+        self.assertIsNotNone(circuit["lastRecoveredAt"])
+
+    def test_half_open_failure_after_one_hour_switches_to_thirty_minute_probes(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                profit_trade_module.PROFIT_TRADE_LISTINGS_CIRCUIT_KEY,
+                {
+                    "status": "open",
+                    "reason": "test long HTTP 429 cooldown",
+                    "first429At": (now - timedelta(minutes=61)).isoformat(),
+                    "last429At": (now - timedelta(minutes=30)).isoformat(),
+                    "cooldownUntil": (now - timedelta(seconds=1)).isoformat(),
+                    "nextProbeAt": (now - timedelta(seconds=1)).isoformat(),
+                    "consecutive429Count": 12,
+                },
+            )
+        finally:
+            db.close()
+        trade_id = self._create_locked_trade()
+        client = FakeSearchListings429Client(failures=99)
+
+        execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            c5_client=FakeC5PreBuyRefreshClient(),
+        )
+
+        dashboard = build_profit_trade_dashboard_payload(self.settings)
+        circuit = dashboard["listingsCircuit"]
+        self.assertEqual("open", circuit["status"])
+        self.assertTrue(circuit["longMode"])
+        self.assertEqual(1800, circuit["probeIntervalSeconds"])
+        self.assertEqual(1, len(client.search_listing_calls))
+
+    def test_manual_lock_is_rejected_while_listings_circuit_is_open(self) -> None:
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            self.config,
+            inventory_payload=self.inventory_payload,
+            market_service=FakeProfitMarketService(),
+            record=True,
+            lock_asset=False,
+        )
+        trade_id = report.created_trade_ids[0]
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                profit_trade_module.PROFIT_TRADE_LISTINGS_CIRCUIT_KEY,
+                {
+                    "status": "open",
+                    "cooldownUntil": (now + timedelta(minutes=10)).isoformat(),
+                    "nextProbeAt": (now + timedelta(minutes=10)).isoformat(),
+                },
+            )
+        finally:
+            db.close()
+
+        with self.assertRaisesRegex(RuntimeError, "禁止手工锁定"):
+            lock_profit_trade(self.settings, trade_id)
+
         db = Database(self.settings.db_path)
         try:
             db.initialize()
@@ -2102,6 +2360,114 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         db = Database(self.settings.db_path)
         try:
             db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_buy_step_stops_before_market_lookup_when_runtime_is_disabled(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSteamBuyClient(total=10000)
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            new_action_guard=lambda: False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(
+            "before_market_lookup",
+            result["trade"]["note"]["runtimeDisabledStage"],
+        )
+        self.assertEqual([], client.order_book_calls)
+        self.assertEqual([], client.search_listing_calls)
+        self.assertEqual([], client.buy_calls)
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertIsNone(db.get_active_asset_reservation("asset-a"))
+        finally:
+            db.close()
+
+    def test_buy_step_rechecks_runtime_immediately_before_purchase_request(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSteamBuyClient(total=10000)
+        guard_results = iter((True, True, False))
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            new_action_guard=lambda: next(guard_results),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(
+            "before_purchase_request",
+            result["trade"]["note"]["runtimeDisabledStage"],
+        )
+        self.assertEqual(1, len(client.order_book_calls))
+        self.assertEqual(1, len(client.search_listing_calls))
+        self.assertEqual([], client.buy_calls)
+        self.assertEqual([], client.create_buy_order_calls)
+
+    def test_buy_step_rechecks_runtime_after_scheduler_queue_before_http(self) -> None:
+        trade_id = self._create_locked_trade()
+        client = FakeSteamBuyClient(total=10000)
+        guard_results = iter((True, True, True, False))
+        http_sent: list[bool] = []
+
+        def queued_buy_listing(**kwargs: object) -> dict[str, object]:
+            execution_guard = kwargs.get("execution_guard")
+            assert callable(execution_guard)
+            if not execution_guard():
+                raise SteamRequestGuardRejected("runtime disabled before HTTP callback")
+            http_sent.append(True)
+            return {"wallet_info": {"success": 1}}
+
+        client.buy_listing = queued_buy_listing  # type: ignore[method-assign]
+
+        result = execute_profit_trade_buy(
+            self.settings,
+            trade_id,
+            config=profit_config(profit_trade_allow_real_execution=True),
+            steam_client=client,
+            new_action_guard=lambda: next(guard_results),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("cancelled", result["trade"]["status"])
+        self.assertEqual(
+            "scheduler_before_purchase_http",
+            result["trade"]["note"]["runtimeDisabledStage"],
+        )
+        self.assertFalse(result["trade"]["note"]["purchaseRequestSent"])
+        self.assertEqual([], http_sent)
+
+    def test_scan_does_not_create_or_lock_trade_after_runtime_is_disabled(self) -> None:
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            self.config,
+            inventory_payload=self.inventory_payload,
+            market_service=FakeProfitMarketService(),
+            record=True,
+            lock_asset=True,
+            new_action_guard=lambda: False,
+        )
+
+        self.assertEqual(1, report.opportunity_count)
+        self.assertEqual([], report.created_trade_ids)
+        self.assertEqual([], report.locked_trade_ids)
+        self.assertTrue(any("runtime was disabled" in note for note in report.notes))
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertEqual([], db.list_profit_trades(limit=20))
             self.assertIsNone(db.get_active_asset_reservation("asset-a"))
         finally:
             db.close()
@@ -2397,7 +2763,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=FakeC5SaleClient(active_product_ids=[]),
@@ -2452,7 +2818,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=FakeC5SaleClient(active_product_ids=[]),
@@ -2522,7 +2888,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         second_result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=c5_client,
@@ -2578,7 +2944,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=c5_client,
@@ -2638,7 +3004,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=c5_client,
@@ -2690,7 +3056,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         result = refresh_profit_trade_sales(
             self.settings,
             profit_config(
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
                 profit_trade_c5_current_sale_net_factor=0.99,
             ),
             c5_client=c5_client,
@@ -2733,7 +3099,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             profit_config(
                 profit_trade_allow_real_execution=False,
                 profit_trade_allow_reprice_execution=False,
-                listing_check_interval_minutes=0,
+                profit_trade_sale_sync_initial_grace_seconds=0,
             ),
             inventory_payload={"source": "fixture", "list": []},
             market_service=FakeProfitMarketService(),
@@ -3480,6 +3846,149 @@ class ProfitTradeScanTestCase(unittest.TestCase):
         self.assertEqual([], result["skippedTradeIds"])
         self.assertEqual([], result["errors"])
         self.assertEqual([], c5_client.sale_search_calls)
+
+
+class ProfitTradeManualRecordTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.settings = Settings(db_path=Path(self.temp_dir.name) / "assistant.db")
+        save_strategy_config(self.settings, profit_config(profit_trade_balance_discount=0.69))
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+        finally:
+            db.close()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_create_manual_record_converts_time_recalculates_and_skips_daily_budget(self) -> None:
+        result = create_manual_profit_trade_record(
+            self.settings,
+            market_hash_name="AK-47 | Redline (Field-Tested)",
+            name="AK-47 | 红线（略有磨损）",
+            steam_buy_price=100,
+            balance_discount=0.69,
+            c5_sold_net_price=75,
+            steam_bought_at="2026-07-14T10:20:30+08:00",
+            completed_at="2026-07-14T11:21:31+08:00",
+            memo="historical manual trade",
+        )
+
+        trade = result["trade"]
+        self.assertEqual("completed", trade["status"])
+        self.assertEqual("settled", trade["stepKey"])
+        self.assertEqual(6, trade["stepIndex"])
+        self.assertEqual("manual_backfill", trade["recordOrigin"])
+        self.assertEqual("2026-07-14T02:20:30+00:00", trade["steamBoughtAt"])
+        self.assertEqual("2026-07-14T03:21:31+00:00", trade["completedAt"])
+        self.assertAlmostEqual(69.0, trade["steamRealCost"])
+        self.assertAlmostEqual(6.0, trade["realizedProfit"])
+        self.assertAlmostEqual(0.06, trade["realizedRoi"])
+        dashboard = build_profit_trade_dashboard_payload(self.settings)
+        self.assertEqual(1, dashboard["summary"]["completedCount"])
+        self.assertAlmostEqual(6.0, dashboard["summary"]["realizedProfit"])
+        self.assertAlmostEqual(0.0, dashboard["summary"]["dailySteamSpent"])
+
+    def test_update_completed_auto_record_preserves_original_times_and_writes_audit(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade_id = db.add_profit_trade(
+                trade_no="PT-auto-edit",
+                market_hash_name="Dreams & Nightmares Case",
+                status="completed",
+                step_key="settled",
+                step_index=6,
+                steam_buy_price=10.0,
+                steam_balance_discount=0.69,
+                steam_real_cost=6.9,
+                c5_sold_net_price=8.0,
+                realized_profit=1.1,
+                realized_roi=0.11,
+                note=profit_trade_module._build_note(
+                    {"steamBuySucceededAt": "2026-07-14T01:00:00+00:00"}
+                ),
+            )
+            db.update_profit_trade(trade_id, completed_at="2026-07-14T02:00:00+00:00")
+        finally:
+            db.close()
+
+        result = update_manual_profit_trade_record(
+            self.settings,
+            trade_id,
+            market_hash_name="Dreams & Nightmares Case",
+            steam_buy_price=12.0,
+            balance_discount=0.68,
+            c5_sold_net_price=9.5,
+            steam_bought_at="2026-07-13T20:00:00+08:00",
+            completed_at="2026-07-13T21:00:00+08:00",
+            a_asset_id="asset-a",
+            b_asset_id="asset-b",
+            memo="corrected from Steam history",
+        )
+
+        trade = result["trade"]
+        self.assertTrue(trade["manuallyEdited"])
+        self.assertEqual("2026-07-13T12:00:00+00:00", trade["steamBoughtAt"])
+        self.assertEqual("2026-07-13T13:00:00+00:00", trade["completedAt"])
+        self.assertAlmostEqual(8.16, trade["steamRealCost"])
+        self.assertAlmostEqual(1.34, trade["realizedProfit"])
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_profit_trade(trade_id)
+            note = profit_trade_module._read_note(row["note"])
+            self.assertEqual("2026-07-14T01:00:00+00:00", note["steamBuySucceededAt"])
+            self.assertEqual("2026-07-13T12:00:00+00:00", note["manualSteamBoughtAtOverride"])
+            self.assertEqual("2026-07-14T02:00:00+00:00", row["completed_at"])
+            events = db.list_profit_trade_state_events(trade_id)
+        finally:
+            db.close()
+        self.assertEqual("manual_edit", events[-1]["eventType"])
+
+    def test_update_rejects_non_completed_and_invalid_inputs(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade_id = db.add_profit_trade(
+                trade_no="PT-not-completed",
+                market_hash_name="Dreams & Nightmares Case",
+                status="candidate",
+            )
+        finally:
+            db.close()
+        with self.assertRaisesRegex(RuntimeError, "only completed"):
+            update_manual_profit_trade_record(
+                self.settings,
+                trade_id,
+                market_hash_name="Dreams & Nightmares Case",
+                steam_buy_price=10,
+                balance_discount=0.69,
+                c5_sold_net_price=8,
+                steam_bought_at="2026-07-14T10:00:00+08:00",
+                completed_at="2026-07-14T11:00:00+08:00",
+            )
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            create_manual_profit_trade_record(
+                self.settings,
+                market_hash_name="Dreams & Nightmares Case",
+                steam_buy_price=10,
+                balance_discount=0.69,
+                c5_sold_net_price=8,
+                steam_bought_at="2026-07-14T10:00:00",
+                completed_at="2026-07-14T11:00:00+08:00",
+            )
+        with self.assertRaisesRegex(ValueError, "earlier"):
+            create_manual_profit_trade_record(
+                self.settings,
+                market_hash_name="Dreams & Nightmares Case",
+                steam_buy_price=10,
+                balance_discount=0.69,
+                c5_sold_net_price=8,
+                steam_bought_at="2026-07-14T12:00:00+08:00",
+                completed_at="2026-07-14T11:00:00+08:00",
+            )
 
 
 if __name__ == "__main__":

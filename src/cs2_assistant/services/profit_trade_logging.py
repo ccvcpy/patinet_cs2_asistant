@@ -309,6 +309,11 @@ class ProfitTradeEventLogger:
     broker.
     """
 
+    event_source = "profit_trade"
+    event_id_prefix = "ptlog"
+    maintenance_thread_name = "profit-trade-log-maintenance"
+    failure_label = "profit-trade-log"
+
     def __init__(
         self,
         log_dir: str | Path | None = None,
@@ -375,7 +380,7 @@ class ProfitTradeEventLogger:
 
         try:
             source = str(event.get("source") or "").strip()
-            if source != "profit_trade":
+            if source != self.event_source:
                 return
             event = self._with_request_activity(event)
             fields = {key: event.get(key) for key in _EVENT_FIELDS if key in event}
@@ -437,7 +442,7 @@ class ProfitTradeEventLogger:
         def callback(event: dict[str, Any]) -> None:
             merged = dict(safe_context)
             merged.update(event)
-            merged["source"] = "profit_trade"
+            merged["source"] = self.event_source
             self.telemetry_callback(merged)
 
         return callback
@@ -678,7 +683,7 @@ class ProfitTradeEventLogger:
 
         threading.Thread(
             target=worker,
-            name="profit-trade-log-maintenance",
+            name=self.maintenance_thread_name,
             daemon=True,
         ).start()
 
@@ -700,11 +705,11 @@ class ProfitTradeEventLogger:
         if normalized_level == "WARN":
             normalized_level = "WARNING"
         event: dict[str, Any] = {
-            "event_id": f"ptlog_{uuid.uuid4().hex}",
+            "event_id": f"{self.event_id_prefix}_{uuid.uuid4().hex}",
             "timestamp_utc": _utc_timestamp(now),
             "sequence": sequence,
             "level": normalized_level,
-            "source": "profit_trade",
+            "source": self.event_source,
             "provider": str(provider or "local").lower(),
             "component": _truncate_text(str(component or "unknown"), limit=120),
             "operation": _truncate_text(str(operation or "unknown"), limit=160),
@@ -798,7 +803,7 @@ class ProfitTradeEventLogger:
                     event = json.loads(line)
                 except (TypeError, ValueError):
                     continue
-                if isinstance(event, dict) and event.get("source") == "profit_trade":
+                if isinstance(event, dict) and event.get("source") == self.event_source:
                     yield event
 
     def _iter_filtered_events(self, **filters: Any) -> Iterator[dict[str, Any]]:
@@ -896,12 +901,11 @@ class ProfitTradeEventLogger:
         suffix = f" ({', '.join(references)})" if references else ""
         return f"{prefix}{suffix} - {event.get('message', '')}"
 
-    @staticmethod
-    def _report_internal_failure(stage: str, exc: Exception) -> None:
+    def _report_internal_failure(self, stage: str, exc: Exception) -> None:
         try:
             summary = redact_sensitive_data(str(exc), max_string_length=400)
             sys.stderr.write(
-                f"[profit-trade-log] {stage} failed: {type(exc).__name__}: {summary}\n"
+                f"[{self.failure_label}] {stage} failed: {type(exc).__name__}: {summary}\n"
             )
         except Exception:
             pass

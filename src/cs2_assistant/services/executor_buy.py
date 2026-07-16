@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cs2_assistant.clients import C5GameClient, C5GameError, SteamMarketClient
-from cs2_assistant.utils import safe_float
+from cs2_assistant.utils import safe_float, utc_now_iso
 
 
 @dataclass(slots=True)
@@ -21,6 +21,7 @@ class RebuyResult:
     listing_ratio_now: float | None = None
     payload: dict[str, Any] | None = None
     out_trade_no: str | None = None
+    submitted_at: str | None = None
 
 
 def _parse_c5_error(exc: Exception) -> dict[str, Any] | None:
@@ -131,6 +132,7 @@ def execute_rebuy(
         )
 
     out_trade_no = uuid.uuid4().hex
+    submitted_at = utc_now_iso()
     try:
         payload = client.quick_buy(
             app_id=app_id,
@@ -154,6 +156,7 @@ def execute_rebuy(
                 listing_ratio_now=listing_ratio_now,
                 payload={"error": str(exc)},
                 out_trade_no=out_trade_no,
+                submitted_at=submitted_at,
             )
         if payload and payload.get("errorCode") in {1317, 1014452}:
             return RebuyResult(
@@ -167,6 +170,7 @@ def execute_rebuy(
                 listing_ratio_now=listing_ratio_now,
                 payload=payload,
                 out_trade_no=out_trade_no,
+                submitted_at=submitted_at,
             )
         return RebuyResult(
             False,
@@ -179,6 +183,7 @@ def execute_rebuy(
             listing_ratio_now=listing_ratio_now,
             payload=payload,
             out_trade_no=out_trade_no,
+            submitted_at=submitted_at,
         )
     except Exception as exc:
         return RebuyResult(
@@ -191,6 +196,7 @@ def execute_rebuy(
             steam_reference_price=steam_reference_price,
             listing_ratio_now=listing_ratio_now,
             out_trade_no=out_trade_no,
+            submitted_at=submitted_at,
         )
     return RebuyResult(
         True,
@@ -203,4 +209,5 @@ def execute_rebuy(
         listing_ratio_now=listing_ratio_now,
         payload=payload,
         out_trade_no=out_trade_no,
+        submitted_at=submitted_at,
     )

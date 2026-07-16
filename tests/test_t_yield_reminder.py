@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ from cs2_assistant.reminders.t_yield import (
     TYieldReminderConfig,
     TYieldReminderState,
     evaluate_reminder,
+    run_once,
 )
 from cs2_assistant.services.t_yield_scan import (
     INVENTORY_FILTER_COOLDOWN_ONLY,
@@ -82,6 +84,30 @@ def _report(
 
 
 class TYieldReminderTestCase(unittest.TestCase):
+    def test_run_once_applies_inventory_scope_before_scan(self) -> None:
+        config = TYieldReminderConfig(
+            inventory_scope=INVENTORY_SCOPE_NOT_ALL_COOLDOWN,
+            min_price=5.0,
+        )
+        report = _report()
+        with patch(
+            "cs2_assistant.reminders.t_yield.scan_t_yield",
+            return_value=report,
+        ) as scan_mock, patch(
+            "cs2_assistant.reminders.t_yield.evaluate_reminder",
+            return_value=object(),
+        ):
+            run_once(
+                object(),
+                config,
+                TYieldReminderState(),
+            )
+
+        self.assertEqual(
+            INVENTORY_SCOPE_NOT_ALL_COOLDOWN,
+            scan_mock.call_args.kwargs["inventory_filter"],
+        )
+
     def test_hot_candidate_triggers_notification(self) -> None:
         config = TYieldReminderConfig()
         state = TYieldReminderState()

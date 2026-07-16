@@ -128,9 +128,15 @@
 
 箱子有一个明确例外：
 
-- 仅针对箱子，`sell_on_steam.listed` / `rebuy_on_c5.pending` 低于 `caseMaxOpenGuadaoCount` 时，可以继续开启下一轮挂刀
+- 仅针对箱子，Steam 当前挂单槽低于 `caseMaxOpenGuadaoCount` 时，可以继续开启下一轮挂刀
+- 挂单槽只统计 `sell_on_steam.listed`；已经卖出但等待 C5 补仓的 `rebuy_on_c5.pending` / `failed` 不占挂单槽，也不能参与随机撤单
 - 默认上限是 `caseMaxOpenGuadaoCount = 100`
 - 达到上限后必须暂停开启新一轮并提醒用户，但执行器不能停止；后续每轮仍要继续扫描、推进 Steam 卖出和 C5 补仓
+- 活跃挂单槽连续满载 `caseFullReleaseAfterHours = 3` 小时后，只从 Steam 远端确认仍活跃的箱子挂单中随机撤销 `caseFullReleaseFraction = 0.125`（12.5%）；不得按挂单年龄选择该批释放对象
+- 满载随机撤单必须等 Steam 远端撤单成功后，才能把本地 operation 改为 `canceled` 并恢复 asset；低于上限后，下一次重新满载要重新开始计时
+- 原有单笔挂单超过 48 小时自动撤单恢复的规则继续保留，它与满载随机释放是两条独立规则
+- 单笔挂单超过 48 小时后，如果本单挂价仍处于 Steam 当前 `rgCompactSellOrders` 最低价，并且当前 `C5补仓价 / 本单Steam税后到手` 不超过本单冻结的最大挂刀比例加 `staleListedMaxRatioTolerancePct = 1.5` 个百分点，则不得撤单；使用 `staleListedRecheckHours = 24` 每天复查一次
+- 超过 48 小时的挂单已经不在当前最低价，或者复查比例超过上述容忍上限时，才走原有远端撤单成功后恢复本地资产的流程；盘口或 C5 价格无法安全读取时保留挂单，不能误撤
 - 这个例外不适用于非箱子，也不适用于 `listing_pending`、`rebuy_failed` 等需要人工确认或失败处理的状态
 
 不要破坏这条链路：
@@ -187,6 +193,10 @@
 - `listingPriceOffset`
 - `caseListingPriceOffset`
 - `caseMaxOpenGuadaoCount`
+- `caseFullReleaseAfterHours`
+- `caseFullReleaseFraction`
+- `staleListedRecheckHours`
+- `staleListedMaxRatioTolerancePct`
 - `guadaoItemScope`
 
 修改定价逻辑时，优先确认是：
@@ -474,6 +484,16 @@ Profit Trade 日志规则：
 - 日志写入、压缩、查询或实时广播失败不得改变真实交易结果。
 - 429 日志要记录请求来源、账号、operation、request ID、状态码、耗时、`Retry-After` 和近期 Profit Trade Steam 请求频率；这只增强可观测性，不改变现有请求重试、relogin 或买入状态机。
 - `429` 不等于 cookie 失效，也不能仅凭 Profit Trade 自身日志证明是挂刀执行器造成的。只有以后拿到独立挂刀日志，才能按 UTC 时间、账号和请求频率进行交叉分析。
+
+Profit Trade 的 Steam `search_listings` 429 熔断规则：
+
+- 单笔流水仍先进行最多 3 次 listings 查询；没有 `Retry-After` 时按 2 秒、4 秒短退避。该规则独立于且不得削弱 `STEAM_BUY_LISTING_RETRY_ATTEMPTS = 3` 的具体购买失败重试。
+- 三次 listings 查询均为 429 后，打开 Profit Trade 全账号共享的 listings 路由熔断，首次冷却 10 分钟；冷却期间继续 ROI 观察、Steam orderbook、C5 同步和收益结算，但禁止创建新的买 B 执行流水、禁止锁定 A、禁止新的 `search_listings`。
+- 冷却到期进入 `half_open`，只允许一笔恢复探测。探测前必须重新读取 Steam orderbook、C5 行情和深度并重新计算价格容差、ROI、C5 风控；不再符合条件时不探测、不购买。
+- 恢复探测返回 200 后关闭熔断并继续正常执行；再次 429 时重新冷却 10 分钟，不能在探测轮内再连续请求三次。
+- 从首次 429 起持续 60 分钟仍未恢复时，探测间隔扩大到 30 分钟并发送一次 ServerChan；首次打开熔断和恢复成功也各发送一次，禁止每轮重复提醒。
+- 熔断状态必须持久化并在总览、观察卡片、执行区、中断追踪和实时日志中展示触发账号、连续 429、最后 429、剩余时间和下次探测时间。刷新前端或重启后端不能丢失。
+- 三次 429 的原流水仍安全取消并释放 A，明确记录没有取得 listingId、没有发送购买请求；历史中断卡片永久保留。路由恢复只代表可以重新评估未来机会，不能把旧中断流水改成成功。
 
 ### 7.5 Steam Guard 确认与撤单安全
 

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import contextlib
+import argparse
 import io
 import json
 import sys
@@ -50,6 +51,77 @@ class FakeC5Client:
 
     def steam_info(self) -> dict:
         return self.payload
+
+
+class CliSteamSchedulerInitializationTests(unittest.TestCase):
+    def _run_main_with_args(
+        self,
+        args: argparse.Namespace,
+        *,
+        configure_side_effect: object = None,
+    ) -> tuple[int, list[str]]:
+        from cs2_assistant import cli
+
+        order: list[str] = []
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+        args.handler = lambda _: order.append("handler") or 0
+        settings = mock.Mock()
+        settings.db_path = Path("default.db")
+
+        def configured(path: Path) -> None:
+            order.append(f"configure:{path}")
+            if isinstance(configure_side_effect, BaseException):
+                raise configure_side_effect
+
+        with mock.patch.object(cli, "build_parser", return_value=parser):
+            with mock.patch.object(cli, "load_settings", return_value=settings):
+                with mock.patch.object(cli, "_configure_console_encoding"):
+                    with mock.patch(
+                        "cs2_assistant.services.steam_request_scheduler.configure_shared_steam_scheduler",
+                        side_effect=configured,
+                    ):
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            code = cli.main([])
+        return code, order
+
+    def test_steam_capable_cli_configures_queue_before_handler(self) -> None:
+        code, order = self._run_main_with_args(
+            argparse.Namespace(command="account", db_path="custom.db")
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual([f"configure:{Path('custom.db')}", "handler"], order)
+
+    def test_executor_once_process_also_configures_shared_queue(self) -> None:
+        code, order = self._run_main_with_args(
+            argparse.Namespace(
+                command="executor",
+                executor_command="start",
+                once=True,
+                db_path=None,
+            )
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual([f"configure:{Path('default.db')}", "handler"], order)
+
+    def test_non_steam_cli_does_not_initialize_scheduler(self) -> None:
+        code, order = self._run_main_with_args(
+            argparse.Namespace(command="search-item", db_path=None)
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual(["handler"], order)
+
+    def test_scheduler_configuration_failure_is_fail_closed(self) -> None:
+        code, order = self._run_main_with_args(
+            argparse.Namespace(command="steam", db_path=None),
+            configure_side_effect=RuntimeError("queue unavailable"),
+        )
+
+        self.assertEqual(1, code)
+        self.assertEqual([f"configure:{Path('default.db')}",], order)
 
 
 class BalanceCommandTestCase(unittest.TestCase):
@@ -119,6 +191,57 @@ class BalanceCommandTestCase(unittest.TestCase):
         self.assertIn("TOTAL", rendered)
         self.assertIn("30.50", rendered)
         self.assertIn("31.75", rendered)
+
+    def test_account_balance_stops_after_429_and_does_not_report_zero_total(self) -> None:
+        from cs2_assistant import cli
+        from cs2_assistant.clients.steam_market import SteamMarketError
+
+        class FakeSettings:
+            steam_market_base_url = "https://steam.test"
+
+        class FakeAccount:
+            def __init__(self, name: str, steam_id64: str) -> None:
+                self.id = name
+                self.name = name
+                self.steam_id64 = steam_id64
+                self.cookies = f"sessionid={name}; steamLoginSecure={steam_id64}%7C%7Ct"
+                self.identity_secret = None
+                self.device_id = None
+
+        accounts = [
+            FakeAccount("a", "76561198000000001"),
+            FakeAccount("b", "76561198000000002"),
+        ]
+        requested: list[str] = []
+
+        class FakeStore:
+            def list_accounts(self) -> list[FakeAccount]:
+                return accounts
+
+        class FakeSteam:
+            def __init__(self, **kwargs: object) -> None:
+                self.steam_id64 = str(kwargs["steam_id64"])
+
+            def wallet_balance(self) -> dict:
+                requested.append(self.steam_id64)
+                raise SteamMarketError("rate limited", status_code=429)
+
+        args = build_parser().parse_args(["account", "balance"])
+        with mock.patch.object(cli, "load_settings", return_value=FakeSettings()), mock.patch.object(
+            cli,
+            "_account_store",
+            return_value=FakeStore(),
+        ), mock.patch.object(cli, "SteamMarketClient", FakeSteam):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = args.handler(args)
+
+        self.assertEqual(0, code)
+        self.assertEqual(["76561198000000001"], requested)
+        rendered = output.getvalue()
+        self.assertIn("N/A", rendered)
+        self.assertIn("Steam 429", rendered)
+        self.assertIn("unavailable", rendered)
 
 
 class SteamConfirmCommandTestCase(unittest.TestCase):
@@ -573,6 +696,22 @@ class ParserTestCase(unittest.TestCase):
 
 
 class StrategyConfigCompatTestCase(unittest.TestCase):
+    def test_case_full_release_config_round_trips(self) -> None:
+        config = StrategyConfig.from_dict(
+            {
+                "guadaoBalance": {
+                    "caseFullReleaseAfterHours": 3.0,
+                    "caseFullReleaseFraction": 0.125,
+                }
+            }
+        )
+
+        self.assertEqual(3.0, config.case_full_release_after_hours)
+        self.assertEqual(0.125, config.case_full_release_fraction)
+        payload = config.to_dict()
+        self.assertEqual(3.0, payload["guadaoBalance"]["caseFullReleaseAfterHours"])
+        self.assertEqual(0.125, payload["guadaoBalance"]["caseFullReleaseFraction"])
+
     def test_from_dict_prefers_new_max_transfer_buy_key(self) -> None:
         config = StrategyConfig.from_dict(
             {
@@ -612,7 +751,8 @@ class StrategyConfigCompatTestCase(unittest.TestCase):
         self.assertEqual(0.12, config.profit_trade_min_roi)
         self.assertEqual(80, config.profit_trade_min_item_value)
         self.assertEqual(0, config.max_transfer_buy_per_cycle)
-        self.assertEqual(0.5, config.listing_check_interval_minutes)
+        self.assertNotIn("listingCheckIntervalMinutes", config.to_dict()["common"])
+        self.assertEqual(120.0, config.effective_guadao_task_schedule()["steamSyncIntervalSeconds"])
 
 
 class GuadaoDiscountReportTestCase(unittest.TestCase):

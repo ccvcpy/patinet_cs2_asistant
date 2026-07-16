@@ -48,6 +48,7 @@ class ExecuteRebuyTestCase(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertFalse(result.skipped)
+        self.assertIsNotNone(result.submitted_at)
         self.assertEqual(1, len(client.quick_buy_calls))
 
         call = client.quick_buy_calls[0]

@@ -40,6 +40,124 @@ class _FakeResponse:
 
 
 class SteamMarketClientTests(unittest.TestCase):
+    def test_safety_terminal_reads_are_scheduled_as_p0(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+
+        def fake_request(**kwargs: object) -> _FakeResponse:
+            url = str(kwargs.get("url") or "")
+            if url.rstrip("/").endswith("/market"):
+                return _FakeResponse(
+                    {},
+                    text=(
+                        'g_rgWalletInfo = {"wallet_balance":0,'
+                        '"wallet_delayed_balance":0,"wallet_currency":23};'
+                    ),
+                )
+            if "myhistory" in url:
+                return _FakeResponse({"success": True, "events": []})
+            return _FakeResponse({"success": True, "buy_orders": []})
+
+        client._session.request = fake_request  # type: ignore[method-assign]
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.wallet_balance(safety_terminal=True)
+            client.my_listings(safety_terminal=True)
+            client.market_history(safety_terminal=True)
+
+        self.assertEqual([0, 0, 0], [int(row["priority"]) for row in scheduled])
+
+    def test_real_action_methods_forward_last_moment_execution_guard(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": 1}
+        )
+        client._session.post = lambda *args, **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": 1}
+        )
+        guard = lambda: True
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.sell_item(
+                app_id=730,
+                context_id="2",
+                asset_id="asset-1",
+                price=10.0,
+                execution_guard=guard,
+            )
+            client.buy_listing(
+                listing_id="listing-1",
+                app_id=730,
+                subtotal=100,
+                fee=10,
+                total=110,
+                execution_guard=guard,
+            )
+            client.create_buy_order(
+                app_id=730,
+                market_hash_name="Kilowatt Case",
+                price_total=110,
+                execution_guard=guard,
+            )
+
+        self.assertEqual(3, len(scheduled))
+        self.assertTrue(all(row.get("execution_guard") is guard for row in scheduled))
+
+    def test_search_listings_forwards_only_explicit_bounded_retry_to_scheduler(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": True, "listinginfo": {}}
+        )
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.search_listings(
+                app_id=730,
+                market_hash_name="USP-S | Tropical Breeze (Factory New)",
+                bounded_retry=True,
+            )
+
+        self.assertEqual(1, len(scheduled))
+        self.assertIs(scheduled[0]["bounded_retry"], True)
+        self.assertIs(scheduled[0]["quiet_before"], True)
+
     def test_request_telemetry_captures_429_without_changing_relogin_or_retry(self) -> None:
         events: list[dict[str, object]] = []
         client = SteamMarketClient(
@@ -102,6 +220,34 @@ class SteamMarketClientTests(unittest.TestCase):
         payload = client.order_book(app_id=730, market_hash_name="Kilowatt Case")
 
         self.assertTrue(payload["success"])
+
+    def test_order_book_passes_market_name_to_scheduler_metadata(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="guadao",
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": True, "rgCompactSellOrders": []}
+        )
+
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.order_book(app_id=730, market_hash_name="Kilowatt Case")
+
+        self.assertEqual(1, len(scheduled))
+        metadata = scheduled[0]["metadata"]
+        self.assertIsInstance(metadata, dict)
+        self.assertEqual("Kilowatt Case", metadata["marketHashName"])  # type: ignore[index]
 
     def test_get_transport_retry_count_remains_three_with_telemetry(self) -> None:
         events: list[dict[str, object]] = []
@@ -344,12 +490,14 @@ class SteamMarketClientTests(unittest.TestCase):
             data: dict[str, object] | str | None = None,
             headers: dict[str, str] | None = None,
             _allow_retry: bool = True,
+            _scheduler_metadata: dict[str, object] | None = None,
         ) -> _FakeResponse:
             captured["method"] = method
             captured["path"] = path
             captured["params"] = params
             captured["data"] = data
             captured["headers"] = headers
+            captured["scheduler_metadata"] = _scheduler_metadata
             return _FakeResponse(
                 {
                     "more": True,
@@ -398,6 +546,10 @@ class SteamMarketClientTests(unittest.TestCase):
             captured["path"],
         )
         self.assertEqual({"currency": 23, "language": "schinese", "country": "CN"}, captured["params"])
+        self.assertEqual(
+            {"marketHashName": "Glock-18 | Candy Apple (Factory New)"},
+            captured["scheduler_metadata"],
+        )
         headers = captured["headers"]
         assert isinstance(headers, dict)
         self.assertEqual("routeAction", headers["X-Valve-Request-Type"])
@@ -559,6 +711,7 @@ class SteamMarketClientTests(unittest.TestCase):
         ) -> _FakeResponse:
             captured["method"] = method
             captured["path"] = path
+            captured["headers"] = dict(headers or {})
             return _FakeResponse(
                 {},
                 text=(
@@ -574,6 +727,12 @@ class SteamMarketClientTests(unittest.TestCase):
 
         self.assertEqual("GET", captured["method"])
         self.assertEqual("/market/", captured["path"])
+        self.assertEqual(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            captured["headers"]["Accept"],  # type: ignore[index]
+        )
+        self.assertIn("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", captured["headers"]["User-Agent"])  # type: ignore[index]
+        self.assertEqual("1", captured["headers"]["Upgrade-Insecure-Requests"])  # type: ignore[index]
         self.assertEqual(21.39, wallet["balance"])
         self.assertEqual(0.0, wallet["delayed_balance"])
         self.assertEqual("CNY", wallet["currency"])
@@ -795,6 +954,72 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertEqual(1783512000, receipt["timeSold"])
         self.assertEqual(1.56, receipt["receivedAmount"])
         self.assertEqual("2023", receipt["receivedCurrencyId"])
+
+    def test_find_sale_receipts_for_targets_shares_history_pages_and_finds_page_three(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        starts: list[int] = []
+
+        def fake_history(*, start: int = 0, count: int = 100) -> dict[str, object]:
+            starts.append(start)
+            if start < 200:
+                return {
+                    "success": True,
+                    "total_count": 300,
+                    "events": [
+                        {
+                            "listingid": f"unrelated-{start}",
+                            "purchaseid": f"purchase-{start}",
+                            "event_type": 3,
+                        }
+                    ],
+                    "purchases": {},
+                }
+            return {
+                "success": True,
+                "total_count": 300,
+                "events": [
+                    {
+                        "listingid": "listing-page-3",
+                        "purchaseid": "purchase-page-3",
+                        "event_type": 3,
+                        "time_event": 1783512933,
+                    }
+                ],
+                "purchases": {
+                    "listing-page-3_purchase-page-3": {
+                        "asset": {"id": "asset-page-3"},
+                        "time_sold": 1783512000,
+                        "received_amount": 156,
+                        "received_currencyid": "2023",
+                    }
+                },
+            }
+
+        client.market_history = fake_history  # type: ignore[method-assign]
+
+        receipts = client.find_sale_receipts_for_targets(
+            [
+                {
+                    "key": "operation-1",
+                    "listingId": "listing-page-3",
+                    "assetId": "asset-page-3",
+                },
+                {
+                    "key": "operation-2",
+                    "listingId": "listing-never-sold",
+                    "assetId": "asset-never-sold",
+                },
+            ],
+            max_pages=3,
+        )
+
+        self.assertEqual([0, 100, 200], starts)
+        self.assertEqual({"operation-1"}, set(receipts))
+        self.assertEqual("purchase-page-3", receipts["operation-1"]["purchaseId"])
+        self.assertEqual(1.56, receipts["operation-1"]["receivedAmount"])
 
     def test_find_purchase_receipt_matches_item_time_and_paid_total(self) -> None:
         client = SteamMarketClient(

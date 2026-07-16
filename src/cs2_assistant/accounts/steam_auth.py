@@ -15,10 +15,15 @@ from cs2_assistant.accounts.store import Account, AccountStore
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _AUTO_RELOGIN_LOCK = threading.Lock()
-_AUTO_RELOGIN_LAST_SUCCESS = 0.0
+_AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT: dict[str, float] = {}
+
+COOKIE_STATUS_VALID = "cookie_valid"
+COOKIE_STATUS_INVALID = "cookie_invalid"
+COOKIE_STATUS_LIMITED = "steam_cookie_429_limited"
+COOKIE_STATUS_NETWORK_UNKNOWN = "cookie_network_unknown"
 
 
-def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
+def _verify_steam_cookies_status(cookie_str: str, steam_id: str = "") -> str:
     cookie_dict: dict[str, str] = {}
     for part in (cookie_str or "").split(";"):
         segment = part.strip()
@@ -27,7 +32,7 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
         key, _, value = segment.partition("=")
         cookie_dict[key.strip()] = value.strip()
     if not cookie_dict.get("steamLoginSecure") or not cookie_dict.get("sessionid"):
-        return False
+        return COOKIE_STATUS_INVALID
 
     session = requests.Session()
     session.verify = False
@@ -54,16 +59,18 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
         )
         final_url = (response.url or "").lower()
         if "login" in final_url:
-            return False
+            return COOKIE_STATUS_INVALID
+        if response.status_code == 429:
+            return COOKIE_STATUS_LIMITED
         if response.status_code in (400, 401, 403):
-            return False
+            return COOKIE_STATUS_INVALID
         if response.status_code == 200:
             try:
                 payload = response.json()
             except ValueError:
                 payload = None
             if isinstance(payload, dict) and payload.get("success") in (1, True):
-                return True
+                return COOKIE_STATUS_VALID
     except Exception:
         pass
 
@@ -75,6 +82,8 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
             "https://store.steampowered.com/pointssummary/ajaxgetasyncconfig",
             timeout=12,
         )
+        if response.status_code == 429:
+            return COOKIE_STATUS_LIMITED
         if response.status_code == 200:
             try:
                 payload = response.json()
@@ -82,9 +91,9 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
                 payload = None
             if isinstance(payload, dict):
                 if payload.get("logged_in") is True:
-                    return True
+                    return COOKIE_STATUS_VALID
                 if payload.get("logged_in") is False:
-                    return False
+                    return COOKIE_STATUS_INVALID
     except Exception:
         pass
 
@@ -93,12 +102,30 @@ def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
         response = session.get(profile_url, timeout=12, allow_redirects=True)
         final_url = (response.url or "").lower()
         if "login" in final_url:
-            return False
+            return COOKIE_STATUS_INVALID
+        if response.status_code == 429:
+            return COOKIE_STATUS_LIMITED
         if response.status_code in (401, 403):
-            return False
-        return True
+            return COOKIE_STATUS_INVALID
+        if response.status_code == 200:
+            return COOKIE_STATUS_VALID
+        return COOKIE_STATUS_NETWORK_UNKNOWN
     except Exception:
-        return True
+        return COOKIE_STATUS_NETWORK_UNKNOWN
+
+
+def _verify_steam_cookies_valid(cookie_str: str, steam_id: str = "") -> bool:
+    """Compatibility boolean projection for explicit validity checks."""
+
+    return _verify_steam_cookies_status(cookie_str, steam_id) == COOKIE_STATUS_VALID
+
+
+def _steam_cookie_validation_result(
+    cookie_str: str,
+    steam_id: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    status = _verify_steam_cookies_status(cookie_str, steam_id)
+    return status == COOKIE_STATUS_VALID, status, {}
 
 
 def _normalize_secret(raw: str | None) -> str:
@@ -414,33 +441,64 @@ def try_steam_auto_relogin(
     account_id: str | None = None,
     force_login: bool = False,
 ) -> tuple[bool, str, Account | None]:
-    global _AUTO_RELOGIN_LAST_SUCCESS
+    account = store.get_account(account_id) if account_id else store.get_current()
+    if account is None:
+        return False, "no_account", None
+    success_key = str(account.id)
     if not _AUTO_RELOGIN_LOCK.acquire(blocking=False):
-        if time.time() - _AUTO_RELOGIN_LAST_SUCCESS < 30:
-            return True, "auto_ok", store.get_account(account_id) if account_id else store.get_current()
+        if time.time() - _AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT.get(success_key, 0.0) < 30:
+            return True, "auto_ok", store.get_account(success_key) or account
         return False, "busy", None
 
     try:
-        account = store.get_account(account_id) if account_id else store.get_current()
-        if account is None:
-            return False, "no_account", None
-
         if account.cookies and not force_login:
             try:
-                if _verify_steam_cookies_valid(account.cookies, account.steam_id64 or ""):
-                    _AUTO_RELOGIN_LAST_SUCCESS = time.time()
+                from cs2_assistant.services.steam_request_scheduler import (
+                    SteamRequestPriority,
+                    get_shared_steam_scheduler,
+                )
+
+                cookie_valid, cookie_status, _ = get_shared_steam_scheduler().execute(
+                    lambda: _steam_cookie_validation_result(
+                        account.cookies or "",
+                        account.steam_id64 or "",
+                    ),
+                    source="cookie_refresh",
+                    route="steam/auth/cookie-validation",
+                    priority=SteamRequestPriority.P0_SAFETY,
+                    account_id=account.id,
+                    method="GET",
+                    operation_id="cookie_validation",
+                )
+                if cookie_valid:
+                    _AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT[success_key] = time.time()
                     return True, "cookie_valid", account
+                if cookie_status in {COOKIE_STATUS_LIMITED, COOKIE_STATUS_NETWORK_UNKNOWN}:
+                    return False, cookie_status, account
             except Exception:
-                pass
+                return False, COOKIE_STATUS_NETWORK_UNKNOWN, account
 
         if not account.username or not account.password:
             return False, "no_creds", account
 
         steam_guard_dict = _build_steam_guard_dict(account)
-        ok, err_code, cookie_dict = _do_steampy_login(
-            account.username,
-            account.password,
-            steam_guard_dict,
+        from cs2_assistant.services.steam_request_scheduler import (
+            SteamRequestPriority,
+            get_shared_steam_scheduler,
+        )
+
+        ok, err_code, cookie_dict = get_shared_steam_scheduler().execute(
+            lambda: _do_steampy_login(
+                account.username or "",
+                account.password or "",
+                steam_guard_dict,
+            ),
+            source="cookie_refresh",
+            route="steam/auth/login",
+            priority=SteamRequestPriority.P0_SAFETY,
+            account_id=account.id,
+            method="POST",
+            operation_id="cookie_refresh",
         )
         if (
             not ok
@@ -448,11 +506,19 @@ def try_steam_auto_relogin(
             and steam_guard_dict
             and steam_guard_dict.get("shared_secret")
         ):
-            ok, err_code, cookie_dict = _do_playwright_login(
-                account.username,
-                account.password,
-                steam_guard_dict["shared_secret"],
-                Path(store.storage_dir) / "playwright_steam" / account.id,
+            ok, err_code, cookie_dict = get_shared_steam_scheduler().execute(
+                lambda: _do_playwright_login(
+                    account.username or "",
+                    account.password or "",
+                    steam_guard_dict["shared_secret"],
+                    Path(store.storage_dir) / "playwright_steam" / account.id,
+                ),
+                source="cookie_refresh",
+                route="steam/auth/playwright-login",
+                priority=SteamRequestPriority.P0_SAFETY,
+                account_id=account.id,
+                method="POST",
+                operation_id="cookie_refresh_playwright",
             )
         if ok and cookie_dict.get("steamLoginSecure"):
             cookie_str, _, steam_id = _extract_creds_from_cookie_dict(cookie_dict)
@@ -461,7 +527,7 @@ def try_steam_auto_relogin(
                 cookies=cookie_str,
                 steam_id64=steam_id or account.steam_id64,
             )
-            _AUTO_RELOGIN_LAST_SUCCESS = time.time()
+            _AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT[success_key] = time.time()
             return True, "auto_ok", updated or store.get_account(account.id)
         return False, err_code or "error", account
     finally:

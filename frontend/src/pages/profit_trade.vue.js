@@ -1,4 +1,5 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
+import FolioIcon from "../components/FolioIcon.vue";
 import ProfitTradeRoiWatch from "../components/ProfitTradeRoiWatch.vue";
 const fallbackDashboard = {
     generatedAt: "",
@@ -12,6 +13,7 @@ const fallbackDashboard = {
         minItemValue: undefined,
         maxBuyPerCycle: 1,
         dailySteamBudget: 1000,
+        accountReservedBalances: {},
         scanMaxItems: 80,
         reservationSeconds: 60,
         steamBuyPriceTolerancePct: 1,
@@ -52,6 +54,8 @@ const fallbackDashboard = {
         dailySteamRemaining: 1000,
     },
     trades: [],
+    manualEntryOptions: { accounts: [] },
+    listingsCircuit: { status: "closed", isBlocking: false },
     lastRun: null,
 };
 const dashboard = ref(fallbackDashboard);
@@ -62,25 +66,63 @@ const manualProtectedAssetId = ref("");
 const manualProtectedMarketHashName = ref("");
 const manualProtectedSteamId = ref("");
 const dailySteamBudgetDraft = ref("1000");
+const reservedBalanceDrafts = ref({});
 const manualSettleInputs = ref({});
-const autoRunIntervalMs = 10 * 60 * 1000;
-const autoRunStorageKey = "profitTrade.autoRun.v1";
 const lastRunStorageKey = "profitTrade.lastRun.v1";
-const autoRunTimer = ref(null);
-const autoRunTickTimer = ref(null);
-const autoRunActive = ref(false);
-const autoRunNextAt = ref(null);
-const autoRunInFlight = ref(false);
+const runtimeBusy = ref(false);
+const runtimeConfirmEnabled = ref(null);
 const lastRunAt = ref(null);
 const lastRunResult = ref("");
-const nowMs = ref(Date.now());
 const completedDateFrom = ref("");
 const completedDateTo = ref("");
 const completedPage = ref(1);
 const completedPageSize = 10;
+const manualRecordOpen = ref(false);
+const manualRecordSaving = ref(false);
+const manualRecordEditingTradeId = ref(null);
+const manualRecordError = ref("");
+const manualItemQuery = ref("");
+const manualItemSuggestions = ref([]);
+const manualItemSearchOpen = ref(false);
+const manualItemSearchBusy = ref(false);
+let manualItemSearchTimer = null;
+const manualRecordForm = ref({
+    marketHashName: "",
+    name: "",
+    steamAccountId: "",
+    steamBuyPrice: "",
+    balanceDiscount: "0.69",
+    c5SoldNetPrice: "",
+    steamBoughtAt: "",
+    completedAt: "",
+    aAssetId: "",
+    bAssetId: "",
+    memo: "",
+});
 const sortedTrades = computed(() => [...dashboard.value.trades].sort((a, b) => b.id - a.id));
 const activeTrades = computed(() => sortedTrades.value.filter((trade) => trade.status !== "completed"));
-const completedTrades = computed(() => sortedTrades.value.filter((trade) => trade.status === "completed"));
+const completedTrades = computed(() => sortedTrades.value
+    .filter((trade) => trade.status === "completed")
+    .sort((a, b) => {
+    const aTime = completedTradePurchaseTimeMs(a) ?? Number.NEGATIVE_INFINITY;
+    const bTime = completedTradePurchaseTimeMs(b) ?? Number.NEGATIVE_INFINITY;
+    return bTime - aTime || b.id - a.id;
+}));
+const manualEntryAccounts = computed(() => dashboard.value.manualEntryOptions?.accounts ?? []);
+const manualRecordPreview = computed(() => {
+    const steamBuyPrice = Number(manualRecordForm.value.steamBuyPrice);
+    const balanceDiscount = Number(manualRecordForm.value.balanceDiscount);
+    const c5SoldNetPrice = Number(manualRecordForm.value.c5SoldNetPrice);
+    if (![steamBuyPrice, balanceDiscount, c5SoldNetPrice].every(Number.isFinite) || steamBuyPrice <= 0) {
+        return { steamRealCost: null, realizedProfit: null, realizedRoiPct: null };
+    }
+    const steamRealCost = steamBuyPrice * balanceDiscount;
+    return {
+        steamRealCost,
+        realizedProfit: c5SoldNetPrice - steamRealCost,
+        realizedRoiPct: (c5SoldNetPrice / steamBuyPrice - balanceDiscount) * 100,
+    };
+});
 const completedHasDateFilter = computed(() => completedDateFrom.value !== "" || completedDateTo.value !== "");
 const completedFilteredTrades = computed(() => {
     const from = parseDateStart(completedDateFrom.value);
@@ -123,17 +165,9 @@ const protectedSteamCount = computed(() => dashboard.value.config.protectedSteam
 const protectedAssetPreview = computed(() => dashboard.value.config.protectedAssetIds ?? []);
 const protectedNamePreview = computed(() => dashboard.value.config.protectedMarketHashNames ?? []);
 const protectedSteamPreview = computed(() => dashboard.value.config.protectedSteamIds ?? []);
-const autoRunEnabled = computed(() => autoRunActive.value);
+const autoRunEnabled = computed(() => Boolean(dashboard.value.runtime?.enabled ?? dashboard.value.config.enabled));
 const stickerSlabActive = computed(() => dashboard.value.config.stickerSlabStatus === "active");
 const stickerActive = computed(() => dashboard.value.config.stickerStatus === "active");
-const autoRunCountdown = computed(() => {
-    if (!autoRunNextAt.value)
-        return "";
-    const remainingSeconds = Math.max(0, Math.ceil((autoRunNextAt.value - nowMs.value) / 1000));
-    const minutes = Math.floor(remainingSeconds / 60);
-    const seconds = remainingSeconds % 60;
-    return `${minutes}:${String(seconds).padStart(2, "0")}`;
-});
 const apiStatusLabel = computed(() => {
     if (apiOnline.value === true)
         return "后端 API 已启动";
@@ -143,24 +177,23 @@ const apiStatusLabel = computed(() => {
 });
 const realExecutionLabel = computed(() => (dashboard.value.config.allowRealExecution ? "真实执行已开放" : "真实执行未开放"));
 const autoRunStatusLabel = computed(() => {
-    if (autoRunInFlight.value)
-        return "浏览器循环执行中";
-    return autoRunActive.value ? "浏览器循环运行中" : "浏览器循环未运行";
+    if (dashboard.value.runtime?.preparing)
+        return "后端 Worker 启动准备中";
+    return autoRunEnabled.value ? `后端 Worker ${dashboard.value.runtime?.status || "运行中"}` : "后端 Worker 已关闭";
 });
 const nextAutoRunLabel = computed(() => {
-    if (autoRunInFlight.value)
-        return "本轮执行中";
-    if (!autoRunActive.value)
-        return "未计划";
-    if (!autoRunNextAt.value)
-        return "等待安排";
-    return `${formatDateTime(autoRunNextAt.value)}（${autoRunCountdown.value}）`;
+    if (!autoRunEnabled.value)
+        return "新机会任务已暂停";
+    const nextAt = dashboard.value.runtime?.nextAttemptAt;
+    return nextAt ? formatDateTime(nextAt) : "等待后端安排到期任务";
 });
 const lastRunLabel = computed(() => {
     const backendLastRun = dashboard.value.lastRun;
     if (backendLastRun?.generatedAt && backendLastRun?.summary) {
         return `${formatDateTime(backendLastRun.generatedAt)}｜${backendLastRun.summary}`;
     }
+    if (dashboard.value.runtime?.lastRunAt)
+        return `${formatDateTime(dashboard.value.runtime.lastRunAt)}｜${dashboard.value.runtime.lastRunSummary || "后端任务已运行"}`;
     if (!lastRunAt.value || !lastRunResult.value)
         return "暂无";
     return `${formatDateTime(lastRunAt.value)}｜${lastRunResult.value}`;
@@ -208,6 +241,190 @@ function completedTradePurchaseTimeMs(trade) {
         return null;
     const time = new Date(raw).getTime();
     return Number.isNaN(time) ? null : time;
+}
+function isoToBeijingInput(value) {
+    if (!value)
+        return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime()))
+        return "";
+    return new Date(date.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 19);
+}
+function beijingInputNow() {
+    return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 19);
+}
+function beijingInputToIso(value) {
+    return `${value}+08:00`;
+}
+function manualAccountInitials(name) {
+    const normalized = String(name || "").trim();
+    if (!normalized)
+        return "--";
+    const parts = normalized.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+    if (parts.length >= 2)
+        return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+    return normalized.slice(0, 2).toUpperCase();
+}
+function resolveTradeSteamAccountId(trade) {
+    const note = trade.note ?? {};
+    const recordedId = String(note.steamAccountId ?? "").trim();
+    const recordedSteamId = String(note.steamId ?? "").trim();
+    const recordedName = String(note.steamAccountName ?? "").trim().toLowerCase();
+    const matched = manualEntryAccounts.value.find((account) => ((recordedId && account.accountId === recordedId)
+        || (recordedSteamId && account.steamId === recordedSteamId)
+        || (recordedName && account.name.trim().toLowerCase() === recordedName)));
+    return matched?.accountId ?? "";
+}
+function openCreateManualRecord() {
+    const now = beijingInputNow();
+    manualRecordEditingTradeId.value = null;
+    manualRecordError.value = "";
+    manualItemQuery.value = "";
+    manualItemSuggestions.value = [];
+    manualItemSearchOpen.value = false;
+    manualRecordForm.value = {
+        marketHashName: "",
+        name: "",
+        steamAccountId: "",
+        steamBuyPrice: "",
+        balanceDiscount: String(dashboard.value.config.balanceDiscount ?? 0.69),
+        c5SoldNetPrice: "",
+        steamBoughtAt: now,
+        completedAt: now,
+        aAssetId: "",
+        bAssetId: "",
+        memo: "",
+    };
+    manualRecordOpen.value = true;
+}
+function openEditManualRecord(trade) {
+    if (trade.status !== "completed")
+        return;
+    manualRecordEditingTradeId.value = trade.id;
+    manualRecordError.value = "";
+    manualItemQuery.value = trade.name && trade.name !== trade.marketHashName
+        ? `${trade.name} / ${trade.marketHashName}`
+        : trade.marketHashName;
+    manualItemSuggestions.value = [];
+    manualItemSearchOpen.value = false;
+    manualRecordForm.value = {
+        marketHashName: trade.marketHashName,
+        name: trade.name && trade.name !== trade.marketHashName ? trade.name : "",
+        steamAccountId: resolveTradeSteamAccountId(trade),
+        steamBuyPrice: String(trade.steamBuyPrice ?? ""),
+        balanceDiscount: String(trade.steamBalanceDiscount ?? dashboard.value.config.balanceDiscount ?? 0.69),
+        c5SoldNetPrice: String(trade.c5SoldNetPrice ?? ""),
+        steamBoughtAt: isoToBeijingInput(trade.steamBoughtAt),
+        completedAt: isoToBeijingInput(trade.completedAt),
+        aAssetId: String(trade.aAssetId ?? ""),
+        bAssetId: String(trade.bAssetId ?? ""),
+        memo: String(trade.note?.manualEditedMemo ?? trade.note?.manualCreatedMemo ?? ""),
+    };
+    manualRecordOpen.value = true;
+}
+function closeManualRecord() {
+    if (manualRecordSaving.value)
+        return;
+    manualRecordOpen.value = false;
+    manualRecordError.value = "";
+}
+async function searchManualItems() {
+    manualItemSearchBusy.value = true;
+    try {
+        const payload = await fetchJson(`/api/profit-trade/items/search?query=${encodeURIComponent(manualItemQuery.value.trim())}&limit=20`);
+        manualItemSuggestions.value = payload.items ?? [];
+        manualItemSearchOpen.value = true;
+        apiOnline.value = true;
+    }
+    catch (error) {
+        if (error instanceof TypeError)
+            apiOnline.value = false;
+        manualRecordError.value = `物品搜索失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    finally {
+        manualItemSearchBusy.value = false;
+    }
+}
+function onManualItemInput() {
+    manualRecordForm.value.marketHashName = "";
+    manualRecordForm.value.name = "";
+    manualItemSearchOpen.value = true;
+    if (manualItemSearchTimer)
+        clearTimeout(manualItemSearchTimer);
+    manualItemSearchTimer = setTimeout(() => void searchManualItems(), 220);
+}
+function chooseManualItem(item) {
+    manualRecordForm.value.marketHashName = item.marketHashName;
+    manualRecordForm.value.name = item.name !== item.marketHashName ? item.name : "";
+    manualItemQuery.value = item.name !== item.marketHashName
+        ? `${item.name} / ${item.marketHashName}`
+        : item.marketHashName;
+    manualItemSearchOpen.value = false;
+    manualRecordError.value = "";
+}
+async function saveManualRecord() {
+    const form = manualRecordForm.value;
+    const steamBuyPrice = Number(form.steamBuyPrice);
+    const balanceDiscount = Number(form.balanceDiscount);
+    const c5SoldNetPrice = Number(form.c5SoldNetPrice);
+    if (!form.marketHashName.trim()) {
+        manualRecordError.value = "请先搜索并选择一个标准物品名称，不能只输入自由文本";
+        return;
+    }
+    if (!Number.isFinite(steamBuyPrice) || steamBuyPrice <= 0 || !Number.isFinite(c5SoldNetPrice) || c5SoldNetPrice <= 0) {
+        manualRecordError.value = "Steam 买入价和 C5 实际到手必须大于 0";
+        return;
+    }
+    if (!Number.isFinite(balanceDiscount) || balanceDiscount <= 0 || balanceDiscount > 1) {
+        manualRecordError.value = "余额折扣必须大于 0 且不超过 1";
+        return;
+    }
+    if (!form.steamBoughtAt || !form.completedAt) {
+        manualRecordError.value = "Steam 购买时间和结算时间都必须填写";
+        return;
+    }
+    if (new Date(beijingInputToIso(form.completedAt)) < new Date(beijingInputToIso(form.steamBoughtAt))) {
+        manualRecordError.value = "结算时间不能早于 Steam 购买时间";
+        return;
+    }
+    manualRecordSaving.value = true;
+    manualRecordError.value = "";
+    const editing = manualRecordEditingTradeId.value !== null;
+    try {
+        await fetchJson(editing
+            ? "/api/profit-trade/manual-record/update"
+            : "/api/profit-trade/manual-record/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                ...(editing ? { tradeId: manualRecordEditingTradeId.value } : {}),
+                marketHashName: form.marketHashName.trim(),
+                name: form.name.trim() || null,
+                steamAccountId: form.steamAccountId || null,
+                steamBuyPrice,
+                balanceDiscount,
+                c5SoldNetPrice,
+                steamBoughtAt: beijingInputToIso(form.steamBoughtAt),
+                completedAt: beijingInputToIso(form.completedAt),
+                aAssetId: form.aAssetId.trim() || null,
+                bAssetId: form.bAssetId.trim() || null,
+                memo: form.memo.trim() || null,
+            }),
+        });
+        apiOnline.value = true;
+        manualRecordOpen.value = false;
+        message.value = editing ? "已保存人工修正" : "已新增手工流水";
+        resetCompletedPage();
+        await loadDashboard();
+    }
+    catch (error) {
+        if (error instanceof TypeError)
+            apiOnline.value = false;
+        manualRecordError.value = `保存失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    finally {
+        manualRecordSaving.value = false;
+    }
 }
 function resetCompletedPage() {
     completedPage.value = 1;
@@ -331,12 +548,40 @@ async function fetchJson(url, init) {
     }
     return response.json();
 }
+function reservedBalanceKey(account) {
+    return String(account.steamId || account.accountId || "").trim();
+}
+function syncReservedBalanceDrafts() {
+    const configured = dashboard.value.config.accountReservedBalances || {};
+    reservedBalanceDrafts.value = Object.fromEntries(dashboard.value.manualEntryOptions.accounts.map((account) => {
+        const key = reservedBalanceKey(account);
+        const configuredValue = configured[key]
+            ?? configured[account.accountId]
+            ?? configured[account.name]
+            ?? 0;
+        return [account.accountId, String(configuredValue)];
+    }));
+}
 async function loadDashboard() {
     loading.value = true;
     message.value = "";
     try {
-        dashboard.value = (await fetchJson("/api/profit-trade/dashboard"));
+        const payload = (await fetchJson("/api/profit-trade/dashboard"));
+        let runtimeState = payload.runtime;
+        try {
+            const runtimePayload = await fetchJson("/api/runtime/state?executor=profit_trade");
+            runtimeState = runtimePayload.state || runtimeState;
+        }
+        catch {
+            // The dashboard remains usable while the shared runtime endpoint starts up.
+        }
+        dashboard.value = {
+            ...payload,
+            runtime: runtimeState,
+            listingsCircuit: payload.listingsCircuit || { status: "closed", isBlocking: false },
+        };
         dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
+        syncReservedBalanceDrafts();
         apiOnline.value = true;
         window.dispatchEvent(new CustomEvent("profit-trade:dashboard-status", {
             detail: { allowRealExecution: dashboard.value.config.allowRealExecution },
@@ -352,20 +597,26 @@ async function loadDashboard() {
     }
 }
 async function toggleEnabled() {
-    const nextEnabled = !dashboard.value.config.enabled;
+    const nextEnabled = runtimeConfirmEnabled.value ?? !autoRunEnabled.value;
     message.value = "";
+    runtimeBusy.value = true;
     try {
-        await fetchJson("/api/profit-trade/config", {
+        await fetchJson("/api/runtime/toggle", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ enabled: nextEnabled }),
+            body: JSON.stringify({ executor: "profit_trade", enabled: nextEnabled }),
         });
         apiOnline.value = true;
+        runtimeConfirmEnabled.value = null;
+        message.value = nextEnabled ? "Profit Trade 后端 Worker 已提交开启，正在执行 Cookie 门禁。" : "Profit Trade 新机会已停止；已有流水继续安全闭环。";
         await loadDashboard();
     }
     catch (error) {
         apiOnline.value = false;
         message.value = `API未连接，无法${nextEnabled ? "开启" : "关闭"}后端开关`;
+    }
+    finally {
+        runtimeBusy.value = false;
     }
 }
 async function toggleRealExecution() {
@@ -438,6 +689,34 @@ async function saveDailySteamBudget() {
     catch (error) {
         apiOnline.value = false;
         message.value = `每日余额上限保存失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+}
+async function saveAccountReservedBalances() {
+    const nextBalances = {};
+    for (const account of dashboard.value.manualEntryOptions.accounts) {
+        const rawValue = reservedBalanceDrafts.value[account.accountId] ?? "0";
+        const value = Number(rawValue);
+        if (!Number.isFinite(value) || value < 0) {
+            message.value = `${account.name} 的保留余额必须是大于等于 0 的数字`;
+            return;
+        }
+        if (value > 0)
+            nextBalances[reservedBalanceKey(account)] = value;
+    }
+    message.value = "";
+    try {
+        await fetchJson("/api/profit-trade/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accountReservedBalances: nextBalances }),
+        });
+        apiOnline.value = true;
+        await loadDashboard();
+        message.value = "Steam 账号保留余额已保存，下一次 Profit Trade 买入立即生效";
+    }
+    catch (error) {
+        apiOnline.value = false;
+        message.value = `Steam 账号保留余额保存失败：${error instanceof Error ? error.message : String(error)}`;
     }
 }
 async function manualSettleTrade(trade) {
@@ -527,41 +806,6 @@ async function scanOpportunities() {
     catch (error) {
         apiOnline.value = false;
         message.value = "API未连接或扫描失败";
-    }
-    finally {
-        loading.value = false;
-    }
-}
-async function runOnce() {
-    message.value = "";
-    loading.value = true;
-    try {
-        const payload = await fetchJson("/api/profit-trade/run-once", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ scanMaxItems: dashboard.value.config.scanMaxItems }),
-        });
-        apiOnline.value = true;
-        const bought = payload.report?.boughtTradeIds?.length ?? 0;
-        const listed = payload.report?.listedTradeIds?.length ?? 0;
-        const settled = payload.report?.settledTradeIds?.length ?? 0;
-        const skipped = payload.report?.skippedTradeIds?.length ?? 0;
-        const errors = payload.report?.errors?.length ?? 0;
-        const summary = `买入B ${bought} 笔，C5上架 ${listed} 笔，结算 ${settled} 笔，跳过 ${skipped} 笔，错误 ${errors} 个`;
-        lastRunAt.value = Date.now();
-        lastRunResult.value = summary;
-        saveLastRunState();
-        message.value = `执行完成：${summary}`;
-        await loadDashboard();
-        window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
-    }
-    catch (error) {
-        apiOnline.value = false;
-        const summary = `失败：${error instanceof Error ? error.message : String(error)}`;
-        lastRunAt.value = Date.now();
-        lastRunResult.value = summary;
-        saveLastRunState();
-        message.value = `执行一轮失败：${summary.replace(/^失败：/, "")}`;
     }
     finally {
         loading.value = false;
@@ -675,20 +919,6 @@ async function addManualProtectedSteamId() {
     await updateProtection("add", "steamId", manualProtectedSteamId.value);
     manualProtectedSteamId.value = "";
 }
-function saveAutoRunState() {
-    if (typeof window === "undefined")
-        return;
-    if (!autoRunActive.value || !autoRunNextAt.value) {
-        window.localStorage.removeItem(autoRunStorageKey);
-        window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: false } }));
-        return;
-    }
-    window.localStorage.setItem(autoRunStorageKey, JSON.stringify({
-        enabled: true,
-        nextAt: autoRunNextAt.value,
-    }));
-    window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
-}
 function handleSharedConfigChange() {
     void loadDashboard();
 }
@@ -703,96 +933,6 @@ function saveLastRunState() {
         at: lastRunAt.value,
         result: lastRunResult.value,
     }));
-}
-function clearAutoRunTimers() {
-    if (autoRunTimer.value !== null) {
-        clearTimeout(autoRunTimer.value);
-        autoRunTimer.value = null;
-    }
-    if (autoRunTickTimer.value !== null) {
-        clearInterval(autoRunTickTimer.value);
-        autoRunTickTimer.value = null;
-    }
-}
-function scheduleAutoRun(nextAt) {
-    if (autoRunTimer.value !== null) {
-        clearTimeout(autoRunTimer.value);
-        autoRunTimer.value = null;
-    }
-    autoRunActive.value = true;
-    autoRunNextAt.value = nextAt;
-    nowMs.value = Date.now();
-    saveAutoRunState();
-    autoRunTimer.value = setTimeout(() => {
-        autoRunTimer.value = null;
-        void runScheduledOnce();
-    }, Math.max(0, nextAt - Date.now()));
-    if (autoRunTickTimer.value === null) {
-        autoRunTickTimer.value = setInterval(() => {
-            nowMs.value = Date.now();
-        }, 1000);
-    }
-}
-async function runScheduledOnce() {
-    if (autoRunInFlight.value)
-        return;
-    autoRunInFlight.value = true;
-    try {
-        await runOnce();
-    }
-    finally {
-        autoRunInFlight.value = false;
-        if (autoRunActive.value) {
-            scheduleAutoRun(Date.now() + autoRunIntervalMs);
-        }
-    }
-}
-async function startAutoRun() {
-    if (autoRunActive.value)
-        return;
-    autoRunActive.value = true;
-    autoRunNextAt.value = null;
-    nowMs.value = Date.now();
-    message.value = "循环执行已开启：正在立刻执行第一轮";
-    window.dispatchEvent(new CustomEvent("profit-trade:runtime-state", { detail: { active: true } }));
-    await runScheduledOnce();
-}
-function stopAutoRun() {
-    clearAutoRunTimers();
-    autoRunActive.value = false;
-    autoRunNextAt.value = null;
-    autoRunInFlight.value = false;
-    nowMs.value = Date.now();
-    saveAutoRunState();
-    message.value = "循环执行已停止";
-}
-function toggleAutoRun() {
-    if (autoRunEnabled.value) {
-        stopAutoRun();
-        return;
-    }
-    void startAutoRun();
-}
-function restoreAutoRun() {
-    if (typeof window === "undefined")
-        return;
-    const raw = window.localStorage.getItem(autoRunStorageKey);
-    if (!raw)
-        return;
-    try {
-        const stored = JSON.parse(raw);
-        if (!stored.enabled)
-            return;
-        const nextAt = Number(stored.nextAt);
-        const restoredNextAt = Number.isFinite(nextAt) && nextAt > 0
-            ? Math.max(nextAt, Date.now())
-            : Date.now() + autoRunIntervalMs;
-        scheduleAutoRun(restoredNextAt);
-        message.value = "循环执行已恢复：页面刷新后继续计时";
-    }
-    catch {
-        window.localStorage.removeItem(autoRunStorageKey);
-    }
 }
 function restoreLastRun() {
     if (typeof window === "undefined")
@@ -815,11 +955,11 @@ function restoreLastRun() {
 onMounted(() => {
     restoreLastRun();
     void loadDashboard();
-    restoreAutoRun();
     window.addEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 onUnmounted(() => {
-    clearAutoRunTimers();
+    if (manualItemSearchTimer)
+        clearTimeout(manualItemSearchTimer);
     window.removeEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
@@ -856,6 +996,18 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['status-toggle']} */ ;
 /** @type {__VLS_StyleScopedClasses['active']} */ ;
 /** @type {__VLS_StyleScopedClasses['budget-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-input']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-input']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-input']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
@@ -1048,6 +1200,59 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['completed-profit-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-filter-actions']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-pagination']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel-title-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-card-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-edit-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-unrecorded']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['positive']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['negative']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
@@ -1080,18 +1285,6 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     type: "button",
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.runOnce) },
-    ...{ class: "secondary-button" },
-    type: "button",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.toggleAutoRun) },
-    ...{ class: "secondary-button" },
-    ...{ class: ({ active: __VLS_ctx.autoRunEnabled }) },
-    type: "button",
-});
-(__VLS_ctx.autoRunEnabled ? `停止循环 ${__VLS_ctx.autoRunCountdown}` : "循环执行10分钟");
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.refreshSales) },
     ...{ class: "secondary-button" },
     type: "button",
@@ -1102,11 +1295,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     type: "button",
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.toggleEnabled) },
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.runtimeConfirmEnabled = !__VLS_ctx.autoRunEnabled;
+        } },
     ...{ class: "primary-button" },
     type: "button",
+    disabled: (__VLS_ctx.runtimeBusy),
 });
-(__VLS_ctx.dashboard.config.enabled ? "关闭执行器" : "开启执行器");
+(__VLS_ctx.autoRunEnabled ? "关闭执行器" : "开启执行器");
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.toggleRepriceExecution) },
     ...{ class: "secondary-button" },
@@ -1128,7 +1324,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-(__VLS_ctx.dashboard.config.enabled ? "已开启" : "已关闭");
+(__VLS_ctx.autoRunEnabled ? "已开启" : "已关闭");
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
     ...{ class: "profit-metric" },
 });
@@ -1188,7 +1384,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElement
 (__VLS_ctx.realExecutionLabel);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
     ...{ class: "execution-status-item" },
-    ...{ class: ({ online: __VLS_ctx.autoRunEnabled, running: __VLS_ctx.autoRunInFlight }) },
+    ...{ class: ({ online: __VLS_ctx.autoRunEnabled }) },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -1205,6 +1401,57 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
 (__VLS_ctx.lastRunLabel);
+if (__VLS_ctx.runtimeConfirmEnabled !== null) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ onClick: (...[$event]) => {
+                if (!(__VLS_ctx.runtimeConfirmEnabled !== null))
+                    return;
+                __VLS_ctx.runtimeConfirmEnabled = null;
+            } },
+        ...{ class: "runtime-confirm-backdrop" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "runtime-confirm-dialog" },
+        role: "dialog",
+        'aria-modal': "true",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    /** @type {[typeof FolioIcon, ]} */ ;
+    // @ts-ignore
+    const __VLS_0 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: (__VLS_ctx.runtimeConfirmEnabled ? 'shield' : 'warning'),
+        size: (22),
+    }));
+    const __VLS_1 = __VLS_0({
+        name: (__VLS_ctx.runtimeConfirmEnabled ? 'shield' : 'warning'),
+        size: (22),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_0));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+    (__VLS_ctx.runtimeConfirmEnabled ? "开启 Profit Trade 执行器" : "关闭 Profit Trade 执行器");
+    if (__VLS_ctx.runtimeConfirmEnabled) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    else {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (...[$event]) => {
+                if (!(__VLS_ctx.runtimeConfirmEnabled !== null))
+                    return;
+                __VLS_ctx.runtimeConfirmEnabled = null;
+            } },
+        ...{ class: "secondary-button" },
+        type: "button",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.toggleEnabled) },
+        ...{ class: "primary-button" },
+        type: "button",
+        disabled: (__VLS_ctx.runtimeBusy),
+    });
+    (__VLS_ctx.runtimeBusy ? "提交中…" : "确认");
+}
 if (__VLS_ctx.message) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
         ...{ class: "inline-status" },
@@ -1213,8 +1460,8 @@ if (__VLS_ctx.message) {
 }
 /** @type {[typeof ProfitTradeRoiWatch, ]} */ ;
 // @ts-ignore
-const __VLS_0 = __VLS_asFunctionalComponent(ProfitTradeRoiWatch, new ProfitTradeRoiWatch({}));
-const __VLS_1 = __VLS_0({}, ...__VLS_functionalComponentArgsRest(__VLS_0));
+const __VLS_3 = __VLS_asFunctionalComponent(ProfitTradeRoiWatch, new ProfitTradeRoiWatch({}));
+const __VLS_4 = __VLS_3({}, ...__VLS_functionalComponentArgsRest(__VLS_3));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "profit-layout" },
 });
@@ -1343,6 +1590,53 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     ...{ class: "mini-action protect-action" },
     type: "submit",
 });
+__VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
+    ...{ onSubmit: (__VLS_ctx.saveAccountReservedBalances) },
+    ...{ class: "wallet-reserve-panel" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "wallet-reserve-heading" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.h3, __VLS_intrinsicElements.h3)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ class: "mini-action protect-action" },
+    type: "submit",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "wallet-reserve-list" },
+});
+for (const [account] of __VLS_getVForSourceType((__VLS_ctx.dashboard.manualEntryOptions.accounts))) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        key: (account.accountId),
+        ...{ class: "wallet-reserve-account" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    (account.name);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    (account.steamId || account.accountId);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+        ...{ class: "wallet-reserve-input" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "number",
+        min: "0",
+        step: "0.01",
+        inputmode: "decimal",
+        autocomplete: "off",
+        'aria-label': "Profit Trade 保留余额",
+    });
+    (__VLS_ctx.reservedBalanceDrafts[account.accountId]);
+}
+if (!__VLS_ctx.dashboard.manualEntryOptions.accounts.length) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "wallet-reserve-empty" },
+    });
+}
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "protection-panel" },
 });
@@ -1480,7 +1774,12 @@ else if (__VLS_ctx.activeTrades.length === 0) {
         ...{ class: "panel empty-state" },
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    if (__VLS_ctx.dashboard.listingsCircuit.isBlocking) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    }
+    else {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    }
     if (__VLS_ctx.dashboard.config.allowRealExecution) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
     }
@@ -1650,6 +1949,12 @@ else {
                 type: "button",
             });
         }
+        if (__VLS_ctx.dashboard.listingsCircuit.isBlocking && trade.stepIndex <= 2) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+                ...{ class: "trade-circuit-note" },
+            });
+            (__VLS_ctx.formatDateTime(__VLS_ctx.dashboard.listingsCircuit.nextProbeAt || __VLS_ctx.dashboard.listingsCircuit.cooldownUntil));
+        }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "progress-track" },
             'aria-hidden': "true",
@@ -1757,6 +2062,11 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 (__VLS_ctx.completedFilteredTrades.length);
 (__VLS_ctx.completedTrades.length);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (__VLS_ctx.openCreateManualRecord) },
+    ...{ class: "primary-button" },
+    type: "button",
+});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
     ...{ class: "completed-filter-note" },
 });
@@ -1867,11 +2177,47 @@ else {
             key: (`completed-${trade.id}`),
             ...{ class: "completed-trade-row" },
         });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!!(__VLS_ctx.completedTrades.length === 0))
+                        return;
+                    if (!!(__VLS_ctx.completedFilteredTrades.length === 0))
+                        return;
+                    __VLS_ctx.openEditManualRecord(trade);
+                } },
+            ...{ class: "completed-edit-button" },
+            type: "button",
+            title: "编辑本地记录",
+            'aria-label': "编辑本地记录",
+        });
+        /** @type {[typeof FolioIcon, ]} */ ;
+        // @ts-ignore
+        const __VLS_6 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+            name: "edit",
+            size: (16),
+        }));
+        const __VLS_7 = __VLS_6({
+            name: "edit",
+            size: (16),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_6));
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "completed-main" },
         });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "completed-card-head" },
+        });
         __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
         (trade.name || trade.marketHashName);
+        if (trade.recordOrigin === 'manual_backfill') {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: "manual-record-badge" },
+            });
+        }
+        else if (trade.manuallyEdited) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: "manual-record-badge corrected" },
+            });
+        }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         (trade.tradeNo);
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -1915,14 +2261,257 @@ else {
         (__VLS_ctx.formatMoney(trade.realizedProfit));
     }
 }
+if (__VLS_ctx.manualRecordOpen) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ onClick: (__VLS_ctx.closeManualRecord) },
+        ...{ class: "manual-record-backdrop" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "manual-record-modal" },
+        role: "dialog",
+        'aria-modal': "true",
+        'aria-labelledby': "manual-record-title",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({
+        ...{ class: "manual-record-header" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    (__VLS_ctx.manualRecordEditingTradeId === null ? "历史补录" : "本地修正");
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({
+        id: "manual-record-title",
+    });
+    (__VLS_ctx.manualRecordEditingTradeId === null ? "新增手工流水" : "编辑已完结流水");
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.closeManualRecord) },
+        ...{ class: "mini-action" },
+        type: "button",
+        disabled: (__VLS_ctx.manualRecordSaving),
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "manual-record-notice" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
+        ...{ onSubmit: (__VLS_ctx.saveManualRecord) },
+        ...{ class: "manual-record-form" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        ...{ class: "wide-field manual-item-field" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "manual-item-search" },
+    });
+    /** @type {[typeof FolioIcon, ]} */ ;
+    // @ts-ignore
+    const __VLS_9 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: "scan",
+        size: (17),
+    }));
+    const __VLS_10 = __VLS_9({
+        name: "scan",
+        size: (17),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_9));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        ...{ onInput: (__VLS_ctx.onManualItemInput) },
+        ...{ onFocus: (__VLS_ctx.searchManualItems) },
+        autocomplete: "off",
+        placeholder: "输入中文名或英文名，例如：次时代、M4A4",
+    });
+    (__VLS_ctx.manualItemQuery);
+    if (__VLS_ctx.manualItemSearchBusy) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    }
+    if (__VLS_ctx.manualItemSearchOpen) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "manual-item-suggestions" },
+        });
+        for (const [item] of __VLS_getVForSourceType((__VLS_ctx.manualItemSuggestions))) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.manualRecordOpen))
+                            return;
+                        if (!(__VLS_ctx.manualItemSearchOpen))
+                            return;
+                        __VLS_ctx.chooseManualItem(item);
+                    } },
+                key: (item.marketHashName),
+                type: "button",
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+            (item.name);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+            (item.marketHashName);
+        }
+        if (!__VLS_ctx.manualItemSearchBusy && __VLS_ctx.manualItemSuggestions.length === 0) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+        }
+    }
+    if (__VLS_ctx.manualRecordForm.marketHashName) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+            ...{ class: "manual-item-selected" },
+        });
+        (__VLS_ctx.manualRecordForm.marketHashName);
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.fieldset, __VLS_intrinsicElements.fieldset)({
+        ...{ class: "manual-account-picker wide-field" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.legend, __VLS_intrinsicElements.legend)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "manual-account-heading" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (...[$event]) => {
+                if (!(__VLS_ctx.manualRecordOpen))
+                    return;
+                __VLS_ctx.manualRecordForm.steamAccountId = '';
+            } },
+        ...{ class: "manual-account-unrecorded" },
+        ...{ class: ({ selected: __VLS_ctx.manualRecordForm.steamAccountId === '' }) },
+        type: "button",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "manual-account-cards" },
+    });
+    for (const [account] of __VLS_getVForSourceType((__VLS_ctx.manualEntryAccounts))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.manualRecordOpen))
+                        return;
+                    __VLS_ctx.manualRecordForm.steamAccountId = account.accountId;
+                } },
+            key: (account.accountId),
+            type: "button",
+            ...{ class: ({ selected: __VLS_ctx.manualRecordForm.steamAccountId === account.accountId }) },
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({});
+        (__VLS_ctx.manualAccountInitials(account.name));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (account.name);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        (account.steamId || "SteamID 未记录");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (__VLS_ctx.manualRecordForm.steamAccountId === account.accountId ? "已选择" : "选择");
+    }
+    if (__VLS_ctx.manualEntryAccounts.length === 0) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "number",
+        min: "0.01",
+        step: "0.01",
+        required: true,
+    });
+    (__VLS_ctx.manualRecordForm.steamBuyPrice);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "number",
+        min: "0.0001",
+        max: "1",
+        step: "0.0001",
+        required: true,
+    });
+    (__VLS_ctx.manualRecordForm.balanceDiscount);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "number",
+        min: "0.01",
+        step: "0.01",
+        required: true,
+    });
+    (__VLS_ctx.manualRecordForm.c5SoldNetPrice);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "datetime-local",
+        step: "1",
+        required: true,
+    });
+    (__VLS_ctx.manualRecordForm.steamBoughtAt);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        type: "datetime-local",
+        step: "1",
+        required: true,
+    });
+    (__VLS_ctx.manualRecordForm.completedAt);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        autocomplete: "off",
+    });
+    (__VLS_ctx.manualRecordForm.aAssetId);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        autocomplete: "off",
+    });
+    (__VLS_ctx.manualRecordForm.bAssetId);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        ...{ class: "wide-field" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.textarea)({
+        value: (__VLS_ctx.manualRecordForm.memo),
+        rows: "3",
+        maxlength: "1000",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({
+        ...{ class: "manual-record-preview wide-field" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.formatMoney(__VLS_ctx.manualRecordPreview.steamRealCost));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({
+        ...{ class: (__VLS_ctx.signedClass(__VLS_ctx.manualRecordPreview.realizedProfit)) },
+    });
+    (__VLS_ctx.formatMoney(__VLS_ctx.manualRecordPreview.realizedProfit));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({
+        ...{ class: (__VLS_ctx.signedClass(__VLS_ctx.manualRecordPreview.realizedRoiPct)) },
+    });
+    (__VLS_ctx.formatPct(__VLS_ctx.manualRecordPreview.realizedRoiPct));
+    if (__VLS_ctx.manualRecordError) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+            ...{ class: "manual-record-error wide-field" },
+        });
+        (__VLS_ctx.manualRecordError);
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElements.footer)({
+        ...{ class: "manual-record-actions wide-field" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.closeManualRecord) },
+        ...{ class: "secondary-button" },
+        type: "button",
+        disabled: (__VLS_ctx.manualRecordSaving),
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ class: "primary-button" },
+        type: "submit",
+        disabled: (__VLS_ctx.manualRecordSaving),
+    });
+    (__VLS_ctx.manualRecordSaving ? "保存中…" : "保存本地记录");
+}
 /** @type {__VLS_StyleScopedClasses['page']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-trade-page']} */ ;
 /** @type {__VLS_StyleScopedClasses['page-header']} */ ;
 /** @type {__VLS_StyleScopedClasses['eyebrow']} */ ;
 /** @type {__VLS_StyleScopedClasses['toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['api-pill']} */ ;
-/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
-/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
@@ -1946,6 +2535,10 @@ else {
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['wide']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['inline-status']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-layout']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
@@ -1961,6 +2554,14 @@ else {
 /** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
 /** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-input']} */ ;
+/** @type {__VLS_StyleScopedClasses['wallet-reserve-empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
@@ -2008,6 +2609,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-settle-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['trade-circuit-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['progress-track']} */ ;
 /** @type {__VLS_StyleScopedClasses['step-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-detail-grid']} */ ;
@@ -2016,6 +2618,7 @@ else {
 /** @type {__VLS_StyleScopedClasses['completed-zone']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel-title-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['soft-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-filter-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-filter-actions']} */ ;
@@ -2031,12 +2634,43 @@ else {
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-trade-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-edit-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-main']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed-card-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-badge']} */ ;
+/** @type {__VLS_StyleScopedClasses['corrected']} */ ;
 /** @type {__VLS_StyleScopedClasses['completed-metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-notice']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-unrecorded']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-preview']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-record-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
 var __VLS_dollars;
 const __VLS_self = (await import('vue')).defineComponent({
     setup() {
         return {
+            FolioIcon: FolioIcon,
             ProfitTradeRoiWatch: ProfitTradeRoiWatch,
             dashboard: dashboard,
             loading: loading,
@@ -2046,12 +2680,25 @@ const __VLS_self = (await import('vue')).defineComponent({
             manualProtectedMarketHashName: manualProtectedMarketHashName,
             manualProtectedSteamId: manualProtectedSteamId,
             dailySteamBudgetDraft: dailySteamBudgetDraft,
+            reservedBalanceDrafts: reservedBalanceDrafts,
             manualSettleInputs: manualSettleInputs,
-            autoRunInFlight: autoRunInFlight,
+            runtimeBusy: runtimeBusy,
+            runtimeConfirmEnabled: runtimeConfirmEnabled,
             completedDateFrom: completedDateFrom,
             completedDateTo: completedDateTo,
+            manualRecordOpen: manualRecordOpen,
+            manualRecordSaving: manualRecordSaving,
+            manualRecordEditingTradeId: manualRecordEditingTradeId,
+            manualRecordError: manualRecordError,
+            manualItemQuery: manualItemQuery,
+            manualItemSuggestions: manualItemSuggestions,
+            manualItemSearchOpen: manualItemSearchOpen,
+            manualItemSearchBusy: manualItemSearchBusy,
+            manualRecordForm: manualRecordForm,
             activeTrades: activeTrades,
             completedTrades: completedTrades,
+            manualEntryAccounts: manualEntryAccounts,
+            manualRecordPreview: manualRecordPreview,
             completedHasDateFilter: completedHasDateFilter,
             completedFilteredTrades: completedFilteredTrades,
             completedTotalProfit: completedTotalProfit,
@@ -2073,7 +2720,6 @@ const __VLS_self = (await import('vue')).defineComponent({
             autoRunEnabled: autoRunEnabled,
             stickerSlabActive: stickerSlabActive,
             stickerActive: stickerActive,
-            autoRunCountdown: autoRunCountdown,
             apiStatusLabel: apiStatusLabel,
             realExecutionLabel: realExecutionLabel,
             autoRunStatusLabel: autoRunStatusLabel,
@@ -2082,6 +2728,14 @@ const __VLS_self = (await import('vue')).defineComponent({
             formatMoney: formatMoney,
             formatPct: formatPct,
             formatDateTime: formatDateTime,
+            manualAccountInitials: manualAccountInitials,
+            openCreateManualRecord: openCreateManualRecord,
+            openEditManualRecord: openEditManualRecord,
+            closeManualRecord: closeManualRecord,
+            searchManualItems: searchManualItems,
+            onManualItemInput: onManualItemInput,
+            chooseManualItem: chooseManualItem,
+            saveManualRecord: saveManualRecord,
             resetCompletedPage: resetCompletedPage,
             setCompletedDatePreset: setCompletedDatePreset,
             goCompletedPage: goCompletedPage,
@@ -2101,13 +2755,13 @@ const __VLS_self = (await import('vue')).defineComponent({
             toggleRealExecution: toggleRealExecution,
             toggleRepriceExecution: toggleRepriceExecution,
             saveDailySteamBudget: saveDailySteamBudget,
+            saveAccountReservedBalances: saveAccountReservedBalances,
             manualSettleTrade: manualSettleTrade,
             dismissTrade: dismissTrade,
             toggleStickerSlabStatus: toggleStickerSlabStatus,
             toggleStickerStatus: toggleStickerStatus,
             sendDailyReport: sendDailyReport,
             scanOpportunities: scanOpportunities,
-            runOnce: runOnce,
             refreshSales: refreshSales,
             lockTrade: lockTrade,
             buyTrade: buyTrade,
@@ -2116,7 +2770,6 @@ const __VLS_self = (await import('vue')).defineComponent({
             addManualProtectedAsset: addManualProtectedAsset,
             addManualProtectedMarketHashName: addManualProtectedMarketHashName,
             addManualProtectedSteamId: addManualProtectedSteamId,
-            toggleAutoRun: toggleAutoRun,
         };
     },
 });

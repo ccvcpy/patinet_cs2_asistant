@@ -3,7 +3,7 @@ import FolioIcon from "./components/FolioIcon.vue";
 const pages = [
     { to: "/account", label: "挂刀余额核对", icon: "account" },
     { to: "/steam", label: "Steam余额统计", icon: "wallet" },
-    { to: "/guadao", label: "挂刀报表", icon: "report" },
+    { to: "/guadao/overview", match: "/guadao", label: "挂刀运营", icon: "report" },
     { to: "/case-ratio", label: "箱子挂刀比", icon: "case" },
     { to: "/profit-trade/overview", match: "/profit-trade", label: "搬砖做T", icon: "scan" },
     { to: "/c5-sweeper", label: "C5扫货", icon: "price" },

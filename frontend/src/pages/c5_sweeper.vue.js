@@ -666,8 +666,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
-// CSS variable injection
-// CSS variable injection end
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
     ...{ class: "sweeper-page" },
 });

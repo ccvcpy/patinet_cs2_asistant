@@ -281,8 +281,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['detail-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail-grid']} */ ;
-// CSS variable injection
-// CSS variable injection end
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
     ...{ class: "logs-page" },
 });

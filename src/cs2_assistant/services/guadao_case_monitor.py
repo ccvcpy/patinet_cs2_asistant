@@ -401,6 +401,7 @@ def build_steam_clients_for_monitor(settings: Settings) -> list[SteamMarketClien
                     device_id=account.device_id,
                     account_id=account.id,
                     base_url=settings.steam_market_base_url,
+                    request_source="guadao_monitor",
                 )
             )
         except SteamMarketError:
@@ -411,6 +412,7 @@ def build_steam_clients_for_monitor(settings: Settings) -> list[SteamMarketClien
             SteamMarketClient(
                 cookies=settings.steam_cookies,
                 base_url=settings.steam_market_base_url,
+                request_source="guadao_monitor",
             )
         )
     return clients

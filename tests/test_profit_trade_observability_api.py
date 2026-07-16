@@ -149,6 +149,22 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
                 scan_id="PTSCAN-api-contract",
                 observed_at="2026-07-13T01:02:03+00:00",
             )
+            trade_id = db.add_profit_trade(
+                trade_no="PT-api-linked",
+                market_hash_name=MARKET_HASH_NAME,
+                status="steam_bought",
+                step_key="steam_bought",
+                step_index=3,
+                steam_buy_price=100.0,
+                note=json.dumps(
+                    {
+                        "source": "profit_trade_scan",
+                        "originScanId": "PTSCAN-api-contract",
+                        "steamBuySucceededAt": "2026-07-13T01:03:04+00:00",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
         finally:
             db.close()
 
@@ -161,6 +177,8 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         self.assertEqual({"items", "total", "page", "pageSize"}, {key for key in payload if key in {"items", "total", "page", "pageSize"}})
         self.assertEqual("observe_only", payload["items"][0]["executionStatus"])
         self.assertEqual("below_min_roi", payload["items"][0]["executionStatusCode"])
+        self.assertEqual(trade_id, payload["items"][0]["latestTrade"]["tradeId"])
+        self.assertEqual("steam_bought", payload["items"][0]["latestTrade"]["status"])
 
         query = urlencode(
             {
@@ -178,6 +196,48 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         self.assertEqual(200, history_status)
         self.assertEqual(1, history["total"])
         self.assertEqual("PTSCAN-api-contract", history["items"][0]["scanId"])
+        self.assertEqual(trade_id, history["items"][0]["relatedTrade"]["tradeId"])
+        self.assertEqual("steam_bought", history["items"][0]["relatedTrade"]["status"])
+
+    def test_dashboard_roi_watch_and_interruptions_expose_persistent_listings_circuit(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.set_profit_trade_runtime_state(
+                "steam_search_listings",
+                {
+                    "status": "open",
+                    "reason": "Steam listings HTTP 429 cooldown",
+                    "first429At": "2026-07-16T05:00:00+00:00",
+                    "last429At": "2026-07-16T05:01:00+00:00",
+                    "cooldownUntil": "2099-07-16T05:11:00+00:00",
+                    "nextProbeAt": "2099-07-16T05:11:00+00:00",
+                    "consecutive429Count": 3,
+                    "triggerAccountName": "xiaodigu11",
+                },
+            )
+        finally:
+            db.close()
+
+        dashboard_status, dashboard = self._request("GET", "/api/profit-trade/dashboard")
+        self.assertEqual(200, dashboard_status)
+        self.assertEqual("open", dashboard["listingsCircuit"]["status"])
+        self.assertTrue(dashboard["listingsCircuit"]["isBlocking"])
+        self.assertEqual("xiaodigu11", dashboard["listingsCircuit"]["triggerAccountName"])
+
+        watch_status, watch = self._request(
+            "GET",
+            "/api/profit-trade/roi-watch?active=true&page=1&pageSize=12&sort=roi_desc",
+        )
+        self.assertEqual(200, watch_status)
+        self.assertEqual("open", watch["listingsCircuit"]["status"])
+
+        interruptions_status, interruptions = self._request(
+            "GET",
+            "/api/profit-trade/interruptions?acknowledged=exclude&page=1&pageSize=20",
+        )
+        self.assertEqual(200, interruptions_status)
+        self.assertEqual("open", interruptions["listingsCircuit"]["status"])
 
     def test_interruption_endpoint_searches_chinese_name_and_rejects_completed(self) -> None:
         db = Database(self.settings.db_path)
@@ -434,6 +494,111 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
             db.close()
         self.assertEqual("SECRET_TOKEN_SENTINEL", stored_note["token"])
         self.assertEqual("SECRET_STYLE_TOKEN_SENTINEL", stored_note["styleToken"])
+
+    def test_manual_record_create_update_and_safe_account_options(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.conn.execute(
+                """
+                INSERT INTO items (
+                    market_hash_name, name_cn, raw_json, imported_at, updated_at
+                ) VALUES (?, ?, '{}', ?, ?)
+                """,
+                (
+                    "M4A4 | Temukau (Field-Tested)",
+                    "M4A4 | 反冲精英（略有磨损）",
+                    "2026-07-14T00:00:00+00:00",
+                    "2026-07-14T00:00:00+00:00",
+                ),
+            )
+            db.conn.commit()
+        finally:
+            db.close()
+        search_status, search = self._request(
+            "GET",
+            f"/api/profit-trade/items/search?{urlencode({'query': '反冲', 'limit': 20})}",
+        )
+        self.assertEqual(200, search_status)
+        self.assertEqual("M4A4 | Temukau (Field-Tested)", search["items"][0]["marketHashName"])
+
+        create_status, created = self._request(
+            "POST",
+            "/api/profit-trade/manual-record/create",
+            body={
+                "marketHashName": "Dreams & Nightmares Case",
+                "name": "梦魇武器箱",
+                "steamAccountId": None,
+                "steamBuyPrice": 10.0,
+                "balanceDiscount": 0.69,
+                "c5SoldNetPrice": 8.0,
+                "steamBoughtAt": "2026-07-14T10:00:00+08:00",
+                "completedAt": "2026-07-14T11:00:00+08:00",
+                "aAssetId": "asset-a",
+                "bAssetId": "asset-b",
+                "memo": "manual API test",
+            },
+        )
+        self.assertEqual(200, create_status)
+        self.assertTrue(created["ok"])
+        self.assertEqual("manual_backfill", created["trade"]["recordOrigin"])
+        trade_id = created["trade"]["id"]
+
+        update_status, updated = self._request(
+            "POST",
+            "/api/profit-trade/manual-record/update",
+            body={
+                "tradeId": trade_id,
+                "marketHashName": "Dreams & Nightmares Case",
+                "name": "梦魇武器箱",
+                "steamAccountId": None,
+                "steamBuyPrice": 11.0,
+                "balanceDiscount": 0.68,
+                "c5SoldNetPrice": 9.0,
+                "steamBoughtAt": "2026-07-13T10:00:00+08:00",
+                "completedAt": "2026-07-13T11:00:00+08:00",
+                "aAssetId": "asset-a",
+                "bAssetId": "asset-b",
+                "memo": "corrected API test",
+            },
+        )
+        self.assertEqual(200, update_status)
+        self.assertTrue(updated["trade"]["manuallyEdited"])
+        self.assertAlmostEqual(7.48, updated["trade"]["steamRealCost"])
+        self.assertEqual("2026-07-13T02:00:00+00:00", updated["trade"]["steamBoughtAt"])
+
+        dashboard_status, dashboard = self._request("GET", "/api/profit-trade/dashboard")
+        self.assertEqual(200, dashboard_status)
+        self.assertEqual(trade_id, dashboard["trades"][0]["id"])
+        for account in dashboard["manualEntryOptions"]["accounts"]:
+            self.assertEqual({"accountId", "name", "steamId"}, set(account))
+
+    def test_manual_record_update_rejects_non_completed_trade(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            trade_id = db.add_profit_trade(
+                trade_no="PT-api-not-completed",
+                market_hash_name="Dreams & Nightmares Case",
+                status="candidate",
+            )
+        finally:
+            db.close()
+        status, payload = self._request(
+            "POST",
+            "/api/profit-trade/manual-record/update",
+            body={
+                "tradeId": trade_id,
+                "marketHashName": "Dreams & Nightmares Case",
+                "steamBuyPrice": 10.0,
+                "balanceDiscount": 0.69,
+                "c5SoldNetPrice": 8.0,
+                "steamBoughtAt": "2026-07-14T10:00:00+08:00",
+                "completedAt": "2026-07-14T11:00:00+08:00",
+            },
+        )
+        self.assertEqual(409, status)
+        self.assertFalse(payload["ok"])
 
 
 if __name__ == "__main__":

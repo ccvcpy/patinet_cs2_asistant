@@ -3,7 +3,7 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from "vue-rou
 const legacyRoutes: Record<string, string> = {
   account: "/account",
   steam: "/steam",
-  guadao: "/guadao",
+  guadao: "/guadao/overview",
   "case-ratio": "/case-ratio",
   "profit-trade": "/profit-trade/overview",
   "c5-sweeper": "/c5-sweeper",
@@ -34,7 +34,19 @@ const routes: RouteRecordRaw[] = [
   { path: "/", redirect: "/profit-trade/overview" },
   { path: "/account", component: () => import("./pages/account_profit.vue") },
   { path: "/steam", component: () => import("./pages/steam_balances.vue") },
-  { path: "/guadao", component: () => import("./pages/guadao_report.vue") },
+  {
+    path: "/guadao",
+    component: () => import("./pages/guadao_layout.vue"),
+    children: [
+      { path: "", redirect: { name: "guadao-overview" } },
+      { path: "overview", name: "guadao-overview", component: () => import("./pages/guadao_overview.vue") },
+      { path: "operations", name: "guadao-operations", component: () => import("./pages/guadao_operations.vue") },
+      { path: "issues", name: "guadao-issues", component: () => import("./pages/guadao_issues.vue") },
+      { path: "logs", name: "guadao-logs", component: () => import("./pages/guadao_logs.vue") },
+      { path: "settings", name: "guadao-settings", component: () => import("./pages/guadao_settings.vue") },
+      { path: "report", name: "guadao-report", component: () => import("./pages/guadao_report.vue") },
+    ],
+  },
   { path: "/case-ratio", component: () => import("./pages/case_ratio_monitor.vue") },
   { path: "/c5-sweeper", component: () => import("./pages/c5_sweeper.vue") },
   {

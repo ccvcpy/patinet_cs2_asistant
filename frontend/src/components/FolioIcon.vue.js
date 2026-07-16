@@ -4,8 +4,8 @@ const __VLS_withDefaultsArg = (function (t) { return t; })({ size: 18, strokeWid
 const __VLS_ctx = {};
 let __VLS_components;
 let __VLS_directives;
-// CSS variable injection
-// CSS variable injection end
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.svg, __VLS_intrinsicElements.svg)({
     ...{ class: "folio-icon" },
     viewBox: "0 0 24 24",
@@ -125,6 +125,14 @@ else if (__VLS_ctx.name === 'error') {
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
         d: "m9 9 6 6m0-6-6 6",
+    });
+}
+else if (__VLS_ctx.name === 'edit') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16v4Z",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m13.5 6.5 4 4M12 20h8",
     });
 }
 else {

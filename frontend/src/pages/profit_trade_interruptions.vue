@@ -20,11 +20,18 @@ type StateEvent = {
   logEventId?: string | null;
 };
 type StepCount = { stepKey: string; stepIndex: number; count: number };
+type ListingsCircuit = {
+  status?: "closed" | "open" | "half_open"; isBlocking?: boolean;
+  nextProbeAt?: string | null; cooldownUntil?: string | null;
+  triggerAccountName?: string | null; triggerAccountId?: string | null;
+  consecutive429Count?: number; lastRecoveredAt?: string | null;
+};
 type InterruptionResponse = {
   items: Interruption[]; total: number; page: number; pageSize: number;
   summary?: { total?: number; stepCounts?: StepCount[] }; stepCounts?: StepCount[];
+  listingsCircuit?: ListingsCircuit;
 };
-type TimelineResponse = { trade: Interruption; events: StateEvent[] };
+type TimelineResponse = { trade: Interruption; events: StateEvent[]; listingsCircuit?: ListingsCircuit };
 
 const steps = [
   { key: "discovered", label: "发现机会", index: 0 }, { key: "audited", label: "审计", index: 1 },
@@ -56,6 +63,7 @@ const timelineError = ref("");
 const acknowledgeReason = ref("");
 const actionBusy = ref(false);
 const actionMessage = ref("");
+const listingsCircuit = ref<ListingsCircuit>({ status: "closed", isBlocking: false });
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 
 function stepCount(index: number): number {
@@ -106,6 +114,11 @@ function evidenceLabel(trade: Interruption, field: "purchaseRequestSent"|"listin
   if (field === "purchaseRequestSent") return resolved ? "已发送" : "未发送";
   return resolved ? "已取得" : "未取得";
 }
+function isListings429Interruption(trade: Interruption): boolean {
+  const source = String(trade.cancelSource || trade.note?.cancelSource || "").toLowerCase();
+  const detail = `${reason(trade)} ${String(trade.note?.searchListingsError || "")}`.toLowerCase();
+  return source.includes("search_listings_429") || source.includes("listings_circuit") || detail.includes("429");
+}
 async function responseError(response: Response): Promise<string> {
   try { const payload = await response.json() as { error?: string; detail?: string }; return payload.error || payload.detail || response.statusText; }
   catch { return response.statusText; }
@@ -123,6 +136,7 @@ async function load(): Promise<void> {
     const payload = await response.json() as InterruptionResponse;
     rows.value = Array.isArray(payload.items) ? payload.items : []; total.value = Number(payload.total) || 0;
     stepCounts.value = payload.summary?.stepCounts || payload.stepCounts || [];
+    listingsCircuit.value = payload.listingsCircuit || { status: "closed", isBlocking: false };
     const queryTradeNo = typeof route.query.tradeNo === "string" ? route.query.tradeNo : "";
     const nextSelected = rows.value.find(item => item.tradeNo === queryTradeNo)
       || rows.value.find(item => item.id === selected.value?.id) || rows.value[0] || null;
@@ -142,6 +156,7 @@ async function selectTrade(trade: Interruption): Promise<void> {
     if (!response.ok) throw new Error(await responseError(response));
     const payload = await response.json() as TimelineResponse;
     selected.value = payload.trade || trade; timeline.value = Array.isArray(payload.events) ? payload.events : [];
+    listingsCircuit.value = payload.listingsCircuit || listingsCircuit.value;
   } catch (cause) { timeline.value = []; timelineError.value = `时间线读取失败：${cause instanceof Error ? cause.message : String(cause)}`; }
   finally { timelineLoading.value = false; }
 }
@@ -183,6 +198,10 @@ onMounted(() => void load());
     </form>
     <p v-if="error" class="page-error">{{ error }}。不会使用静态数据替代。</p>
     <p v-if="actionMessage" class="action-message global-message">{{ actionMessage }}</p>
+    <section v-if="listingsCircuit.isBlocking" class="interruption-circuit">
+      <div><strong>Steam listings 冷却仍在生效</strong><span>中断流水永久保留；恢复的是查询路由，不会把旧流水改成成功。</span></div>
+      <dl><div><dt>触发账号</dt><dd>{{ listingsCircuit.triggerAccountName || listingsCircuit.triggerAccountId || "-" }}</dd></div><div><dt>连续429</dt><dd>{{ listingsCircuit.consecutive429Count || 0 }}次</dd></div><div><dt>下次探测</dt><dd>{{ time(listingsCircuit.nextProbeAt || listingsCircuit.cooldownUntil) }}</dd></div></dl>
+    </section>
 
     <section class="master-detail">
       <aside class="trade-list panel">
@@ -204,6 +223,11 @@ onMounted(() => void load());
           <section class="process"><div v-for="step in steps" :key="step.key" :class="step.index < selected.stepIndex ? 'done' : step.index === selected.stepIndex ? 'stopped' : 'pending'"><span>{{ step.index + 1 }}</span><strong>{{ step.label }}</strong><small>{{ step.index < selected.stepIndex ? "已完成" : step.index === selected.stepIndex ? "停止位置" : "未开始" }}</small></div></section>
 
           <section class="stop-evidence"><div><p>停止原因</p><strong>{{ reason(selected) }}</strong></div><dl><div><dt>中断来源</dt><dd>{{ selected.cancelSource || note(selected,"cancelSource") }}</dd></div><div><dt>中断时间</dt><dd>{{ time(selected.completedAt || selected.updatedAt) }}</dd></div><div><dt>A assetId</dt><dd>{{ selected.aAssetId || "-" }}</dd></div><div><dt>A Steam账号</dt><dd>{{ selected.aSteamId || "-" }}</dd></div><div><dt>B assetId</dt><dd>{{ selected.bAssetId || "未获得" }}</dd></div><div><dt>Steam 买入价</dt><dd>{{ money(selected.steamBuyPrice) }}</dd></div><div><dt>预计 ROI</dt><dd>{{ pct(selected.expectedRoiPct) }}</dd></div><div><dt>listingId 获取</dt><dd>{{ evidenceLabel(selected,"listingIdObtained") }}</dd></div><div><dt>购买请求</dt><dd>{{ evidenceLabel(selected,"purchaseRequestSent") }}</dd></div></dl></section>
+          <section v-if="isListings429Interruption(selected)" class="listings-evidence">
+            <strong>这笔流水没有取得 listingId，也没有发送新的 Steam 购买请求。</strong>
+            <span v-if="listingsCircuit.isBlocking">程序会在 {{ time(listingsCircuit.nextProbeAt || listingsCircuit.cooldownUntil) }} 进行一次恢复探测；恢复前不会重新创建同资产执行流水。</span>
+            <span v-else>Steam listings 路由当前已恢复；这张卡片仍作为历史中断保留，后续机会会重新评估。</span>
+          </section>
 
           <section class="timeline"><div class="section-heading"><h3>永久状态时间线</h3><span>{{ timeline.length }} 条事件</span></div><p v-if="timelineError" class="page-error">{{ timelineError }}</p><div v-if="timelineLoading" class="empty">正在读取时间线…</div><div v-else-if="timeline.length === 0" class="empty">历史流水只有当前快照，未伪造缺失的中间事件。</div><ol v-else><li v-for="(event,index) in timeline" :key="event.id || index" :class="{ snapshot:event.isSnapshot }"><span></span><div><header><strong>{{ event.eventType || (event.isSnapshot ? "历史快照" : "状态迁移") }}</strong><time>{{ time(event.createdAt) }}</time></header><p>{{ event.statusFrom || "-" }} → {{ event.statusTo || "-" }} · {{ event.stepKeyFrom || "-" }} → {{ event.stepKeyTo || "-" }}</p><small>{{ event.reason || "未记录补充原因" }}</small></div></li></ol></section>
 
@@ -218,9 +242,11 @@ onMounted(() => void load());
 .interruptions-page{width:min(1280px,calc(100vw - 40px));margin:0 auto;padding:22px 0 38px;display:grid;gap:14px;color:#17201c}.page-title{display:flex;justify-content:space-between;align-items:flex-start}.page-title h1{margin:0;font-size:24px}.page-title p:not(.eyebrow){margin:6px 0;color:#6f7872;font-size:12px}.refresh,.log-link{display:inline-flex;align-items:center;gap:6px}
 .step-summary{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}.step-summary button{display:flex;align-items:center;gap:9px;padding:11px;border:1px solid #dfe5df;border-radius:8px;text-align:left;color:#27342d;background:#fff}.step-summary button>span{display:grid;place-items:center;width:25px;height:25px;border-radius:50%;color:#647068;background:#edf1ed;font-size:11px}.step-summary button div{display:grid}.step-summary strong{font-size:17px}.step-summary small{color:#77817b;font-size:10px}.step-summary button.active{border-color:#75a68d;background:#edf6f0}.step-summary button.active>span{color:#fff;background:#236a4c}
 .filter-bar{display:grid;grid-template-columns:minmax(210px,1.5fr) repeat(4,minmax(125px,1fr)) auto auto;gap:8px;align-items:end;padding:12px;border:1px solid #dfe5df;border-radius:9px;background:#fff}.filter-bar label{display:grid;gap:4px;min-width:0}.filter-bar label span{color:#6f7872;font-size:10px;font-weight:650}.filter-bar input,.filter-bar select{min-width:0;min-height:35px;border:1px solid #d6ddd6;border-radius:6px;padding:6px 8px;background:#fff}.page-error{margin:0;padding:9px 11px;border:1px solid #e6b6af;border-radius:7px;color:#8c382f;background:#fff7f5;font-size:12px}
+.interruption-circuit{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px 13px;border:1px solid #dfc77e;border-radius:8px;color:#5f5127;background:#fff9e9}.interruption-circuit>div{display:grid;gap:2px}.interruption-circuit strong{font-size:12px}.interruption-circuit span{color:#786b43;font-size:10px}.interruption-circuit dl{display:flex;gap:16px;margin:0}.interruption-circuit dl>div{display:grid}.interruption-circuit dt{color:#8a7d53;font-size:9px}.interruption-circuit dd{margin:1px 0 0;font-size:10px;font-weight:700;white-space:nowrap}
 .master-detail{display:grid;grid-template-columns:370px minmax(0,1fr);gap:12px;align-items:start}.trade-list,.detail{padding:0;border-color:#dfe5df;overflow:hidden}.trade-list>header{display:flex;justify-content:space-between;align-items:end;padding:14px;border-bottom:1px solid #e3e8e3}.trade-list>header>div{display:flex;align-items:baseline;gap:8px}.trade-list h2{margin:0;font-size:16px}.trade-list header span,.trade-list header small{color:#77817b;font-size:11px}.trade-item{display:grid;width:100%;gap:5px;padding:12px 14px;border:0;border-bottom:1px solid #e8ece8;text-align:left;color:#17201c;background:#fff}.trade-item:hover,.trade-item.selected{background:#f0f6f2}.trade-item.selected{box-shadow:inset 3px 0 #236a4c}.trade-item-head,.stop-line{display:flex;justify-content:space-between;gap:8px;align-items:center}.trade-item time,.trade-item small{color:#7a837e;font-size:10px}.trade-item>strong{overflow-wrap:anywhere}.trade-item>p{margin:0;color:#735148;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.stop-line span{color:#4f5e56;font-size:11px;font-weight:650}.stop-line em{color:#68726c;font-size:9px;font-style:normal}.status{padding:3px 6px;border-radius:999px;font-size:9px;font-weight:750}.status.cancelled{color:#6b5b31;background:#f6f0dc}.status.failed{color:#923c33;background:#fbe9e6}.status.manual{color:#8a4b26;background:#faebdf}.list-pagination{display:flex;justify-content:space-between;align-items:center;padding:10px 14px}.list-pagination button{border:1px solid #d8ded8;border-radius:5px;padding:4px 8px;background:#fff}.list-pagination span{color:#78817c;font-size:10px}.empty{display:grid;place-items:center;min-height:90px;color:#7a837e;font-size:12px}.empty.large{min-height:520px}
 .detail{padding:17px}.detail-head{display:flex;justify-content:space-between;gap:20px;padding-bottom:14px;border-bottom:1px solid #e2e7e2}.detail-badges{display:flex;gap:6px;align-items:center}.detail-badges>span:not(.status){padding:3px 6px;border-radius:999px;color:#66716b;background:#edf1ed;font-size:9px}.detail-head h2{margin:8px 0 2px;font-size:19px}.detail-head p,.detail-head small{margin:0;color:#77817b;font-size:11px}.log-link{height:max-content;padding:7px 10px;border:1px solid #b8cfc1;border-radius:7px;color:#205f45;text-decoration:none;background:#f2f8f4;font-size:11px;font-weight:700}
 .process{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin:17px 0}.process>div{position:relative;display:grid;justify-items:center;gap:3px;text-align:center}.process>div:not(:last-child)::after{content:"";position:absolute;left:64%;right:-36%;top:12px;height:2px;background:#dfe4df}.process>div.done::after{background:#7dac93}.process>div>span{z-index:1;display:grid;place-items:center;width:25px;height:25px;border:2px solid #d9dfda;border-radius:50%;color:#738079;background:#fff;font-size:10px}.process>div.done>span{border-color:#2f7956;color:#fff;background:#2f7956}.process>div.stopped>span{border-color:#b7564b;color:#b0443a;background:#fff0ed}.process strong{font-size:10px}.process small{color:#7b847f;font-size:9px}.stop-evidence{padding:13px;border:1px solid #ead8d2;border-radius:8px;background:#fff9f7}.stop-evidence>div>p{margin:0;color:#8a5b51;font-size:10px}.stop-evidence>div>strong{color:#7f372f;font-size:12px}.stop-evidence dl{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:12px 0 0}.stop-evidence dt{color:#7b847f;font-size:9px}.stop-evidence dd{margin:2px 0 0;font-size:10px;font-weight:650;overflow-wrap:anywhere}
+.listings-evidence{display:grid;gap:4px;margin-top:8px;padding:10px 12px;border:1px solid #dfc77e;border-radius:8px;color:#604f20;background:#fff9e9}.listings-evidence strong{font-size:11px}.listings-evidence span{color:#786b43;font-size:10px}
 .timeline{margin-top:16px}.section-heading{display:flex;justify-content:space-between}.section-heading h3,.acknowledge h3{margin:0;font-size:14px}.section-heading span{color:#7a837e;font-size:10px}.timeline ol{display:grid;gap:0;margin:12px 0;padding:0;list-style:none}.timeline li{display:grid;grid-template-columns:18px 1fr;gap:8px;min-height:62px}.timeline li>span{position:relative;width:9px;height:9px;margin-top:4px;border:2px solid #2d7654;border-radius:50%;background:#fff}.timeline li:not(:last-child)>span::after{content:"";position:absolute;left:2px;top:9px;width:1px;height:49px;background:#cfdbd2}.timeline li.snapshot>span{border-color:#a7afa9}.timeline li header{display:flex;justify-content:space-between}.timeline li header strong{font-size:11px}.timeline li time,.timeline li small{color:#7a837e;font-size:9px}.timeline li p{margin:3px 0;color:#4f5d55;font-size:10px}
 .acknowledge{display:grid;grid-template-columns:1fr minmax(220px,330px) auto;gap:12px;align-items:center;margin-top:8px;padding:12px;border:1px solid #e1e6e1;border-radius:8px;background:#f7f9f6}.acknowledge p{margin:4px 0 0;color:#707a74;font-size:10px}.acknowledge input{min-height:34px;border:1px solid #d5dcd6;border-radius:6px;padding:6px 8px}.secondary-button.danger{color:#893a32;border-color:#d9aaa4;background:#fff7f5}.action-message{margin:8px 0 0;padding:8px;border-radius:6px;color:#4d5c54;background:#edf3ef;font-size:11px}.global-message{margin:0;border:1px solid #d5e4d9}
 </style>

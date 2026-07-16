@@ -166,6 +166,20 @@ _STEAM_CURRENCY_CODES = {
     32: "AED",
 }
 
+_STEAM_DESKTOP_HTML_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
+}
+
 
 def _steam_wallet_amount(raw: Any) -> float | None:
     if raw is None:
@@ -361,6 +375,7 @@ class SteamMarketClient:
         timeout: int = 30,
         telemetry_callback: SteamTelemetryCallback | None = None,
         telemetry_context: Mapping[str, Any] | None = None,
+        request_source: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity_secret = _normalize_identity_secret(identity_secret) if identity_secret else identity_secret
@@ -375,6 +390,7 @@ class SteamMarketClient:
             if key in _STEAM_TELEMETRY_CONTEXT_FIELDS
         }
         self._telemetry_client_instance_id = f"steam_{uuid.uuid4().hex}"
+        self._request_source = str(request_source or "cli").strip() or "cli"
 
         self._session = requests.Session()
         self._session.headers.update(
@@ -507,6 +523,8 @@ class SteamMarketClient:
         attempt: int,
         request: Callable[[], requests.Response],
         safe_context: Mapping[str, Any] | None = None,
+        priority_override: int | None = None,
+        execution_guard: Callable[[], bool] | None = None,
     ) -> requests.Response:
         request_id = f"steam_req_{uuid.uuid4().hex}"
         operation = self._telemetry_operation(path)
@@ -523,7 +541,47 @@ class SteamMarketClient:
             safe_context={"phase": "start", **context},
         )
         try:
-            response = request()
+            from cs2_assistant.services.steam_request_scheduler import (
+                SteamRequestPriority,
+                get_shared_steam_scheduler,
+            )
+
+            priority = SteamRequestPriority.P3_OBSERVATION
+            if operation in {
+                "remove_listing",
+                "cancel_buy_order",
+                "confirm_market_action",
+                "list_confirmations",
+            }:
+                priority = SteamRequestPriority.P0_SAFETY
+            elif operation in {
+                "buy_listing",
+                "create_buy_order",
+                "search_listings",
+                "sell_item",
+                "get_trade_url",
+            }:
+                priority = SteamRequestPriority.P1_EXECUTION
+            elif operation in {"my_listings", "market_history"}:
+                priority = SteamRequestPriority.P2_SYNC
+            if self._request_source in {"cli", "account_balance"}:
+                priority = min(priority, SteamRequestPriority.P1_EXECUTION)
+            if priority_override is not None:
+                priority = SteamRequestPriority(int(priority_override))
+            response = get_shared_steam_scheduler().call(
+                method=method,
+                url=f"{self.base_url}{path}",
+                callback=request,
+                account=self.account_id or str(getattr(self, "steam_id64", "") or "") or None,
+                route=path,
+                priority=priority,
+                source=self._request_source,
+                operation=operation,
+                metadata={"attempt": int(attempt), **context},
+                quiet_before=self._request_source == "profit_trade" and operation == "search_listings",
+                bounded_retry=bool(context.get("boundedRetry")),
+                execution_guard=execution_guard,
+            )
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
             self._emit_telemetry(
@@ -573,6 +631,10 @@ class SteamMarketClient:
         files: Any | None = None,
         headers: dict[str, str] | None = None,
         _allow_retry: bool = True,
+        _scheduler_bounded_retry: bool = False,
+        _scheduler_priority: int | None = None,
+        _scheduler_execution_guard: Callable[[], bool] | None = None,
+        _scheduler_metadata: Mapping[str, Any] | None = None,
     ) -> requests.Response:
         url = f"{self.base_url}{path}"
         merged_headers = dict(headers or {})
@@ -582,6 +644,9 @@ class SteamMarketClient:
             response = None
             for attempt in range(attempts):
                 try:
+                    request_context = dict(_scheduler_metadata or {})
+                    if _scheduler_bounded_retry:
+                        request_context["boundedRetry"] = True
                     response = self._request_with_telemetry(
                         method=method,
                         path=path,
@@ -595,6 +660,9 @@ class SteamMarketClient:
                             headers=merged_headers,
                             timeout=self.timeout,
                         ),
+                        safe_context=request_context or None,
+                        priority_override=_scheduler_priority,
+                        execution_guard=_scheduler_execution_guard,
                     )
                     break
                 except (requests.Timeout, requests.ConnectionError) as exc:
@@ -618,7 +686,13 @@ class SteamMarketClient:
                         headers=merged_headers,
                         timeout=self.timeout,
                     ),
-                    safe_context={"after_relogin": True},
+                    safe_context={
+                        **dict(_scheduler_metadata or {}),
+                        "after_relogin": True,
+                        **({"boundedRetry": True} if _scheduler_bounded_retry else {}),
+                    },
+                    priority_override=_scheduler_priority,
+                    execution_guard=_scheduler_execution_guard,
                 )
             response.raise_for_status()
         except requests.RequestException as exc:
@@ -650,8 +724,17 @@ class SteamMarketClient:
             return match.group(0)
         raise SteamMarketError("无法从页面提取交易链接，请确认账号已登录且交易链接已启用")
 
-    def wallet_balance(self) -> dict[str, Any]:
-        response = self._request("GET", "/market/")
+    def wallet_balance(self, *, safety_terminal: bool = False) -> dict[str, Any]:
+        # Steam's market home page is a desktop HTML flow. It can redirect via
+        # /market/eligibilitycheck/ before returning g_rgWalletInfo. Reusing the
+        # client's mobile/API headers here causes Steam to return a 429 page.
+        scheduler_options = {"_scheduler_priority": 0} if safety_terminal else {}
+        response = self._request(
+            "GET",
+            "/market/",
+            headers=dict(_STEAM_DESKTOP_HTML_HEADERS),
+            **scheduler_options,
+        )
         match = re.search(r"g_rgWalletInfo\s*=\s*(\{.*?\});", response.text, re.S)
         if not match:
             raise SteamMarketError("Steam wallet info not found")
@@ -699,6 +782,7 @@ class SteamMarketClient:
         price: float,
         quantity: int = 1,
         steam_net_factor: float = 0.869,
+        execution_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """List an item on the Steam market.
 
@@ -731,6 +815,11 @@ class SteamMarketClient:
             "price": seller_net_cents,
         }
         profile_inventory_url = f"{self.base_url}/profiles/{self.steam_id64}/inventory"
+        scheduler_options = (
+            {"_scheduler_execution_guard": execution_guard}
+            if execution_guard is not None
+            else {}
+        )
         response = self._request(
             "POST",
             "/market/sellitem/",
@@ -745,6 +834,7 @@ class SteamMarketClient:
                 ),
                 "Accept-Language": "zh-CN,zh;q=0.9",
             },
+            **scheduler_options,
         )
         try:
             payload = response.json()
@@ -766,6 +856,7 @@ class SteamMarketClient:
         country: str = "CN",
         tradefee_tax: int = 0,
         market_hash_name: str | None = None,
+        execution_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not listing_id:
             raise SteamMarketError("listing_id is required")
@@ -822,7 +913,11 @@ class SteamMarketClient:
                     timeout=self.timeout,
                     allow_redirects=False,
                 ),
-                safe_context={"confirmation_round": confirmation != "0"},
+                safe_context={
+                    "confirmation_round": confirmation != "0",
+                    "marketHashName": market_hash_name,
+                },
+                execution_guard=execution_guard,
             )
             try:
                 payload = response.json()
@@ -867,6 +962,7 @@ class SteamMarketClient:
         currency: int = 23,
         country: str = "CN",
         return_uncertain_after_confirmation: bool = False,
+        execution_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not market_hash_name:
             raise SteamMarketError("market_hash_name is required")
@@ -917,7 +1013,11 @@ class SteamMarketClient:
                     timeout=self.timeout,
                     allow_redirects=False,
                 ),
-                safe_context={"confirmation_round": confirmation != "0"},
+                safe_context={
+                    "confirmation_round": confirmation != "0",
+                    "marketHashName": market_hash_name,
+                },
+                execution_guard=execution_guard,
             )
             try:
                 payload = response.json()
@@ -1006,6 +1106,7 @@ class SteamMarketClient:
         currency: int = 23,
         country: str = "CN",
         language: str = "schinese",
+        bounded_retry: bool = False,
     ) -> dict[str, Any]:
         encoded_name = quote(market_hash_name, safe="")
         params = {
@@ -1025,6 +1126,9 @@ class SteamMarketClient:
         # Steam's current market UI no longer returns the legacy JSON from
         # /render/. The React route action behind the new page returns concrete
         # listing ids with unPrice/unFee, which are the values buylisting needs.
+        scheduler_options = (
+            {"_scheduler_bounded_retry": True} if bounded_retry else {}
+        )
         response = self._request(
             "POST",
             f"/market/listings/{app_id}/{encoded_name}",
@@ -1042,6 +1146,8 @@ class SteamMarketClient:
                 "X-Valve-Request-Type": "routeAction",
                 "X-Valve-Action-Type": "4OPT6VBA:Search",
             },
+            _scheduler_metadata={"marketHashName": market_hash_name},
+            **scheduler_options,
         )
         try:
             payload = response.json()
@@ -1082,6 +1188,7 @@ class SteamMarketClient:
                 ),
                 "X-Requested-With": "XMLHttpRequest",
             },
+            _scheduler_metadata={"marketHashName": market_hash_name},
         )
         try:
             payload = response.json()
@@ -1115,6 +1222,7 @@ class SteamMarketClient:
                     "AppleWebKit/537.36 Chrome/124 Safari/537.36"
                 ),
             },
+            _scheduler_metadata={"marketHashName": market_hash_name},
         )
         try:
             payload = response.json()
@@ -1150,6 +1258,7 @@ class SteamMarketClient:
                     "AppleWebKit/537.36 Chrome/124 Safari/537.36"
                 ),
             },
+            _scheduler_metadata={"marketHashName": market_hash_name},
         )
         try:
             payload = response.json()
@@ -1159,17 +1268,41 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload
 
-    def my_listings(self, *, start: int = 0, count: int = 100) -> dict[str, Any]:
+    def my_listings(
+        self,
+        *,
+        start: int = 0,
+        count: int = 100,
+        safety_terminal: bool = False,
+    ) -> dict[str, Any]:
         params = {"start": start, "count": count, "norender": 1}
-        response = self._request("GET", "/market/mylistings", params=params)
+        scheduler_options = {"_scheduler_priority": 0} if safety_terminal else {}
+        response = self._request(
+            "GET",
+            "/market/mylistings",
+            params=params,
+            **scheduler_options,
+        )
         try:
             return response.json()
         except ValueError as exc:
             raise SteamMarketError(f"Steam mylistings invalid JSON: {response.text}") from exc
 
-    def market_history(self, *, start: int = 0, count: int = 100) -> dict[str, Any]:
+    def market_history(
+        self,
+        *,
+        start: int = 0,
+        count: int = 100,
+        safety_terminal: bool = False,
+    ) -> dict[str, Any]:
         params = {"query": "", "start": start, "count": count, "norender": 1}
-        response = self._request("GET", "/market/myhistory/render/", params=params)
+        scheduler_options = {"_scheduler_priority": 0} if safety_terminal else {}
+        response = self._request(
+            "GET",
+            "/market/myhistory/render/",
+            params=params,
+            **scheduler_options,
+        )
         try:
             payload = response.json()
         except ValueError as exc:
@@ -1187,6 +1320,7 @@ class SteamMarketClient:
         total_tolerance: float = 0.02,
         count: int = 100,
         max_pages: int = 2,
+        safety_terminal: bool = False,
     ) -> dict[str, Any] | None:
         """Find an official Steam Market purchase event (event_type=4).
 
@@ -1253,7 +1387,11 @@ class SteamMarketClient:
         start = 0
         page_size = max(1, int(count))
         for _ in range(max(1, int(max_pages))):
-            payload = self.market_history(start=start, count=page_size)
+            payload = self.market_history(
+                start=start,
+                count=page_size,
+                safety_terminal=safety_terminal,
+            )
             events = payload.get("events") or []
             purchases = payload.get("purchases") or {}
             assets = payload.get("assets") or {}
@@ -1318,41 +1456,11 @@ class SteamMarketClient:
         listing_id = str(listing_id or "").strip()
         if not listing_id:
             return None
-        start = 0
-        for _ in range(max(1, int(max_pages))):
-            payload = self.market_history(start=start, count=count)
-            events = payload.get("events") or []
-            purchases = payload.get("purchases") or {}
-            if not isinstance(events, list) or not events:
-                return None
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-                if str(event.get("listingid") or "") != listing_id:
-                    continue
-                if int(event.get("event_type") or 0) != 3:
-                    continue
-                purchase_id = str(event.get("purchaseid") or "")
-                purchase = {}
-                if isinstance(purchases, dict):
-                    purchase = purchases.get(f"{listing_id}_{purchase_id}") or purchases.get(listing_id) or {}
-                received_amount = purchase.get("received_amount") if isinstance(purchase, dict) else None
-                try:
-                    received_value = float(received_amount) / 100.0 if received_amount is not None else None
-                except (TypeError, ValueError):
-                    received_value = None
-                return {
-                    "listingId": listing_id,
-                    "purchaseId": purchase_id,
-                    "timeSold": purchase.get("time_sold") or event.get("time_event"),
-                    "receivedAmount": received_value,
-                    "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
-                }
-            start += int(count)
-            total = payload.get("total_count")
-            if total is not None and start >= int(total):
-                return None
-        return None
+        return self.find_sale_receipts_for_targets(
+            [{"key": "target", "listingId": listing_id, "assetId": ""}],
+            count=count,
+            max_pages=max_pages,
+        ).get("target")
 
     def find_sale_receipt_by_asset(
         self,
@@ -1364,13 +1472,54 @@ class SteamMarketClient:
         asset_id = str(asset_id or "").strip()
         if not asset_id:
             return None
+        return self.find_sale_receipts_for_targets(
+            [{"key": "target", "listingId": "", "assetId": asset_id}],
+            count=count,
+            max_pages=max_pages,
+        ).get("target")
+
+    def find_sale_receipts_for_targets(
+        self,
+        targets: list[dict[str, str]],
+        *,
+        count: int = 100,
+        max_pages: int = 3,
+    ) -> dict[str, dict[str, Any]]:
+        """Find multiple sale receipts from one shared market-history walk.
+
+        Steam market history is account-scoped, so fetching the same pages once
+        and matching every due operation avoids multiplying requests by the
+        number of local listings.  A caller-provided key keeps the result
+        stable even when either the listing id or asset id is missing.
+        """
+
+        normalized: dict[str, tuple[str, str]] = {}
+        listing_keys: dict[str, set[str]] = {}
+        asset_keys: dict[str, set[str]] = {}
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            key = str(target.get("key") or "").strip()
+            listing_id = str(target.get("listingId") or "").strip()
+            asset_id = str(target.get("assetId") or "").strip()
+            if not key or (not listing_id and not asset_id):
+                continue
+            normalized[key] = (listing_id, asset_id)
+            if listing_id:
+                listing_keys.setdefault(listing_id, set()).add(key)
+            if asset_id:
+                asset_keys.setdefault(asset_id, set()).add(key)
+        if not normalized:
+            return {}
+
+        receipts: dict[str, dict[str, Any]] = {}
         start = 0
         for _ in range(max(1, int(max_pages))):
             payload = self.market_history(start=start, count=count)
             events = payload.get("events") or []
             purchases = payload.get("purchases") or {}
             if not isinstance(events, list) or not events:
-                return None
+                return receipts
             for event in events:
                 if not isinstance(event, dict):
                     continue
@@ -1389,25 +1538,33 @@ class SteamMarketClient:
                     or (purchase_asset or {}).get("id")
                     or ""
                 ).strip()
-                if event_asset_id != asset_id:
+                matching_keys = set(listing_keys.get(listing_id) or set())
+                if event_asset_id:
+                    matching_keys.update(asset_keys.get(event_asset_id) or set())
+                matching_keys.difference_update(receipts)
+                if not matching_keys:
                     continue
                 received_amount = purchase.get("received_amount") if isinstance(purchase, dict) else None
                 try:
                     received_value = float(received_amount) / 100.0 if received_amount is not None else None
                 except (TypeError, ValueError):
                     received_value = None
-                return {
+                receipt = {
                     "listingId": listing_id,
                     "purchaseId": purchase_id,
                     "timeSold": purchase.get("time_sold") or event.get("time_event"),
                     "receivedAmount": received_value,
                     "receivedCurrencyId": purchase.get("received_currencyid") if isinstance(purchase, dict) else None,
                 }
+                for key in matching_keys:
+                    receipts[key] = dict(receipt)
+                if len(receipts) >= len(normalized):
+                    return receipts
             start += int(count)
             total = payload.get("total_count")
             if total is not None and start >= int(total):
-                return None
-        return None
+                return receipts
+        return receipts
 
     def _parse_my_listing_rows(self, payload: dict[str, Any], listings_raw: Any) -> list[SteamListing]:
         assets: dict[str, Any] = payload.get("assets") or {}

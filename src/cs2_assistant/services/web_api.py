@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -8,14 +9,23 @@ from urllib.parse import parse_qs, urlparse
 
 from cs2_assistant.config import Settings
 from cs2_assistant.services.c5_case_sweeper import C5CaseSweeper
+from cs2_assistant.services.guadao_logging import get_guadao_event_logger
 from cs2_assistant.services.profit_trade_logging import get_profit_trade_event_logger
 from cs2_assistant.services.public_payload import sanitize_public_payload
+from cs2_assistant.services.runtime_controller import UnifiedRuntimeController
+from cs2_assistant.services.steam_request_scheduler import (
+    DEFAULT_ACCOUNT_ROUTE_COOLDOWN_SECONDS,
+    DEFAULT_GLOBAL_COOLDOWN_SECONDS,
+    DEGRADED_GLOBAL_PROBE_SECONDS,
+    GLOBAL_DEGRADED_AFTER_SECONDS,
+)
 from cs2_assistant.services.profit_trade import (
     build_profit_trade_dashboard_payload,
     build_profit_trade_interruption_timeline_payload,
     build_profit_trade_interruptions_payload,
     build_profit_trade_roi_history_payload,
     build_profit_trade_roi_watch_payload,
+    create_manual_profit_trade_record,
     dismiss_profit_trade,
     execute_profit_trade_buy,
     execute_profit_trade_list_c5,
@@ -24,10 +34,12 @@ from cs2_assistant.services.profit_trade import (
     refresh_profit_trade_sales,
     run_profit_trade_once,
     scan_profit_trade_opportunities,
+    search_profit_trade_catalog_items,
     send_profit_trade_daily_report,
     set_profit_trade_config,
     set_profit_trade_interruption_acknowledged,
     update_profit_trade_protection,
+    update_manual_profit_trade_record,
 )
 
 
@@ -78,6 +90,62 @@ def _profit_trade_log_filters(query: dict[str, list[str]]) -> dict[str, Any]:
     return filters
 
 
+def _guadao_log_filters(query: dict[str, list[str]]) -> dict[str, Any]:
+    """Translate the S4 user-facing query names to the shared logger contract."""
+
+    filters = _profit_trade_log_filters(query)
+    aliases = {
+        "startAt": "from",
+        "endAt": "to",
+        "service": "component",
+        "account": "accountId",
+        "q": "keyword",
+    }
+    for query_key, filter_key in aliases.items():
+        value = _query_value(query, query_key)
+        if value:
+            filters[filter_key] = value
+    market_hash_name = _query_value(query, "marketHashName")
+    if market_hash_name:
+        filters["marketHashName"] = market_hash_name
+    operation_id = _query_value(query, "operationId")
+    if operation_id:
+        filters["operationId"] = operation_id
+    http_status = _query_value(query, "httpStatus")
+    if http_status:
+        filters["httpStatus"] = http_status
+    return filters
+
+
+def _guadao_settings_payload(
+    runtime: UnifiedRuntimeController,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Add the immutable shared-Steam policy used by this API process.
+
+    The runtime configures the scheduler with its production defaults.  Expose
+    those real defaults instead of presenting editable per-priority intervals
+    that do not exist in the scheduler.
+    """
+
+    payload = dict(payload if payload is not None else runtime.settings_payload())
+    settings = dict(payload.get("settings") or {})
+    scheduler = dict(settings.get("steamScheduler") or {})
+    scheduler.update(
+        {
+            "mode": "single_channel",
+            "accountRouteCooldownSeconds": DEFAULT_ACCOUNT_ROUTE_COOLDOWN_SECONDS,
+            "globalCooldownSeconds": DEFAULT_GLOBAL_COOLDOWN_SECONDS,
+            "degradedAfterSeconds": GLOBAL_DEGRADED_AFTER_SECONDS,
+            "degradedProbeSeconds": DEGRADED_GLOBAL_PROBE_SECONDS,
+            "quietWindowEnabled": True,
+        }
+    )
+    settings["steamScheduler"] = scheduler
+    payload["settings"] = settings
+    return payload
+
+
 def _profit_trade_log_event_matches(event: dict[str, Any], filters: dict[str, Any]) -> bool:
     exact_fields = {
         "level": "level",
@@ -105,6 +173,91 @@ def _profit_trade_log_event_matches(event: dict[str, Any], filters: dict[str, An
     return True
 
 
+def _public_guadao_log_matches(
+    event: dict[str, Any],
+    query: dict[str, list[str]],
+) -> bool:
+    exact = {
+        "level": "level",
+        "service": "service",
+        "operation": "operation",
+    }
+    for query_key, event_key in exact.items():
+        expected = _query_value(query, query_key).lower()
+        if expected and str(event.get(event_key) or "").lower() != expected:
+            return False
+    for query_key, event_key in (
+        ("account", "accountName"),
+        ("marketHashName", "marketHashName"),
+    ):
+        expected = _query_value(query, query_key).lower()
+        if expected and expected not in str(event.get(event_key) or "").lower():
+            return False
+    keyword = _query_value(query, "q").lower()
+    if keyword and keyword not in json.dumps(event, ensure_ascii=False).lower():
+        return False
+
+    operation_id = _query_value(query, "operationId").lower()
+    if operation_id:
+        detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+        operation_candidates = (
+            event.get("operationId"),
+            event.get("tradeNo"),
+            detail.get("operationId"),
+            detail.get("operation_id"),
+            detail.get("tradeNo"),
+            detail.get("trade_no"),
+        )
+        normalized_candidates = {
+            str(value).strip().lower()
+            for value in operation_candidates
+            if value not in (None, "")
+        }
+        normalized_expected = operation_id.removeprefix("gd-")
+        if not any(
+            operation_id in candidate
+            or normalized_expected == candidate.removeprefix("gd-")
+            for candidate in normalized_candidates
+        ):
+            return False
+
+    http_status = _query_value(query, "httpStatus").lower()
+    if http_status:
+        try:
+            actual_status = int(event.get("httpStatus"))
+        except (TypeError, ValueError):
+            return False
+        if http_status.endswith("xx") and len(http_status) == 3:
+            if actual_status // 100 != int(http_status[0]):
+                return False
+        elif http_status == "error":
+            if actual_status < 400:
+                return False
+        elif actual_status != int(http_status):
+            return False
+
+    def parse(value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    timestamp = parse(str(event.get("timestamp") or ""))
+    start = parse(_query_value(query, "startAt"))
+    end = parse(_query_value(query, "endAt"))
+    if start is not None and (timestamp is None or timestamp < start):
+        return False
+    if end is not None and (timestamp is None or timestamp > end):
+        return False
+    return True
+
+
 def run_profit_trade_api_server(
     settings: Settings,
     *,
@@ -114,9 +267,14 @@ def run_profit_trade_api_server(
         [Settings, str, str | None, str | None, bool],
         dict[str, Any],
     ] | None = None,
+    runtime_controller: UnifiedRuntimeController | None = None,
 ) -> None:
     c5_sweeper = C5CaseSweeper(settings)
     profit_trade_logger = get_profit_trade_event_logger()
+    guadao_logger = get_guadao_event_logger()
+    owns_runtime_controller = runtime_controller is None
+    runtime = runtime_controller or UnifiedRuntimeController(settings)
+    runtime.start()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "CS2AssistantAPI/0.2"
@@ -221,6 +379,86 @@ def run_profit_trade_api_server(
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
 
+        def _send_guadao_log_export(
+            self,
+            *,
+            filters: dict[str, Any],
+            export_format: str,
+        ) -> None:
+            safe_format = str(export_format or "jsonl").strip().lower()
+            if safe_format not in {"jsonl", "log", "csv"}:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "format must be jsonl, log or csv"},
+                )
+                return
+            filename = f"guadao-logs.{safe_format}"
+            content_type = {
+                "jsonl": "application/x-ndjson; charset=utf-8",
+                "log": "text/plain; charset=utf-8",
+                "csv": "text/csv; charset=utf-8",
+            }[safe_format]
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                for chunk in guadao_logger.export_iter(filters, format=safe_format):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        def _send_guadao_log_stream(self, *, query: dict[str, list[str]]) -> None:
+            include_scheduler = _query_value(
+                query, "includeSteamScheduler", "false"
+            ).lower() in {"1", "true", "yes", "include"}
+            last_event_id = str(
+                self.headers.get("Last-Event-ID")
+                or _query_value(query, "lastEventId")
+                or ""
+            ).strip() or None
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                while True:
+                    events = guadao_logger.wait_after(last_event_id, timeout=15.0, limit=250)
+                    if not events:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                        continue
+                    last_event_id = str(events[-1].get("event_id") or last_event_id or "") or None
+                    for event in events:
+                        if (
+                            not include_scheduler
+                            and str(event.get("component") or "")
+                            == "shared_steam_request_scheduler"
+                        ):
+                            continue
+                        public_event = runtime._public_guadao_log(event)
+                        if not _public_guadao_log_matches(public_event, query):
+                            continue
+                        event_id = str(event.get("event_id") or "")
+                        payload = json.dumps(
+                            public_event,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        self.wfile.write(f"id: {event_id}\n".encode("utf-8"))
+                        self.wfile.write(b"event: guadao_log\n")
+                        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send_json(HTTPStatus.NO_CONTENT, {})
 
@@ -228,6 +466,177 @@ def run_profit_trade_api_server(
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            if path == "/api/runtime/cookies":
+                self._send_json(HTTPStatus.OK, {"ok": True, **runtime.cookie_snapshot()})
+                return
+            if path == "/api/runtime/state":
+                try:
+                    payload = runtime.runtime_states(_query_value(query, "executor") or None)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/guadao/dashboard":
+                payload = runtime.dashboard()
+                # `sanitize_public_payload()` intentionally removes keys that
+                # contain "cookie".  Publish the already-safe health projection
+                # under a neutral name so S1 can render account auth state
+                # without exposing authentication material.
+                payload["steamAuthHealth"] = payload.get("cookieGate")
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/guadao/operations":
+                try:
+                    payload = runtime.operations(
+                        limit=_query_int(query, "limit", 50_000, maximum=50_000),
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "pageSize", 10, maximum=100),
+                        keyword=_query_value(query, "q") or None,
+                        account_name=_query_value(query, "account") or None,
+                        status=_query_value(query, "status") or None,
+                        start_at=_query_value(query, "startAt") or None,
+                        end_at=_query_value(query, "endAt") or None,
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/guadao/issues":
+                include_ack = _query_value(query, "acknowledged", "include").lower() in {
+                    "all", "include", "true", "1"
+                }
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, **runtime.issues(include_acknowledged=include_ack)},
+                )
+                return
+            if path == "/api/guadao/settings":
+                self._send_json(HTTPStatus.OK, {"ok": True, **_guadao_settings_payload(runtime)})
+                return
+            if path == "/api/guadao/items/search":
+                try:
+                    payload = runtime.search_items(
+                        _query_value(query, "q") or _query_value(query, "query"),
+                        limit=_query_int(query, "limit", 30, maximum=100),
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/guadao/logs":
+                try:
+                    page = _query_int(query, "page", 1)
+                    page_size = _query_int(query, "pageSize", 20, maximum=100)
+                    filters = _guadao_log_filters(query)
+                    filters.pop("cursor", None)
+                    storage = guadao_logger.storage_status()
+                    include_scheduler = _query_value(
+                        query, "includeSteamScheduler", "false"
+                    ).lower() in {"1", "true", "yes", "include"}
+                    target_count = page * page_size + 1
+                    public_events: list[dict[str, Any]] = []
+                    cursor: str | None = None
+                    logger_has_more = False
+                    seen_cursors: set[str] = set()
+                    while len(public_events) < target_count:
+                        query_filters = dict(filters)
+                        query_filters["pageSize"] = 1000
+                        if cursor:
+                            query_filters["cursor"] = cursor
+                        result = guadao_logger.query(query_filters)
+                        chunk = [
+                            runtime._public_guadao_log(event)
+                            for event in result.get("events") or []
+                        ]
+                        if not include_scheduler:
+                            chunk = [
+                                event
+                                for event in chunk
+                                if event.get("service") != "shared_steam_request_scheduler"
+                            ]
+                        public_events.extend(
+                            event
+                            for event in chunk
+                            if _public_guadao_log_matches(event, query)
+                        )
+                        logger_has_more = bool(result.get("hasMore"))
+                        next_cursor = str(result.get("nextCursor") or "") or None
+                        if not logger_has_more or not next_cursor or next_cursor in seen_cursors:
+                            break
+                        seen_cursors.add(next_cursor)
+                        cursor = next_cursor
+                    if include_scheduler:
+                        logged_request_ids = {
+                            str(event.get("requestId"))
+                            for event in public_events
+                            if event.get("requestId")
+                        }
+                        public_events.extend(
+                            event
+                            for event in runtime.steam_scheduler_log_rows(limit=1000)
+                            if str(event.get("caller") or "") != "guadao"
+                            and str(event.get("requestId") or "") not in logged_request_ids
+                            and _public_guadao_log_matches(event, query)
+                        )
+                    public_events.sort(
+                        key=lambda event: str(event.get("timestamp") or ""), reverse=True
+                    )
+                    start = (page - 1) * page_size
+                    public_logs = public_events[start : start + page_size]
+                    has_more = logger_has_more or len(public_events) > start + page_size
+                    total = len(public_events) + (1 if logger_has_more else 0)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "logs": public_logs,
+                        "events": public_logs,
+                        "items": public_logs,
+                        "total": total,
+                        "page": page,
+                        "pageSize": page_size,
+                        "hasMore": has_more,
+                        "meta": {
+                            "retentionDays": storage.get("retentionDays"),
+                            "diskUsageMb": round(float(storage.get("totalBytes") or 0) / 1_048_576, 3),
+                            "fileCount": storage.get("fileCount"),
+                            "streamStatus": "available",
+                            "startAt": storage.get("earliestTimestamp"),
+                            "endAt": storage.get("latestTimestamp"),
+                        },
+                        "storage": storage,
+                    },
+                )
+                return
+            if path == "/api/guadao/logs/event":
+                event = guadao_logger.get_event(_query_value(query, "eventId"))
+                if event is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "log_event_not_found"})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "event": runtime._public_guadao_log(event), "rawEvent": event},
+                )
+                return
+            if path == "/api/guadao/logs/stream":
+                self._send_guadao_log_stream(query=query)
+                return
+            if path == "/api/guadao/logs/export":
+                export_filters = _guadao_log_filters(query)
+                export_filters["includeSteamScheduler"] = _query_value(
+                    query, "includeSteamScheduler", "false"
+                ).lower() in {"1", "true", "yes", "include"}
+                self._send_guadao_log_export(
+                    filters=export_filters,
+                    export_format=_query_value(query, "format", "jsonl"),
+                )
+                return
             if path == "/api/profit-trade/roi-watch":
                 try:
                     active_text = _query_value(query, "active", "true").lower()
@@ -369,6 +778,16 @@ def run_profit_trade_api_server(
             if path == "/api/profit-trade/dashboard":
                 self._send_json(HTTPStatus.OK, build_profit_trade_dashboard_payload(settings))
                 return
+            if path == "/api/profit-trade/items/search":
+                keyword = _query_value(query, "query")
+                try:
+                    limit = _query_int(query, "limit", 20, minimum=1, maximum=50)
+                    result = search_profit_trade_catalog_items(settings, keyword, limit=limit)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/api/profit-trade/config":
                 self._send_json(
                     HTTPStatus.OK,
@@ -379,6 +798,117 @@ def run_profit_trade_api_server(
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if path in {"/api/runtime/toggle", "/api/guadao/runtime/toggle"}:
+                body = self._read_json_body()
+                executor_key = str(body.get("executor") or "guadao")
+                if "enabled" not in body:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "enabled is required"})
+                    return
+                try:
+                    result = runtime.toggle_executor(executor_key, bool(body["enabled"]))
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "runtime": result})
+                return
+            if path == "/api/guadao/runtime/run-due":
+                runtime.wake()
+                self._send_json(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "ok": True,
+                        "queued": True,
+                        "scope": "unified_runtime",
+                        "message": "已唤醒统一到期任务调度；各执行器仍服从自己的持久化开关",
+                    },
+                )
+                return
+            if path == "/api/guadao/runtime/full-scan":
+                try:
+                    result = runtime.full_scan_now()
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                if not bool(result.get("ok")):
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {**result, "error": "guadao_scan_task_not_scheduled"},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
+                return
+            if path in {"/api/runtime/migration/confirm", "/api/guadao/migration/confirm"}:
+                try:
+                    result = runtime.confirm_migration()
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path in {"/api/runtime/cookies/refresh", "/api/guadao/cookies/refresh"}:
+                try:
+                    result = runtime.refresh_all_cookies_now()
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
+                return
+            if path == "/api/guadao/auth/retry-failed":
+                try:
+                    result = runtime.retry_failed_steam_auth_now()
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
+                return
+            if path == "/api/guadao/issues/review":
+                body = self._read_json_body()
+                issue_id = str(body.get("issueId") or "").strip()
+                if not issue_id:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "issueId is required"})
+                    return
+                try:
+                    result = runtime.queue_issue_safe_review(issue_id)
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
+                return
+            if path == "/api/guadao/issues/ack":
+                body = self._read_json_body()
+                issue_id = str(body.get("issueId") or "").strip()
+                if not issue_id:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "issueId is required"})
+                    return
+                try:
+                    result = runtime.acknowledge_issue(
+                        issue_id,
+                        acknowledged=bool(body.get("acknowledged", True)),
+                        reason=str(body.get("reason") or "") or None,
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "acknowledgement": result})
+                return
+            if path == "/api/guadao/settings":
+                body = self._read_json_body()
+                try:
+                    result = runtime.update_settings(body)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, **_guadao_settings_payload(runtime, result)},
+                )
+                return
             if path == "/api/guadao-report/query":
                 if guadao_report_builder is None:
                     self._send_json(
@@ -483,10 +1013,11 @@ def run_profit_trade_api_server(
                     and "stickerSlabStatus" not in body
                     and "stickerStatus" not in body
                     and "dailySteamBudget" not in body
+                    and "accountReservedBalances" not in body
                 ):
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
-                        {"error": "enabled, allowRealExecution, allowRepriceExecution, stickerSlabStatus, stickerStatus or dailySteamBudget is required"},
+                        {"error": "enabled, allowRealExecution, allowRepriceExecution, stickerSlabStatus, stickerStatus, dailySteamBudget or accountReservedBalances is required"},
                     )
                     return
                 config = set_profit_trade_config(
@@ -506,6 +1037,9 @@ def run_profit_trade_api_server(
                     else None,
                     daily_steam_budget=float(body["dailySteamBudget"])
                     if "dailySteamBudget" in body
+                    else None,
+                    account_reserved_balances=body["accountReservedBalances"]
+                    if "accountReservedBalances" in body
                     else None,
                 )
                 self._send_json(
@@ -566,16 +1100,12 @@ def run_profit_trade_api_server(
                 self._send_json(HTTPStatus.OK, {"ok": True, "report": report.to_dict()})
                 return
             if path == "/api/profit-trade/run-once":
-                body = self._read_json_body()
                 try:
-                    report = run_profit_trade_once(
-                        settings,
-                        scan_max_items=int(body["scanMaxItems"]) if body.get("scanMaxItems") is not None else None,
-                    )
-                except Exception as exc:
-                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    result = runtime.profit_cycle_now()
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
                     return
-                self._send_json(HTTPStatus.OK, {"ok": True, "report": report.to_dict()})
+                self._send_json(HTTPStatus.ACCEPTED, result)
                 return
             if path == "/api/profit-trade/refresh-sales":
                 try:
@@ -669,6 +1199,58 @@ def run_profit_trade_api_server(
                     return
                 self._send_json(HTTPStatus.OK, result)
                 return
+            if path == "/api/profit-trade/manual-record/create":
+                body = self._read_json_body()
+                try:
+                    result = create_manual_profit_trade_record(
+                        settings,
+                        market_hash_name=body.get("marketHashName"),
+                        name=body.get("name"),
+                        steam_account_id=body.get("steamAccountId"),
+                        steam_buy_price=body.get("steamBuyPrice"),
+                        balance_discount=body.get("balanceDiscount"),
+                        c5_sold_net_price=body.get("c5SoldNetPrice"),
+                        steam_bought_at=body.get("steamBoughtAt"),
+                        completed_at=body.get("completedAt"),
+                        a_asset_id=body.get("aAssetId"),
+                        b_asset_id=body.get("bAssetId"),
+                        memo=body.get("memo"),
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/profit-trade/manual-record/update":
+                body = self._read_json_body()
+                trade_id = body.get("tradeId")
+                if trade_id is None:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "tradeId is required"})
+                    return
+                try:
+                    result = update_manual_profit_trade_record(
+                        settings,
+                        int(trade_id),
+                        market_hash_name=body.get("marketHashName"),
+                        name=body.get("name"),
+                        steam_account_id=body.get("steamAccountId"),
+                        steam_buy_price=body.get("steamBuyPrice"),
+                        balance_discount=body.get("balanceDiscount"),
+                        c5_sold_net_price=body.get("c5SoldNetPrice"),
+                        steam_bought_at=body.get("steamBoughtAt"),
+                        completed_at=body.get("completedAt"),
+                        a_asset_id=body.get("aAssetId"),
+                        b_asset_id=body.get("bAssetId"),
+                        memo=body.get("memo"),
+                    )
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/api/profit-trade/lock":
                 body = self._read_json_body()
                 trade_id = body.get("tradeId") or body.get("trade_id")
@@ -718,5 +1300,7 @@ def run_profit_trade_api_server(
     try:
         server.serve_forever()
     finally:
+        if owns_runtime_controller:
+            runtime.stop()
         c5_sweeper.close()
         server.server_close()

@@ -849,7 +849,7 @@ def run_once(
         steam_discount=config.steam_discount,
         allow_cached_fallback=config.allow_cached_fallback,
         cache_max_age_minutes=config.cache_max_age_minutes,
-        inventory_filter=INVENTORY_FILTER_ALL,
+        inventory_filter=config.inventory_scope,
     )
     return evaluate_reminder(
         report,

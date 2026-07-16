@@ -10,6 +10,7 @@ const status = ref("active");
 const sort = ref("roi_desc");
 const loading = ref(false);
 const error = ref("");
+const listingsCircuit = ref({ status: "closed", isBlocking: false });
 const selected = ref(null);
 const history = ref([]);
 const historyPage = ref(1);
@@ -42,6 +43,11 @@ async function responseError(response) {
     }
 }
 function stateLabel(row) {
+    if (row.executionStatus === "listings_probe_ready")
+        return "达到门槛 · 等待恢复探测";
+    if (row.executionStatus === "listings_cooldown"
+        || (listingsCircuit.value.isBlocking && ["executable", "eligible"].includes(row.executionStatus || "")))
+        return "达到门槛 · listings冷却中";
     const labels = {
         executable: "达到执行门槛", eligible: "达到执行门槛", observe_only: "仅观察，不执行",
         blocked: "风控阻断", manual_review: "异常 ROI，需人工", exited: "已退出观察池",
@@ -51,11 +57,48 @@ function stateLabel(row) {
 function stateClass(row) {
     if (row.active === false)
         return "exited";
+    if (["listings_cooldown", "listings_probe_ready"].includes(row.executionStatus || ""))
+        return "cooldown";
+    if (listingsCircuit.value.isBlocking && ["executable", "eligible"].includes(row.executionStatus || ""))
+        return "cooldown";
     if (["executable", "eligible"].includes(row.executionStatus || ""))
         return "ready";
     if (["blocked", "manual_review"].includes(row.executionStatus || ""))
         return "blocked";
     return "observe";
+}
+function tradeStateLabel(trade) {
+    const status = trade.status || "";
+    if (status === "completed")
+        return "已完成";
+    if (status === "c5_listed")
+        return "已买入，C5 在售";
+    if (status === "listing_c5")
+        return "已买入，正在 C5 上架";
+    if (status === "steam_bought")
+        return "已买入，准备 C5 上架";
+    if (status === "buying")
+        return "正在买入";
+    if (status === "locked")
+        return "执行中，已锁定 A";
+    if (status === "audited" || status === "candidate")
+        return "已转化为流水，执行中";
+    if (status === "manual_required")
+        return "执行中断，需人工处理";
+    if (status === "failed")
+        return "执行失败";
+    if (status === "cancelled")
+        return "已取消";
+    return status || "执行状态待同步";
+}
+function tradeStateClass(trade) {
+    if (trade.status === "completed")
+        return "done";
+    if (["manual_required", "failed"].includes(trade.status || ""))
+        return "attention";
+    if (trade.status === "cancelled")
+        return "stopped";
+    return "running";
 }
 async function load() {
     loading.value = true;
@@ -71,6 +114,7 @@ async function load() {
         const payload = await response.json();
         rows.value = Array.isArray(payload.items) ? payload.items : [];
         total.value = Number(payload.total) || 0;
+        listingsCircuit.value = payload.listingsCircuit || { status: "closed", isBlocking: false };
     }
     catch (reason) {
         rows.value = [];
@@ -136,6 +180,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['watch-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-toolbar']} */ ;
+/** @type {__VLS_StyleScopedClasses['watch-circuit-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['card-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['card-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['card-head']} */ ;
@@ -153,6 +198,23 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['watch-metrics']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-metrics']} */ ;
 /** @type {__VLS_StyleScopedClasses['pagination']} */ ;
+/** @type {__VLS_StyleScopedClasses['watch-state']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
+/** @type {__VLS_StyleScopedClasses['linked-trade']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
 /** @type {__VLS_StyleScopedClasses['history-drawer']} */ ;
 /** @type {__VLS_StyleScopedClasses['history-drawer']} */ ;
 /** @type {__VLS_StyleScopedClasses['history-drawer']} */ ;
@@ -166,8 +228,22 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['history-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['history-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['history-list']} */ ;
-// CSS variable injection
-// CSS variable injection end
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['attention']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
+/** @type {__VLS_StyleScopedClasses['history-trade-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
+// CSS variable injection 
+// CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "roi-watch panel" },
     'aria-labelledby': "roi-watch-title",
@@ -253,6 +329,13 @@ if (__VLS_ctx.error) {
     });
     (__VLS_ctx.error);
 }
+if (__VLS_ctx.listingsCircuit.isBlocking) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "watch-circuit-note" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    (__VLS_ctx.time(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
+}
 if (__VLS_ctx.loading) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "watch-empty" },
@@ -286,6 +369,12 @@ else {
             ...{ class: (['watch-state', __VLS_ctx.stateClass(row)]) },
         });
         (__VLS_ctx.stateLabel(row));
+        if (row.executionStatus === 'listings_cooldown' || row.executionStatus === 'listings_probe_ready' || (__VLS_ctx.listingsCircuit.isBlocking && ['executable', 'eligible'].includes(row.executionStatus || ''))) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+                ...{ class: "card-cooldown" },
+            });
+            (__VLS_ctx.listingsCircuit.status === "half_open" ? "恢复探测" : "冷却");
+        }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "price-line" },
         });
@@ -338,6 +427,20 @@ else {
                 ...{ class: "reason" },
             });
             (row.executionReason || row.riskReason || row.exitReason);
+        }
+        if (row.latestTrade) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                ...{ class: (['linked-trade', __VLS_ctx.tradeStateClass(row.latestTrade)]) },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+            (__VLS_ctx.tradeStateLabel(row.latestTrade));
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+            (row.latestTrade.tradeNo);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+            (__VLS_ctx.money(row.latestTrade.steamBuyPrice));
         }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
             ...{ onClick: (...[$event]) => {
@@ -451,6 +554,47 @@ if (__VLS_ctx.selected) {
                 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
                 (event.executionReason || event.riskReason || event.exitReason);
             }
+            if (event.relatedTrade) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+                    ...{ class: (['history-trade-link', __VLS_ctx.tradeStateClass(event.relatedTrade)]) },
+                });
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+                (__VLS_ctx.tradeStateLabel(event.relatedTrade));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                (event.relatedTrade.tradeNo);
+                (event.relatedTrade.tradeId);
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.money(event.relatedTrade.steamBuyPrice));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.time(event.relatedTrade.steamBoughtAt));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.money(event.relatedTrade.c5SoldNetPrice));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.time(event.relatedTrade.completedAt));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.money(event.relatedTrade.realizedProfit));
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+                (__VLS_ctx.pct(event.relatedTrade.realizedRoi));
+                if (event.relatedTrade.error) {
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+                    (event.relatedTrade.error);
+                }
+            }
         }
     }
     __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElements.footer)({
@@ -492,11 +636,13 @@ if (__VLS_ctx.selected) {
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['refresh']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['watch-circuit-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['card-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['card-cooldown']} */ ;
 /** @type {__VLS_StyleScopedClasses['price-line']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-metrics']} */ ;
 /** @type {__VLS_StyleScopedClasses['positive']} */ ;
@@ -527,6 +673,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             sort: sort,
             loading: loading,
             error: error,
+            listingsCircuit: listingsCircuit,
             selected: selected,
             history: history,
             historyPage: historyPage,
@@ -540,6 +687,8 @@ const __VLS_self = (await import('vue')).defineComponent({
             time: time,
             stateLabel: stateLabel,
             stateClass: stateClass,
+            tradeStateLabel: tradeStateLabel,
+            tradeStateClass: tradeStateClass,
             load: load,
             search: search,
             turn: turn,

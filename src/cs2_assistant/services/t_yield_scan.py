@@ -636,6 +636,7 @@ def build_market_service(
     settings: Settings,
     *,
     include_c5_purchase_prices: bool,
+    include_c5: bool = True,
 ) -> MarketService:
     store = AccountStore(PROJECT_ROOT / "config")
     usable_accounts = []
@@ -657,6 +658,7 @@ def build_market_service(
                 device_id=account.device_id,
                 account_id=account.id,
                 base_url=settings.steam_market_base_url,
+                request_source="notify",
             )
             steam_market_client = candidate_client
             break
@@ -669,6 +671,7 @@ def build_market_service(
                 identity_secret=settings.steam_identity_secret,
                 device_id=settings.steam_device_id,
                 base_url=settings.steam_market_base_url,
+                request_source="notify",
             )
         except Exception:
             pass
@@ -680,12 +683,39 @@ def build_market_service(
         if settings.csqaq_api_token
         else None,
         c5_client=C5GameClient(settings.c5_api_key, settings.c5_base_url)
-        if settings.c5_api_key
+        if include_c5 and settings.c5_api_key
         else None,
         steam_market_client=steam_market_client,
         app_id=settings.app_id,
         include_c5_purchase_prices=include_c5_purchase_prices,
     )
+
+
+def _prefilter_inventory_types_by_c5_price(
+    c5_client: C5GameClient,
+    inventory_types: list[dict[str, Any]],
+    *,
+    app_id: int,
+    min_price: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load official C5 batch prices before any Steam market requests."""
+    c5_states = MarketService(
+        c5_client=c5_client,
+        app_id=app_id,
+        include_c5_purchase_prices=False,
+    ).refresh_items(inventory_types)
+    c5_state_map = {state.market_hash_name: state for state in c5_states}
+    eligible_inventory_types = [
+        item_type
+        for item_type in inventory_types
+        if (
+            (state := c5_state_map.get(str(item_type.get("market_hash_name") or ""))) is not None
+            and state.c5_price_source == "c5_batch"
+            and state.c5_sell_price is not None
+            and float(state.c5_sell_price) >= min_price
+        )
+    ]
+    return eligible_inventory_types, c5_state_map
 
 
 def scan_t_yield(
@@ -738,7 +768,43 @@ def scan_t_yield(
             missing_steam_price_path=str(missing_path),
         )
 
-    states = build_market_service(settings, include_c5_purchase_prices=False).refresh_items(inventory_types)
+    inventory_types, c5_state_map = _prefilter_inventory_types_by_c5_price(
+        c5_client,
+        inventory_types,
+        app_id=settings.app_id,
+        min_price=min_price,
+    )
+    if not inventory_types:
+        missing_path = _save_missing_steam_report(settings, [])
+        return TYieldScanReport(
+            generated_at=utc_now_iso(),
+            inventory_source=str(inventory_payload.get("source") or "live"),
+            inventory_cached_at=str(inventory_payload.get("cachedAt") or "") or None,
+            inventory_filter=normalized_inventory_filter,
+            accounts=accounts,
+            inventory_type_total_count=len(all_inventory_types),
+            inventory_type_count=0,
+            candidates=[],
+            missing_steam_prices=[],
+            missing_steam_price_path=str(missing_path),
+        )
+
+    states = build_market_service(
+        settings,
+        include_c5_purchase_prices=False,
+        include_c5=False,
+    ).refresh_items(inventory_types)
+    for state in states:
+        c5_state = c5_state_map.get(state.market_hash_name)
+        if c5_state is None:
+            continue
+        state.c5_sell_price = c5_state.c5_sell_price
+        state.c5_sell_count = c5_state.c5_sell_count
+        state.c5_item_id = c5_state.c5_item_id
+        state.c5_website = c5_state.c5_website
+        state.c5_price_source = c5_state.c5_price_source
+        if "c5_batch" in c5_state.raw_json:
+            state.raw_json["c5_batch"] = c5_state.raw_json["c5_batch"]
     state_map = {state.market_hash_name: state for state in states}
     attempted_sources = configured_steam_sources(settings)
 

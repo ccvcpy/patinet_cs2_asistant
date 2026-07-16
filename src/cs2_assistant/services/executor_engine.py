@@ -1,12 +1,14 @@
 ﻿from __future__ import annotations
 
 import json
+import math
+import random
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Callable
 
 from cs2_assistant.accounts import Account, AccountStore
 from cs2_assistant.accounts.steam_auth import try_steam_auto_relogin
@@ -42,7 +44,8 @@ from cs2_assistant.models import (
 )
 from cs2_assistant.services.executor_buy import execute_rebuy, is_retryable_c5_network_error
 from cs2_assistant.services.market import calculate_listing_ratio, calculate_transfer_real_ratio
-from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price
+from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price, summarize_orderbook_prices
+from cs2_assistant.services.steam_request_scheduler import SteamRequestGuardRejected
 from cs2_assistant.services.strategy import classify_strategies, load_strategy_config, scan_strategies
 from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories, summarize_inventory_types
 from cs2_assistant.utils import safe_float, safe_int, utc_now_iso
@@ -57,8 +60,54 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+def _normalize_timestamp_iso(value: Any) -> str | None:
+    """Return Steam/API timestamps as timezone-aware ISO 8601 strings.
+
+    Steam market history commonly returns Unix seconds, while older local
+    records may already contain ISO strings.  Persisting the raw integer is
+    ambiguous to JavaScript (which interprets numbers as milliseconds) and
+    also prevents the Python report path from parsing the official sale time.
+    """
+
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    numeric: float | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+    elif text.replace(".", "", 1).isdigit():
+        try:
+            numeric = float(text)
+        except ValueError:
+            numeric = None
+    if numeric is not None:
+        if abs(numeric) >= 1_000_000_000_000:
+            numeric /= 1000.0
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return text
+    parsed = _parse_iso(text)
+    if parsed is None:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _guadao_client_telemetry_callback(**context: Any) -> Any:
+    """Bind an explicit guadao source without making logging a dependency."""
+
+    try:
+        from cs2_assistant.services.guadao_logging import get_guadao_event_logger
+
+        return get_guadao_event_logger().bind_telemetry(**context)
+    except Exception:
+        return None
 
 
 LISTING_CONFIRMATION_PENDING_STATUSES = {
@@ -72,7 +121,8 @@ LISTING_CONFIRMATION_PENDING_STATUSES = {
     "listing_missing_unverified",
 }
 REBUY_NO_MATCHING_TIMEOUT_SECONDS = 3 * 60 * 60
-REBUY_ORDER_AUDIT_LOOKBACK_DAYS = 5
+REBUY_ORDER_AUDIT_LOOKBACK_DAYS = 7
+C5_DELIVERY_DEADLINE_SECONDS = 24 * 60 * 60
 C5_DELIVERY_STATUS_KEY = "c5FinalStatus"
 C5_DELIVERY_SUCCESS = "c5_success"
 C5_DELIVERY_FAILED = "c5_failed"
@@ -86,7 +136,13 @@ STEAM_LISTING_ACCOUNT_BACKOFF_SECONDS = 3 * 60
 GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS = 48 * 60 * 60
 STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES = 2
 STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES = 30
-GUADAO_PENDING_CONFIRMATION_RELEASE_AFTER_SECONDS = 30 * 60
+STEAM_SALE_RECEIPT_DEEP_LOOKUP_INITIAL_DELAY_SECONDS = 30 * 60
+STEAM_SALE_RECEIPT_DEEP_LOOKUP_INTERVAL_SECONDS = 6 * 60 * 60
+C5_INVENTORY_REFERENCE_CACHE_MAX_AGE_SECONDS = 180 * 60
+
+
+class _NewGuadaoActionBlocked(RuntimeError):
+    """Internal control-flow signal used before a new real Steam listing."""
 
 
 def _format_decimal(value: Any, *, digits: int = 3) -> str:
@@ -392,6 +448,7 @@ class ExecutionEngine:
         account: Account | str | None = None,
         dry_run_override: bool | None = None,
         force_refresh_override: bool | None = None,
+        new_action_guard: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings
         self.config = config or load_strategy_config(settings)
@@ -426,7 +483,16 @@ class ExecutionEngine:
         self.db.initialize()
         if not self._c5_api_key:
             raise RuntimeError("missing C5GAME_API_KEY / C5_API_KEY")
-        self.c5_client = C5GameClient(self._c5_api_key, settings.c5_base_url)
+        c5_telemetry_context = {
+            "account_id": self.account.id if self.account else None,
+            "steam_id64": self.account.steam_id64 if self.account else None,
+        }
+        self.c5_client = C5GameClient(
+            self._c5_api_key,
+            settings.c5_base_url,
+            telemetry_callback=_guadao_client_telemetry_callback(**c5_telemetry_context),
+            telemetry_context={"source": "guadao", **c5_telemetry_context},
+        )
         self.serverchan = (
             ServerChanClient(settings.serverchan_sendkey, settings.serverchan_base_url)
             if settings.serverchan_sendkey
@@ -442,6 +508,7 @@ class ExecutionEngine:
                 device_id=self._steam_device_id,
                 account_id=self.account.id if self.account else None,
                 base_url=settings.steam_market_base_url,
+                request_source="guadao",
             )
         self._steam_clients: dict[str, SteamMarketClient] = {}
         self._cache_steam_client(self.steam_client, self.account)
@@ -452,6 +519,7 @@ class ExecutionEngine:
         self._market_pending_cleanup_failed_count = 0
         self._stop_requested = False
         self._stop_reason: str | None = None
+        self._new_action_guard = new_action_guard
         self._case_open_guadao_limit_notified = False
         self._rebuy_wait_started_at: dict[int, datetime] = {}
         self._recent_rebuy_delivery_failures_checked = False
@@ -473,6 +541,57 @@ class ExecutionEngine:
 
     def close(self) -> None:
         self.db.close()
+
+    def _emit_guadao_local_event(
+        self,
+        *,
+        operation: str,
+        message: str,
+        level: str = "INFO",
+        market_hash_name: str | None = None,
+        operation_id: int | None = None,
+        asset_id: str | None = None,
+        note: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a fail-open state event while preserving existing CLI output."""
+
+        try:
+            from cs2_assistant.services.guadao_logging import get_guadao_event_logger
+
+            source_note = dict(note or {})
+            normalized_operation_id = safe_int(operation_id)
+            if normalized_operation_id is not None and normalized_operation_id <= 0:
+                normalized_operation_id = None
+            account_id = source_note.get("steamAccountId")
+            account_name = source_note.get("steamAccountName")
+            steam_id64 = source_note.get("steamId64")
+            if not account_id and getattr(self, "account", None) is not None:
+                account_id = self.account.id
+                account_name = account_name or self.account.name
+                steam_id64 = steam_id64 or self.account.steam_id64
+            safe_context = {
+                "operationId": normalized_operation_id,
+                "accountName": account_name,
+                **dict(context or {}),
+            }
+            get_guadao_event_logger().emit(
+                level=level,
+                provider="local",
+                component="executor_engine",
+                operation=operation,
+                message=message,
+                trade_id=normalized_operation_id,
+                trade_no=f"GD-{normalized_operation_id}" if normalized_operation_id is not None else None,
+                market_hash_name=market_hash_name,
+                asset_id=asset_id,
+                account_id=account_id,
+                steam_id64=steam_id64,
+                safe_context=safe_context,
+            )
+        except Exception:
+            # Logging must never change a trading transition or retry decision.
+            return
 
     def _listing_account_key(self, client: SteamMarketClient | None) -> str | None:
         if client is None:
@@ -567,6 +686,7 @@ class ExecutionEngine:
                 device_id=self._steam_device_id,
                 account_id=self.account.id if self.account else None,
                 base_url=self.settings.steam_market_base_url,
+                request_source="guadao",
             )
         except SteamMarketError as exc:
             print(f"[警告] 当前账号 Steam client 重建失败，将在实际使用时再尝试自动登录: {exc}")
@@ -615,7 +735,7 @@ class ExecutionEngine:
         self._refresh_all_account_cookies_on_startup()
         while True:
             try:
-                self.run_once(wait_for_cycle=True)
+                self.run_once(wait_for_cycle=False)
             except C5GameError as exc:
                 if once or not is_retryable_c5_network_error(exc):
                     raise
@@ -626,9 +746,15 @@ class ExecutionEngine:
                 return
             if once:
                 return
-            time.sleep(self.config.cycle_interval_minutes * 60)
+            # 兼容旧 CLI。正式常驻运行由 8765 后端的持久化任务 worker
+            # 持有；这里不再进入挂刀内部 while/sleep 等待状态闭环。
+            schedule = self.config.effective_guadao_task_schedule()
+            time.sleep(max(1.0, float(schedule["scanIntervalSeconds"])))
 
     def run_once(self, *, wait_for_cycle: bool = True) -> None:
+        # wait_for_cycle 仅保留调用兼容；run-once 永远只推进一个有限轮次。
+        # 旧的阻塞等待会造成卖出检测和补仓在两个分支重复执行。
+        _ = wait_for_cycle
         self._pending_confirmation_count = 0
         self._market_pending_cleanup_failed_count = 0
         self._steam_market_validated_accounts = set()
@@ -660,7 +786,7 @@ class ExecutionEngine:
         self._print_guadao_account_inventory_summary(report)
         self._guadao_skipped_by_account = []
 
-        listed, sold, rebought = self._run_guadao_cycle(report, wait_for_cycle=wait_for_cycle)
+        listed, sold, rebought = self._run_guadao_cycle(report)
         if self._has_open_guadao_cycle():
             print("[等待] 挂刀循环尚未闭环，先跳过本轮导余额执行。")
             transfer_bought = 0
@@ -925,6 +1051,32 @@ class ExecutionEngine:
             print(f"[警告] 读取本地 Steam 账号配置失败: {exc}")
             return None
 
+    def _new_listing_account_is_allowed(self, account: Account | None) -> bool:
+        """Exclude a runtime-degraded account from *new* guadao listings.
+
+        The runtime tables are optional for legacy CLI/test callers.  With no
+        persisted Cookie health rows, existing behavior is preserved.  Once
+        the unified runtime has established account health, only ``valid``
+        accounts may contribute assets to a new listing plan.  Existing state
+        synchronization and C5 closure paths do not call this helper.
+        """
+
+        if account is None:
+            return True
+        loader = getattr(self.db, "list_steam_cookie_health", None)
+        if not callable(loader):
+            return True
+        try:
+            rows = list(loader())
+        except Exception:
+            # A health-store read failure must not invent a false "valid"
+            # result once the runtime health table is in use.
+            return False
+        if not rows:
+            return True
+        row = next((item for item in rows if str(item["account_id"]) == account.id), None)
+        return row is not None and str(row["status"] or "").lower() == "valid"
+
     def _steam_client_cache(self) -> dict[str, SteamMarketClient]:
         cache = getattr(self, "_steam_clients", None)
         if cache is None:
@@ -1075,6 +1227,7 @@ class ExecutionEngine:
                 device_id=refreshed_account.device_id,
                 account_id=refreshed_account.id,
                 base_url=self.settings.steam_market_base_url,
+                request_source="guadao",
             )
         except SteamMarketError as exc:
             ok, status, updated = try_steam_auto_relogin(
@@ -1093,6 +1246,7 @@ class ExecutionEngine:
                     device_id=updated.device_id,
                     account_id=updated.id,
                     base_url=self.settings.steam_market_base_url,
+                    request_source="guadao",
                 )
                 refreshed_account = updated
             except SteamMarketError as relogin_exc:
@@ -1140,22 +1294,27 @@ class ExecutionEngine:
         steam_id64: str | None = None,
         exclude_asset_ids: set[str] | None = None,
     ) -> GuadaoAssetTarget | None:
-        asset_row = self.db.pick_tradable_asset(
-            candidate.market_hash_name,
-            steam_id=steam_id64,
-            exclude_asset_ids=exclude_asset_ids,
-        )
-        if asset_row is None:
-            return None
-        asset_steam_id = str(asset_row["steam_id"] or "").strip() or None
-        account = self._account_by_steam_id64(asset_steam_id)
-        if account is None and self._steam_client_matches(asset_steam_id):
-            account = self.account
-        return GuadaoAssetTarget(
-            asset_id=str(asset_row["asset_id"]),
-            steam_id64=asset_steam_id,
-            account=account,
-        )
+        blocked_asset_ids = set(exclude_asset_ids or set())
+        while True:
+            asset_row = self.db.pick_tradable_asset(
+                candidate.market_hash_name,
+                steam_id=steam_id64,
+                exclude_asset_ids=blocked_asset_ids,
+            )
+            if asset_row is None:
+                return None
+            asset_id = str(asset_row["asset_id"])
+            asset_steam_id = str(asset_row["steam_id"] or "").strip() or None
+            account = self._account_by_steam_id64(asset_steam_id)
+            if account is None and self._steam_client_matches(asset_steam_id):
+                account = self.account
+            if self._new_listing_account_is_allowed(account):
+                return GuadaoAssetTarget(
+                    asset_id=asset_id,
+                    steam_id64=asset_steam_id,
+                    account=account,
+                )
+            blocked_asset_ids.add(asset_id)
 
     def _operation_steam_id64(self, op: Any) -> str | None:
         note = _read_note(op["note"])
@@ -1389,6 +1548,31 @@ class ExecutionEngine:
                 self.db.set_pool_status(candidate.market_hash_name, POOL_STATUS_HOLDING)
         else:
             self.db.set_pool_status(candidate.market_hash_name, status_after)
+        if op_status in {"listed", POOL_STATUS_LISTING_PENDING}:
+            expected_net = _steam_seller_net_from_gross(price, self.config.steam_net_factor)
+            self._emit_guadao_local_event(
+                operation=(
+                    "steam_listing_active"
+                    if op_status == "listed"
+                    else "steam_listing_pending_confirmation"
+                ),
+                message=(
+                    "Steam 挂刀已确认活跃"
+                    if op_status == "listed"
+                    else "Steam 挂刀已提交，等待确认或活跃状态"
+                ),
+                market_hash_name=candidate.market_hash_name,
+                operation_id=op_id,
+                asset_id=asset_id,
+                note=note_dict,
+                context={
+                    "state": op_status,
+                    "steamListPrice": price,
+                    "steamExpectedNetAmount": expected_net,
+                    "listingRatio": note_dict.get("listingRatioAtOpen"),
+                    "listingId": note_dict.get("listingId"),
+                },
+            )
         if status_after == POOL_STATUS_LISTING_PENDING and client is not None and op_id:
             if self._mark_pending_sell_operation_sold_if_receipted(
                 op_id=op_id,
@@ -1540,15 +1724,15 @@ class ExecutionEngine:
                 f"挂刀候选 {len(skipped_by_account)} 个在当前 executor 账号本地无可交易资产，"
                 f"被账号过滤跳过：{sample}{suffix}"
             )
+        pool_status_map = self.db.get_pool_status_map()
         open_statuses = self._get_open_guadao_statuses()
-        if open_statuses:
+        if open_statuses and self._has_open_guadao_cycle(pool_status_map):
             summary = ", ".join(
                 f"{status}={count}" for status, count in sorted(open_statuses.items())
             )
-            reasons.append(f"上一轮挂刀循环未闭环（{summary}），本轮仅做等待和状态检查。")
+            reasons.append(f"挂刀执行存在阻塞状态（{summary}），本轮仅做等待和状态检查。")
 
         inventory_type_names = self._current_inventory_type_names()
-        pool_status_map = self.db.get_pool_status_map()
         missing_inventory_names = sorted(
             [
                 name
@@ -1738,19 +1922,19 @@ class ExecutionEngine:
             return True
         return expected_steam_id == trade_url_steam_id
 
-    def _run_guadao_cycle(self, report: Any, *, wait_for_cycle: bool) -> tuple[int, int, int]:
+    def _run_guadao_cycle(self, report: Any) -> tuple[int, int, int]:
         status_map = self.db.get_pool_status_map()
         listed = 0
         sold = 0
         rebought = 0
 
         if self._has_open_guadao_cycle(status_map):
-            print("[等待] 检测到上一轮挂刀循环未闭环，本轮先等待卖出/补仓完成。")
+            print("[等待] 检测到挂刀待确认/失败状态，或箱子活跃挂单槽已满，本轮暂停新上架。")
         else:
             case_open_count = self._open_case_guadao_count()
             if case_open_count > 0:
                 print(
-                    f"[继续] 箱子未闭环挂刀 {case_open_count}/{self._case_max_open_guadao_count()}，"
+                    f"[继续] 箱子活跃挂单槽 {case_open_count}/{self._case_max_open_guadao_count()}，"
                     "未达上限，本轮继续开启新挂刀。"
                 )
             listed = self._execute_guadao_listings(report, status_map)
@@ -1758,11 +1942,7 @@ class ExecutionEngine:
         sold_delta, rebought_delta = self._advance_guadao_cycle()
         sold += sold_delta
         rebought += rebought_delta
-
-        if wait_for_cycle and self._has_open_guadao_cycle():
-            waited_sold, waited_rebought = self._wait_for_guadao_cycle_close()
-            sold += waited_sold
-            rebought += waited_rebought
+        self._release_full_case_listing_capacity()
 
         return listed, sold, rebought
 
@@ -1781,35 +1961,11 @@ class ExecutionEngine:
         rebought = self._execute_rebuys()
         return sold, rebought
 
-    def _wait_for_guadao_cycle_close(self) -> tuple[int, int]:
-        sold = 0
-        rebought = 0
-        while self._has_open_guadao_cycle():
-            case_open_count = self._open_case_guadao_count()
-            if self._case_open_guadao_limit_reached(case_open_count):
-                self._notify_case_open_guadao_limit(case_open_count)
-                return sold, rebought
-            wait_seconds = self._guadao_wait_seconds()
-            open_statuses = self._get_open_guadao_statuses()
-            if open_statuses and set(open_statuses) == {POOL_STATUS_REBUY_FAILED}:
-                print("[停止] 挂刀循环卡在补仓失败状态，需人工处理后才能开启下一轮。")
-                return sold, rebought
-            status_summary = ", ".join(
-                f"{status}={count}" for status, count in sorted(open_statuses.items())
-            ) or "unknown"
-            print(
-                f"[等待] 挂刀循环未完成（{status_summary}），"
-                f"{int(wait_seconds)} 秒后继续检查。"
-            )
-            time.sleep(wait_seconds)
-            self._sync_assets()
-            sold_delta, rebought_delta = self._advance_guadao_cycle()
-            sold += sold_delta
-            rebought += rebought_delta
-        return sold, rebought
-
-    def _guadao_wait_seconds(self) -> float:
-        return max(1.0, float(self.config.listing_check_interval_minutes) * 60.0)
+    def _minimum_action_confirmation_seconds(self) -> float:
+        schedule = self.config.effective_guadao_task_schedule()
+        values = schedule.get("actionConfirmationDelaysSeconds") or [10.0]
+        normalized = [float(value) for value in values if float(value) >= 0]
+        return max(2.0, min(normalized or [10.0]))
 
     def _get_open_guadao_statuses(self) -> dict[str, int]:
         open_statuses = {
@@ -1847,12 +2003,11 @@ class ExecutionEngine:
             counts["rebuy_on_c5.failed"] = len(failed_rebuy_ops)
         case_open_count = self._open_case_guadao_count()
         if case_open_count:
-            counts["case_open_guadao.unclosed"] = case_open_count
+            counts["case_open_guadao.active_listings"] = case_open_count
         return counts
 
     def _has_open_guadao_cycle(self, status_map: dict[str, str] | None = None) -> bool:
         current_status_map = status_map or self.db.get_pool_status_map()
-        case_pool_open_count = 0
         for market_hash_name, status in current_status_map.items():
             if status not in {
                 POOL_STATUS_LISTING_PENDING,
@@ -1863,13 +2018,17 @@ class ExecutionEngine:
                 continue
             if not self._is_weapon_case(market_hash_name):
                 return True
-            case_pool_open_count += 1
 
         if self._has_non_case_open_guadao_operation():
             return True
 
         case_open_count = self._open_case_guadao_count()
-        if case_pool_open_count and case_open_count == 0:
+        case_has_blocking_pool_status = any(
+            status in {POOL_STATUS_LISTING_PENDING, POOL_STATUS_REBUY_FAILED}
+            and self._is_weapon_case(market_hash_name)
+            for market_hash_name, status in current_status_map.items()
+        )
+        if case_has_blocking_pool_status:
             return True
         if self._case_open_guadao_limit_reached(case_open_count):
             self._notify_case_open_guadao_limit(case_open_count)
@@ -1882,18 +2041,11 @@ class ExecutionEngine:
     def _open_case_guadao_count(self) -> int:
         count = 0
         limit = max(500, self._case_max_open_guadao_count() + 10)
-        for operation_type, status in (
-            (OP_SELL_STEAM, "listed"),
-            (OP_REBUY_C5, "pending"),
-            (OP_REBUY_C5, "failed"),
-        ):
-            for op in self.db.list_pool_operations_by_type(operation_type, status=status, limit=limit):
-                if operation_type == OP_REBUY_C5 and status == "failed" and not self._failed_rebuy_counts_as_open(op):
-                    continue
-                if not self._is_weapon_case(op["market_hash_name"]):
-                    continue
-                quantity = safe_int(op["quantity"]) or 1
-                count += max(1, quantity)
+        for op in self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=limit):
+            if not self._is_weapon_case(op["market_hash_name"]):
+                continue
+            quantity = safe_int(op["quantity"]) or 1
+            count += max(1, quantity)
         return count
 
     def _has_non_case_open_guadao_operation(self) -> bool:
@@ -1911,11 +2063,14 @@ class ExecutionEngine:
 
     def _case_open_guadao_limit_reached(self, count: int | None = None) -> bool:
         count = self._open_case_guadao_count() if count is None else count
-        return count > 0 and count >= self._case_max_open_guadao_count()
+        reached = count > 0 and count >= self._case_max_open_guadao_count()
+        if not reached:
+            self._case_open_guadao_limit_notified = False
+        return reached
 
     def _notify_case_open_guadao_limit(self, count: int) -> None:
         limit = self._case_max_open_guadao_count()
-        message = f"箱子未闭环挂刀已达到 {count}/{limit} 个，已暂停新上架；程序会继续每轮扫描卖出和补仓。"
+        message = f"箱子活跃挂单槽已达到 {count}/{limit} 个，已暂停新上架；程序会继续每轮扫描卖出和补仓。"
         if getattr(self, "_case_open_guadao_limit_notified", False):
             return
         self._case_open_guadao_limit_notified = True
@@ -1925,11 +2080,12 @@ class ExecutionEngine:
             return
         try:
             serverchan.send(
-                "[挂刀暂停] 箱子未闭环已达上限",
+                "[挂刀暂停] 箱子活跃挂单槽已满",
                 (
-                    f"箱子未闭环挂刀: {count}/{limit}\n"
+                    f"箱子活跃挂单槽: {count}/{limit}\n"
                     "状态: 已暂停新上架，程序仍会继续扫描卖出和补仓\n"
-                    "处理: 等待未闭环数量下降后自动恢复新一轮箱子挂刀"
+                    f"处理: 连续满载 {self.config.case_full_release_after_hours:g} 小时后，"
+                    f"随机撤销 {self.config.case_full_release_fraction * 100:g}% 的远端活跃挂单"
                 ),
             )
         except Exception as exc:
@@ -2155,11 +2311,18 @@ class ExecutionEngine:
         listing_ratio = safe_float(decision.listing_ratio if decision is not None else None)
         if listing_ratio is None:
             listing_ratio = safe_float(candidate.listing_ratio)
-        hard_max_ratio = safe_float(self.config.guadao_max_listing_ratio)
+        special_rule = self.config.guadao_special_ratio_rule_for(candidate.market_hash_name)
+        hard_max_ratio = self.config.guadao_max_listing_ratio_for(candidate.market_hash_name)
+        rule_fields = {
+            "guadaoRatioRuleSource": "special_case" if special_rule else "global",
+            "guadaoRatioRuleId": special_rule.get("ruleId") if special_rule else None,
+            "guadaoRatioRuleVersion": special_rule.get("version") if special_rule else None,
+        }
         if listing_ratio is None or listing_ratio <= 0:
             return {
                 "guadaoMaxListingRatioAtOpen": hard_max_ratio,
                 "steamNetFactorAtOpen": self.config.steam_net_factor,
+                **rule_fields,
             }
         max_rebuy_ratio = listing_ratio
         if hard_max_ratio is not None and hard_max_ratio > 0:
@@ -2169,6 +2332,7 @@ class ExecutionEngine:
             "maxRebuyRatioAtOpen": max_rebuy_ratio,
             "guadaoMaxListingRatioAtOpen": hard_max_ratio,
             "steamNetFactorAtOpen": self.config.steam_net_factor,
+            **rule_fields,
         }
 
     def _guadao_open_ratio_note_from_price(
@@ -2259,7 +2423,9 @@ class ExecutionEngine:
             decision = self._finalize_listing_decision(candidate, decision, client=client)
             if decision is None:
                 continue
-            if decision.listing_ratio > self.config.guadao_max_listing_ratio:
+            if decision.listing_ratio > self.config.guadao_max_listing_ratio_for(
+                candidate.market_hash_name
+            ):
                 continue
 
             steam_id64 = str(getattr(client, "steam_id64", "") or target.steam_id64 or "").strip()
@@ -2463,6 +2629,14 @@ class ExecutionEngine:
                         asset_id=asset_id,
                         price=decision.list_price,
                     )
+                except _NewGuadaoActionBlocked:
+                    self._stop_requested = True
+                    self._stop_reason = "new_action_guard_blocked"
+                    print(
+                        f"[停止新上架] {candidate.market_hash_name} | asset={asset_id} | "
+                        "执行器已关闭或新动作门禁不可用；未发送 Steam sellitem"
+                    )
+                    break
                 except SteamMarketError as exc:
                     if _is_pending_confirmation_sellitem_error(exc):
                         _, status_after = self._record_listing_pending_confirmation_from_sellitem(
@@ -2601,6 +2775,32 @@ class ExecutionEngine:
                 else:
                     self.db.set_pool_status(candidate.market_hash_name, status_after)
                     status_map[candidate.market_hash_name] = status_after
+                if op_status in {"listed", POOL_STATUS_LISTING_PENDING}:
+                    self._emit_guadao_local_event(
+                        operation=(
+                            "steam_listing_active"
+                            if op_status == "listed"
+                            else "steam_listing_pending_confirmation"
+                        ),
+                        message=(
+                            "Steam 挂刀已确认活跃"
+                            if op_status == "listed"
+                            else "Steam 挂刀已提交，等待确认或活跃状态"
+                        ),
+                        market_hash_name=candidate.market_hash_name,
+                        operation_id=op_id,
+                        asset_id=str(asset_id),
+                        note=note_dict,
+                        context={
+                            "state": op_status,
+                            "steamListPrice": decision.list_price,
+                            "steamExpectedNetAmount": (
+                                decision.list_price * self.config.steam_net_factor
+                            ),
+                            "listingRatio": decision.listing_ratio,
+                            "listingId": listing_id or None,
+                        },
+                    )
                 immediate_sold = False
                 if op_status == POOL_STATUS_LISTING_PENDING and client is not None:
                     immediate_sold = self._mark_pending_sell_operation_sold_if_receipted(
@@ -2656,6 +2856,14 @@ class ExecutionEngine:
         for attempt in range(STEAM_LISTING_MAX_ATTEMPTS):
             try:
                 self._wait_for_listing_account_slot(active_client)
+                guard = getattr(self, "_new_action_guard", None)
+                if guard is not None:
+                    try:
+                        action_allowed = bool(guard())
+                    except Exception:
+                        action_allowed = False
+                    if not action_allowed:
+                        raise _NewGuadaoActionBlocked("new guadao action is no longer allowed")
                 return active_client.sell_item(
                     app_id=self.settings.app_id,
                     context_id=self.config.steam_context_id,
@@ -2663,7 +2871,10 @@ class ExecutionEngine:
                     price=price,
                     quantity=1,
                     steam_net_factor=self.config.steam_net_factor,
+                    **({"execution_guard": guard} if guard is not None else {}),
                 )
+            except SteamRequestGuardRejected as exc:
+                raise _NewGuadaoActionBlocked(str(exc)) from exc
             except SteamMarketError as exc:
                 if not _is_transient_listing_error(exc):
                     raise
@@ -2674,53 +2885,127 @@ class ExecutionEngine:
             raise last_exc
         raise SteamMarketError("Steam sellitem failed without response")
 
-    def _refresh_pending_listing_confirmations(self, *, client: SteamMarketClient | None = None) -> int:
+    def _refresh_pending_listing_confirmations(
+        self,
+        *,
+        client: SteamMarketClient | None = None,
+        active_listings: list[Any] | None = None,
+        operation_ids: set[int] | None = None,
+        sale_receipt_results: dict[int, dict[str, Any] | None] | None = None,
+        sale_receipt_deep_attempt_ids: set[int] | None = None,
+        sale_receipt_deep_attempted_at: str | None = None,
+    ) -> int:
         active_client = client or self.steam_client
         if not active_client:
             return 0
-        try:
-            active = active_client.list_active_listings()
-        except Exception as exc:
-            print(f"[警告] 获取 Steam 挂单列表失败: {exc}")
-            return 0
+        if active_listings is None:
+            try:
+                active = active_client.list_active_listings()
+            except Exception as exc:
+                print(f"[警告] 获取 Steam 挂单列表失败: {exc}")
+                return 0
+        else:
+            active = active_listings
         active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active)
         updated = 0
         existing_rebuy_sources: set[str] | None = None
         existing_rebuy_sell_ops: set[str] | None = None
-        def retry_steam_guard_confirmation(
-            *,
-            listing_id: str,
-            asset_id: str,
-        ) -> tuple[int | None, Exception | None]:
-            nonlocal active_listing_ids, active_asset_ids
-            nonlocal active
-            confirmer = getattr(active_client, "confirm_listing_assets", None)
-            if not callable(confirmer):
-                return None, SteamMarketError("Steam client does not support scoped listing confirmation")
-            try:
-                confirmation_retry_count = confirmer(
-                    asset_ids=[asset_id],
-                    listing_ids=[listing_id] if listing_id else None,
-                )
-            except Exception as exc:
-                return None, exc
-            try:
-                refreshed_active = active_client.list_active_listings()
-            except Exception:
-                return confirmation_retry_count, None
-            active = refreshed_active
-            active_listing_ids, active_asset_ids = self._active_listing_identity_sets(refreshed_active)
-            return confirmation_retry_count, None
-
         candidate_ops = self.db.list_pool_operations_by_type_and_statuses(
             OP_SELL_STEAM,
-            statuses=[POOL_STATUS_LISTING_PENDING, "listed"],
+            statuses=[POOL_STATUS_LISTING_PENDING, "listed", "manual_required"],
             limit=300,
         )
+        if operation_ids is not None:
+            selected_ids = {int(value) for value in operation_ids}
+            candidate_ops = [op for op in candidate_ops if int(op["id"]) in selected_ids]
+
+        if sale_receipt_results is None:
+            (
+                sale_receipt_results,
+                sale_receipt_deep_attempt_ids,
+                sale_receipt_deep_attempted_at,
+            ) = self._lookup_steam_sale_receipts_for_operations(
+                active_client,
+                candidate_ops,
+                active_listing_ids=active_listing_ids,
+                active_asset_ids=active_asset_ids,
+            )
+        deep_attempt_ids = set(sale_receipt_deep_attempt_ids or set())
+
+        # Confirm every due operation first, then refresh mylistings exactly
+        # once for the account.  The old per-operation refresh multiplied the
+        # same expensive Steam route by the number of pending listings.
+        confirmation_results: dict[int, tuple[int | None, Exception | None]] = {}
+        confirmer = getattr(active_client, "confirm_listing_assets", None)
         for op in candidate_ops:
             if not self._operation_matches_client(op, active_client):
                 continue
             note = _read_note(op["note"])
+            listing_id = str(note.get("listingId") or "").strip()
+            asset_id = str(op["asset_id"] or "").strip()
+            if self._listing_is_active(
+                active_listing_ids=active_listing_ids,
+                active_asset_ids=active_asset_ids,
+                listing_id=listing_id,
+                asset_id=asset_id,
+            ):
+                continue
+            operation_id = int(op["id"])
+            if sale_receipt_results.get(operation_id) is not None:
+                # Official history is already terminal evidence.  Do not send
+                # an unnecessary Steam Guard confirmation request afterward.
+                continue
+            if str(op["status"] or "") == "manual_required":
+                continue
+            needs_confirmation_retry = (
+                op["status"] == POOL_STATUS_LISTING_PENDING
+                or note.get("confirmationStatus") in LISTING_CONFIRMATION_PENDING_STATUSES
+                or not note.get("activeVerifiedAt")
+            )
+            if not needs_confirmation_retry:
+                continue
+            if not callable(confirmer):
+                confirmation_results[operation_id] = (
+                    None,
+                    SteamMarketError(
+                        "Steam client does not support scoped listing confirmation"
+                    ),
+                )
+                continue
+            try:
+                count = confirmer(
+                    asset_ids=[asset_id],
+                    listing_ids=[listing_id] if listing_id else None,
+                )
+                confirmation_results[operation_id] = (count, None)
+            except Exception as exc:
+                confirmation_results[operation_id] = (None, exc)
+
+        if confirmation_results:
+            try:
+                active = active_client.list_active_listings()
+                active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active)
+            except Exception:
+                # Keep the original snapshot.  A failed post-confirmation
+                # refresh is inconclusive and must not invent a transition.
+                pass
+
+        for op in candidate_ops:
+            if not self._operation_matches_client(op, active_client):
+                continue
+            note = _read_note(op["note"])
+            is_stale_manual_recheck = (
+                str(op["status"] or "") == "manual_required"
+                and str(note.get("staleListedCleanupStatus") or "") == "manual_required"
+            )
+            if str(op["status"] or "") == "manual_required" and not is_stale_manual_recheck:
+                continue
+            operation_id = int(op["id"])
+            if operation_id in deep_attempt_ids:
+                self._record_sale_receipt_deep_attempt(
+                    note,
+                    attempted_at=sale_receipt_deep_attempted_at,
+                )
             listing_id = str(note.get("listingId") or "").strip()
             asset_id = str(op["asset_id"] or "").strip()
             if not self._listing_is_active(
@@ -2729,12 +3014,7 @@ class ExecutionEngine:
                 listing_id=listing_id,
                 asset_id=asset_id,
             ):
-                sale_receipt = self._lookup_steam_sale_receipt_for_listing_or_asset(
-                    active_client,
-                    listing_id=listing_id,
-                    asset_id=asset_id,
-                    max_pages=STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES,
-                )
+                sale_receipt = sale_receipt_results.get(operation_id)
                 if sale_receipt is not None:
                     if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
                         existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
@@ -2747,15 +3027,24 @@ class ExecutionEngine:
                     )
                     updated += 1
                     continue
+                if is_stale_manual_recheck:
+                    note["staleListedLastRecheckedAt"] = utc_now_iso()
+                    self.db.update_pool_operation(op["id"], note=_build_note(note))
+                    continue
                 needs_confirmation_retry = (
                     op["status"] == POOL_STATUS_LISTING_PENDING
                     or note.get("confirmationStatus") in LISTING_CONFIRMATION_PENDING_STATUSES
                     or not note.get("activeVerifiedAt")
                 )
                 if needs_confirmation_retry:
-                    confirmation_retry_count, confirmation_retry_error = retry_steam_guard_confirmation(
-                        listing_id=listing_id,
-                        asset_id=asset_id,
+                    confirmation_retry_count, confirmation_retry_error = confirmation_results.get(
+                        operation_id,
+                        (
+                            None,
+                            SteamMarketError(
+                                "Steam listing confirmation was not attempted"
+                            ),
+                        ),
                     )
                     if self._listing_is_active(
                         active_listing_ids=active_listing_ids,
@@ -2773,28 +3062,10 @@ class ExecutionEngine:
                         self._mark_steam_listing_active(op, note)
                         updated += 1
                         continue
-                    sale_receipt = self._lookup_steam_sale_receipt_for_listing_or_asset(
-                        active_client,
-                        listing_id=listing_id,
-                        asset_id=asset_id,
-                        max_pages=STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES,
-                    )
-                    if sale_receipt is not None:
-                        if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
-                            existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
-                        note["confirmationRetryCount"] = confirmation_retry_count
-                        self._mark_steam_listing_sold(
-                            op,
-                            note,
-                            sale_receipt=sale_receipt,
-                            existing_rebuy_sources=existing_rebuy_sources,
-                            existing_rebuy_sell_ops=existing_rebuy_sell_ops,
-                        )
-                        updated += 1
-                        continue
                     retry_note = {
                         **note,
                         "confirmationRetryAt": utc_now_iso(),
+                        "listingPendingAt": note.get("listingPendingAt") or utc_now_iso(),
                     }
                     if confirmation_retry_error is not None:
                         retry_note["confirmationRetryStatus"] = "failed"
@@ -2833,23 +3104,6 @@ class ExecutionEngine:
                             f"automatic remove failed: {remove_error}"
                         )
                         self._market_pending_cleanup_failed_count += 1
-                    if (
-                        confirmation_retry_error is None
-                        and pending_market_listing is None
-                        and (confirmation_retry_count or 0) <= 0
-                        and self._pending_listing_asset_is_relistable(op)
-                    ):
-                        if self._mark_pending_sell_operation_sold_if_receipted(
-                            op_id=int(op["id"]),
-                            note=retry_note,
-                            client=active_client,
-                            asset_id=asset_id,
-                            max_pages=STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES,
-                        ):
-                            updated += 1
-                            continue
-                        self._release_stale_pending_listing(op, retry_note)
-                        continue
                     self.db.update_pool_operation(
                         op["id"],
                         status=POOL_STATUS_LISTING_PENDING,
@@ -2867,6 +3121,9 @@ class ExecutionEngine:
                 continue
             note["confirmationStatus"] = "confirmed_late"
             note["confirmationRecoveredAt"] = utc_now_iso()
+            confirmation_retry = confirmation_results.get(operation_id)
+            if confirmation_retry is not None:
+                note["confirmationRetryCount"] = confirmation_retry[0]
             if not listing_id:
                 recovered_listing_id = self._active_listing_id_for_asset(active, asset_id)
                 if recovered_listing_id:
@@ -2987,32 +3244,6 @@ class ExecutionEngine:
         if asset_id:
             self.db.set_asset_status(asset_id, "listing_pending")
 
-    def _pending_listing_asset_is_relistable(self, op: Any) -> bool:
-        asset_id = str(op["asset_id"] or "").strip()
-        if not asset_id:
-            return False
-        note = _read_note(op["note"])
-        if (
-            note.get("sellitemPendingMessage")
-            or note.get("marketPendingListingId")
-            or note.get("confirmationStatus") in {"market_pending_visible", "market_pending_remove_failed"}
-        ):
-            return False
-        created_at = _parse_iso(op["created_at"])
-        age_seconds = (_now_utc() - created_at).total_seconds() if created_at else None
-        if (
-            note.get("confirmationStatus") == "confirm_sent_waiting_active_listing"
-            and age_seconds is not None
-            and age_seconds < GUADAO_PENDING_CONFIRMATION_RELEASE_AFTER_SECONDS
-        ):
-            return False
-        if age_seconds is not None and age_seconds < self._guadao_wait_seconds():
-            return False
-        inventory_item = self._inventory_items_by_asset_id.get(asset_id)
-        if not inventory_item:
-            return False
-        return self._is_inventory_item_tradable(inventory_item)
-
     def _has_other_open_guadao_operation(self, market_hash_name: str, *, exclude_op_id: int) -> bool:
         rows = self.db.conn.execute(
             """
@@ -3038,23 +3269,6 @@ class ExecutionEngine:
         ).fetchone()
         return rows is not None
 
-    def _release_stale_pending_listing(self, op: Any, note: dict[str, Any]) -> None:
-        asset_id = str(op["asset_id"] or "").strip()
-        note["stalePendingReleasedAt"] = utc_now_iso()
-        note["stalePendingReleaseReason"] = "confirmation_not_found_asset_relistable"
-        self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
-        if asset_id:
-            self.db.set_asset_status(asset_id, "available")
-        if not self._has_other_open_guadao_operation(
-            op["market_hash_name"],
-            exclude_op_id=int(op["id"]),
-        ):
-            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
-        print(
-            f"[挂单待确认失效] {op['market_hash_name']} | asset={asset_id or '-'} | "
-            "未找到令牌确认/活跃挂单/卖出回执，且资产已重新可交易；已释放旧记录，下轮可重新上架"
-        )
-
     def _release_removed_market_pending_listing(self, op: Any, note: dict[str, Any]) -> None:
         asset_id = str(op["asset_id"] or "").strip()
         listing_id = str(note.get("marketPendingListingId") or note.get("listingId") or "").strip()
@@ -3075,6 +3289,170 @@ class ExecutionEngine:
             "Steam 网页待确认挂单已撤下，资产已释放，下轮可重新上架"
         )
 
+    def _case_full_release_after_seconds(self) -> float:
+        try:
+            hours = float(self.config.case_full_release_after_hours)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(hours) or hours <= 0:
+            return 0.0
+        return hours * 3600.0
+
+    def _case_full_release_fraction(self) -> float:
+        try:
+            fraction = float(self.config.case_full_release_fraction)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(fraction) or fraction <= 0:
+            return 0.0
+        return min(1.0, fraction)
+
+    def _listed_case_guadao_operations(self) -> list[Any]:
+        query_limit = max(500, self._case_max_open_guadao_count() * 2)
+        return [
+            op
+            for op in self.db.list_pool_operations_by_type(
+                OP_SELL_STEAM,
+                status="listed",
+                limit=query_limit,
+            )
+            if self._is_weapon_case(op["market_hash_name"])
+        ]
+
+    def _case_listing_capacity_full_since(self, listed_ops: list[Any]) -> datetime | None:
+        capacity = self._case_max_open_guadao_count()
+        if capacity <= 0:
+            return None
+        dated_ops: list[tuple[datetime, Any]] = []
+        for op in listed_ops:
+            note = _read_note(op["note"])
+            slot_started_at = _parse_iso(str(note.get("activeVerifiedAt") or "")) or _parse_iso(
+                op["created_at"]
+            )
+            if slot_started_at is None:
+                continue
+            if slot_started_at.tzinfo is None:
+                slot_started_at = slot_started_at.replace(tzinfo=timezone.utc)
+            dated_ops.append((slot_started_at.astimezone(timezone.utc), op))
+        dated_ops.sort(key=lambda entry: (entry[0], int(entry[1]["id"])))
+
+        occupied = 0
+        for created_at, op in dated_ops:
+            occupied += max(1, safe_int(op["quantity"]) or 1)
+            if occupied >= capacity:
+                return created_at
+        return None
+
+    def _release_full_case_listing_capacity(self) -> int:
+        listed_ops = self._listed_case_guadao_operations()
+        capacity = self._case_max_open_guadao_count()
+        occupied = sum(max(1, safe_int(op["quantity"]) or 1) for op in listed_ops)
+        if capacity <= 0 or occupied < capacity:
+            return 0
+
+        release_after_seconds = self._case_full_release_after_seconds()
+        release_fraction = self._case_full_release_fraction()
+        if release_after_seconds <= 0 or release_fraction <= 0:
+            return 0
+        full_since = self._case_listing_capacity_full_since(listed_ops)
+        if full_since is None:
+            return 0
+        now = _now_utc()
+        full_seconds = max(0.0, (now - full_since).total_seconds())
+        if full_seconds < release_after_seconds:
+            return 0
+
+        targets = self._open_guadao_steam_targets()
+        if not targets:
+            targets = [(str(getattr(self.steam_client, "steam_id64", "") or "") or None, self.account)]
+
+        active_records: list[tuple[Any, dict[str, Any], SteamMarketClient, str]] = []
+        seen_operation_ids: set[int] = set()
+        for steam_id, account in targets:
+            client = self._steam_client_for_account(account, steam_id)
+            if client is None:
+                continue
+            try:
+                active = client.list_active_listings()
+            except Exception as exc:
+                print(
+                    f"[警告] 满载随机释放读取 Steam 活跃挂单失败 | "
+                    f"steam={steam_id or '-'} | 原因: {exc}"
+                )
+                continue
+            active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active)
+            for op in listed_ops:
+                operation_id = int(op["id"])
+                if operation_id in seen_operation_ids or not self._operation_matches_client(op, client):
+                    continue
+                note = _read_note(op["note"])
+                listing_id = str(note.get("listingId") or "").strip()
+                asset_id = str(op["asset_id"] or "").strip()
+                if not self._listing_is_active(
+                    active_listing_ids=active_listing_ids,
+                    active_asset_ids=active_asset_ids,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                ):
+                    continue
+                if not listing_id and asset_id:
+                    listing_id = self._active_listing_id_for_asset(active, asset_id) or ""
+                    if listing_id:
+                        note["listingId"] = listing_id
+                if not listing_id:
+                    continue
+                seen_operation_ids.add(operation_id)
+                active_records.append((op, note, client, listing_id))
+
+        if not active_records:
+            return 0
+        active_records.sort(key=lambda record: int(record[0]["id"]))
+        release_count = min(
+            len(active_records),
+            max(1, int(math.ceil(len(active_records) * release_fraction))),
+        )
+        selected_records = random.sample(active_records, release_count)
+        released = 0
+        for op, note, client, listing_id in selected_records:
+            remover = getattr(client, "remove_listing", None)
+            try:
+                removed = bool(remover(listing_id)) if callable(remover) else False
+                remove_error = None if removed else "Steam remove_listing returned false"
+            except Exception as exc:
+                removed = False
+                remove_error = str(exc)
+            if not removed:
+                print(
+                    f"[满载随机释放失败] {op['market_hash_name']} | "
+                    f"asset={op['asset_id'] or '-'} | listing={listing_id} | 原因: {remove_error}"
+                )
+                continue
+
+            note["sequenceReleaseReason"] = "case_listing_capacity_full_random"
+            note["sequenceReleasedAt"] = utc_now_iso()
+            note["sequenceReleaseListingId"] = listing_id
+            note["caseListingCapacity"] = capacity
+            note["caseListingOccupiedAtRelease"] = occupied
+            note["caseListingFullSince"] = full_since.isoformat()
+            note["caseListingFullHoursAtRelease"] = round(full_seconds / 3600.0, 4)
+            note["caseFullReleaseFraction"] = release_fraction
+            self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
+            asset_id = str(op["asset_id"] or "").strip()
+            if asset_id:
+                self.db.set_asset_status(asset_id, "available")
+            if not self._has_other_open_guadao_operation(
+                op["market_hash_name"],
+                exclude_op_id=int(op["id"]),
+            ):
+                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+            released += 1
+            print(
+                f"[满载随机释放] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                f"listing={listing_id} | 活跃挂单槽连续满载 {full_seconds / 3600.0:.2f} 小时 | "
+                f"随机释放比例 {release_fraction * 100:g}% | Steam撤单成功，资产已恢复可上架"
+            )
+        return released
+
     def _guadao_listed_age_seconds(self, op: Any, *, now: datetime) -> float | None:
         created_at = _parse_iso(op["created_at"])
         if created_at is None:
@@ -3089,6 +3467,200 @@ class ExecutionEngine:
     def _is_stale_guadao_listed_operation(self, op: Any, *, now: datetime) -> bool:
         age_seconds = self._guadao_listed_age_seconds(op, now=now)
         return age_seconds is not None and age_seconds >= GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS
+
+    def _stale_listed_recheck_after_seconds(self) -> float:
+        try:
+            hours = float(self.config.stale_listed_recheck_hours)
+        except (TypeError, ValueError):
+            return 24.0 * 3600.0
+        if not math.isfinite(hours) or hours <= 0:
+            return 24.0 * 3600.0
+        return hours * 3600.0
+
+    def _stale_listed_ratio_tolerance(self) -> float:
+        try:
+            pct = float(self.config.stale_listed_max_ratio_tolerance_pct)
+        except (TypeError, ValueError):
+            return 0.015
+        if not math.isfinite(pct) or pct <= 0:
+            return 0.0
+        return pct / 100.0
+
+    def _stale_listed_recheck_due(self, note: dict[str, Any], *, now: datetime) -> bool:
+        next_check_at = _parse_iso(str(note.get("staleListedNextCheckAt") or ""))
+        if next_check_at is None:
+            return True
+        if next_check_at.tzinfo is None:
+            next_check_at = next_check_at.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc) >= next_check_at.astimezone(timezone.utc)
+
+    def _current_inventory_reference_price(self, market_hash_name: str) -> float | None:
+        cache_path = self.settings.db_path.parent / "c5_inventory_all_cache.json"
+        try:
+            cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            cached_payload = None
+        if isinstance(cached_payload, dict):
+            cached_at = _parse_iso(str(cached_payload.get("cachedAt") or ""))
+            if cached_at is not None:
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                cache_age = (_now_utc() - cached_at.astimezone(timezone.utc)).total_seconds()
+            else:
+                cache_age = None
+            if cache_age is None or cache_age <= C5_INVENTORY_REFERENCE_CACHE_MAX_AGE_SECONDS:
+                for summary in summarize_inventory_types(list(cached_payload.get("list") or [])):
+                    if str(summary.get("market_hash_name") or "") != market_hash_name:
+                        continue
+                    price = safe_float(summary.get("reference_price"))
+                    if price is not None and price > 0:
+                        return price
+
+        summaries = summarize_inventory_types(list(self._last_inventory_payload.get("list") or []))
+        for summary in summaries:
+            if str(summary.get("market_hash_name") or "") != market_hash_name:
+                continue
+            price = safe_float(summary.get("reference_price"))
+            return price if price is not None and price > 0 else None
+        return None
+
+    def _stale_listed_market_snapshot(
+        self,
+        market_hash_name: str,
+        *,
+        client: SteamMarketClient,
+        cache: dict[str, tuple[float | None, float | None, str | None]],
+    ) -> tuple[float | None, float | None, str | None]:
+        cached = cache.get(market_hash_name)
+        if cached is not None:
+            return cached
+
+        c5_price = self._current_inventory_reference_price(market_hash_name)
+        try:
+            payload = client.order_book(
+                app_id=self.settings.app_id,
+                market_hash_name=market_hash_name,
+            )
+        except Exception as exc:
+            result = (None, c5_price, f"Steam orderbook unavailable: {exc}")
+            cache[market_hash_name] = result
+            return result
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            data = payload if isinstance(payload, dict) else {}
+        actual_currency = safe_int(data.get("eCurrency"))
+        if actual_currency is not None and actual_currency != int(self.config.steam_currency):
+            result = (
+                None,
+                c5_price,
+                f"Steam orderbook currency mismatch: expected={self.config.steam_currency} actual={actual_currency}",
+            )
+            cache[market_hash_name] = result
+            return result
+
+        # 老挂单只认 Steam compact 卖家墙第一档，不读取买家盘口或第三方价格。
+        compact_sell_orders = data.get("rgCompactSellOrders")
+        summary = summarize_orderbook_prices(
+            {"rgCompactSellOrders": compact_sell_orders},
+            wall_min_count=1,
+            price_offset=0.0,
+        )
+        floor_price = safe_float(summary.seller_floor_price)
+        error: str | None = None
+        if floor_price is None or floor_price <= 0:
+            error = "Steam compact sell orderbook has no floor price"
+            floor_price = None
+        elif c5_price is None:
+            error = "current C5 inventory reference price is unavailable"
+        result = (floor_price, c5_price, error)
+        cache[market_hash_name] = result
+        return result
+
+    def _keep_stale_active_listing_if_still_competitive(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        client: SteamMarketClient,
+        now: datetime,
+        market_snapshot_cache: dict[str, tuple[float | None, float | None, str | None]],
+    ) -> bool:
+        if not self._stale_listed_recheck_due(note, now=now):
+            return True
+
+        market_hash_name = str(op["market_hash_name"])
+        floor_price, c5_price, snapshot_error = self._stale_listed_market_snapshot(
+            market_hash_name,
+            client=client,
+            cache=market_snapshot_cache,
+        )
+        checked_at = now.astimezone(timezone.utc)
+        next_check_at = checked_at + timedelta(seconds=self._stale_listed_recheck_after_seconds())
+        note["staleListedCheckedAt"] = checked_at.isoformat()
+        note["staleListedNextCheckAt"] = next_check_at.isoformat()
+        note["staleListedCurrentFloorPrice"] = floor_price
+        note["staleListedCurrentC5Price"] = c5_price
+
+        if snapshot_error:
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = snapshot_error
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            print(
+                f"[挂刀老挂单复查延后] {market_hash_name} | "
+                f"无法安全读取当前最低价/补仓价，保留挂单，下次复查 {next_check_at.isoformat()} | "
+                f"原因: {snapshot_error}"
+            )
+            return True
+
+        list_price = safe_float(note.get("steamListPrice")) or safe_float(op["expected_price"])
+        steam_net_factor = safe_float(note.get("steamNetFactorAtOpen"))
+        if steam_net_factor is None or steam_net_factor <= 0:
+            steam_net_factor = float(self.config.steam_net_factor)
+        hard_max_ratio = safe_float(note.get("guadaoMaxListingRatioAtOpen"))
+        if hard_max_ratio is None or hard_max_ratio <= 0:
+            hard_max_ratio = float(self.config.guadao_max_listing_ratio)
+        allowed_ratio = hard_max_ratio + self._stale_listed_ratio_tolerance()
+        steam_after_tax = (
+            list_price * steam_net_factor
+            if list_price is not None and list_price > 0 and steam_net_factor > 0
+            else None
+        )
+        current_ratio = (
+            c5_price / steam_after_tax
+            if c5_price is not None and steam_after_tax is not None and steam_after_tax > 0
+            else None
+        )
+        note["staleListedCurrentRatio"] = current_ratio
+        note["staleListedAllowedMaxRatio"] = allowed_ratio
+        note["staleListedRatioTolerancePct"] = self.config.stale_listed_max_ratio_tolerance_pct
+
+        if list_price is None or floor_price is None or current_ratio is None:
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = "listing price or ratio is unavailable"
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            return True
+
+        # 本单价格低于盘口第一档时同样位于最前面，不能因为盘口短时未包含本单而误撤。
+        is_at_market_floor = list_price <= floor_price + 0.005
+        note["staleListedAtMarketFloor"] = is_at_market_floor
+        if is_at_market_floor and current_ratio <= allowed_ratio:
+            note["staleListedCleanupStatus"] = "kept_at_market_floor"
+            note["staleListedCleanupReason"] = "still at market floor and ratio remains acceptable"
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            print(
+                f"[挂刀老挂单继续等待] {market_hash_name} | 挂价 {list_price:.2f} | "
+                f"当前最低价 {floor_price:.2f} | C5价 {c5_price:.2f} | "
+                f"挂刀比例 {_format_pct(current_ratio)} <= 允许上限 {_format_pct(allowed_ratio)} | "
+                f"下次复查 {next_check_at.isoformat()}"
+            )
+            return True
+
+        if not is_at_market_floor:
+            note["staleListedRemoveReason"] = "listed more than 48 hours and no longer at market floor"
+        else:
+            note["staleListedRemoveReason"] = "stale listing ratio exceeds tolerated maximum"
+        return False
 
     def _remove_stale_active_guadao_listing(
         self,
@@ -3142,7 +3714,7 @@ class ExecutionEngine:
 
         note["staleListedCleanupStatus"] = "removed"
         note["staleListedRemovedAt"] = utc_now_iso()
-        note["staleListedRemoveReason"] = "listed more than 48 hours"
+        note["staleListedRemoveReason"] = note.get("staleListedRemoveReason") or "listed more than 48 hours"
         self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
         if asset_id:
             self.db.set_asset_status(asset_id, "available")
@@ -3153,7 +3725,8 @@ class ExecutionEngine:
             self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
         print(
             f"[挂刀老挂单已撤单恢复] {op['market_hash_name']} | asset={asset_id or '-'} | "
-            f"listing={removable_listing_id} | 已超过48小时，Steam撤单成功后恢复本地资产"
+            f"listing={removable_listing_id} | 已超过48小时且不再满足继续等待条件，"
+            "Steam撤单成功后恢复本地资产"
         )
         return True
 
@@ -3171,7 +3744,13 @@ class ExecutionEngine:
             f"listing={listing_id or '-'} | 已超过48小时，远端不在售且无Steam卖出回执；未恢复本地资产"
         )
 
-    def _backfill_listing_ids(self, *, client: SteamMarketClient | None = None) -> int:
+    def _backfill_listing_ids(
+        self,
+        *,
+        client: SteamMarketClient | None = None,
+        active_listings: list[Any] | None = None,
+        operation_ids: set[int] | None = None,
+    ) -> int:
         """上架确认后，Steam 才分配 listing_id。
         此方法查询当前活跃挂单，按 asset_id 匹配，把真实 listing_id 回填到 DB。
         """
@@ -3179,6 +3758,9 @@ class ExecutionEngine:
         if not active_client:
             return 0
         ops = self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
+        if operation_ids is not None:
+            selected_ids = {int(value) for value in operation_ids}
+            ops = [op for op in ops if int(op["id"]) in selected_ids]
         empty_ops = [
             op for op in ops
             if not _read_note(op["note"]).get("listingId")
@@ -3187,10 +3769,11 @@ class ExecutionEngine:
         ]
         if not empty_ops:
             return 0
-        try:
-            active_listings = active_client.list_active_listings()
-        except Exception:
-            return 0
+        if active_listings is None:
+            try:
+                active_listings = active_client.list_active_listings()
+            except Exception:
+                return 0
         asset_to_lid = {
             lst.asset_id: lst.listing_id
             for lst in active_listings
@@ -3849,6 +4432,133 @@ class ExecutionEngine:
             )
         return sale_receipt
 
+    def _steam_sale_receipt_deep_lookup_due(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> bool:
+        """Return whether an unresolved listing is due for a bounded deep walk."""
+
+        pending_since = (
+            _parse_iso(str(note.get("listingPendingAt") or ""))
+            or _parse_iso(str(note.get("staleListedManualRequiredAt") or ""))
+        )
+        if pending_since is None:
+            return False
+        if pending_since.tzinfo is None:
+            pending_since = pending_since.replace(tzinfo=timezone.utc)
+        if (
+            now - pending_since.astimezone(timezone.utc)
+        ).total_seconds() < STEAM_SALE_RECEIPT_DEEP_LOOKUP_INITIAL_DELAY_SECONDS:
+            return False
+        last_deep = _parse_iso(str(note.get("saleEvidenceDeepLastAttemptAt") or ""))
+        if last_deep is None:
+            return True
+        if last_deep.tzinfo is None:
+            last_deep = last_deep.replace(tzinfo=timezone.utc)
+        return (
+            now - last_deep.astimezone(timezone.utc)
+        ).total_seconds() >= STEAM_SALE_RECEIPT_DEEP_LOOKUP_INTERVAL_SECONDS
+
+    def _lookup_steam_sale_receipts_for_operations(
+        self,
+        client: SteamMarketClient,
+        operations: list[Any],
+        *,
+        active_listing_ids: set[str],
+        active_asset_ids: set[str],
+        now: datetime | None = None,
+    ) -> tuple[dict[int, dict[str, Any] | None], set[int], str | None]:
+        """Read one account history snapshot for every unresolved due operation.
+
+        Routine checks stay on the first two pages.  Once an unresolved
+        listing has waited long enough, one shared bounded deep walk covers all
+        due operations for the account.  The deep attempt timestamp is only
+        returned after a successful history read so transient Steam errors do
+        not postpone the next recovery attempt for six hours.
+        """
+
+        checked_at = now or _now_utc()
+        missing: list[tuple[Any, dict[str, Any]]] = []
+        deep_due_ids: set[int] = set()
+        for op in operations:
+            if not self._operation_matches_client(op, client):
+                continue
+            note = _read_note(op["note"])
+            listing_id = str(note.get("listingId") or "").strip()
+            asset_id = str(op["asset_id"] or "").strip()
+            if self._listing_is_active(
+                active_listing_ids=active_listing_ids,
+                active_asset_ids=active_asset_ids,
+                listing_id=listing_id,
+                asset_id=asset_id,
+            ):
+                continue
+            if not listing_id and not asset_id:
+                continue
+            missing.append((op, note))
+            if self._steam_sale_receipt_deep_lookup_due(op, note, now=checked_at):
+                deep_due_ids.add(int(op["id"]))
+        if not missing:
+            return {}, set(), None
+
+        max_pages = (
+            STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES
+            if deep_due_ids
+            else STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES
+        )
+        results: dict[int, dict[str, Any] | None] = {
+            int(op["id"]): None for op, _ in missing
+        }
+        batch_finder = getattr(client, "find_sale_receipts_for_targets", None)
+        try:
+            if callable(batch_finder):
+                targets = [
+                    {
+                        "key": str(int(op["id"])),
+                        "listingId": str(note.get("listingId") or "").strip(),
+                        "assetId": str(op["asset_id"] or "").strip(),
+                    }
+                    for op, note in missing
+                ]
+                batch_results = batch_finder(targets, max_pages=max_pages)
+                if isinstance(batch_results, dict):
+                    for operation_id in results:
+                        receipt = batch_results.get(str(operation_id))
+                        if isinstance(receipt, dict):
+                            results[operation_id] = receipt
+            else:
+                # Compatibility for tests and older injected clients.  The
+                # production Steam client supports the account-level batch
+                # finder above, so real requests are not multiplied per op.
+                for op, note in missing:
+                    results[int(op["id"])] = self._lookup_steam_sale_receipt_for_listing_or_asset(
+                        client,
+                        listing_id=str(note.get("listingId") or "").strip(),
+                        asset_id=str(op["asset_id"] or "").strip(),
+                        max_pages=max_pages,
+                    )
+        except Exception:
+            return results, set(), None
+        attempted_at = checked_at.astimezone(timezone.utc).isoformat()
+        return results, deep_due_ids, attempted_at if deep_due_ids else None
+
+    @staticmethod
+    def _record_sale_receipt_deep_attempt(
+        note: dict[str, Any],
+        *,
+        attempted_at: str | None,
+    ) -> None:
+        if not attempted_at:
+            return
+        note["saleEvidenceDeepLastAttemptAt"] = attempted_at
+        note["saleEvidenceDeepAttemptCount"] = max(
+            0,
+            safe_int(note.get("saleEvidenceDeepAttemptCount")) or 0,
+        ) + 1
+
     def _load_existing_rebuy_source_keys(self) -> tuple[set[str], set[str]]:
         existing_rebuy_sources: set[str] = set()
         existing_rebuy_sell_ops: set[str] = set()
@@ -3895,7 +4605,7 @@ class ExecutionEngine:
                 note["steamPurchaseId"] = receipt_purchase_id
                 note_changed = True
             if receipt_time_sold not in (None, ""):
-                note["steamSoldAt"] = receipt_time_sold
+                note["steamSoldAt"] = _normalize_timestamp_iso(receipt_time_sold)
                 note_changed = True
             if receipt_currency_id not in (None, ""):
                 note["steamHistoryCurrencyId"] = receipt_currency_id
@@ -3925,6 +4635,23 @@ class ExecutionEngine:
         if steam_net_price is not None:
             sold_message += f" | 税后到手 CNY {_format_decimal(steam_net_price)}"
         print(sold_message)
+        self._emit_guadao_local_event(
+            operation="steam_listing_sold",
+            message="Steam 挂刀已确认卖出",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=asset_id or None,
+            note=note,
+            context={
+                "state": "sold",
+                "listingId": listing_id or None,
+                "steamSalePrice": steam_list_price,
+                "steamNetAmount": steam_net_price,
+                "steamNetAmountSource": note.get("steamSellerNetPriceSource"),
+                "steamSoldAt": note.get("steamSoldAt"),
+                "steamPurchaseId": note.get("steamPurchaseId"),
+            },
+        )
 
         rebuy_price = note.get("rebuyPrice")
         if isinstance(rebuy_price, (int, float)) and rebuy_price > 0:
@@ -3951,6 +4678,9 @@ class ExecutionEngine:
                             "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
                             "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
                             "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
+                            "guadaoRatioRuleSource": note.get("guadaoRatioRuleSource"),
+                            "guadaoRatioRuleId": note.get("guadaoRatioRuleId"),
+                            "guadaoRatioRuleVersion": note.get("guadaoRatioRuleVersion"),
                         }
                     ),
                 )
@@ -3958,34 +4688,67 @@ class ExecutionEngine:
                     existing_rebuy_sources.add(listing_id)
                 existing_rebuy_sell_ops.add(source_sell_op_id)
 
-    def _refresh_listings(self, *, client: SteamMarketClient | None = None) -> int:
+    def _refresh_listings(
+        self,
+        *,
+        client: SteamMarketClient | None = None,
+        active_listings: list[Any] | None = None,
+        operation_ids: set[int] | None = None,
+        sale_receipt_results: dict[int, dict[str, Any] | None] | None = None,
+        sale_receipt_deep_attempt_ids: set[int] | None = None,
+        sale_receipt_deep_attempted_at: str | None = None,
+    ) -> int:
         active_client = client or self.steam_client
         if not active_client:
             return 0
-        try:
-            active = active_client.list_active_listings()
-        except Exception as exc:
-            print(
-                "[警告] 获取 Steam 挂单列表失败，暂按网络/Steam 超时处理，"
-                f"不会判定为已卖出: {exc}"
-            )
-            return 0
+        if active_listings is None:
+            try:
+                active = active_client.list_active_listings()
+            except Exception as exc:
+                print(
+                    "[警告] 获取 Steam 挂单列表失败，暂按网络/Steam 超时处理，"
+                    f"不会判定为已卖出: {exc}"
+                )
+                return 0
+        else:
+            active = active_listings
         active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active)
         now = _now_utc()
         sold_count = 0
         pool_status_map = self.db.get_pool_status_map()
         existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
+        stale_market_snapshot_cache: dict[str, tuple[float | None, float | None, str | None]] = {}
 
         listed_ops = [
             op
             for op in self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
             if self._operation_matches_client(op, active_client)
+            and (operation_ids is None or int(op["id"]) in operation_ids)
         ]
+        if sale_receipt_results is None:
+            (
+                sale_receipt_results,
+                sale_receipt_deep_attempt_ids,
+                sale_receipt_deep_attempted_at,
+            ) = self._lookup_steam_sale_receipts_for_operations(
+                active_client,
+                listed_ops,
+                active_listing_ids=active_listing_ids,
+                active_asset_ids=active_asset_ids,
+                now=now,
+            )
+        deep_attempt_ids = set(sale_receipt_deep_attempt_ids or set())
         for op in listed_ops:
             pool_status = pool_status_map.get(op["market_hash_name"], POOL_STATUS_HOLDING)
             if pool_status == POOL_STATUS_LISTING_PENDING:
                 continue
             note = _read_note(op["note"])
+            operation_id = int(op["id"])
+            if operation_id in deep_attempt_ids:
+                self._record_sale_receipt_deep_attempt(
+                    note,
+                    attempted_at=sale_receipt_deep_attempted_at,
+                )
             listing_id = str(note.get("listingId") or "")
             asset_id = str(op["asset_id"] or "")
             is_stale_listed = self._is_stale_guadao_listed_operation(op, now=now)
@@ -3997,6 +4760,14 @@ class ExecutionEngine:
                 asset_id=asset_id,
             ):
                 if is_stale_listed:
+                    if self._keep_stale_active_listing_if_still_competitive(
+                        op,
+                        note,
+                        client=active_client,
+                        now=now,
+                        market_snapshot_cache=stale_market_snapshot_cache,
+                    ):
+                        continue
                     self._remove_stale_active_guadao_listing(
                         op,
                         note,
@@ -4010,9 +4781,7 @@ class ExecutionEngine:
                     self.db.update_pool_operation(op["id"], note=_build_note(note))
                 continue
 
-            sale_receipt = self._lookup_steam_sale_receipt(active_client, listing_id)
-            if sale_receipt is None and asset_id:
-                sale_receipt = self._lookup_steam_sale_receipt_by_asset(active_client, asset_id)
+            sale_receipt = sale_receipt_results.get(operation_id)
             if sale_receipt is not None:
                 self._mark_steam_listing_sold(
                     op,
@@ -4032,28 +4801,21 @@ class ExecutionEngine:
                 continue
 
             created_at = _parse_iso(op["created_at"])
-            if created_at and (now - created_at).total_seconds() < self.config.listing_check_interval_minutes * 60:
+            if created_at and (now - created_at).total_seconds() < self._minimum_action_confirmation_seconds():
                 continue
 
-            if sale_receipt is None and (
-                note.get("confirmationStatus") in LISTING_CONFIRMATION_PENDING_STATUSES
-                or not note.get("activeVerifiedAt")
-            ):
-                self._mark_steam_listing_pending(op, note, reason="listing_missing_unverified")
-                print(
-                    f"[挂单待确认] {op['market_hash_name']} | asset={asset_id or '-'} | "
-                    f"listing={listing_id or '-'} | Steam活跃挂单未找到，未判定为卖出"
-                )
-                continue
-
-            self._mark_steam_listing_sold(
-                op,
-                note,
-                sale_receipt=sale_receipt,
-                existing_rebuy_sources=existing_rebuy_sources,
-                existing_rebuy_sell_ops=existing_rebuy_sell_ops,
+            # A listing disappearing from mylistings is not sale evidence.
+            # History may lag, mylistings may be incomplete, or a manual
+            # removal may have occurred.  Keep the asset locked in a resumable
+            # confirmation state until Steam supplies an official receipt (or
+            # the existing safe pending-state reconciliation proves it can be
+            # released).  Never create a rebuy from absence alone.
+            self._mark_steam_listing_pending(op, note, reason="listing_missing_unverified")
+            print(
+                f"[挂单待确认] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                f"listing={listing_id or '-'} | Steam活跃挂单未找到且无官方卖出回执，未判定为卖出"
             )
-            sold_count += 1
+            continue
         return sold_count
 
     def _refresh_transfer_sales(self) -> int:
@@ -4069,7 +4831,7 @@ class ExecutionEngine:
             if not product_id or product_id in active_ids:
                 continue
             created_at = _parse_iso(op["created_at"])
-            if created_at and (now - created_at).total_seconds() < self.config.listing_check_interval_minutes * 60:
+            if created_at and (now - created_at).total_seconds() < self._minimum_action_confirmation_seconds():
                 continue
             self.db.update_pool_operation(op["id"], status="sold")
             if op["asset_id"]:
@@ -4255,6 +5017,71 @@ class ExecutionEngine:
             op_time = op_time.replace(tzinfo=timezone.utc)
         return op_time >= cutoff
 
+    def _rebuy_delivery_deadline(self, op: Any, note: dict[str, Any]) -> datetime | None:
+        # The 24-hour delivery clock starts only after a real C5 order was
+        # submitted.  Local operation timestamps describe our state machine,
+        # not C5's seller-delivery obligation, and must never start this clock.
+        submitted = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
+        if submitted is None:
+            return None
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=timezone.utc)
+        return submitted.astimezone(timezone.utc) + timedelta(seconds=C5_DELIVERY_DEADLINE_SECONDS)
+
+    def _expire_rebuy_delivery_if_due(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        deadline = self._rebuy_delivery_deadline(op, note)
+        current = now or _now_utc()
+        if deadline is None or current < deadline:
+            return False
+        failed_note = {
+            **note,
+            C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED,
+            "c5OrderInvalidated": True,
+            "c5OrderFailedCode": "delivery_timeout_24h",
+            "c5OrderFailedDesc": "C5 补仓下单后 24 小时仍未发货，按补仓失败处理",
+            "c5DeliveryDeadlineAt": deadline.isoformat(),
+            "c5DeliveryTimedOutAt": current.isoformat(),
+            REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+        }
+        self.db.update_pool_operation(
+            op["id"],
+            status=C5_DELIVERY_FAILED,
+            note=_build_note(failed_note),
+        )
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_delivery_timeout_24h",
+            message="C5 补仓满 24 小时仍未发货，已按失败处理",
+            level="ERROR",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=failed_note,
+            context={
+                "state": C5_DELIVERY_FAILED,
+                "c5OrderId": failed_note.get("c5OrderId"),
+                "c5OutTradeNo": failed_note.get("c5OutTradeNo"),
+                "c5ActualPrice": safe_float(op["actual_price"]),
+                "c5ExpectedPrice": safe_float(op["expected_price"]),
+                "deliveryDeadlineAt": deadline.isoformat(),
+                "timedOutAt": current.isoformat(),
+                "maxRebuyRatioAtOpen": failed_note.get("maxRebuyRatioAtOpen"),
+            },
+        )
+        self._create_replacement_rebuy_for_failed_op(
+            self._get_pool_operation_by_id(int(op["id"])) or op,
+            failed_note,
+            replacement_reason="c5_delivery_failed",
+            failed_status=C5_DELIVERY_FAILED,
+            created_by="c5_delivery_timeout_24h",
+        )
+        return True
+
     def _create_replacement_rebuy_for_failed_op(
         self,
         op: Any,
@@ -4302,6 +5129,9 @@ class ExecutionEngine:
             "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
             "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
             "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
+            "guadaoRatioRuleSource": note.get("guadaoRatioRuleSource"),
+            "guadaoRatioRuleId": note.get("guadaoRatioRuleId"),
+            "guadaoRatioRuleVersion": note.get("guadaoRatioRuleVersion"),
             "steamAccountId": note.get("steamAccountId"),
             "steamAccountName": note.get("steamAccountName"),
             "steamId64": note.get("steamId64"),
@@ -4345,6 +5175,27 @@ class ExecutionEngine:
             f"[补仓失效] {op['market_hash_name']} | 原补仓 op={op['id']} 已失败，"
             f"已创建替换补仓 op={replacement_id} | 原因: {failed_reason}"
         )
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_replacement_created",
+            message="C5 失败补仓已创建替换补仓任务",
+            level="WARNING",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=note,
+            context={
+                "state": "replacement_pending",
+                "replacementOperationId": replacement_id,
+                "replacementReason": replacement_reason,
+                "failedReason": failed_reason,
+                "originalC5OrderId": order_id or None,
+                "replacementMaxPrice": (
+                    expected_price if replacement_reason == "c5_delivery_failed" else None
+                ),
+                "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
+                "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
+            },
+        )
         return 1
 
     def _fetch_c5_buyer_order_detail(self, op: Any, note: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
@@ -4384,8 +5235,8 @@ class ExecutionEngine:
         )
         return None, None, updated_note
 
-    def _check_recent_rebuy_delivery_failures(self) -> int:
-        if self.config.dry_run or not self.config.auto_rebuy_enabled:
+    def _check_recent_rebuy_delivery_failures(self, *, operation_id: int | None = None) -> int:
+        if self.config.dry_run or (not self.config.auto_rebuy_enabled and operation_id is None):
             return 0
 
         cutoff = _now_utc() - timedelta(days=REBUY_ORDER_AUDIT_LOOKBACK_DAYS)
@@ -4393,11 +5244,29 @@ class ExecutionEngine:
         successes = 0
         failures = 0
         replacements = 0
-        for op in self.db.list_pool_operations_by_type(OP_REBUY_C5, status="completed", limit=5000):
-            if not self._op_is_within_rebuy_audit_window(op, cutoff):
+        delivery_candidates = self.db.list_pool_operations_by_type_and_statuses(
+            OP_REBUY_C5,
+            statuses=["delivery_pending", "completed"],
+            limit=5000,
+        )
+        if operation_id is not None:
+            delivery_candidates = [
+                op for op in delivery_candidates if int(op["id"]) == int(operation_id)
+            ]
+        for op in delivery_candidates:
+            is_delivery_pending = str(op["status"] or "") == "delivery_pending"
+            if not is_delivery_pending and not self._op_is_within_rebuy_audit_window(op, cutoff):
                 continue
             note = _read_note(op["note"])
             if note.get(C5_DELIVERY_STATUS_KEY) in {C5_DELIVERY_SUCCESS, C5_DELIVERY_FAILED}:
+                continue
+            # C5 requires delivery within 24 hours. Once the persisted deadline
+            # has passed, the local terminal decision no longer depends on a
+            # successful detail lookup: network errors, mismatched responses,
+            # and old audit age must not leave this operation pending forever.
+            if is_delivery_pending and self._expire_rebuy_delivery_if_due(op, note):
+                failures += 1
+                replacements += 1
                 continue
             if not _c5_order_lookup_ids(note):
                 continue
@@ -4409,6 +5278,9 @@ class ExecutionEngine:
                 print(f"[警告] 复查 C5 补仓订单失败: op={op['id']} | {exc}")
                 continue
             if detail is None:
+                if self._expire_rebuy_delivery_if_due(op, note):
+                    failures += 1
+                    replacements += 1
                 continue
 
             final_status = _c5_delivery_final_status(detail)
@@ -4419,7 +5291,12 @@ class ExecutionEngine:
                 "c5OrderCheckedAt": utc_now_iso(),
             }
             if final_status is None:
+                deadline = self._rebuy_delivery_deadline(op, checked_note)
+                checked_note["c5DeliveryDeadlineAt"] = deadline.isoformat() if deadline else None
                 self.db.update_pool_operation(op["id"], note=_build_note(checked_note))
+                if self._expire_rebuy_delivery_if_due(op, checked_note):
+                    failures += 1
+                    replacements += 1
                 continue
 
             detail_market_hash_name = _c5_order_detail_market_hash_name(detail)
@@ -4433,6 +5310,7 @@ class ExecutionEngine:
             if final_status == C5_DELIVERY_SUCCESS:
                 self.db.update_pool_operation(
                     op["id"],
+                    status="completed",
                     note=_build_note(
                         {
                             **checked_note,
@@ -4440,6 +5318,28 @@ class ExecutionEngine:
                             "c5OrderInvalidated": False,
                         }
                     ),
+                )
+                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+                completed_note = {
+                    **checked_note,
+                    C5_DELIVERY_STATUS_KEY: C5_DELIVERY_SUCCESS,
+                    "c5OrderInvalidated": False,
+                }
+                self._emit_guadao_local_event(
+                    operation="c5_rebuy_completed",
+                    message="C5 补仓已确认发货完成",
+                    market_hash_name=str(op["market_hash_name"]),
+                    operation_id=int(op["id"]),
+                    asset_id=str(op["asset_id"] or "") or None,
+                    note=completed_note,
+                    context={
+                        "state": "completed",
+                        "c5ActualPrice": safe_float(op["actual_price"]),
+                        "c5ExpectedPrice": safe_float(op["expected_price"]),
+                        "c5OrderId": order_id or checked_note.get("c5OrderId"),
+                        "c5OutTradeNo": checked_note.get("c5OutTradeNo"),
+                        "deliveryStatus": C5_DELIVERY_SUCCESS,
+                    },
                 )
                 successes += 1
                 continue
@@ -4452,10 +5352,29 @@ class ExecutionEngine:
                 "c5OrderInvalidated": True,
             }
             self.db.update_pool_operation(op["id"], status=C5_DELIVERY_FAILED, note=_build_note(failed_note))
+            self._emit_guadao_local_event(
+                operation="c5_rebuy_delivery_failed",
+                message="C5 补仓订单已明确发货失败",
+                level="ERROR",
+                market_hash_name=str(op["market_hash_name"]),
+                operation_id=int(op["id"]),
+                asset_id=str(op["asset_id"] or "") or None,
+                note=failed_note,
+                context={
+                    "state": C5_DELIVERY_FAILED,
+                    "c5ActualPrice": safe_float(op["actual_price"]),
+                    "c5ExpectedPrice": safe_float(op["expected_price"]),
+                    "c5OrderId": order_id or failed_note.get("c5OrderId"),
+                    "failedCode": failed_note.get("c5OrderFailedCode"),
+                    "failedReason": failed_note.get("c5OrderFailedDesc"),
+                },
+            )
             failures += 1
 
         for failed_status in (C5_DELIVERY_FAILED, "failed", "canceled", "skipped"):
             for op in self.db.list_pool_operations_by_type(OP_REBUY_C5, status=failed_status, limit=5000):
+                if operation_id is not None and int(op["id"]) != int(operation_id):
+                    continue
                 if failed_status not in {"canceled", "skipped"} and not self._op_is_within_rebuy_audit_window(op, cutoff):
                     continue
                 note = _read_note(op["note"])
@@ -4510,10 +5429,12 @@ class ExecutionEngine:
             )
         return replacements
 
-    def _execute_rebuys(self) -> int:
+    def _execute_rebuys(self, *, operation_id: int | None = None) -> int:
         if not self.config.auto_rebuy_enabled:
             return 0
         pending = self.db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=200)
+        if operation_id is not None:
+            pending = [op for op in pending if int(op["id"]) == int(operation_id)]
         rebuy_count = 0
         for op in pending:
             expected_price = op["expected_price"]
@@ -4596,6 +5517,7 @@ class ExecutionEngine:
                         }
                     ),
                 )
+                steam_sold_net = None
                 if result.listing_ratio_now:
                     steam_sold_net = (
                         float(result.steam_reference_price) * float(rebuy_steam_net_factor)
@@ -4618,6 +5540,25 @@ class ExecutionEngine:
                         f"账号={_steam_account_log_label(note) or '-'} | "
                         f"原因: {result.reason}"
                     )
+                self._emit_guadao_local_event(
+                    operation="c5_rebuy_waiting",
+                    message="C5 补仓条件暂不满足，已安排后续重试",
+                    level="WARNING",
+                    market_hash_name=str(op["market_hash_name"]),
+                    operation_id=int(op["id"]),
+                    asset_id=str(op["asset_id"] or "") or None,
+                    note=note,
+                    context={
+                        "state": "pending",
+                        "reason": result.reason,
+                        "c5ActualPrice": result.actual_price,
+                        "c5MaxPrice": result.max_price,
+                        "steamNetAmount": steam_sold_net,
+                        "rebuyRatio": result.listing_ratio_now,
+                        "isReplacement": bool(is_replacement),
+                        "nextAttemptPolicy": "scheduled_task",
+                    },
+                )
                 continue
             if result.reason == "price_too_high":
                 # C5 当前价格超出预算上限 → 永久跳过本次补仓
@@ -4639,9 +5580,17 @@ class ExecutionEngine:
                 c5_payload = getattr(result, "payload", None)
                 c5_order_id = _extract_c5_order_id(c5_payload)
                 c5_trade_order_id = _extract_c5_trade_order_id(c5_payload)
+                submitted_at = (
+                    _parse_iso(str(getattr(result, "submitted_at", None) or ""))
+                    or _now_utc()
+                )
+                if submitted_at.tzinfo is None:
+                    submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+                submitted_at = submitted_at.astimezone(timezone.utc)
+                delivery_deadline = submitted_at + timedelta(seconds=C5_DELIVERY_DEADLINE_SECONDS)
                 self.db.update_pool_operation(
                     op["id"],
-                    status="completed",
+                    status="delivery_pending",
                     actual_price=result.actual_price,
                     note=_build_note(
                         {
@@ -4650,16 +5599,38 @@ class ExecutionEngine:
                             "c5OrderId": c5_order_id,
                             "c5TradeOrderId": c5_trade_order_id,
                             "c5OrderStatus": "ordered",
+                            C5_DELIVERY_STATUS_KEY: "pending",
+                            "c5OrderSubmittedAt": submitted_at.isoformat(),
+                            "c5DeliveryDeadlineAt": delivery_deadline.isoformat(),
                             "c5OrderPayload": c5_payload,
                         }
                     ),
                 )
-                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
                 prefix = "[补仓替换]" if is_replacement else "[补仓]"
                 print(
                     f"{prefix} {op['market_hash_name']} | "
                     f"账号={_steam_account_log_label(note) or '-'} | "
                     f"C5买入 CNY {_format_decimal(result.actual_price)}"
+                )
+                self._emit_guadao_local_event(
+                    operation="c5_rebuy_submitted",
+                    message="C5 补仓已提交，等待发货确认",
+                    market_hash_name=str(op["market_hash_name"]),
+                    operation_id=int(op["id"]),
+                    asset_id=str(op["asset_id"] or "") or None,
+                    note=note,
+                    context={
+                        "state": "delivery_pending",
+                        "c5ActualPrice": result.actual_price,
+                        "c5MaxPrice": result.max_price,
+                        "c5OutTradeNo": getattr(result, "out_trade_no", None),
+                        "c5OrderId": c5_order_id,
+                        "c5TradeOrderId": c5_trade_order_id,
+                        "deliveryDeadlineAt": delivery_deadline.isoformat(),
+                        "isReplacement": bool(is_replacement),
+                        "replacementMaxPrice": replacement_max_price,
+                    },
                 )
                 rebuy_count += 1
             elif result.skipped:
@@ -4685,6 +5656,22 @@ class ExecutionEngine:
                         f"账号={_steam_account_log_label(note) or '-'} | "
                         "原因: c5_balance_insufficient | 保持 pending，下轮重试"
                     )
+                    self._emit_guadao_local_event(
+                        operation="c5_rebuy_waiting",
+                        message="C5 余额不足，补仓保持等待",
+                        level="WARNING",
+                        market_hash_name=str(op["market_hash_name"]),
+                        operation_id=int(op["id"]),
+                        asset_id=str(op["asset_id"] or "") or None,
+                        note=note,
+                        context={
+                            "state": "pending",
+                            "reason": "c5_balance_insufficient",
+                            "c5ActualPrice": result.actual_price,
+                            "c5MaxPrice": result.max_price,
+                            "isReplacement": bool(is_replacement),
+                        },
+                    )
                     continue
                 self.db.update_pool_operation(
                     op["id"],
@@ -4706,6 +5693,148 @@ class ExecutionEngine:
                     f"原因: {result.reason}"
                 )
         return rebuy_count
+
+    def run_guadao_scan_task(self) -> dict[str, Any]:
+        """Run only the new-candidate branch; existing-state work has its own tasks."""
+
+        self._pending_confirmation_count = 0
+        self._market_pending_cleanup_failed_count = 0
+        self._steam_market_validated_accounts = set()
+        self._sync_assets()
+        pool_names = self.db.get_pool_market_hash_names()
+        if not pool_names:
+            return {"ok": True, "listed": 0, "evaluated": 0, "reason": "empty_pool"}
+        weapon_case_market_hash_names = {
+            name for name in pool_names if self._is_weapon_case(name)
+        }
+        scan_pool_names = self._pool_names_for_strategy_scan(pool_names)
+        report = scan_strategies(
+            self.settings,
+            self.config,
+            allow_cached_fallback=True,
+            cache_max_age_minutes=180,
+            pool_market_hash_names=scan_pool_names,
+            inventory_payload=self._last_inventory_payload,
+            weapon_case_market_hash_names=weapon_case_market_hash_names,
+        )
+        self._refresh_scan_listing_prices_from_steam(report)
+        status_map = self.db.get_pool_status_map()
+        listed = 0
+        if not self._has_open_guadao_cycle(status_map):
+            listed = self._execute_guadao_listings(report, status_map)
+        self._release_full_case_listing_capacity()
+        return {
+            "ok": True,
+            "listed": listed,
+            "evaluated": len(getattr(report, "all_evaluated", []) or []),
+            "candidateCount": len(getattr(report, "guadao_candidates", []) or []),
+            "generatedAt": getattr(report, "generated_at", utc_now_iso()),
+        }
+
+    def run_guadao_account_sync_task(
+        self,
+        account_id: str | None,
+        *,
+        confirmation_operation_ids: set[int] | None = None,
+        sale_operation_ids: set[int] | None = None,
+    ) -> dict[str, Any]:
+        if confirmation_operation_ids == set() and sale_operation_ids == set():
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "no_due_operations",
+                "accountId": account_id,
+                "confirmed": 0,
+                "backfilled": 0,
+                "sold": 0,
+            }
+        account = self._account_by_id(account_id) if account_id else self.account
+        steam_id = str(account.steam_id64 or "").strip() if account else None
+        client = self._steam_client_for_account(account, steam_id)
+        if client is None:
+            return {"ok": False, "sold": 0, "error": "steam client unavailable"}
+        self._steam_market_validated_accounts = set()
+        try:
+            active_listings = client.list_active_listings()
+        except Exception as exc:
+            return {"ok": False, "sold": 0, "error": str(exc)}
+        active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active_listings)
+        due_operations = self.db.list_pool_operations_by_type_and_statuses(
+            OP_SELL_STEAM,
+            statuses=[POOL_STATUS_LISTING_PENDING, "listed", "manual_required"],
+            limit=5000,
+        )
+        if confirmation_operation_ids is not None or sale_operation_ids is not None:
+            due_operation_ids = set(confirmation_operation_ids or set()) | set(
+                sale_operation_ids or set()
+            )
+            due_operations = [
+                op for op in due_operations if int(op["id"]) in due_operation_ids
+            ]
+        (
+            sale_receipt_results,
+            deep_attempt_ids,
+            deep_attempted_at,
+        ) = self._lookup_steam_sale_receipts_for_operations(
+            client,
+            due_operations,
+            active_listing_ids=active_listing_ids,
+            active_asset_ids=active_asset_ids,
+        )
+        confirmed = self._refresh_pending_listing_confirmations(
+            client=client,
+            active_listings=active_listings,
+            operation_ids=confirmation_operation_ids,
+            sale_receipt_results=sale_receipt_results,
+            sale_receipt_deep_attempt_ids=deep_attempt_ids,
+            sale_receipt_deep_attempted_at=deep_attempted_at,
+        )
+        backfill_operation_ids = None
+        if confirmation_operation_ids is not None or sale_operation_ids is not None:
+            backfill_operation_ids = set(confirmation_operation_ids or set()) | set(
+                sale_operation_ids or set()
+            )
+        backfilled = self._backfill_listing_ids(
+            client=client,
+            active_listings=active_listings,
+            operation_ids=backfill_operation_ids,
+        )
+        sold = self._refresh_listings(
+            client=client,
+            active_listings=active_listings,
+            operation_ids=sale_operation_ids,
+            sale_receipt_results=sale_receipt_results,
+            sale_receipt_deep_attempt_ids=deep_attempt_ids,
+            sale_receipt_deep_attempted_at=deep_attempted_at,
+        )
+        return {
+            "ok": True,
+            "accountId": account.id if account else account_id,
+            "steamId": steam_id,
+            "confirmed": confirmed,
+            "backfilled": backfilled,
+            "sold": sold,
+        }
+
+    def run_guadao_rebuy_task(self, operation_id: int) -> dict[str, Any]:
+        count = self._execute_rebuys(operation_id=operation_id)
+        row = self._get_pool_operation_by_id(int(operation_id))
+        return {
+            "ok": row is not None,
+            "operationId": int(operation_id),
+            "rebought": count,
+            "status": str(row["status"] or "") if row is not None else "missing",
+        }
+
+    def run_guadao_delivery_confirmation_task(self, operation_id: int) -> dict[str, Any]:
+        replacements = self._check_recent_rebuy_delivery_failures(operation_id=operation_id)
+        row = self._get_pool_operation_by_id(int(operation_id))
+        return {
+            "ok": row is not None,
+            "operationId": int(operation_id),
+            "replacements": replacements,
+            "status": str(row["status"] or "") if row is not None else "missing",
+        }
 
     def _handle_no_matching_rebuy_timeout(
         self,

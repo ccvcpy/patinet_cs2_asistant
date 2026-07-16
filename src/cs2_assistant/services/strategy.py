@@ -77,12 +77,14 @@ def classify_strategies(
     config: StrategyConfig,
     *,
     is_weapon_case: bool = False,
+    market_hash_name: str = "",
 ) -> list[str]:
     """Classify which strategies apply to an item based on its ratios."""
     strategies: list[str] = []
 
     # 挂刀做T: listing_ratio 低 → 有利
-    if listing_ratio <= config.guadao_max_listing_ratio and guadao_scope_allows_item(
+    max_listing_ratio = config.guadao_max_listing_ratio_for(market_hash_name)
+    if listing_ratio <= max_listing_ratio and guadao_scope_allows_item(
         config.guadao_item_scope,
         is_weapon_case=is_weapon_case,
     ):
@@ -237,6 +239,7 @@ def scan_strategies(
             transfer_real_ratio,
             config,
             is_weapon_case=item_is_weapon_case,
+            market_hash_name=mhn,
         )
 
         steam_ids = item_type.get("steam_ids") or []

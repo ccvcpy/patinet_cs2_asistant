@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 import json
 from unittest.mock import patch
@@ -10,11 +11,15 @@ import requests
 
 from cs2_assistant.accounts.store import AccountStore
 from cs2_assistant.accounts.steam_auth import (
+    COOKIE_STATUS_LIMITED,
+    COOKIE_STATUS_NETWORK_UNKNOWN,
     _Cs2SteamLoginExecutor,
     _do_steampy_login,
     try_steam_auto_relogin,
+    _verify_steam_cookies_status,
     _verify_steam_cookies_valid,
 )
+from cs2_assistant.accounts import steam_auth as steam_auth_module
 
 
 class _FakeResponse:
@@ -38,6 +43,9 @@ class _FakeResponse:
 
 
 class SteamAuthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        steam_auth_module._AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT.clear()
+
     def test_login_request_posts_input_json_form_payload(self) -> None:
         class FakeSession:
             def __init__(self) -> None:
@@ -178,7 +186,7 @@ class SteamAuthTests(unittest.TestCase):
 
     def test_verify_steam_cookies_valid_falls_back_on_market_timeout(self) -> None:
         def fake_get(*args: object, **kwargs: object) -> object:
-            url = str(args[1] if len(args) > 1 else kwargs.get("url") or "")
+            url = str(args[-1] if args else kwargs.get("url") or "")
             if "steamcommunity.com/market/mylistings" in url:
                 raise requests.Timeout("boom")
             if "store.steampowered.com/pointssummary/ajaxgetasyncconfig" in url:
@@ -196,6 +204,133 @@ class SteamAuthTests(unittest.TestCase):
             )
 
         self.assertTrue(ok)
+
+    def test_market_429_is_limited_and_does_not_fall_back_to_valid(self) -> None:
+        response = _FakeResponse(
+            status_code=429,
+            url="https://steamcommunity.com/market/mylistings",
+            headers={"Retry-After": "30"},
+        )
+        with patch("requests.Session.get", return_value=response) as getter:
+            status = _verify_steam_cookies_status(
+                "sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+                "76561198000000000",
+            )
+
+        self.assertEqual(COOKIE_STATUS_LIMITED, status)
+        self.assertEqual(1, getter.call_count)
+
+    def test_profile_429_after_transport_fallback_is_not_cookie_valid(self) -> None:
+        calls = 0
+
+        def fake_get(*args: object, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                raise requests.Timeout("ambiguous")
+            return _FakeResponse(
+                status_code=429,
+                url="https://steamcommunity.com/profiles/76561198000000000",
+            )
+
+        with patch("requests.Session.get", side_effect=fake_get):
+            status = _verify_steam_cookies_status(
+                "sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+                "76561198000000000",
+            )
+
+        self.assertEqual(COOKIE_STATUS_LIMITED, status)
+
+    def test_cookie_429_does_not_trigger_relogin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"CS2_MASTER_KEY": "test-key"}):
+                store = AccountStore(tmpdir)
+                account = store.add_account(
+                    name="limited-account",
+                    username="limited-account",
+                    password="password",
+                    cookies=(
+                        "sessionid=session-1; "
+                        "steamLoginSecure=76561198000000000%7C%7Ctoken"
+                    ),
+                    steam_id64="76561198000000000",
+                )
+                with patch(
+                    "cs2_assistant.accounts.steam_auth._verify_steam_cookies_status",
+                    return_value=COOKIE_STATUS_LIMITED,
+                ):
+                    with patch(
+                        "cs2_assistant.accounts.steam_auth._do_steampy_login",
+                        side_effect=AssertionError("429 must not relogin"),
+                    ) as login:
+                        ok, status, updated = try_steam_auto_relogin(
+                            store,
+                            account_id=account.id,
+                        )
+
+        self.assertFalse(ok)
+        self.assertEqual(COOKIE_STATUS_LIMITED, status)
+        self.assertEqual(account.id, updated.id if updated else None)
+        login.assert_not_called()
+
+    def test_network_unknown_does_not_trigger_relogin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"CS2_MASTER_KEY": "test-key"}):
+                store = AccountStore(tmpdir)
+                account = store.add_account(
+                    name="unknown-account",
+                    username="unknown-account",
+                    password="password",
+                    cookies=(
+                        "sessionid=session-1; "
+                        "steamLoginSecure=76561198000000000%7C%7Ctoken"
+                    ),
+                    steam_id64="76561198000000000",
+                )
+                with patch(
+                    "cs2_assistant.accounts.steam_auth._verify_steam_cookies_status",
+                    return_value=COOKIE_STATUS_NETWORK_UNKNOWN,
+                ):
+                    with patch(
+                        "cs2_assistant.accounts.steam_auth._do_steampy_login",
+                        side_effect=AssertionError("unknown network state must not relogin"),
+                    ) as login:
+                        ok, status, _ = try_steam_auto_relogin(
+                            store,
+                            account_id=account.id,
+                        )
+
+        self.assertFalse(ok)
+        self.assertEqual(COOKIE_STATUS_NETWORK_UNKNOWN, status)
+        login.assert_not_called()
+
+    def test_recent_success_is_isolated_by_account_id_when_lock_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"CS2_MASTER_KEY": "test-key"}):
+                store = AccountStore(tmpdir)
+                first = store.add_account(name="first", username="first", password="one")
+                second = store.add_account(name="second", username="second", password="two")
+                steam_auth_module._AUTO_RELOGIN_LAST_SUCCESS_BY_ACCOUNT[first.id] = time.time()
+                steam_auth_module._AUTO_RELOGIN_LOCK.acquire()
+                try:
+                    second_ok, second_status, _ = try_steam_auto_relogin(
+                        store,
+                        account_id=second.id,
+                        force_login=True,
+                    )
+                    first_ok, first_status, first_account = try_steam_auto_relogin(
+                        store,
+                        account_id=first.id,
+                        force_login=True,
+                    )
+                finally:
+                    steam_auth_module._AUTO_RELOGIN_LOCK.release()
+
+        self.assertFalse(second_ok)
+        self.assertEqual("busy", second_status)
+        self.assertTrue(first_ok)
+        self.assertEqual("auto_ok", first_status)
+        self.assertEqual(first.id, first_account.id if first_account else None)
 
 
 if __name__ == "__main__":

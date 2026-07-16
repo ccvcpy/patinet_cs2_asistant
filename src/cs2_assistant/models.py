@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -159,10 +160,12 @@ class StrategyConfig:
     profit_trade_min_item_value: float = 50.0
     profit_trade_max_buy_per_cycle: int = 1
     profit_trade_daily_steam_budget: float = 1000.0
+    profit_trade_account_reserved_balances: dict[str, float] | None = None
     profit_trade_scan_max_items: int = 80
     profit_trade_reservation_seconds: int = 60
     profit_trade_steam_buy_price_tolerance_pct: float = 1.0
     profit_trade_c5_current_sale_net_factor: float = 0.99
+    profit_trade_sale_sync_initial_grace_seconds: float = 30.0
     profit_trade_recent_sold_fee_already_deducted: bool = True
     profit_trade_liquidity_min_recent_sales: int = 3
     profit_trade_require_c5_recent_sales: bool = True
@@ -199,8 +202,10 @@ class StrategyConfig:
     price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
     max_transfer_buy_per_cycle: int = 3
-    cycle_interval_minutes: int = 15
-    listing_check_interval_minutes: float = 5.0
+    # 挂刀调度已迁移为持久化的按任务 nextAttemptAt；旧的
+    # cycleIntervalMinutes / listingCheckIntervalMinutes 不再参与运行或序列化。
+    guadao_task_schedule: dict[str, Any] | None = None
+    guadao_special_ratio_rules: list[dict[str, Any]] | None = None
     dry_run: bool = True
     steam_context_id: str = "2"
     steam_currency: int = 23
@@ -210,9 +215,77 @@ class StrategyConfig:
     listing_price_offset: float = 0.01
     case_listing_price_offset: float | None = -0.01
     case_max_open_guadao_count: int = 100
+    # 箱子活跃挂单槽连续满载多少小时后随机释放；设为 0 可关闭满载释放。
+    case_full_release_after_hours: float = 3.0
+    # 满载超时后，从 Steam 确认仍活跃的箱子挂单中随机撤销的比例；0.125 表示 12.5%。
+    case_full_release_fraction: float = 0.125
+    # 单笔挂单超过 48 小时且仍处于最低价时，隔多久重新检查一次。
+    stale_listed_recheck_hours: float = 24.0
+    # 老挂单继续等待时，在本单最大挂刀比例上允许增加的百分点；1.5 表示 +0.015。
+    stale_listed_max_ratio_tolerance_pct: float = 1.5
     force_refresh_before_execution: bool = True
     steam_price_cache_ttl: float = 60.0
     rebuy_steam_drop_tolerance_pct: float = 5.0
+
+    @staticmethod
+    def default_guadao_task_schedule() -> dict[str, Any]:
+        return {
+            "scanIntervalSeconds": 300.0,
+            "steamSyncIntervalSeconds": 120.0,
+            "actionConfirmationDelaysSeconds": [10.0, 20.0, 40.0],
+            "saleEvidenceDelaysSeconds": [0.0, 60.0, 180.0, 600.0],
+            "rebuyRetryTiers": [
+                {"untilSeconds": 900.0, "intervalSeconds": 60.0},
+                {"untilSeconds": 3600.0, "intervalSeconds": 180.0},
+                {"untilSeconds": None, "intervalSeconds": 600.0},
+            ],
+            "deliveryConfirmationTiers": [
+                {"untilSeconds": 600.0, "intervalSeconds": 60.0},
+                {"untilSeconds": 7200.0, "intervalSeconds": 300.0},
+                {"untilSeconds": 43200.0, "intervalSeconds": 900.0},
+                {"untilSeconds": 86400.0, "intervalSeconds": 1800.0},
+            ],
+        }
+
+    def effective_guadao_task_schedule(self) -> dict[str, Any]:
+        schedule = self.default_guadao_task_schedule()
+        configured = self.guadao_task_schedule or {}
+        for key in schedule:
+            if key in configured:
+                schedule[key] = configured[key]
+        return schedule
+
+    def guadao_special_ratio_rule_for(self, market_hash_name: str) -> dict[str, Any] | None:
+        target = str(market_hash_name or "").strip()
+        if not target:
+            return None
+        for raw_rule in self.guadao_special_ratio_rules or []:
+            if not isinstance(raw_rule, dict):
+                continue
+            if not bool(raw_rule.get("enabled", True)):
+                continue
+            if str(raw_rule.get("marketHashName") or "").strip() != target:
+                continue
+            try:
+                ratio = float(raw_rule.get("maxListingRatio"))
+            except (TypeError, ValueError):
+                continue
+            if ratio < float(self.guadao_max_listing_ratio) or ratio > 0.80:
+                continue
+            return {
+                **raw_rule,
+                "marketHashName": target,
+                "maxListingRatio": ratio,
+                "ruleId": str(raw_rule.get("ruleId") or target),
+                "version": max(1, int(raw_rule.get("version") or 1)),
+            }
+        return None
+
+    def guadao_max_listing_ratio_for(self, market_hash_name: str) -> float:
+        rule = self.guadao_special_ratio_rule_for(market_hash_name)
+        if rule is not None:
+            return float(rule["maxListingRatio"])
+        return float(self.guadao_max_listing_ratio)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -223,8 +296,6 @@ class StrategyConfig:
                 "minPrice": self.min_price,
                 "executionEnabled": self.execution_enabled,
                 "dryRun": self.dry_run,
-                "cycleIntervalMinutes": self.cycle_interval_minutes,
-                "listingCheckIntervalMinutes": self.listing_check_interval_minutes,
                 "steamContextId": self.steam_context_id,
                 "steamCurrency": self.steam_currency,
                 "steamCountry": self.steam_country,
@@ -243,8 +314,14 @@ class StrategyConfig:
                 "listingPriceOffset": self.listing_price_offset,
                 "caseListingPriceOffset": self.case_listing_price_offset,
                 "caseMaxOpenGuadaoCount": self.case_max_open_guadao_count,
+                "caseFullReleaseAfterHours": self.case_full_release_after_hours,
+                "caseFullReleaseFraction": self.case_full_release_fraction,
+                "staleListedRecheckHours": self.stale_listed_recheck_hours,
+                "staleListedMaxRatioTolerancePct": self.stale_listed_max_ratio_tolerance_pct,
                 "rebuySteamDropTolerancePct": self.rebuy_steam_drop_tolerance_pct,
+                "specialCaseRatioRules": list(self.guadao_special_ratio_rules or []),
             },
+            "guadaoRuntime": self.effective_guadao_task_schedule(),
             "profitTrade": {
                 "enabled": self.profit_trade_enabled,
                 "allowRealExecution": self.profit_trade_allow_real_execution,
@@ -254,10 +331,14 @@ class StrategyConfig:
                 "minItemValue": self.profit_trade_min_item_value,
                 "maxBuyPerCycle": self.profit_trade_max_buy_per_cycle,
                 "dailySteamBudget": self.profit_trade_daily_steam_budget,
+                "accountReservedBalances": dict(
+                    self.profit_trade_account_reserved_balances or {}
+                ),
                 "scanMaxItems": self.profit_trade_scan_max_items,
                 "reservationSeconds": self.profit_trade_reservation_seconds,
                 "steamBuyPriceTolerancePct": self.profit_trade_steam_buy_price_tolerance_pct,
                 "c5CurrentSaleNetFactor": self.profit_trade_c5_current_sale_net_factor,
+                "saleSyncInitialGraceSeconds": self.profit_trade_sale_sync_initial_grace_seconds,
                 "recentSoldFeeAlreadyDeducted": self.profit_trade_recent_sold_fee_already_deducted,
                 "liquidityMinRecentSales": self.profit_trade_liquidity_min_recent_sales,
                 "requireC5RecentSales": self.profit_trade_require_c5_recent_sales,
@@ -314,6 +395,7 @@ class StrategyConfig:
 
         common = _section("common")
         guadao_balance = _section("guadaoBalance")
+        guadao_runtime = _section("guadaoRuntime")
         profit_trade = _section("profitTrade")
         notifications = _section("notifications")
         ai_audit = _section("aiAudit")
@@ -332,6 +414,23 @@ class StrategyConfig:
             if isinstance(value, (list, tuple, set)):
                 return [str(item).strip() for item in value if str(item).strip()]
             return []
+
+        def _as_nonnegative_float_dict(value: Any) -> dict[str, float]:
+            if not isinstance(value, dict):
+                return {}
+            result: dict[str, float] = {}
+            for raw_key, raw_value in value.items():
+                key = str(raw_key or "").strip()
+                if not key:
+                    continue
+                try:
+                    amount = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(amount) or amount < 0:
+                    continue
+                result[key] = amount
+            return result
 
         def _as_item_type_status(status_value: Any, legacy_allow_value: Any) -> str:
             text = str(status_value or "").strip().lower()
@@ -365,6 +464,9 @@ class StrategyConfig:
             profit_trade_min_item_value=float(_get(profit_trade, "minItemValue", 50.0)),
             profit_trade_max_buy_per_cycle=int(_get(profit_trade, "maxBuyPerCycle", 1)),
             profit_trade_daily_steam_budget=float(_get(profit_trade, "dailySteamBudget", 1000.0)),
+            profit_trade_account_reserved_balances=_as_nonnegative_float_dict(
+                _get(profit_trade, "accountReservedBalances", {})
+            ),
             profit_trade_scan_max_items=int(_get(profit_trade, "scanMaxItems", 80)),
             profit_trade_reservation_seconds=int(_get(profit_trade, "reservationSeconds", 60)),
             profit_trade_steam_buy_price_tolerance_pct=float(
@@ -372,6 +474,9 @@ class StrategyConfig:
             ),
             profit_trade_c5_current_sale_net_factor=float(
                 _get(profit_trade, "c5CurrentSaleNetFactor", 0.99)
+            ),
+            profit_trade_sale_sync_initial_grace_seconds=float(
+                _get(profit_trade, "saleSyncInitialGraceSeconds", 30.0)
             ),
             profit_trade_recent_sold_fee_already_deducted=_as_bool(
                 _get(profit_trade, "recentSoldFeeAlreadyDeducted", True),
@@ -455,8 +560,12 @@ class StrategyConfig:
                     data.get("maxBuyPerCycle", 3),
                 )
             ),
-            cycle_interval_minutes=int(_get(common, "cycleIntervalMinutes", 15)),
-            listing_check_interval_minutes=float(_get(common, "listingCheckIntervalMinutes", 5.0)),
+            guadao_task_schedule=dict(guadao_runtime),
+            guadao_special_ratio_rules=[
+                dict(item)
+                for item in (_get(guadao_balance, "specialCaseRatioRules", []) or [])
+                if isinstance(item, dict)
+            ],
             dry_run=_as_bool(_get(common, "dryRun", True), True),
             steam_context_id=str(_get(common, "steamContextId", "2")),
             steam_currency=int(_get(common, "steamCurrency", 23)),
@@ -470,6 +579,18 @@ class StrategyConfig:
                 else None
             ),
             case_max_open_guadao_count=int(_get(guadao_balance, "caseMaxOpenGuadaoCount", 100)),
+            case_full_release_after_hours=float(
+                _get(guadao_balance, "caseFullReleaseAfterHours", 3.0)
+            ),
+            case_full_release_fraction=float(
+                _get(guadao_balance, "caseFullReleaseFraction", 0.125)
+            ),
+            stale_listed_recheck_hours=float(
+                _get(guadao_balance, "staleListedRecheckHours", 24.0)
+            ),
+            stale_listed_max_ratio_tolerance_pct=float(
+                _get(guadao_balance, "staleListedMaxRatioTolerancePct", 1.5)
+            ),
             force_refresh_before_execution=_as_bool(
                 _get(common, "forceRefreshBeforeExecution", True),
                 True,

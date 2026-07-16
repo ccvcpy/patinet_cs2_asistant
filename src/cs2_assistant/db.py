@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -16,8 +16,54 @@ PROFIT_TRADE_OBSERVABILITY_TABLES = frozenset(
         "profit_trade_roi_observations",
         "profit_trade_state_events",
         "profit_trade_acknowledgements",
+        "profit_trade_runtime_state",
     }
 )
+
+RUNTIME_COORDINATION_TABLES = frozenset(
+    {
+        "executor_runtime_state",
+        "scheduled_tasks",
+        "steam_cookie_health",
+        "steam_request_queue",
+        "steam_route_circuits",
+        "guadao_issue_acknowledgements",
+        "strategy_config_audit",
+    }
+)
+
+
+def _utc_iso(value: str | datetime | None = None) -> str:
+    """Return a timezone-aware UTC timestamp suitable for SQLite ordering."""
+
+    if value is None:
+        return utc_now_iso()
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("timestamp is required")
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _lease_expiry(now: str, lease_seconds: float) -> str:
+    seconds = float(lease_seconds)
+    if seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    parsed = datetime.fromisoformat(now)
+    return (parsed + timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
+
+
+def _json_object(value: dict[str, Any] | None) -> str:
+    return json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _emit_profit_trade_local_event(
@@ -48,8 +94,12 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         ensure_parent_dir(path)
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=5.0)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        if str(path) != ":memory:":
+            self.conn.execute("PRAGMA journal_mode = WAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -85,8 +135,41 @@ class Database:
             backup_conn.close()
         return backup_path
 
+    def _backup_before_runtime_coordination_upgrade(self) -> Path | None:
+        """Back up an existing operational DB once before adding runtime tables."""
+
+        if str(self.path) == ":memory:" or not self.path.exists():
+            return None
+        existing_tables = {
+            str(row[0])
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not {"inventory_pool", "pool_operations"}.intersection(existing_tables):
+            return None
+        if RUNTIME_COORDINATION_TABLES.issubset(existing_tables):
+            return None
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        suffix = self.path.suffix or ".db"
+        base_name = f"{self.path.stem}.pre-runtime-coordination-{timestamp}"
+        backup_path = self.path.with_name(f"{base_name}{suffix}")
+        counter = 1
+        while backup_path.exists():
+            backup_path = self.path.with_name(f"{base_name}-{counter}{suffix}")
+            counter += 1
+        backup_conn = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup_conn)
+        finally:
+            backup_conn.close()
+        return backup_path
+
     def initialize(self) -> None:
-        self._backup_before_profit_trade_observability_upgrade()
+        observability_backup = self._backup_before_profit_trade_observability_upgrade()
+        if observability_backup is None:
+            self._backup_before_runtime_coordination_upgrade()
         self.conn.executescript(
             """
             PRAGMA foreign_keys = ON;
@@ -402,6 +485,13 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_profit_trade_acknowledgements_state
             ON profit_trade_acknowledgements(acknowledged, updated_at DESC);
 
+            CREATE TABLE IF NOT EXISTS profit_trade_runtime_state (
+                state_key TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS strategy_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_hash_name TEXT NOT NULL,
@@ -461,7 +551,163 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_pool_ops_status
             ON pool_operations(status);
+
+            -- ===== Persistent runtime coordination =====
+
+            CREATE TABLE IF NOT EXISTS executor_runtime_state (
+                executor_key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                runtime_status TEXT NOT NULL DEFAULT 'stopped',
+                migration_hold INTEGER NOT NULL DEFAULT 1,
+                gate_reason TEXT,
+                heartbeat_at TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_executor_runtime_status
+            ON executor_runtime_state(enabled, runtime_status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_key TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                account_id TEXT,
+                operation_id TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                priority INTEGER NOT NULL DEFAULT 2,
+                next_attempt_at TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+            ON scheduled_tasks(status, next_attempt_at, priority, id);
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_source
+            ON scheduled_tasks(source, task_type, status, next_attempt_at);
+
+            CREATE TABLE IF NOT EXISTS steam_cookie_health (
+                account_id TEXT PRIMARY KEY,
+                account_name TEXT,
+                steam_id TEXT,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                batch_id TEXT,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_validated_at TEXT,
+                next_retry_at TEXT,
+                retry_after_seconds REAL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_steam_cookie_health_status
+            ON steam_cookie_health(status, next_retry_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS steam_request_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                route TEXT NOT NULL,
+                method TEXT,
+                account_id TEXT,
+                operation_id TEXT,
+                priority INTEGER NOT NULL DEFAULT 3,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                available_at TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                http_status INTEGER,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_steam_request_queue_claim
+            ON steam_request_queue(status, available_at, priority, id);
+
+            CREATE INDEX IF NOT EXISTS idx_steam_request_queue_route_time
+            ON steam_request_queue(route, account_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_steam_request_queue_http_status
+            ON steam_request_queue(http_status, completed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS steam_route_circuits (
+                circuit_key TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                account_id TEXT,
+                route TEXT,
+                state TEXT NOT NULL DEFAULT 'closed',
+                consecutive_429 INTEGER NOT NULL DEFAULT 0,
+                first_429_at TEXT,
+                last_429_at TEXT,
+                cooldown_until TEXT,
+                next_probe_at TEXT,
+                probe_lease_owner TEXT,
+                probe_lease_expires_at TEXT,
+                reason TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_steam_route_circuits_state
+            ON steam_route_circuits(state, next_probe_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS guadao_issue_acknowledgements (
+                issue_key TEXT PRIMARY KEY,
+                acknowledged INTEGER NOT NULL DEFAULT 1,
+                reason TEXT,
+                actor TEXT,
+                acknowledged_at TEXT,
+                restored_at TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guadao_issue_ack_state
+            ON guadao_issue_acknowledgements(acknowledged, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS strategy_config_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_scope TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'update',
+                old_value_json TEXT NOT NULL DEFAULT '{}',
+                new_value_json TEXT NOT NULL DEFAULT '{}',
+                diff_json TEXT NOT NULL DEFAULT '{}',
+                actor TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_strategy_config_audit_scope_time
+            ON strategy_config_audit(config_scope, created_at DESC, id DESC);
             """
+        )
+        now = utc_now_iso()
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO executor_runtime_state (
+                executor_key, enabled, runtime_status, migration_hold,
+                payload_json, created_at, updated_at
+            ) VALUES (?, 0, 'stopped', 1, '{}', ?, ?)
+            """,
+            (("guadao", now, now), ("profit_trade", now, now)),
         )
         self.conn.commit()
 
@@ -1511,6 +1757,7 @@ class Database:
         event_context = fields.pop("_event_context", None)
         log_event_id = fields.pop("_log_event_id", None)
         allowed = {
+            "market_hash_name",
             "status",
             "step_key",
             "step_index",
@@ -1626,6 +1873,129 @@ class Database:
                 },
             )
 
+    def add_profit_trade_audit_event(
+        self,
+        trade_id: int,
+        *,
+        event_type: str,
+        reason: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Append an audit event without changing the trade state machine."""
+
+        current = self.get_profit_trade(trade_id)
+        if current is None:
+            raise ValueError(f"profit trade not found: {trade_id}")
+        normalized_event_type = str(event_type or "").strip()
+        if not normalized_event_type:
+            raise ValueError("event_type is required")
+        now = utc_now_iso()
+        safe_context = context if isinstance(context, dict) else {}
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO profit_trade_state_events (
+                    trade_id,
+                    event_type,
+                    status_from,
+                    status_to,
+                    step_key_from,
+                    step_key_to,
+                    step_index_from,
+                    step_index_to,
+                    reason,
+                    context_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_id,
+                    normalized_event_type,
+                    current["status"],
+                    current["status"],
+                    current["step_key"],
+                    current["step_key"],
+                    int(current["step_index"] or 0),
+                    int(current["step_index"] or 0),
+                    str(reason) if reason is not None else None,
+                    json.dumps(safe_context, ensure_ascii=False),
+                    now,
+                ),
+            )
+        _emit_profit_trade_local_event(
+            component="profit_trade_manual_record",
+            operation=normalized_event_type,
+            message="Profit Trade manual record audit event",
+            trade_id=trade_id,
+            trade_no=str(current["trade_no"] or "") or None,
+            market_hash_name=str(current["market_hash_name"] or "") or None,
+            asset_id=str(current["a_asset_id"] or "") or None,
+            state_from=str(current["status"] or "") or None,
+            state_to=str(current["status"] or "") or None,
+            step_from=str(current["step_key"] or "") or None,
+            step_to=str(current["step_key"] or "") or None,
+            safe_context={"reason": reason, **safe_context},
+        )
+
+    def get_profit_trade_runtime_state(self, state_key: str) -> dict[str, Any] | None:
+        normalized_key = str(state_key or "").strip()
+        if not normalized_key:
+            raise ValueError("state_key is required")
+        row = self.conn.execute(
+            "SELECT * FROM profit_trade_runtime_state WHERE state_key = ?",
+            (normalized_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        result = payload if isinstance(payload, dict) else {}
+        return {
+            **result,
+            "stateKey": normalized_key,
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def set_profit_trade_runtime_state(
+        self,
+        state_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized_key = str(state_key or "").strip()
+        if not normalized_key:
+            raise ValueError("state_key is required")
+        safe_payload = payload if isinstance(payload, dict) else {}
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO profit_trade_runtime_state (
+                    state_key,
+                    payload_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_key,
+                    json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_profit_trade_runtime_state(normalized_key) or {
+            **safe_payload,
+            "stateKey": normalized_key,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+
     def get_profit_trade(self, trade_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM profit_trades WHERE id = ?",
@@ -1660,6 +2030,23 @@ class Database:
         params.append(limit)
         return self.conn.execute(sql, tuple(params)).fetchall()
 
+    def list_profit_trades_for_market_hash_name(
+        self,
+        market_hash_name: str,
+        *,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT *
+            FROM profit_trades
+            WHERE market_hash_name = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (str(market_hash_name), max(1, int(limit))),
+        ).fetchall()
+
     # ------------------------------------------------------------------
     # Profit Trade observability
     # ------------------------------------------------------------------
@@ -1675,6 +2062,8 @@ class Database:
             execution_status = "executable"
         elif execution_status_code == "manual_review":
             execution_status = "manual_review"
+        elif execution_status_code in {"listings_cooldown", "listings_probe_ready"}:
+            execution_status = execution_status_code
         elif execution_status_code in {"c5_risk_blocked", "ai_audit_blocked"}:
             execution_status = "blocked"
         else:
@@ -2565,6 +2954,1151 @@ class Database:
     def latest_guadao_case_ratio_snapshot_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS count FROM guadao_case_ratio_snapshots").fetchone()
         return int(row["count"] if row is not None else 0)
+
+    # ------------------------------------------------------------------
+    # Persistent executor runtime state
+    # ------------------------------------------------------------------
+
+    def get_executor_runtime_state(self, executor_key: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM executor_runtime_state WHERE executor_key = ?",
+            (str(executor_key).strip(),),
+        ).fetchone()
+
+    def list_executor_runtime_states(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM executor_runtime_state ORDER BY executor_key"
+        ).fetchall()
+
+    def upsert_executor_runtime_state(
+        self,
+        executor_key: str,
+        *,
+        enabled: bool,
+        runtime_status: str,
+        migration_hold: bool,
+        gate_reason: str | None = None,
+        heartbeat_at: str | datetime | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        key = str(executor_key or "").strip()
+        status = str(runtime_status or "").strip()
+        if not key:
+            raise ValueError("executor_key is required")
+        if not status:
+            raise ValueError("runtime_status is required")
+        now = utc_now_iso()
+        heartbeat = _utc_iso(heartbeat_at) if heartbeat_at is not None else None
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO executor_runtime_state (
+                    executor_key, enabled, runtime_status, migration_hold,
+                    gate_reason, heartbeat_at, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(executor_key) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    runtime_status = excluded.runtime_status,
+                    migration_hold = excluded.migration_hold,
+                    gate_reason = excluded.gate_reason,
+                    heartbeat_at = excluded.heartbeat_at,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    1 if enabled else 0,
+                    status,
+                    1 if migration_hold else 0,
+                    gate_reason,
+                    heartbeat,
+                    _json_object(payload),
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_executor_runtime_state(key)
+        if row is None:  # pragma: no cover - guarded by the successful insert
+            raise RuntimeError(f"executor runtime state was not persisted: {key}")
+        return row
+
+    # ------------------------------------------------------------------
+    # Scheduled task queue
+    # ------------------------------------------------------------------
+
+    def upsert_scheduled_task(
+        self,
+        task_key: str,
+        *,
+        source: str,
+        task_type: str,
+        next_attempt_at: str | datetime,
+        account_id: str | None = None,
+        operation_id: str | int | None = None,
+        payload: dict[str, Any] | None = None,
+        status: str = "pending",
+        priority: int = 2,
+        last_error: str | None = None,
+    ) -> sqlite3.Row:
+        key = str(task_key or "").strip()
+        normalized_source = str(source or "").strip()
+        normalized_type = str(task_type or "").strip()
+        normalized_status = str(status or "").strip()
+        if not key or not normalized_source or not normalized_type:
+            raise ValueError("task_key, source and task_type are required")
+        if not normalized_status:
+            raise ValueError("status is required")
+        now = utc_now_iso()
+        completed_at = now if normalized_status in {"completed", "failed", "cancelled"} else None
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO scheduled_tasks (
+                    task_key, source, task_type, account_id, operation_id,
+                    payload_json, status, priority, next_attempt_at,
+                    last_error, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_key) DO UPDATE SET
+                    source = excluded.source,
+                    task_type = excluded.task_type,
+                    account_id = excluded.account_id,
+                    operation_id = excluded.operation_id,
+                    payload_json = excluded.payload_json,
+                    status = CASE
+                        WHEN scheduled_tasks.status = 'running' THEN scheduled_tasks.status
+                        ELSE excluded.status
+                    END,
+                    priority = excluded.priority,
+                    next_attempt_at = CASE
+                        WHEN scheduled_tasks.status = 'running' THEN scheduled_tasks.next_attempt_at
+                        ELSE excluded.next_attempt_at
+                    END,
+                    lease_owner = CASE
+                        WHEN scheduled_tasks.status = 'running' THEN scheduled_tasks.lease_owner
+                        ELSE NULL
+                    END,
+                    lease_expires_at = CASE
+                        WHEN scheduled_tasks.status = 'running' THEN scheduled_tasks.lease_expires_at
+                        ELSE NULL
+                    END,
+                    last_error = excluded.last_error,
+                    completed_at = CASE
+                        WHEN scheduled_tasks.status = 'running' THEN scheduled_tasks.completed_at
+                        ELSE excluded.completed_at
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    normalized_source,
+                    normalized_type,
+                    str(account_id) if account_id is not None else None,
+                    str(operation_id) if operation_id is not None else None,
+                    _json_object(payload),
+                    normalized_status,
+                    int(priority),
+                    _utc_iso(next_attempt_at),
+                    last_error,
+                    now,
+                    now,
+                    completed_at,
+                ),
+            )
+        row = self.get_scheduled_task(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"scheduled task was not persisted: {key}")
+        return row
+
+    def ensure_scheduled_task(
+        self,
+        task_key: str,
+        *,
+        source: str,
+        task_type: str,
+        next_attempt_at: str | datetime,
+        account_id: str | None = None,
+        operation_id: str | int | None = None,
+        payload: dict[str, Any] | None = None,
+        status: str = "pending",
+        priority: int = 2,
+        last_error: str | None = None,
+    ) -> sqlite3.Row:
+        """Create a task once without changing an existing lease or terminal state."""
+
+        key = str(task_key or "").strip()
+        normalized_source = str(source or "").strip()
+        normalized_type = str(task_type or "").strip()
+        normalized_status = str(status or "").strip()
+        if not key or not normalized_source or not normalized_type:
+            raise ValueError("task_key, source and task_type are required")
+        if not normalized_status:
+            raise ValueError("status is required")
+        now = utc_now_iso()
+        completed_at = now if normalized_status in {"completed", "failed", "cancelled"} else None
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO scheduled_tasks (
+                    task_key, source, task_type, account_id, operation_id,
+                    payload_json, status, priority, next_attempt_at,
+                    last_error, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    normalized_source,
+                    normalized_type,
+                    str(account_id) if account_id is not None else None,
+                    str(operation_id) if operation_id is not None else None,
+                    _json_object(payload),
+                    normalized_status,
+                    int(priority),
+                    _utc_iso(next_attempt_at),
+                    last_error,
+                    now,
+                    now,
+                    completed_at,
+                ),
+            )
+        row = self.get_scheduled_task(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"scheduled task was not persisted: {key}")
+        return row
+
+    def get_scheduled_task(self, task_key: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE task_key = ?",
+            (str(task_key),),
+        ).fetchone()
+
+    def list_scheduled_tasks(
+        self,
+        *,
+        source: str | None = None,
+        task_type: str | None = None,
+        status: str | None = None,
+        account_id: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("source", source),
+            ("task_type", task_type),
+            ("status", status),
+            ("account_id", account_id),
+        ):
+            if value is not None:
+                where.append(f"{column} = ?")
+                params.append(str(value))
+        sql = "SELECT * FROM scheduled_tasks"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY next_attempt_at ASC, priority ASC, id ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return self.conn.execute(sql, tuple(params)).fetchall()
+
+    def claim_due_scheduled_tasks(
+        self,
+        worker_id: str,
+        *,
+        limit: int = 1,
+        lease_seconds: float = 60,
+        source: str | None = None,
+        now: str | datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        owner = str(worker_id or "").strip()
+        if not owner:
+            raise ValueError("worker_id is required")
+        now_iso = _utc_iso(now)
+        expires_at = _lease_expiry(now_iso, lease_seconds)
+        max_rows = max(1, int(limit))
+        source_clause = " AND source = ?" if source is not None else ""
+        params: list[Any] = [now_iso, now_iso]
+        if source is not None:
+            params.append(str(source))
+        params.append(max_rows)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            rows = self.conn.execute(
+                f"""
+                SELECT id
+                FROM scheduled_tasks
+                WHERE next_attempt_at <= ?
+                  AND (
+                    status IN ('pending', 'retry')
+                    OR (status = 'running' AND lease_expires_at <= ?)
+                  )
+                  {source_clause}
+                ORDER BY priority ASC, next_attempt_at ASC, id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                self.conn.execute(
+                    f"""
+                    UPDATE scheduled_tasks
+                    SET status = 'running',
+                        lease_owner = ?,
+                        lease_expires_at = ?,
+                        attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (owner, expires_at, now_iso, *ids),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        return self.conn.execute(
+            f"SELECT * FROM scheduled_tasks WHERE id IN ({placeholders}) ORDER BY priority, next_attempt_at, id",
+            tuple(ids),
+        ).fetchall()
+
+    def renew_scheduled_task_lease(
+        self,
+        task_key: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 60,
+        now: str | datetime | None = None,
+    ) -> bool:
+        now_iso = _utc_iso(now)
+        cursor = self.conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE task_key = ? AND status = 'running' AND lease_owner = ?
+            """,
+            (_lease_expiry(now_iso, lease_seconds), now_iso, str(task_key), str(worker_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def complete_scheduled_task(
+        self,
+        task_key: str,
+        worker_id: str,
+        *,
+        status: str = "completed",
+        error: str | None = None,
+        now: str | datetime | None = None,
+    ) -> bool:
+        terminal_status = str(status)
+        if terminal_status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("scheduled task terminal status is invalid")
+        now_iso = _utc_iso(now)
+        cursor = self.conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = ?, last_error = ?, lease_owner = NULL,
+                lease_expires_at = NULL, completed_at = ?, updated_at = ?
+            WHERE task_key = ? AND status = 'running' AND lease_owner = ?
+            """,
+            (terminal_status, error, now_iso, now_iso, str(task_key), str(worker_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def reschedule_scheduled_task(
+        self,
+        task_key: str,
+        *,
+        next_attempt_at: str | datetime,
+        worker_id: str | None = None,
+        error: str | None = None,
+        status: str = "pending",
+    ) -> bool:
+        where = "task_key = ?"
+        params: list[Any] = [str(status), _utc_iso(next_attempt_at), error, utc_now_iso(), str(task_key)]
+        if worker_id is not None:
+            where += " AND status = 'running' AND lease_owner = ?"
+            params.append(str(worker_id))
+        cursor = self.conn.execute(
+            f"""
+            UPDATE scheduled_tasks
+            SET status = ?, next_attempt_at = ?, last_error = ?,
+                lease_owner = NULL, lease_expires_at = NULL,
+                completed_at = NULL, updated_at = ?
+            WHERE {where}
+            """,
+            tuple(params),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def delete_scheduled_task(self, task_key: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM scheduled_tasks WHERE task_key = ? AND status != 'running'",
+            (str(task_key),),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    # ------------------------------------------------------------------
+    # Steam Cookie health
+    # ------------------------------------------------------------------
+
+    def upsert_steam_cookie_health(
+        self,
+        account_id: str,
+        *,
+        status: str,
+        account_name: str | None = None,
+        steam_id: str | None = None,
+        batch_id: str | None = None,
+        failure_count: int = 0,
+        last_error: str | None = None,
+        last_validated_at: str | datetime | None = None,
+        next_retry_at: str | datetime | None = None,
+        retry_after_seconds: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        key = str(account_id or "").strip()
+        normalized_status = str(status or "").strip()
+        if not key or not normalized_status:
+            raise ValueError("account_id and status are required")
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO steam_cookie_health (
+                    account_id, account_name, steam_id, status, batch_id,
+                    failure_count, last_error, last_validated_at, next_retry_at,
+                    retry_after_seconds, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    account_name = COALESCE(excluded.account_name, steam_cookie_health.account_name),
+                    steam_id = COALESCE(excluded.steam_id, steam_cookie_health.steam_id),
+                    status = excluded.status,
+                    batch_id = excluded.batch_id,
+                    failure_count = excluded.failure_count,
+                    last_error = excluded.last_error,
+                    last_validated_at = COALESCE(
+                        excluded.last_validated_at,
+                        steam_cookie_health.last_validated_at
+                    ),
+                    next_retry_at = excluded.next_retry_at,
+                    retry_after_seconds = excluded.retry_after_seconds,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    account_name,
+                    steam_id,
+                    normalized_status,
+                    batch_id,
+                    max(0, int(failure_count)),
+                    last_error,
+                    _utc_iso(last_validated_at) if last_validated_at is not None else None,
+                    _utc_iso(next_retry_at) if next_retry_at is not None else None,
+                    float(retry_after_seconds) if retry_after_seconds is not None else None,
+                    _json_object(payload),
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_steam_cookie_health(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"Steam Cookie health was not persisted: {key}")
+        return row
+
+    def get_steam_cookie_health(self, account_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM steam_cookie_health WHERE account_id = ?",
+            (str(account_id),),
+        ).fetchone()
+
+    def list_steam_cookie_health(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM steam_cookie_health ORDER BY account_name, account_id"
+        ).fetchall()
+
+    def list_due_steam_cookie_retries(
+        self,
+        *,
+        now: str | datetime | None = None,
+    ) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT * FROM steam_cookie_health
+            WHERE status != 'valid'
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY COALESCE(next_retry_at, created_at), account_id
+            """,
+            (_utc_iso(now),),
+        ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Cross-process Steam request queue
+    # ------------------------------------------------------------------
+
+    def enqueue_steam_request(
+        self,
+        request_id: str,
+        *,
+        source: str,
+        route: str,
+        priority: int,
+        account_id: str | None = None,
+        method: str | None = None,
+        operation_id: str | int | None = None,
+        payload: dict[str, Any] | None = None,
+        available_at: str | datetime | None = None,
+    ) -> sqlite3.Row:
+        key = str(request_id or "").strip()
+        normalized_source = str(source or "").strip()
+        normalized_route = str(route or "").strip()
+        if not key or not normalized_source or not normalized_route:
+            raise ValueError("request_id, source and route are required")
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO steam_request_queue (
+                    request_id, source, route, method, account_id, operation_id,
+                    priority, payload_json, status, available_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    key,
+                    normalized_source,
+                    normalized_route,
+                    method,
+                    str(account_id) if account_id is not None else None,
+                    str(operation_id) if operation_id is not None else None,
+                    int(priority),
+                    _json_object(payload),
+                    _utc_iso(available_at) if available_at is not None else now,
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_steam_request(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"Steam request was not persisted: {key}")
+        return row
+
+    def get_steam_request(self, request_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM steam_request_queue WHERE request_id = ?",
+            (str(request_id),),
+        ).fetchone()
+
+    def _claim_steam_request_locked(
+        self,
+        request_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float,
+        now_iso: str,
+    ) -> sqlite3.Row | None:
+        active = self.conn.execute(
+            """
+            SELECT * FROM steam_request_queue
+            WHERE status = 'running' AND lease_expires_at > ?
+            ORDER BY id LIMIT 1
+            """,
+            (now_iso,),
+        ).fetchone()
+        if active is not None:
+            if active["request_id"] == request_id and active["lease_owner"] == worker_id:
+                return active
+            return None
+        head = self.conn.execute(
+            """
+            SELECT * FROM steam_request_queue
+            WHERE available_at <= ?
+              AND (
+                status = 'pending'
+                OR (status = 'running' AND lease_expires_at <= ?)
+              )
+            ORDER BY priority ASC, available_at ASC, id ASC
+            LIMIT 1
+            """,
+            (now_iso, now_iso),
+        ).fetchone()
+        if head is None or str(head["request_id"]) != request_id:
+            return None
+        expires_at = _lease_expiry(now_iso, lease_seconds)
+        self.conn.execute(
+            """
+            UPDATE steam_request_queue
+            SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                attempt_count = attempt_count + 1, updated_at = ?
+            WHERE request_id = ?
+            """,
+            (worker_id, expires_at, now_iso, request_id),
+        )
+        return self.get_steam_request(request_id)
+
+    def claim_steam_request(
+        self,
+        request_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 30,
+        now: str | datetime | None = None,
+    ) -> sqlite3.Row | None:
+        key = str(request_id or "").strip()
+        owner = str(worker_id or "").strip()
+        if not key or not owner:
+            raise ValueError("request_id and worker_id are required")
+        now_iso = _utc_iso(now)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self._claim_steam_request_locked(
+                key,
+                owner,
+                lease_seconds=lease_seconds,
+                now_iso=now_iso,
+            )
+            self.conn.commit()
+            return row
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def claim_next_steam_request(
+        self,
+        worker_id: str,
+        *,
+        lease_seconds: float = 30,
+        now: str | datetime | None = None,
+    ) -> sqlite3.Row | None:
+        owner = str(worker_id or "").strip()
+        if not owner:
+            raise ValueError("worker_id is required")
+        now_iso = _utc_iso(now)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            active = self.conn.execute(
+                """
+                SELECT * FROM steam_request_queue
+                WHERE status = 'running' AND lease_expires_at > ?
+                ORDER BY id LIMIT 1
+                """,
+                (now_iso,),
+            ).fetchone()
+            if active is not None:
+                self.conn.commit()
+                return active if active["lease_owner"] == owner else None
+            head = self.conn.execute(
+                """
+                SELECT request_id FROM steam_request_queue
+                WHERE available_at <= ?
+                  AND (status = 'pending' OR (status = 'running' AND lease_expires_at <= ?))
+                ORDER BY priority ASC, available_at ASC, id ASC LIMIT 1
+                """,
+                (now_iso, now_iso),
+            ).fetchone()
+            row = None
+            if head is not None:
+                row = self._claim_steam_request_locked(
+                    str(head["request_id"]),
+                    owner,
+                    lease_seconds=lease_seconds,
+                    now_iso=now_iso,
+                )
+            self.conn.commit()
+            return row
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def renew_steam_request_lease(
+        self,
+        request_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 30,
+        now: str | datetime | None = None,
+    ) -> bool:
+        now_iso = _utc_iso(now)
+        cursor = self.conn.execute(
+            """
+            UPDATE steam_request_queue
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE request_id = ? AND status = 'running' AND lease_owner = ?
+            """,
+            (
+                _lease_expiry(now_iso, lease_seconds),
+                now_iso,
+                str(request_id),
+                str(worker_id),
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def complete_steam_request(
+        self,
+        request_id: str,
+        worker_id: str,
+        *,
+        status: str = "completed",
+        http_status: int | None = None,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        now: str | datetime | None = None,
+    ) -> sqlite3.Row | None:
+        terminal_status = str(status)
+        if terminal_status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("Steam request terminal status is invalid")
+        now_iso = _utc_iso(now)
+        cursor = self.conn.execute(
+            """
+            UPDATE steam_request_queue
+            SET status = ?, http_status = ?, result_json = ?, last_error = ?,
+                lease_owner = NULL, lease_expires_at = NULL,
+                completed_at = ?, updated_at = ?
+            WHERE request_id = ? AND status = 'running' AND lease_owner = ?
+            """,
+            (
+                terminal_status,
+                int(http_status) if http_status is not None else None,
+                _json_object(result) if result is not None else None,
+                error,
+                now_iso,
+                now_iso,
+                str(request_id),
+                str(worker_id),
+            ),
+        )
+        self.conn.commit()
+        return self.get_steam_request(request_id) if cursor.rowcount == 1 else None
+
+    def cancel_steam_request(self, request_id: str, *, reason: str | None = None) -> bool:
+        now = utc_now_iso()
+        cursor = self.conn.execute(
+            """
+            UPDATE steam_request_queue
+            SET status = 'cancelled', last_error = ?, completed_at = ?, updated_at = ?
+            WHERE request_id = ? AND status = 'pending'
+            """,
+            (reason, now, now, str(request_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def cancel_orphaned_steam_requests(
+        self,
+        *,
+        now: str | datetime | None = None,
+        pending_stale_seconds: float = 300.0,
+        running_grace_seconds: float = 5.0,
+    ) -> dict[str, int]:
+        """Cancel persisted tickets whose in-process callback can no longer be trusted.
+
+        Steam callbacks are intentionally never serialized into SQLite. A
+        process crash can therefore leave a pending ticket, or an expired
+        running lease, that no future process is able to execute. Keeping such
+        a row eligible at the queue head would block every later request.
+
+        A grace window avoids treating a briefly delayed heartbeat as an
+        orphan. Pending tickets receive a larger stale window because they may
+        legitimately wait behind a long-running request.
+        """
+
+        now_iso = _utc_iso(now)
+        now_dt = datetime.fromisoformat(now_iso)
+        pending_cutoff = _utc_iso(
+            now_dt - timedelta(seconds=max(0.0, float(pending_stale_seconds)))
+        )
+        running_cutoff = _utc_iso(
+            now_dt - timedelta(seconds=max(0.0, float(running_grace_seconds)))
+        )
+        with self.conn:
+            pending = self.conn.execute(
+                """
+                UPDATE steam_request_queue
+                SET status = 'cancelled', last_error = 'orphaned_pending_request',
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    completed_at = ?, updated_at = ?
+                WHERE status = 'pending' AND updated_at <= ?
+                """,
+                (now_iso, now_iso, pending_cutoff),
+            )
+            running = self.conn.execute(
+                """
+                UPDATE steam_request_queue
+                SET status = 'cancelled', last_error = 'orphaned_expired_lease',
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    completed_at = ?, updated_at = ?
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (now_iso, now_iso, running_cutoff),
+            )
+        return {
+            "pending": max(0, int(pending.rowcount)),
+            "running": max(0, int(running.rowcount)),
+        }
+
+    def list_steam_requests(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        if status is None:
+            return self.conn.execute(
+                "SELECT * FROM steam_request_queue ORDER BY created_at DESC, id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return self.conn.execute(
+            """
+            SELECT * FROM steam_request_queue
+            WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (str(status), max(1, int(limit))),
+        ).fetchall()
+
+    def get_steam_queue_snapshot(self, *, limit: int = 50) -> dict[str, Any]:
+        counts = {
+            str(row["status"]): int(row["count"])
+            for row in self.conn.execute(
+                "SELECT status, COUNT(*) AS count FROM steam_request_queue GROUP BY status"
+            ).fetchall()
+        }
+        rows = self.conn.execute(
+            """
+            SELECT * FROM steam_request_queue
+            WHERE status IN ('pending', 'running')
+            ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+                     priority ASC, available_at ASC, id ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return {"counts": counts, "requests": [dict(row) for row in rows]}
+
+    def list_recent_steam_429_events(
+        self,
+        since: str | datetime,
+        *,
+        account_id: str | None = None,
+        route: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        where = ["http_status = 429", "completed_at >= ?"]
+        params: list[Any] = [_utc_iso(since)]
+        if account_id is not None:
+            where.append("account_id = ?")
+            params.append(str(account_id))
+        if route is not None:
+            where.append("route = ?")
+            params.append(str(route))
+        params.append(max(1, int(limit)))
+        return self.conn.execute(
+            "SELECT * FROM steam_request_queue WHERE "
+            + " AND ".join(where)
+            + " ORDER BY completed_at DESC, id DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Steam route/account/global circuit persistence
+    # ------------------------------------------------------------------
+
+    def get_steam_route_circuit(self, circuit_key: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM steam_route_circuits WHERE circuit_key = ?",
+            (str(circuit_key),),
+        ).fetchone()
+
+    def upsert_steam_route_circuit(
+        self,
+        circuit_key: str,
+        *,
+        scope: str,
+        state: str,
+        account_id: str | None = None,
+        route: str | None = None,
+        consecutive_429: int = 0,
+        first_429_at: str | datetime | None = None,
+        last_429_at: str | datetime | None = None,
+        cooldown_until: str | datetime | None = None,
+        next_probe_at: str | datetime | None = None,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        key = str(circuit_key or "").strip()
+        normalized_scope = str(scope or "").strip()
+        normalized_state = str(state or "").strip()
+        if not key or not normalized_scope or not normalized_state:
+            raise ValueError("circuit_key, scope and state are required")
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO steam_route_circuits (
+                    circuit_key, scope, account_id, route, state, consecutive_429,
+                    first_429_at, last_429_at, cooldown_until, next_probe_at,
+                    reason, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(circuit_key) DO UPDATE SET
+                    scope = excluded.scope,
+                    account_id = excluded.account_id,
+                    route = excluded.route,
+                    state = excluded.state,
+                    consecutive_429 = excluded.consecutive_429,
+                    first_429_at = excluded.first_429_at,
+                    last_429_at = excluded.last_429_at,
+                    cooldown_until = excluded.cooldown_until,
+                    next_probe_at = excluded.next_probe_at,
+                    reason = excluded.reason,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    normalized_scope,
+                    str(account_id) if account_id is not None else None,
+                    route,
+                    normalized_state,
+                    max(0, int(consecutive_429)),
+                    _utc_iso(first_429_at) if first_429_at is not None else None,
+                    _utc_iso(last_429_at) if last_429_at is not None else None,
+                    _utc_iso(cooldown_until) if cooldown_until is not None else None,
+                    _utc_iso(next_probe_at) if next_probe_at is not None else None,
+                    reason,
+                    _json_object(payload),
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_steam_route_circuit(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"Steam circuit was not persisted: {key}")
+        return row
+
+    def list_steam_route_circuits(self, *, state: str | None = None) -> list[sqlite3.Row]:
+        if state is None:
+            return self.conn.execute(
+                "SELECT * FROM steam_route_circuits ORDER BY updated_at DESC, circuit_key"
+            ).fetchall()
+        return self.conn.execute(
+            """
+            SELECT * FROM steam_route_circuits
+            WHERE state = ? ORDER BY updated_at DESC, circuit_key
+            """,
+            (str(state),),
+        ).fetchall()
+
+    def claim_steam_circuit_probe(
+        self,
+        circuit_key: str,
+        worker_id: str,
+        *,
+        lease_seconds: float = 30,
+        now: str | datetime | None = None,
+    ) -> sqlite3.Row | None:
+        key = str(circuit_key)
+        owner = str(worker_id)
+        now_iso = _utc_iso(now)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            cursor = self.conn.execute(
+                """
+                UPDATE steam_route_circuits
+                SET state = 'half_open', probe_lease_owner = ?,
+                    probe_lease_expires_at = ?, updated_at = ?
+                WHERE circuit_key = ?
+                  AND state IN ('open', 'half_open')
+                  AND (next_probe_at IS NULL OR next_probe_at <= ?)
+                  AND (probe_lease_expires_at IS NULL OR probe_lease_expires_at <= ?)
+                """,
+                (
+                    owner,
+                    _lease_expiry(now_iso, lease_seconds),
+                    now_iso,
+                    key,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            row = self.get_steam_route_circuit(key) if cursor.rowcount == 1 else None
+            self.conn.commit()
+            return row
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def release_steam_circuit_probe(
+        self,
+        circuit_key: str,
+        worker_id: str,
+        *,
+        state: str | None = None,
+        cooldown_until: str | datetime | None = None,
+        next_probe_at: str | datetime | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        now = utc_now_iso()
+        cursor = self.conn.execute(
+            """
+            UPDATE steam_route_circuits
+            SET state = COALESCE(?, state),
+                cooldown_until = ?, next_probe_at = ?, reason = COALESCE(?, reason),
+                probe_lease_owner = NULL, probe_lease_expires_at = NULL, updated_at = ?
+            WHERE circuit_key = ? AND probe_lease_owner = ?
+            """,
+            (
+                state,
+                _utc_iso(cooldown_until) if cooldown_until is not None else None,
+                _utc_iso(next_probe_at) if next_probe_at is not None else None,
+                reason,
+                now,
+                str(circuit_key),
+                str(worker_id),
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    # ------------------------------------------------------------------
+    # Guadao issue acknowledgement and configuration audit
+    # ------------------------------------------------------------------
+
+    def set_guadao_issue_acknowledgement(
+        self,
+        issue_key: str,
+        *,
+        acknowledged: bool,
+        reason: str | None = None,
+        actor: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> sqlite3.Row:
+        key = str(issue_key or "").strip()
+        if not key:
+            raise ValueError("issue_key is required")
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO guadao_issue_acknowledgements (
+                    issue_key, acknowledged, reason, actor, acknowledged_at,
+                    restored_at, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                    acknowledged = excluded.acknowledged,
+                    reason = excluded.reason,
+                    actor = excluded.actor,
+                    acknowledged_at = excluded.acknowledged_at,
+                    restored_at = excluded.restored_at,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    1 if acknowledged else 0,
+                    reason,
+                    actor,
+                    now if acknowledged else None,
+                    None if acknowledged else now,
+                    _json_object(payload),
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_guadao_issue_acknowledgement(key)
+        if row is None:  # pragma: no cover
+            raise RuntimeError(f"guadao issue acknowledgement was not persisted: {key}")
+        return row
+
+    def get_guadao_issue_acknowledgement(self, issue_key: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM guadao_issue_acknowledgements WHERE issue_key = ?",
+            (str(issue_key),),
+        ).fetchone()
+
+    def list_guadao_issue_acknowledgements(
+        self,
+        *,
+        acknowledged: bool | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        if acknowledged is None:
+            return self.conn.execute(
+                """
+                SELECT * FROM guadao_issue_acknowledgements
+                ORDER BY updated_at DESC, issue_key LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return self.conn.execute(
+            """
+            SELECT * FROM guadao_issue_acknowledgements
+            WHERE acknowledged = ? ORDER BY updated_at DESC, issue_key LIMIT ?
+            """,
+            (1 if acknowledged else 0, max(1, int(limit))),
+        ).fetchall()
+
+    def add_strategy_config_audit(
+        self,
+        *,
+        config_scope: str,
+        old_value: Any,
+        new_value: Any,
+        diff: Any = None,
+        event_type: str = "update",
+        actor: str | None = None,
+        reason: str | None = None,
+        created_at: str | datetime | None = None,
+    ) -> int:
+        scope = str(config_scope or "").strip()
+        normalized_event = str(event_type or "").strip()
+        if not scope or not normalized_event:
+            raise ValueError("config_scope and event_type are required")
+        cursor = self.conn.execute(
+            """
+            INSERT INTO strategy_config_audit (
+                config_scope, event_type, old_value_json, new_value_json,
+                diff_json, actor, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scope,
+                normalized_event,
+                _json_value(old_value),
+                _json_value(new_value),
+                _json_value(diff if diff is not None else {}),
+                actor,
+                reason,
+                _utc_iso(created_at),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_strategy_config_audit(
+        self,
+        *,
+        config_scope: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        if config_scope is None:
+            return self.conn.execute(
+                "SELECT * FROM strategy_config_audit ORDER BY created_at DESC, id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return self.conn.execute(
+            """
+            SELECT * FROM strategy_config_audit
+            WHERE config_scope = ? ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (str(config_scope), max(1, int(limit))),
+        ).fetchall()
 
     # ------------------------------------------------------------------
     # Pool operations

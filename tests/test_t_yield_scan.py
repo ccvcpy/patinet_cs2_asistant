@@ -28,7 +28,11 @@ from cs2_assistant.services.t_yield_scan import (
 
 
 class FakeMarketService:
+    def __init__(self) -> None:
+        self.received_market_hash_names: list[str] = []
+
     def refresh_items(self, items: list[dict[str, object]]) -> list[SimpleNamespace]:
+        self.received_market_hash_names = [str(item["market_hash_name"]) for item in items]
         return [
             SimpleNamespace(
                 market_hash_name=item["market_hash_name"],
@@ -37,6 +41,26 @@ class FakeMarketService:
                 c5_price_source="c5_batch",
                 steam_sell_price=15.0,
                 steam_price_source="steam_orderbook",
+                raw_json={},
+            )
+            for item in items
+        ]
+
+
+class FakeC5PreflightMarketService:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def refresh_items(self, items: list[dict[str, object]]) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                market_hash_name=item["market_hash_name"],
+                c5_sell_price=item["reference_price"],
+                c5_sell_count=3,
+                c5_item_id=item.get("c5_item_id"),
+                c5_website=None,
+                c5_price_source="c5_batch",
+                raw_json={"c5_batch": {"price": item["reference_price"]}},
             )
             for item in items
         ]
@@ -188,12 +212,16 @@ class TYieldScanTestCase(unittest.TestCase):
                 ],
             }
 
+            steam_market_service = FakeMarketService()
             with patch(
                 "cs2_assistant.services.t_yield_scan.fetch_all_c5_inventories",
                 return_value=inventory_payload,
             ), patch(
+                "cs2_assistant.services.t_yield_scan.MarketService",
+                FakeC5PreflightMarketService,
+            ), patch(
                 "cs2_assistant.services.t_yield_scan.build_market_service",
-                return_value=FakeMarketService(),
+                return_value=steam_market_service,
             ):
                 report = scan_t_yield(
                     settings,
@@ -208,6 +236,7 @@ class TYieldScanTestCase(unittest.TestCase):
         self.assertAlmostEqual((12.0 / 15.0) * 0.99, candidate.ratio)
         self.assertAlmostEqual((12.0 / 15.0) * 0.99 - 0.73, candidate.t_yield_rate)
         self.assertAlmostEqual(12.0 / 15.0, candidate.listing_ratio)
+        self.assertEqual(["Mixed Item"], steam_market_service.received_market_hash_names)
         self.assertEqual(
             ["Mixed Item"],
             [
@@ -218,6 +247,49 @@ class TYieldScanTestCase(unittest.TestCase):
                 )
             ],
         )
+
+    def test_c5_min_price_filters_before_steam_market_refresh(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                db_path=Path(temp_dir) / "assistant.db",
+                c5_api_key="c5-token",
+            )
+            inventory_payload = {
+                "source": "live",
+                "accounts": [{"steamId": "steam-a", "nickname": "115"}],
+                "list": [
+                    {
+                        "marketHashName": "High Value Item",
+                        "name": "High Value Item",
+                        "steamId": "steam-a",
+                        "ifTradable": True,
+                        "price": 12.0,
+                    },
+                    {
+                        "marketHashName": "Low Value Item",
+                        "name": "Low Value Item",
+                        "steamId": "steam-a",
+                        "ifTradable": True,
+                        "price": 4.99,
+                    },
+                ],
+            }
+            steam_market_service = FakeMarketService()
+
+            with patch(
+                "cs2_assistant.services.t_yield_scan.fetch_all_c5_inventories",
+                return_value=inventory_payload,
+            ), patch(
+                "cs2_assistant.services.t_yield_scan.MarketService",
+                FakeC5PreflightMarketService,
+            ), patch(
+                "cs2_assistant.services.t_yield_scan.build_market_service",
+                return_value=steam_market_service,
+            ):
+                report = scan_t_yield(settings, min_price=5.0)
+
+        self.assertEqual(["High Value Item"], steam_market_service.received_market_hash_names)
+        self.assertEqual(["High Value Item"], [candidate.market_hash_name for candidate in report.candidates])
 
 
 if __name__ == "__main__":

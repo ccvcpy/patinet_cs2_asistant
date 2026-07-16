@@ -118,6 +118,37 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     return settings
 
 
+_STEAM_SCHEDULER_COMMANDS = frozenset(
+    {
+        "account",
+        "executor",
+        "notify",
+        "pool",
+        "profit-trade",
+        "steam",
+        "t-profit",
+        "t-yield",
+    }
+)
+
+
+def _configure_cli_shared_steam_scheduler(args: argparse.Namespace) -> None:
+    """Join Steam-capable CLI processes to the cross-process SQLite queue.
+
+    Configuration errors intentionally propagate: a production CLI command
+    must not silently fall back to the in-process direct compatibility facade.
+    """
+
+    if str(getattr(args, "command", "") or "") not in _STEAM_SCHEDULER_COMMANDS:
+        return
+    settings = _settings_from_args(args)
+    from cs2_assistant.services.steam_request_scheduler import (
+        configure_shared_steam_scheduler,
+    )
+
+    configure_shared_steam_scheduler(settings.db_path)
+
+
 def _open_db(settings: Settings) -> Database:
     db = Database(settings.db_path)
     db.initialize()
@@ -144,6 +175,7 @@ def _build_steam_client(settings: Settings) -> SteamMarketClient:
         device_id=device_id,
         account_id=current.id if current else None,
         base_url=settings.steam_market_base_url,
+        request_source="cli",
     )
 
 
@@ -3398,6 +3430,18 @@ def cmd_pool_config(args: argparse.Namespace) -> int:
         config.balance_discount = _prompt_float("余额折扣率 (balance_discount)", config.balance_discount)
         config.guadao_max_listing_ratio = _prompt_float("挂刀阈值 listing_ratio ≤ (guadao_max_listing_ratio)", config.guadao_max_listing_ratio)
         config.guadao_item_scope = _prompt_str("挂刀品类范围 case_only/non_case_only (guadao_item_scope)", config.guadao_item_scope)
+        config.case_max_open_guadao_count = _prompt_int(
+            "箱子 Steam 活跃挂单槽上限 (case_max_open_guadao_count)",
+            config.case_max_open_guadao_count,
+        )
+        config.case_full_release_after_hours = _prompt_float(
+            "箱子挂单槽满载后随机释放等待小时；0=关闭 (case_full_release_after_hours)",
+            config.case_full_release_after_hours,
+        )
+        config.case_full_release_fraction = _prompt_float(
+            "箱子满载随机释放比例；0.125=12.5% (case_full_release_fraction)",
+            config.case_full_release_fraction,
+        )
         config.transfer_min_real_ratio = _prompt_float("导余额阈值 transfer_real_ratio ≥ (transfer_min_real_ratio)", config.transfer_min_real_ratio)
         config.min_price = _prompt_float("最低价格过滤 (min_price)", config.min_price)
         config.poll_interval_minutes = _prompt_int("轮询间隔分钟 (poll_interval_minutes)", config.poll_interval_minutes)
@@ -3412,6 +3456,17 @@ def cmd_pool_config(args: argparse.Namespace) -> int:
         print(f"  余额折扣率 (balance_discount):           {config.balance_discount}")
         print(f"  挂刀阈值 (guadao_max_listing_ratio):     ≤ {config.guadao_max_listing_ratio}")
         print(f"  挂刀品类范围 (guadao_item_scope):        {config.guadao_item_scope}")
+        print(f"  箱子活跃挂单槽上限:                      {config.case_max_open_guadao_count}")
+        print(
+            "  满载随机释放等待:                        "
+            f"{config.case_full_release_after_hours:g} 小时（0=关闭）"
+        )
+        print(
+            "  满载随机释放比例:                        "
+            f"{config.case_full_release_fraction:g} "
+            f"（{config.case_full_release_fraction * 100:g}%）"
+        )
+        print("  单笔老挂单释放:                           超过 48 小时（独立规则）")
         print(f"  导余额阈值 (transfer_min_real_ratio):    ≥ {config.transfer_min_real_ratio}")
         print(f"  最低价格 (min_price):                    {config.min_price}")
         print(f"  轮询间隔 (poll_interval_minutes):        {config.poll_interval_minutes}")
@@ -3510,6 +3565,8 @@ def cmd_pool_monitor(args: argparse.Namespace) -> int:
 
 
 def cmd_executor_start(args: argparse.Namespace) -> int:
+    import time as time_module
+
     settings = _settings_from_args(args)
     config = load_strategy_config(settings)
     if args.enable:
@@ -3529,16 +3586,47 @@ def cmd_executor_start(args: argparse.Namespace) -> int:
         force_refresh_override = True
     if args.no_force_refresh:
         force_refresh_override = False
-    engine = ExecutionEngine(
-        settings,
-        config,
-        dry_run_override=None,
-        force_refresh_override=force_refresh_override,
-    )
+    if force_refresh_override is not None:
+        config.force_refresh_before_execution = force_refresh_override
+    if any(
+        (
+            args.enable,
+            args.disable,
+            args.dry_run,
+            args.no_dry_run,
+            args.max_list is not None,
+            args.max_transfer_buy is not None,
+            force_refresh_override is not None,
+        )
+    ):
+        save_strategy_config(settings, config)
+    from cs2_assistant.services.runtime_controller import UnifiedRuntimeController
+
+    runtime = UnifiedRuntimeController(settings)
+    if args.once:
+        # 跨进程租约保证只领取一个已经到期的任务；不会改写未来 nextAttemptAt。
+        result = runtime.tick(max_tasks=1)
+        _print_json(result)
+        return 0
+    if runtime.is_backend_worker_active():
+        print(
+            "拒绝启动第二个真实挂刀循环：8765 后端或另一个 runtime worker 正在运行。"
+            "请在挂刀运行总览中控制开关。"
+        )
+        return 2
+    runtime.start()
     try:
-        engine.run(once=args.once)
+        if args.enable:
+            runtime.toggle_executor("guadao", True)
+        elif args.disable:
+            runtime.toggle_executor("guadao", False)
+        print("统一后台 runtime 已启动；挂刀与 Profit Trade 由持久化任务调度。按 Ctrl+C 退出。")
+        while runtime.alive:
+            time_module.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
     finally:
-        engine.close()
+        runtime.stop()
     return 0
 
 
@@ -3749,6 +3837,7 @@ def cmd_account_status(args: argparse.Namespace) -> int:
                     device_id=account.device_id,
                     account_id=account.id,
                     base_url=settings.steam_market_base_url,
+                    request_source="cli",
                 )
                 payload = client.my_listings(count=1)
                 if payload and payload.get("success") in (1, True):
@@ -3870,14 +3959,20 @@ def cmd_account_balance(args: argparse.Namespace) -> int:
 
     total_balance = 0.0
     total_delayed = 0.0
+    successful_count = 0
+    queryable_count = sum(1 for account in accounts if account.cookies and account.steam_id64)
+    steam_rate_limited = False
     for account in accounts:
         status = "ok"
         error: str | None = None
-        balance = 0.0
-        delayed = 0.0
+        balance: float | None = None
+        delayed: float | None = None
         if not account.cookies or not account.steam_id64:
             status = "skipped"
             error = "missing Steam cookies or steam_id64"
+        elif steam_rate_limited:
+            status = "skipped"
+            error = "前一账号遇到 Steam 429，已停止后续余额请求，避免继续触发限流"
         else:
             try:
                 wallet = SteamMarketClient(
@@ -3887,25 +3982,42 @@ def cmd_account_balance(args: argparse.Namespace) -> int:
                     device_id=account.device_id,
                     account_id=account.id,
                     base_url=settings.steam_market_base_url,
+                    request_source="account_balance",
                 ).wallet_balance()
-                balance = safe_float(wallet.get("balance")) or 0.0
-                delayed = safe_float(wallet.get("delayed_balance")) or 0.0
+                balance = safe_float(wallet.get("balance"))
+                delayed = safe_float(wallet.get("delayed_balance"))
+                if balance is None or delayed is None:
+                    raise RuntimeError("Steam wallet response missing balance fields")
                 total_balance += balance
                 total_delayed += delayed
+                successful_count += 1
             except Exception as exc:
                 status = "error"
                 error = str(exc)
+                if isinstance(exc, SteamMarketError) and exc.status_code == 429:
+                    steam_rate_limited = True
+        balance_text = f"{balance:.2f}" if balance is not None else "N/A"
+        delayed_text = f"{delayed:.2f}" if delayed is not None else "N/A"
+        combined_text = f"{balance + delayed:.2f}" if balance is not None and delayed is not None else "N/A"
         print(
             f"{account.name:<18} {account.steam_id64 or '-':<22} "
-            f"{balance:>12.2f} {delayed:>12.2f} {balance + delayed:>12.2f} {status}"
+            f"{balance_text:>12} {delayed_text:>12} {combined_text:>12} {status}"
         )
         if error:
             print(f"  错误: {error}")
 
-    print(
-        f"{'TOTAL':<18} {'-':<22} "
-        f"{total_balance:>12.2f} {total_delayed:>12.2f} {total_balance + total_delayed:>12.2f} -"
-    )
+    if successful_count > 0:
+        total_status = "ok" if successful_count == queryable_count else f"partial {successful_count}/{queryable_count}"
+        print(
+            f"{'TOTAL':<18} {'-':<22} "
+            f"{total_balance:>12.2f} {total_delayed:>12.2f} "
+            f"{total_balance + total_delayed:>12.2f} {total_status}"
+        )
+    else:
+        print(
+            f"{'TOTAL':<18} {'-':<22} "
+            f"{'N/A':>12} {'N/A':>12} {'N/A':>12} unavailable"
+        )
     return 0
 
 
@@ -4825,6 +4937,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _configure_cli_shared_steam_scheduler(args)
         return int(args.handler(args))
     except KeyboardInterrupt:
         print("已中断。", file=sys.stderr)

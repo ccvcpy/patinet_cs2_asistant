@@ -182,6 +182,77 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
         finally:
             db.close()
 
+    def test_executable_observation_links_to_live_trade_status_and_completion(self) -> None:
+        report = scan_profit_trade_opportunities(
+            self.settings,
+            profit_config(profit_trade_min_roi=0.05),
+            inventory_payload=self.inventory_payload,
+            market_service=FixedMarketService(c5_price=75.0),
+            record=True,
+            lock_asset=True,
+        )
+
+        self.assertEqual(1, report.opportunity_count)
+        trade_id = report.created_trade_ids[0]
+        watch = build_profit_trade_roi_watch_payload(self.settings)
+        self.assertEqual(trade_id, watch["items"][0]["latestTrade"]["tradeId"])
+        self.assertEqual("locked", watch["items"][0]["latestTrade"]["status"])
+
+        history = build_profit_trade_roi_history_payload(self.settings, MARKET_HASH_NAME)
+        linked = history["items"][0]["relatedTrade"]
+        self.assertEqual(trade_id, linked["tradeId"])
+        self.assertEqual("locked", linked["status"])
+
+        db = self._open_db()
+        try:
+            db.update_profit_trade(
+                trade_id,
+                status="steam_bought",
+                step_key="steam_bought",
+                step_index=3,
+                steam_buy_price=100.0,
+                note=json.dumps(
+                    {
+                        **json.loads(db.get_profit_trade(trade_id)["note"]),
+                        "steamBuySucceededAt": "2026-07-14T12:16:49+00:00",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        finally:
+            db.close()
+
+        bought = build_profit_trade_roi_history_payload(
+            self.settings,
+            MARKET_HASH_NAME,
+        )["items"][0]["relatedTrade"]
+        self.assertEqual("steam_bought", bought["status"])
+        self.assertEqual("2026-07-14T12:16:49+00:00", bought["steamBoughtAt"])
+
+        db = self._open_db()
+        try:
+            db.update_profit_trade(
+                trade_id,
+                status="completed",
+                step_key="settled",
+                step_index=6,
+                c5_sold_net_price=80.0,
+                realized_profit=11.0,
+                realized_roi=0.11,
+                completed_at="2026-07-14T14:19:38+00:00",
+            )
+        finally:
+            db.close()
+
+        completed = build_profit_trade_roi_history_payload(
+            self.settings,
+            MARKET_HASH_NAME,
+        )["items"][0]["relatedTrade"]
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual(80.0, completed["c5SoldNetPrice"])
+        self.assertEqual(11.0, completed["realizedProfit"])
+        self.assertEqual(0.11, completed["realizedRoi"])
+
     def test_completed_scan_exits_stale_watch_and_preserves_history(self) -> None:
         scan_profit_trade_opportunities(
             self.settings,
@@ -433,6 +504,23 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
                     '"steamBuyRequestedAt":"2026-07-11T07:03:45+00:00"}'
                 ),
             )
+            listing_price_guard = db.add_profit_trade(
+                trade_no="PT-listing-price-guard",
+                market_hash_name="USP-S | Tropical Breeze (Factory New)",
+                status="cancelled",
+                step_key="asset_locked",
+                step_index=2,
+                steam_listing_id="507367553952201686",
+                error=(
+                    "Steam listing price moved too much above orderbook before buy: "
+                    "17.17 > 15.87 * 1.0100"
+                ),
+                note=(
+                    '{"cancelSource":"profit_trade_buy_listing_price_guard",'
+                    '"cancelReason":"Steam listing price moved too much above orderbook '
+                    'before buy: 17.17 > 15.87 * 1.0100"}'
+                ),
+            )
         finally:
             db.close()
 
@@ -449,6 +537,14 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
 
         sent = build_profit_trade_interruption_timeline_payload(self.settings, purchase_evidence)["trade"]
         self.assertIs(sent["purchaseRequestSent"], True)
+
+        guarded = build_profit_trade_interruption_timeline_payload(
+            self.settings,
+            listing_price_guard,
+        )["trade"]
+        self.assertIs(guarded["listingIdObtained"], True)
+        self.assertIs(guarded["purchaseRequestSent"], False)
+        self.assertEqual("507367553952201686", guarded["steamListingId"])
 
         db = self._open_db()
         try:
@@ -485,6 +581,7 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
                 DROP TABLE profit_trade_state_events;
                 DROP TABLE profit_trade_roi_observations;
                 DROP TABLE profit_trade_roi_watch;
+                DROP TABLE profit_trade_runtime_state;
                 """
             )
             db.conn.commit()
