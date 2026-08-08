@@ -107,27 +107,31 @@ OP_PROFIT_LOCK_ASSET = "profit_lock_asset"  # 搬砖做T：锁定旧底仓 A
 OP_PROFIT_BUY_STEAM = "profit_buy_steam"    # 搬砖做T：Steam 买入替换 B
 OP_PROFIT_SELL_C5 = "profit_sell_c5"        # 搬砖做T：C5 卖出 A
 
-GUADAO_ITEM_SCOPE_CASE_ONLY = "case_only"
+GUADAO_ITEM_SCOPE_CRATES_ONLY = "crates_only"
 GUADAO_ITEM_SCOPE_NON_CASE_ONLY = "non_case_only"
 GUADAO_ITEM_SCOPES = {
-    GUADAO_ITEM_SCOPE_CASE_ONLY,
+    GUADAO_ITEM_SCOPE_CRATES_ONLY,
     GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
 }
 
 
 def normalize_guadao_item_scope(value: object) -> str:
-    raw = str(value or GUADAO_ITEM_SCOPE_CASE_ONLY).strip().lower().replace("-", "_")
+    raw = str(value or GUADAO_ITEM_SCOPE_CRATES_ONLY).strip().lower().replace("-", "_")
     aliases = {
-        "case": GUADAO_ITEM_SCOPE_CASE_ONLY,
-        "cases": GUADAO_ITEM_SCOPE_CASE_ONLY,
-        "case_only": GUADAO_ITEM_SCOPE_CASE_ONLY,
-        "box": GUADAO_ITEM_SCOPE_CASE_ONLY,
-        "boxes": GUADAO_ITEM_SCOPE_CASE_ONLY,
+        "crate": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "crates": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "crates_only": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        # 历史配置兼容：case_only 的真实业务语义一直是 CSGO-API crates。
+        "case": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "cases": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "case_only": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "box": GUADAO_ITEM_SCOPE_CRATES_ONLY,
+        "boxes": GUADAO_ITEM_SCOPE_CRATES_ONLY,
         "non_case": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
         "non_cases": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
         "non_case_only": GUADAO_ITEM_SCOPE_NON_CASE_ONLY,
     }
-    return aliases.get(raw, GUADAO_ITEM_SCOPE_CASE_ONLY)
+    return aliases.get(raw, GUADAO_ITEM_SCOPE_CRATES_ONLY)
 
 
 def looks_like_weapon_case_name(value: str | None) -> bool:
@@ -139,7 +143,7 @@ def looks_like_weapon_case_name(value: str | None) -> bool:
 
 def guadao_scope_allows_item(scope: object, *, is_weapon_case: bool) -> bool:
     normalized = normalize_guadao_item_scope(scope)
-    if normalized == GUADAO_ITEM_SCOPE_CASE_ONLY:
+    if normalized == GUADAO_ITEM_SCOPE_CRATES_ONLY:
         return is_weapon_case
     return not is_weapon_case
 
@@ -154,7 +158,6 @@ class StrategyConfig:
     transfer_min_real_ratio: float = 0.05
     profit_trade_enabled: bool = False
     profit_trade_allow_real_execution: bool = False
-    profit_trade_allow_reprice_execution: bool = False
     profit_trade_balance_discount: float = 0.69
     profit_trade_min_roi: float = 0.07
     profit_trade_min_item_value: float = 50.0
@@ -176,14 +179,19 @@ class StrategyConfig:
     profit_trade_c5_max_listing_premium_pct: float = 3.0
     profit_trade_manual_review_roi: float = 0.20
     profit_trade_reprice_enabled: bool = True
+    profit_trade_initial_listing_discount_pct: float = 0.33
     profit_trade_reprice_discount_pct: float = 1.0
-    profit_trade_reprice_min_discount: float = 0.1
-    profit_trade_reprice_max_discount: float = 50.0
     profit_trade_reprice_cooldown_hours: float = 3.0
     profit_trade_stale_reprice_after_hours: float = 12.0
     profit_trade_stale_manual_review_after_hours: float = 24.0
-    profit_trade_stale_min_roi: float = 0.04
-    profit_trade_stale_price_offset: float = 0.01
+    profit_trade_stale_min_roi_factor: float = 0.5
+    profit_trade_long_buy_enabled: bool = True
+    profit_trade_long_buy_allow_real_execution: bool = False
+    profit_trade_long_buy_max_active_orders: int = 25
+    profit_trade_long_buy_create_fraction_per_cycle: float = 0.20
+    profit_trade_long_buy_aggressive_roi_delta: float = 0.005
+    profit_trade_long_buy_min_price_advantage: float = 0.10
+    profit_trade_long_buy_max_price_advantage: float = 1.00
     profit_trade_sticker_slab_status: str = "blocked"
     profit_trade_sticker_status: str = "blocked"
     profit_trade_protected_asset_ids: list[str] | None = None
@@ -198,7 +206,7 @@ class StrategyConfig:
     execution_enabled: bool = False
     auto_list_enabled: bool = True
     auto_rebuy_enabled: bool = True
-    guadao_item_scope: str = GUADAO_ITEM_SCOPE_CASE_ONLY
+    guadao_item_scope: str = GUADAO_ITEM_SCOPE_CRATES_ONLY
     price_tolerance_pct: float = 1.0
     max_list_per_cycle: int = 5
     max_transfer_buy_per_cycle: int = 3
@@ -232,6 +240,13 @@ class StrategyConfig:
         return {
             "scanIntervalSeconds": 300.0,
             "steamSyncIntervalSeconds": 120.0,
+            # A Steam account sync may be promoted once it has waited this
+            # long behind C5 rebuy work.  This is a start-lag budget, not an
+            # additional polling interval.
+            "steamSyncMaxStartLagSeconds": 60.0,
+            # Candidate discovery is cheap but still a real P0 maintenance
+            # walk.  A daily default avoids repeatedly taking the safety lane.
+            "staleListedCheckIntervalSeconds": 86400.0,
             "actionConfirmationDelaysSeconds": [10.0, 20.0, 40.0],
             "saleEvidenceDelaysSeconds": [0.0, 60.0, 180.0, 600.0],
             "rebuyRetryTiers": [
@@ -253,6 +268,24 @@ class StrategyConfig:
         for key in schedule:
             if key in configured:
                 schedule[key] = configured[key]
+        # The stale-listing maintenance task must never become a tight loop
+        # because of a malformed persisted interval (0, negative, NaN, or
+        # infinity).  Keep the user-facing config value compatible while
+        # exposing a safe positive runtime value.
+        try:
+            stale_interval = float(schedule.get("staleListedCheckIntervalSeconds"))
+        except (TypeError, ValueError):
+            stale_interval = 86400.0
+        if not math.isfinite(stale_interval) or stale_interval <= 0:
+            stale_interval = 86400.0
+        schedule["staleListedCheckIntervalSeconds"] = stale_interval
+        try:
+            sync_start_lag = float(schedule.get("steamSyncMaxStartLagSeconds"))
+        except (TypeError, ValueError):
+            sync_start_lag = 60.0
+        if not math.isfinite(sync_start_lag) or sync_start_lag <= 0:
+            sync_start_lag = 60.0
+        schedule["steamSyncMaxStartLagSeconds"] = sync_start_lag
         return schedule
 
     def guadao_special_ratio_rule_for(self, market_hash_name: str) -> dict[str, Any] | None:
@@ -270,7 +303,7 @@ class StrategyConfig:
                 ratio = float(raw_rule.get("maxListingRatio"))
             except (TypeError, ValueError):
                 continue
-            if ratio < float(self.guadao_max_listing_ratio) or ratio > 0.80:
+            if ratio <= 0 or ratio > 0.80:
                 continue
             return {
                 **raw_rule,
@@ -325,7 +358,6 @@ class StrategyConfig:
             "profitTrade": {
                 "enabled": self.profit_trade_enabled,
                 "allowRealExecution": self.profit_trade_allow_real_execution,
-                "allowRepriceExecution": self.profit_trade_allow_reprice_execution,
                 "balanceDiscount": self.profit_trade_balance_discount,
                 "minRoi": self.profit_trade_min_roi,
                 "minItemValue": self.profit_trade_min_item_value,
@@ -349,14 +381,19 @@ class StrategyConfig:
                 "c5MaxListingPremiumPct": self.profit_trade_c5_max_listing_premium_pct,
                 "manualReviewRoi": self.profit_trade_manual_review_roi,
                 "repriceEnabled": self.profit_trade_reprice_enabled,
+                "initialListingDiscountPct": self.profit_trade_initial_listing_discount_pct,
                 "repriceDiscountPct": self.profit_trade_reprice_discount_pct,
-                "repriceMinDiscount": self.profit_trade_reprice_min_discount,
-                "repriceMaxDiscount": self.profit_trade_reprice_max_discount,
                 "repriceCooldownHours": self.profit_trade_reprice_cooldown_hours,
                 "staleRepriceAfterHours": self.profit_trade_stale_reprice_after_hours,
                 "staleManualReviewAfterHours": self.profit_trade_stale_manual_review_after_hours,
-                "staleMinRoi": self.profit_trade_stale_min_roi,
-                "stalePriceOffset": self.profit_trade_stale_price_offset,
+                "staleMinRoiFactor": self.profit_trade_stale_min_roi_factor,
+                "longBuyEnabled": self.profit_trade_long_buy_enabled,
+                "longBuyAllowRealExecution": self.profit_trade_long_buy_allow_real_execution,
+                "longBuyMaxActiveOrders": self.profit_trade_long_buy_max_active_orders,
+                "longBuyCreateFractionPerCycle": self.profit_trade_long_buy_create_fraction_per_cycle,
+                "longBuyAggressiveRoiDelta": self.profit_trade_long_buy_aggressive_roi_delta,
+                "longBuyMinPriceAdvantage": self.profit_trade_long_buy_min_price_advantage,
+                "longBuyMaxPriceAdvantage": self.profit_trade_long_buy_max_price_advantage,
                 "stickerSlabStatus": self.profit_trade_sticker_slab_status,
                 "stickerStatus": self.profit_trade_sticker_status,
                 "protectedAssetIds": list(self.profit_trade_protected_asset_ids or []),
@@ -453,10 +490,6 @@ class StrategyConfig:
                 _get(profit_trade, "allowRealExecution", False),
                 False,
             ),
-            profit_trade_allow_reprice_execution=_as_bool(
-                _get(profit_trade, "allowRepriceExecution", False),
-                False,
-            ),
             profit_trade_balance_discount=float(
                 _get(profit_trade, "balanceDiscount", _get(common, "balanceDiscount", 0.69))
             ),
@@ -510,9 +543,10 @@ class StrategyConfig:
                 _get(profit_trade, "repriceEnabled", True),
                 True,
             ),
+            profit_trade_initial_listing_discount_pct=float(
+                _get(profit_trade, "initialListingDiscountPct", 0.33)
+            ),
             profit_trade_reprice_discount_pct=float(_get(profit_trade, "repriceDiscountPct", 1.0)),
-            profit_trade_reprice_min_discount=float(_get(profit_trade, "repriceMinDiscount", 0.1)),
-            profit_trade_reprice_max_discount=float(_get(profit_trade, "repriceMaxDiscount", 50.0)),
             profit_trade_reprice_cooldown_hours=float(_get(profit_trade, "repriceCooldownHours", 3.0)),
             profit_trade_stale_reprice_after_hours=float(
                 _get(profit_trade, "staleRepriceAfterHours", 12.0)
@@ -520,8 +554,33 @@ class StrategyConfig:
             profit_trade_stale_manual_review_after_hours=float(
                 _get(profit_trade, "staleManualReviewAfterHours", 24.0)
             ),
-            profit_trade_stale_min_roi=float(_get(profit_trade, "staleMinRoi", 0.04)),
-            profit_trade_stale_price_offset=float(_get(profit_trade, "stalePriceOffset", 0.01)),
+            profit_trade_stale_min_roi_factor=float(
+                _get(profit_trade, "staleMinRoiFactor", 0.5)
+            ),
+            profit_trade_long_buy_enabled=_as_bool(
+                _get(profit_trade, "longBuyEnabled", True),
+                True,
+            ),
+            profit_trade_long_buy_allow_real_execution=_as_bool(
+                _get(profit_trade, "longBuyAllowRealExecution", False),
+                False,
+            ),
+            profit_trade_long_buy_max_active_orders=max(
+                0,
+                int(_get(profit_trade, "longBuyMaxActiveOrders", 25)),
+            ),
+            profit_trade_long_buy_create_fraction_per_cycle=float(
+                _get(profit_trade, "longBuyCreateFractionPerCycle", 0.20)
+            ),
+            profit_trade_long_buy_aggressive_roi_delta=float(
+                _get(profit_trade, "longBuyAggressiveRoiDelta", 0.005)
+            ),
+            profit_trade_long_buy_min_price_advantage=float(
+                _get(profit_trade, "longBuyMinPriceAdvantage", 0.10)
+            ),
+            profit_trade_long_buy_max_price_advantage=float(
+                _get(profit_trade, "longBuyMaxPriceAdvantage", 1.00)
+            ),
             profit_trade_sticker_slab_status=_as_item_type_status(
                 _get(profit_trade, "stickerSlabStatus", None),
                 _get(profit_trade, "allowStickerSlab", None),
@@ -549,7 +608,7 @@ class StrategyConfig:
             auto_list_enabled=_as_bool(_get(guadao_balance, "autoListEnabled", True), True),
             auto_rebuy_enabled=_as_bool(_get(guadao_balance, "autoRebuyEnabled", True), True),
             guadao_item_scope=normalize_guadao_item_scope(
-                _get(guadao_balance, "guadaoItemScope", GUADAO_ITEM_SCOPE_CASE_ONLY)
+                _get(guadao_balance, "guadaoItemScope", GUADAO_ITEM_SCOPE_CRATES_ONLY)
             ),
             price_tolerance_pct=float(_get(guadao_balance, "priceTolerancePct", 1.0)),
             max_list_per_cycle=int(_get(guadao_balance, "maxListPerCycle", 5)),
@@ -687,6 +746,7 @@ class StrategyScanReport:
     all_evaluated: list[StrategyCandidate]
     total_pool_types: int
     missing_price_count: int
+    item_outcomes: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def guadao_count(self) -> int:

@@ -1,0 +1,25 @@
+{
+  "generatedAt": "2026-07-22T10:52:04.017570+00:00",
+  "execute": false,
+  "candidate": {
+    "market_hash_name": "MAC-10 | Storm Camo (Factory New)",
+    "asset_id": "48995006621",
+    "seller_steam_id": "76561199119018953"
+  },
+  "seller": "vnuzl692",
+  "observers": [],
+  "price": null,
+  "listingId": null,
+  "sampleCount": 0,
+  "timingSeconds": {
+    "submitToRemoteActive": null,
+    "submitToOrderbookVisible": null,
+    "cancelToRemoteRemoved": null,
+    "cancelToOrderbookAbsent": null
+  },
+  "targetEverVisible": false,
+  "errors": [
+    "two independent CNY observer accounts are unavailable"
+  ],
+  "aborted": true
+}

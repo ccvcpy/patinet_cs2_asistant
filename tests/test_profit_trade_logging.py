@@ -24,6 +24,38 @@ from cs2_assistant.services.profit_trade_logging import (
 
 
 class ProfitTradeLoggingTests(unittest.TestCase):
+    def test_market_hash_name_filter_applies_to_query_and_export(self) -> None:
+        fixed_now = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            logger = ProfitTradeEventLogger(temporary, now_provider=lambda: fixed_now)
+            logger.emit(
+                provider="local",
+                component="profit_trade_scan",
+                operation="item_evaluated",
+                message="first",
+                market_hash_name="USP-S | Cyrex (Factory New)",
+            )
+            logger.emit(
+                provider="local",
+                component="profit_trade_scan",
+                operation="item_evaluated",
+                message="second",
+                market_hash_name="AK-47 | Redline (Field-Tested)",
+            )
+
+            queried = logger.query({"marketHashName": "USP-S | Cyrex (Factory New)"})
+            exported = b"".join(
+                logger.export_iter(
+                    {"marketHashName": "USP-S | Cyrex (Factory New)"},
+                    format="jsonl",
+                )
+            ).decode("utf-8")
+
+            self.assertEqual(1, len(queried["events"]))
+            self.assertEqual("USP-S | Cyrex (Factory New)", queried["events"][0]["market_hash_name"])
+            self.assertIn("USP-S | Cyrex (Factory New)", exported)
+            self.assertNotIn("AK-47 | Redline (Field-Tested)", exported)
+
     def test_default_factory_honors_explicit_log_directory_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(

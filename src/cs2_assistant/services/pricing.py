@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from cs2_assistant.clients.steam_market import SteamMarketClient, SteamMarketError
@@ -235,6 +236,75 @@ def summarize_orderbook_prices(
         if seller_floor_price is not None and buyer_max_price is not None
         else None,
     )
+
+
+def build_orderbook_snapshot(
+    payload: dict[str, Any],
+    *,
+    observed_at: str | None = None,
+    depth: int = 5,
+    expected_currency: int = 23,
+) -> dict[str, Any]:
+    """Build one normalized, bounded snapshot from an existing orderbook response.
+
+    This function never performs a network request. Steam can return compact
+    levels as either ``[price, count, ...]`` or ``[[price, count], ...]``;
+    both shapes are normalized before the depth limit is applied.
+    """
+
+    normalized_depth = max(0, int(depth))
+    data = _payload_data(payload or {})
+    currency_id = safe_int(data.get("eCurrency") or data.get("currencyId"))
+    summary = summarize_orderbook_prices(payload or {}, wall_min_count=1, price_offset=0.0)
+
+    def levels(rows: list[list[Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            price = _parse_orderbook_price(row[0])
+            count = safe_float(row[1])
+            if price is None or price <= 0 or count is None or count < 0:
+                continue
+            normalized_count: int | float = int(count) if float(count).is_integer() else float(count)
+            result.append({"price": round(float(price), 2), "count": normalized_count})
+            if len(result) >= normalized_depth:
+                break
+        return result
+
+    seller_floor = summary.seller_floor_price
+    buyer_max = summary.buyer_max_price
+    spread_amount = (
+        float(seller_floor) - float(buyer_max)
+        if seller_floor is not None and buyer_max is not None
+        else None
+    )
+    spread_pct = (
+        spread_amount / float(seller_floor)
+        if spread_amount is not None and seller_floor is not None and seller_floor > 0
+        else None
+    )
+    timestamp = str(observed_at or "").strip() or datetime.now(timezone.utc).isoformat()
+    return {
+        "observedAt": timestamp,
+        "currencyId": currency_id,
+        "currencyValid": currency_id is None or currency_id == int(expected_currency),
+        "sellerFloorPrice": float(seller_floor) if seller_floor is not None else None,
+        "sellerFloorCount": summary.seller_floor_count,
+        "buyerMaxPrice": float(buyer_max) if buyer_max is not None else None,
+        "buyerMaxCount": summary.buyer_max_count,
+        "spreadAmount": spread_amount,
+        "spreadPct": spread_pct,
+        "crossed": bool(
+            seller_floor is not None
+            and buyer_max is not None
+            and float(buyer_max) >= float(seller_floor)
+        ),
+        "sellOrderCountTotal": summary.sell_order_count_total,
+        "buyOrderCountTotal": summary.buy_order_count_total,
+        "sellLevels": levels(_extract_orderbook_sell_rows(payload or {})),
+        "buyLevels": levels(_extract_orderbook_buy_rows(payload or {})),
+    }
 
 
 def choose_orderbook_price(

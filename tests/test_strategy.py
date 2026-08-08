@@ -44,16 +44,117 @@ class FakeThirdPartyMarketService:
 
 
 class StrategyClassificationTestCase(unittest.TestCase):
-    def test_guadao_scope_all_now_normalizes_to_case_only(self) -> None:
-        self.assertEqual("case_only", normalize_guadao_item_scope("all"))
-        self.assertEqual("case_only", normalize_guadao_item_scope(""))
-        self.assertEqual("case_only", StrategyConfig().guadao_item_scope)
+    def test_scan_report_preserves_every_non_evaluated_item_reason(self) -> None:
+        class OutcomeMarketService:
+            def refresh_items(self, items: list[dict]) -> list[MarketState]:
+                states: list[MarketState] = []
+                for item in items:
+                    market_hash_name = str(item["market_hash_name"])
+                    if market_hash_name == "Missing State Case":
+                        continue
+                    state = MarketState(
+                        market_hash_name=market_hash_name,
+                        name_cn=str(item.get("name_cn") or market_hash_name),
+                        steam_sell_price=2.0,
+                        steam_price_source="steam_orderbook",
+                    )
+                    if market_hash_name == "Queue Deferred Case":
+                        state.steam_sell_price = None
+                        state.steam_price_source = None
+                        state.raw_json["steam_orderbook_error_type"] = "queue_timeout"
+                        state.raw_json["steam_orderbook_error"] = "Steam request timed out in queue"
+                    states.append(state)
+                return states
 
-    def test_guadao_scope_case_only_blocks_non_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(
+                db_path=Path(temp_dir) / "assistant.db",
+                c5_api_key="c5-key",
+                steamdt_api_key="steamdt-key",
+            )
+            config = StrategyConfig(
+                dry_run=False,
+                min_price=1.0,
+                guadao_max_listing_ratio=0.90,
+                transfer_min_real_ratio=9999,
+            )
+            inventory_payload = {
+                "source": "live",
+                "list": [
+                    {
+                        "assetId": "asset-ok",
+                        "marketHashName": "Evaluated Case",
+                        "name": "Evaluated Case",
+                        "ifTradable": True,
+                        "price": 1.20,
+                    },
+                    {
+                        "assetId": "asset-low",
+                        "marketHashName": "Below Min Case",
+                        "name": "Below Min Case",
+                        "ifTradable": True,
+                        "price": 0.50,
+                    },
+                    {
+                        "assetId": "asset-queue",
+                        "marketHashName": "Queue Deferred Case",
+                        "name": "Queue Deferred Case",
+                        "ifTradable": True,
+                        "price": 1.20,
+                    },
+                    {
+                        "assetId": "asset-state",
+                        "marketHashName": "Missing State Case",
+                        "name": "Missing State Case",
+                        "ifTradable": True,
+                        "price": 1.20,
+                    },
+                ],
+            }
+            with patch(
+                "cs2_assistant.services.strategy.build_market_service",
+                return_value=OutcomeMarketService(),
+            ):
+                report = scan_strategies(
+                    settings,
+                    config,
+                    inventory_payload=inventory_payload,
+                )
+
+        outcomes = {
+            str(row["marketHashName"]): row
+            for row in report.item_outcomes
+        }
+        self.assertEqual(4, report.total_pool_types)
+        self.assertEqual(4, len(outcomes))
+        self.assertEqual("evaluated", outcomes["Evaluated Case"]["status"])
+        self.assertEqual("below_min_price", outcomes["Below Min Case"]["status"])
+        self.assertEqual("queue_deferred", outcomes["Queue Deferred Case"]["status"])
+        self.assertFalse(outcomes["Queue Deferred Case"]["requestSent"])
+        self.assertEqual("market_state_missing", outcomes["Missing State Case"]["status"])
+        self.assertEqual(0, report.missing_price_count)
+
+    def test_guadao_scope_all_now_normalizes_to_crates_only(self) -> None:
+        self.assertEqual("crates_only", normalize_guadao_item_scope("all"))
+        self.assertEqual("crates_only", normalize_guadao_item_scope(""))
+        self.assertEqual("crates_only", StrategyConfig().guadao_item_scope)
+
+    def test_guadao_scope_legacy_case_only_normalizes_to_crates_only(self) -> None:
+        self.assertEqual("crates_only", normalize_guadao_item_scope("case_only"))
+        config = StrategyConfig.from_dict(
+            {"guadaoBalance": {"guadaoItemScope": "case_only"}}
+        )
+        self.assertEqual("crates_only", config.guadao_item_scope)
+        self.assertEqual(
+            "crates_only",
+            config.to_dict()["guadaoBalance"]["guadaoItemScope"],
+        )
+
+    def test_guadao_scope_crates_only_blocks_non_crates(self) -> None:
         config = StrategyConfig(
             guadao_max_listing_ratio=0.67,
             transfer_min_real_ratio=9999,
-            guadao_item_scope="case_only",
+            guadao_item_scope="crates_only",
         )
 
         case_strategies = classify_strategies(0.60, 0.0, config, is_weapon_case=True)
@@ -131,7 +232,7 @@ class StrategyClassificationTestCase(unittest.TestCase):
                 min_price=1.0,
                 guadao_max_listing_ratio=0.90,
                 transfer_min_real_ratio=9999,
-                guadao_item_scope="case_only",
+                guadao_item_scope="crates_only",
             )
             inventory_payload = {
                 "source": "live",
@@ -202,7 +303,8 @@ class StrategyClassificationTestCase(unittest.TestCase):
                 )
 
         self.assertEqual([], report.all_evaluated)
-        self.assertEqual(1, report.missing_price_count)
+        self.assertEqual(0, report.missing_price_count)
+        self.assertEqual("steam_price_not_orderbook", report.item_outcomes[0]["status"])
 
     def test_scan_strategies_allows_third_party_steam_price_for_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

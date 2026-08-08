@@ -14,6 +14,7 @@ class C5GameError(RuntimeError):
 
 
 C5TelemetryCallback = Callable[[dict[str, Any]], None]
+C5RequestGuard = Callable[[], bool]
 
 _C5_TELEMETRY_CONTEXT_FIELDS = {
     "source",
@@ -35,6 +36,10 @@ _C5_TRADE_URL_RE = re.compile(
     r"https?://steamcommunity\.com/tradeoffer/new/\?[^\s\"']+",
     re.IGNORECASE,
 )
+_C5_IPV4_RE = re.compile(
+    r"(?<![\d.])((?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\."
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?![\d.])"
+)
 
 
 def _redact_app_key(text: str) -> str:
@@ -50,6 +55,18 @@ def _safe_c5_telemetry_error(exc: BaseException) -> str:
     return text if len(text) <= 1000 else f"{text[:1000]}...<truncated>"
 
 
+def _c5_business_error_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only non-secret fields needed for shared runtime protection."""
+
+    error_code = payload.get("errorCode")
+    error_message = str(payload.get("errorMsg") or payload.get("message") or "")
+    ip_match = _C5_IPV4_RE.search(error_message)
+    return {
+        "error_code": error_code,
+        "request_ip": ip_match.group(1) if ip_match else None,
+    }
+
+
 class C5GameClient:
     def __init__(
         self,
@@ -59,11 +76,13 @@ class C5GameClient:
         *,
         telemetry_callback: C5TelemetryCallback | None = None,
         telemetry_context: Mapping[str, Any] | None = None,
+        request_guard: C5RequestGuard | None = None,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._telemetry_callback = telemetry_callback
+        self._request_guard = request_guard
         self._telemetry_context = {
             key: value
             for key, value in dict(telemetry_context or {}).items()
@@ -84,7 +103,6 @@ class C5GameClient:
             ("/sale/v1/modify", "sale_modify"),
             ("/sale/v2/create", "sale_create"),
             ("/sale/v1/cancel", "sale_cancel"),
-            ("/goods/v1/search", "goods_search"),
             ("/trade/v2/normal-buy", "normal_buy"),
             ("/trade/v2/quick-buy", "quick_buy"),
             ("/market/v2/products/search", "market_products_search"),
@@ -201,6 +219,8 @@ class C5GameClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
+        if self._request_guard is not None and not self._request_guard():
+            raise C5GameError("C5 request blocked: shared IP whitelist circuit is open")
         merged_params = dict(params or {})
         merged_params["app-key"] = self.api_key
         headers = {
@@ -245,8 +265,16 @@ class C5GameClient:
             raise C5GameError(f"C5 returned invalid JSON: {response.text}") from exc
 
         if payload.get("success") is not True:
+            business_metadata = _c5_business_error_metadata(payload)
             safe_message = _safe_c5_telemetry_error(
-                RuntimeError(str(payload.get("message") or payload.get("error") or "C5 business request failed"))
+                RuntimeError(
+                    str(
+                        payload.get("errorMsg")
+                        or payload.get("message")
+                        or payload.get("error")
+                        or "C5 business request failed"
+                    )
+                )
             )
             self._emit_telemetry(
                 level="ERROR",
@@ -257,7 +285,13 @@ class C5GameClient:
                 method=str(method).upper(),
                 endpoint=path,
                 status_code=int(getattr(response, "status_code", 0) or 0),
-                safe_context={"phase": "business_failure", "error": safe_message},
+                error_code=business_metadata["error_code"],
+                request_ip=business_metadata["request_ip"],
+                safe_context={
+                    "phase": "business_failure",
+                    "error": safe_message,
+                    **business_metadata,
+                },
             )
             raise C5GameError(json.dumps(payload, ensure_ascii=False))
         return payload.get("data")
@@ -376,26 +410,6 @@ class C5GameClient:
         )
         return dict(data or {})
 
-    def goods_search(
-        self,
-        *,
-        app_id: int,
-        market_hash_name: str,
-        delivery: int = 1,
-        page: int = 1,
-        limit: int = 20,
-    ) -> dict[str, Any]:
-        """搜索市场在售商品，返回 productId 和价格列表。delivery=1 只看自动发货。"""
-        params: dict[str, Any] = {
-            "appId": app_id,
-            "marketHashName": market_hash_name,
-            "delivery": delivery,
-            "page": page,
-            "limit": limit,
-        }
-        data = self._request("GET", "/merchant/goods/v1/search", params=params)
-        return dict(data or {})
-
     def normal_buy(
         self,
         *,
@@ -451,22 +465,21 @@ class C5GameClient:
     def market_products_search(
         self,
         *,
-        app_id: int,
-        market_hash_name: str,
-        price_max: float,
-        delivery: int,
+        item_id: str,
         page_size: int,
     ) -> dict[str, Any]:
-        """Search current C5 listings eligible for one batch-buy request."""
+        """Read one bounded concrete-listing snapshot for a C5 item.
+
+        This internal-preview endpoint can diverge from ``price_batch`` and
+        must not be treated as a complete-market price authority.  Keep the
+        request minimal: adding delivery/bargain or name/price filters can
+        narrow the visible listing set further.
+        """
         data = self._request(
             "POST",
             "/merchant/market/v2/products/search",
             json_body={
-                "appId": app_id,
-                "marketHashName": market_hash_name,
-                "priceMax": price_max,
-                "delivery": delivery,
-                "acceptBargain": False,
+                "itemId": item_id,
                 "pageSize": page_size,
             },
         )

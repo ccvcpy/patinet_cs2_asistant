@@ -15,19 +15,31 @@
 1. `AGENTS.md`
    项目开发硬规则，尤其是 Steam 实时取价、状态机、账号隔离、测试要求。
 
-2. `docs/05_底仓执行口径.md`
+2. `docs/核心规则/CS赚钱核心知识总纲.md`
+   当前赚钱模型、Steam/C5 价格源、求购、挂刀、补仓、ROI、证据链和风险边界的集中总纲。
+
+3. `docs/核心规则/底仓执行口径.md`
    固定 `list / guadao` 和 `transfer` 的业务含义。
 
-3. `data/strategy_config.json`
+4. `data/strategy_config.json`
    运行时真实策略配置源，不是代码里的默认值。
 
-4. `config/accounts.json`
+5. `config/accounts.json`
    本地 Steam/C5 账号配置。里面可能含加密后的敏感信息，不要外发。
 
-5. `docs/使用说明.md`
+6. `docs/开发与操作/使用说明.md`
    本地操作便签，可能包含临时账号示例或个人记录，不作为公开规范文档。
 
-`docs/01_*` 到 `docs/04_*` 主要记录早期需求和接口选型背景。它们和当前执行口径不一致时，以 `AGENTS.md`、`docs/05_底仓执行口径.md` 和真实代码为准。
+`docs/产品与接口/` 主要记录需求和接口选型背景。它们和当前执行口径不一致时，以 `AGENTS.md`、`docs/核心规则/CS赚钱核心知识总纲.md`、`docs/核心规则/底仓执行口径.md` 和真实代码为准。
+
+当前文档分类：
+
+- `docs/核心规则/`：唯一规范入口和底仓状态机口径；
+- `docs/产品与接口/`：产品需求、API 选型、Steam 接口与 ID 清单；
+- `docs/实验与研究/`：Steam 撮合实验、Orderbook 延迟和导余额调查；
+- `docs/测试与对账/`：真实卖出、补仓、余额与数量守恒的验收方法；
+- `docs/开发与操作/`：本地使用、前端教程和库存工具；
+- `docs/畜生学习法.md`：按用户要求独立保留在 `docs` 根目录。
 
 ## 安装与初始化
 
@@ -126,7 +138,7 @@ data/strategy_config.json
     "balanceDiscount": 0.73
   },
   "guadaoBalance": {
-    "guadaoItemScope": "case_only",
+    "guadaoItemScope": "crates_only",
     "guadaoMaxListingRatio": 0.69,
     "listingWallMinCount": 20,
     "caseListingPriceOffset": -0.01,
@@ -136,7 +148,6 @@ data/strategy_config.json
   "profitTrade": {
     "enabled": true,
     "allowRealExecution": false,
-    "allowRepriceExecution": false,
     "balanceDiscount": 0.69,
     "minRoi": 0.08,
     "minItemValue": 5.0,
@@ -165,10 +176,10 @@ data/strategy_config.json
 
 `guadaoItemScope` 当前只按以下两类理解：
 
-- `case_only`：只允许广义箱子进入挂刀候选。
+- `crates_only`：只允许 CSGO-API `crates` 广义箱子进入挂刀候选，包括 Case、Capsule、Package、Container 等；旧 `case_only` 只作为兼容输入，读取后归一为 `crates_only`。
 - `non_case_only`：只允许非箱子进入挂刀候选。
 
-旧配置如果写 `all`，按当前约定应视作 `case_only` 处理，不要重新扩展为全品类，除非重新确认交易口径。
+旧配置如果写 `all`，按当前约定应视作 `crates_only` 处理，不要重新扩展为全品类，除非重新确认交易口径。
 
 ## 真实挂刀定价口径
 
@@ -491,7 +502,8 @@ python .\main.py profit-trade daily-report --send
 
 ```text
 AGENTS.md
-docs/05_底仓执行口径.md
+docs/核心规则/CS赚钱核心知识总纲.md
+docs/核心规则/底仓执行口径.md
 ```
 
 最低测试要求：

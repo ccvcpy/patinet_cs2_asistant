@@ -9,6 +9,42 @@ from cs2_assistant.clients.c5game import C5GameClient, C5GameError
 
 
 class C5GameClientTests(unittest.TestCase):
+    def test_request_guard_blocks_before_network(self) -> None:
+        client = C5GameClient("secret-key", request_guard=lambda: False)
+
+        with patch("requests.request") as request:
+            with self.assertRaisesRegex(C5GameError, "IP whitelist circuit is open"):
+                client.steam_info()
+
+        request.assert_not_called()
+
+    def test_business_failure_telemetry_exposes_ip_whitelist_error_metadata(self) -> None:
+        response = requests.Response()
+        response.status_code = 200
+        response._content = (
+            b'{"success": false, "data": null, "errorCode": 499100, '
+            b'"errorMsg": "ip not in whitelist, current request ip 223.65.10.116"}'
+        )
+        events: list[dict[str, object]] = []
+        client = C5GameClient(
+            "secret-app-key",
+            telemetry_callback=events.append,
+            telemetry_context={"source": "guadao"},
+        )
+
+        with patch("requests.request", return_value=response):
+            with self.assertRaises(C5GameError):
+                client.steam_info()
+
+        failure = next(
+            event
+            for event in events
+            if event.get("safe_context", {}).get("phase") == "business_failure"
+        )
+        self.assertEqual(499100, failure["error_code"])
+        self.assertEqual("223.65.10.116", failure["request_ip"])
+        self.assertNotIn("secret-app-key", str(failure))
+
     def test_request_telemetry_records_c5_activity_without_auth_or_body(self) -> None:
         response = requests.Response()
         response.status_code = 200
@@ -89,15 +125,12 @@ class C5GameClientTests(unittest.TestCase):
         self.assertNotIn("secret-key", message)
         self.assertIn("app-key=<redacted>", message)
 
-    def test_market_products_search_posts_batch_listing_filters(self) -> None:
+    def test_market_products_search_uses_only_item_id_and_page_size(self) -> None:
         client = C5GameClient("secret-key")
         with patch.object(client, "_request", return_value={"list": []}) as mocked:
             result = client.market_products_search(
-                app_id=730,
-                market_hash_name="Kilowatt Case",
-                price_max=1.10,
-                delivery=2,
-                page_size=80,
+                item_id="1399837948321718272",
+                page_size=50,
             )
 
         self.assertEqual({"list": []}, result)
@@ -105,12 +138,35 @@ class C5GameClientTests(unittest.TestCase):
             "POST",
             "/merchant/market/v2/products/search",
             json_body={
+                "itemId": "1399837948321718272",
+                "pageSize": 50,
+            },
+        )
+
+    def test_c5_client_does_not_expose_goods_search(self) -> None:
+        self.assertFalse(hasattr(C5GameClient("secret-key"), "goods_search"))
+
+    def test_sale_search_sends_account_scoped_query_parameters(self) -> None:
+        client = C5GameClient("secret-key")
+        with patch.object(client, "_request", return_value={"list": [], "total": 0}) as mocked:
+            result = client.sale_search(
+                app_id=730,
+                steam_id="76561190000000000",
+                delivery=1,
+                page=2,
+                limit=100,
+            )
+
+        self.assertEqual({"list": [], "total": 0}, result)
+        mocked.assert_called_once_with(
+            "GET",
+            "/merchant/sale/v1/search",
+            params={
                 "appId": 730,
-                "marketHashName": "Kilowatt Case",
-                "priceMax": 1.10,
-                "delivery": 2,
-                "acceptBargain": False,
-                "pageSize": 80,
+                "page": 2,
+                "limit": 100,
+                "steamId": "76561190000000000",
+                "delivery": 1,
             },
         )
 

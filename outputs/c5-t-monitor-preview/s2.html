@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>C5 做T监控 - S2 原子组件板预览</title>
+  <link rel="stylesheet" href="./c5-t-preview.css" />
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+</head>
+<body class="atoms-page">
+  <div class="atoms-reference-nav">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="shield-check"></i></span>
+      <span>CS2 交易运营中心</span>
+    </div>
+    <nav class="topnav">
+      <span class="nav-item"><i data-lucide="layout-dashboard"></i>概览</span>
+      <span class="nav-item"><i data-lucide="archive"></i>仓库</span>
+      <span class="nav-item"><i data-lucide="gem"></i>饰品管理</span>
+      <span class="nav-item active"><i data-lucide="scan-line"></i>C5 扫描 &amp; 库存运营</span>
+      <span class="nav-item"><i data-lucide="clipboard-list"></i>订单管理</span>
+      <span class="nav-item"><i data-lucide="chart-no-axes-column-increasing"></i>数据分析</span>
+      <span class="nav-item"><i data-lucide="briefcase-business"></i>工具箱</span>
+      <span class="nav-item"><i data-lucide="settings"></i>系统设置</span>
+    </nav>
+    <span class="top-spacer"></span>
+    <span class="top-action"><i data-lucide="bell"></i>消息</span>
+    <span class="top-action"><i data-lucide="circle-user-round"></i>运营账号<i data-lucide="chevron-down"></i></span>
+  </div>
+  <h1 class="atoms-title">C5 做T监控 · 原子组件板</h1>
+  <div class="atoms-layout">
+    <section class="atoms-sheet">
+      <article class="atom-cell atom-actions">
+        <h2>操作按钮</h2>
+        <div class="atom-row">
+          <button class="button primary"><i data-lucide="scan-line"></i>开始扫描 C5 市场</button>
+          <button class="button blue"><i data-lucide="download"></i>导出选品报告</button>
+          <button class="button"><i data-lucide="pause"></i>暂停监控</button>
+          <button class="button primary"><i data-lucide="play"></i>开始监控</button>
+          <button class="button disabled"><i data-lucide="circle-x"></i>不可用</button>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-statuses">
+        <h2>运行状态 Chip</h2>
+        <div class="atom-row">
+          <span class="status-chip running">监控运行中</span>
+          <span class="status-chip paused">已暂停</span>
+          <span class="status-chip collecting">正在刷新 82/126</span>
+          <span class="status-chip reporting">正在生成报告</span>
+          <span class="status-chip error">行情异常</span>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-filter">
+        <h2>市场</h2>
+        <span class="select-shell">C5<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+        <h2 class="segment-title">饰品类型</h2>
+        <span class="select-shell">全部<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+      </article>
+
+      <article class="atom-cell atom-filter">
+        <h2>品质</h2>
+        <span class="select-shell">全部<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+        <h2 class="segment-title">磨损区间</h2>
+        <span class="range-shell"><span>0.00</span><i>~</i><span>1.00</span></span>
+      </article>
+
+      <article class="atom-cell atom-filter">
+        <h2>价格区间</h2>
+        <span class="range-shell"><span>¥ 最低价</span><i>~</i><span>¥ 最高价</span></span>
+        <h2 class="segment-title">搜索框</h2>
+        <div class="atom-searches">
+          <span class="input-shell"><i data-lucide="search"></i><span>饰品名称 / 关键词</span></span>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-filter-actions" style="border-right:0">
+        <h2>筛选操作</h2>
+        <div class="atom-row">
+          <button class="button">重置</button>
+          <button class="button primary"><i data-lucide="list-filter"></i>筛选</button>
+        </div>
+        <h2 class="segment-title">选中与输入状态</h2>
+        <div class="atom-searches">
+          <span class="select-shell selected-control">C5<span class="top-spacer"></span><i data-lucide="check"></i></span>
+          <span class="input-shell selected-control"><i data-lucide="search"></i><span style="color:#27352d">USP-S | Cortex</span><i data-lucide="circle-x"></i></span>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-table">
+        <h2>推荐排行表格行（正常 / 选中）</h2>
+        <div class="rank-grid rank-row">
+          <span class="rank-number">1</span>
+          <div class="product"><span class="product-thumb green"><i data-lucide="crosshair"></i></span><span class="product-copy"><strong>USP-S | Cortex</strong><small>脑洞大开 · 崭新出厂</small></span></div>
+          <span><i class="quality-tag covert">隐秘</i></span>
+          <span>¥376.78</span><span>¥267.80</span><span class="roi">1.37%</span><span class="roi">0.84%</span>
+          <span class="stability"><strong>100%</strong><i class="mini-track"><span style="width:100%"></span></i></span>
+          <span><i class="inventory-status ready">可入库</i></span><span><i class="recommendation">稳定推荐</i></span><span><i data-lucide="chevron-right"></i></span>
+        </div>
+        <div class="rank-grid rank-row selected">
+          <span class="rank-number">1</span>
+          <div class="product"><span class="product-thumb green"><i data-lucide="crosshair"></i></span><span class="product-copy"><strong>USP-S | Cortex</strong><small>脑洞大开 · 崭新出厂</small></span></div>
+          <span><i class="quality-tag covert">隐秘</i></span>
+          <span>¥376.78</span><span>¥267.80</span><span class="roi">1.37%</span><span class="roi">0.84%</span>
+          <span class="stability"><strong>100%</strong><i class="mini-track"><span style="width:100%"></span></i></span>
+          <span><i class="inventory-status ready">可入库</i></span><span><i class="recommendation">稳定推荐</i></span><span><i data-lucide="chevron-right"></i></span>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-feedback">
+        <h2>任务反馈条</h2>
+        <div class="feedback success"><i data-lucide="circle-check"></i><span>刷新完成：成功 119，缺 C5 4，缺 Steam 3</span><i class="top-spacer"></i><i data-lucide="x"></i></div>
+        <div class="feedback error"><i data-lucide="circle-x"></i><span>Steam 行情暂不可用，已保留上一份观察</span><i class="top-spacer"></i><i data-lucide="x"></i></div>
+      </article>
+
+      <article class="atom-cell atom-roi">
+        <h2>经营指标原子</h2>
+        <div class="roi-pill-row">
+          <span class="roi-pill"><span>今日扫描饰品</span><strong>8,752</strong><small>+13.6% ↑</small></span>
+          <span class="roi-pill"><span>可做T机会</span><strong>186</strong><small>+8.3% ↑</small></span>
+          <span class="roi-pill"><span>预计利润总额</span><strong>¥24,560.75</strong><small>+11.2% ↑</small></span>
+          <span class="roi-pill reserved"><span>库存周转率</span><strong>2.38</strong><small>前台预留</small></span>
+        </div>
+        <h2 class="segment-title">统计窗口</h2>
+        <div class="segmented">
+          <span>24小时</span><span class="active">7天</span><span>30天</span><span>自定义</span>
+        </div>
+      </article>
+
+      <article class="atom-cell atom-recommendations">
+        <h2>品质与库存状态标签</h2>
+        <div class="atom-tag-row">
+          <i class="quality-tag covert">隐秘</i>
+          <i class="quality-tag classified">保密</i>
+          <i class="quality-tag restricted">受限</i>
+          <i class="quality-tag unknown">未知</i>
+          <i class="inventory-status ready">可入库</i>
+          <i class="inventory-status watch">观望</i>
+          <i class="inventory-status avoid">不建议</i>
+        </div>
+        <h2 class="segment-title">推荐状态与解释</h2>
+        <div class="recommendation-list">
+          <div class="recommendation-line"><i class="recommendation">稳定推荐</i><strong>收益持续且样本充分</strong><span>优先研究</span></div>
+          <div class="recommendation-line"><i class="recommendation observe">等待回落</i><strong>历史稳定，当前买入偏贵</strong><span>继续观察</span></div>
+          <div class="recommendation-line"><i class="recommendation avoid">暂不建议</i><strong>长期均值或覆盖不足</strong><span>不进入候选</span></div>
+        </div>
+      </article>
+    </section>
+
+    <aside class="atomic-drawer">
+      <header class="drawer-head">
+        <strong>USP-S | Cortex (Factory New)</strong>
+        <span class="status-chip running">稳定推荐</span>
+        <span class="drawer-close"><i data-lucide="x"></i></span>
+      </header>
+      <div class="drawer-body">
+        <div class="drawer-summary">
+          <span class="drawer-stat"><span>当前 ROI</span><strong>1.37%</strong></span>
+          <span class="drawer-stat"><span>7日平均</span><strong>0.84%</strong></span>
+          <span class="drawer-stat"><span>历史最高</span><strong>4.05%</strong></span>
+        </div>
+
+        <section class="drawer-section">
+          <p class="drawer-section-title">ROI 走势（7 天）</p>
+          <svg class="drawer-chart" viewBox="0 0 300 130" preserveAspectRatio="none">
+            <line class="trend-grid" x1="0" y1="20" x2="300" y2="20"></line>
+            <line class="trend-grid" x1="0" y1="52" x2="300" y2="52"></line>
+            <line class="trend-grid" x1="0" y1="84" x2="300" y2="84"></line>
+            <polyline class="trend-line" points="0,78 16,75 31,79 47,70 63,72 79,61 95,66 111,58 126,63 142,48 158,52 174,46 189,54 205,42 221,47 237,40 253,45 268,37 284,41 300,34"></polyline>
+            <text class="trend-axis" x="0" y="124">07-24</text><text class="trend-axis" x="70" y="124">07-26</text>
+            <text class="trend-axis" x="142" y="124">07-28</text><text class="trend-axis" x="216" y="124">07-30</text>
+            <text class="trend-axis" x="280" y="124">今日</text>
+          </svg>
+        </section>
+
+        <section class="drawer-section">
+          <p class="drawer-section-title">ROI 区间持续时间</p>
+          <div class="duration-list">
+            <div class="duration-row"><span>≥ 2.00%</span><i class="duration-track"><span style="width:13%"></span></i><b>21h50m · 13%</b></div>
+            <div class="duration-row"><span>1%~2%</span><i class="duration-track"><span style="width:39%"></span></i><b>65h31m · 39%</b></div>
+            <div class="duration-row"><span>0%~1%</span><i class="duration-track"><span style="width:48%"></span></i><b>80h39m · 48%</b></div>
+            <div class="duration-row"><span>&lt; 0%</span><i class="duration-track"><span style="width:2%"></span></i><b>0m · 0%</b></div>
+          </div>
+        </section>
+
+        <div class="drawer-prices">
+          <span class="drawer-price"><span>Steam 买入</span><strong>¥376.78</strong></span>
+          <span class="drawer-price"><span>C5 售价</span><strong>¥267.80</strong></span>
+          <span class="drawer-price"><span>C5 预计到手</span><strong>¥265.12</strong></span>
+          <span class="drawer-price"><span>单件预计收益</span><strong style="color:#08743b">+¥5.14</strong></span>
+        </div>
+        <p class="drawer-note">研究结论：372 个有效样本全部为正 ROI，当前收益高于 7 日平均，价格源完整。该结论只用于选品，不会自动创建 Profit Trade 流水。</p>
+      </div>
+    </aside>
+  </div>
+  <script>lucide.createIcons({ attrs: { "stroke-width": 1.8 } });</script>
+</body>
+</html>

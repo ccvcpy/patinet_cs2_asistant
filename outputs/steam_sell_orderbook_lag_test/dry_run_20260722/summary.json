@@ -1,0 +1,21 @@
+{
+  "generatedAt": "2026-07-22T10:47:24.135475+00:00",
+  "execute": false,
+  "candidate": null,
+  "seller": null,
+  "observers": [],
+  "price": null,
+  "listingId": null,
+  "sampleCount": 0,
+  "timingSeconds": {
+    "submitToRemoteActive": null,
+    "submitToOrderbookVisible": null,
+    "cancelToRemoteRemoved": null,
+    "cancelToOrderbookAbsent": null
+  },
+  "targetEverVisible": false,
+  "errors": [
+    "Expecting value: line 1 column 1 (char 0)"
+  ],
+  "aborted": true
+}

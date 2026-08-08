@@ -23,6 +23,7 @@ QUIET_WINDOW_CIRCUIT_KEY = "steam:quiet:profit_search_listings"
 DEFAULT_ACCOUNT_ROUTE_COOLDOWN_SECONDS = 120.0
 DEFAULT_GLOBAL_COOLDOWN_SECONDS = 600.0
 DEFAULT_ADMISSION_TIMEOUT_SECONDS = 5.0
+DEFAULT_CRITICAL_ADMISSION_TIMEOUT_SECONDS = 30.0
 ORPHAN_PENDING_STALE_SECONDS = 300.0
 ORPHAN_RUNNING_GRACE_SECONDS = 5.0
 DEGRADED_GLOBAL_PROBE_SECONDS = 1_800.0
@@ -489,7 +490,11 @@ class SteamRequestScheduler:
         safe_route = normalize_steam_route(route)
         deadline = None
         admission_timeout = (
-            DEFAULT_ADMISSION_TIMEOUT_SECONDS
+            (
+                DEFAULT_CRITICAL_ADMISSION_TIMEOUT_SECONDS
+                if safe_priority <= SteamRequestPriority.P1_EXECUTION
+                else DEFAULT_ADMISSION_TIMEOUT_SECONDS
+            )
             if timeout_seconds is None
             else max(0.0, float(timeout_seconds))
         )
@@ -693,18 +698,29 @@ class SteamRequestScheduler:
         }
         global_existing = _row_dict(self.store.get_steam_route_circuit(GLOBAL_CIRCUIT_KEY))
         global_state = str(global_existing.get("state") or "closed").lower()
+        global_is_active = global_state in {"open", "half_open"}
+        listings_only_failure = bool(routes) and routes == {"market/listings"}
         should_open_global = (
-            len(recent_rows) >= 3
-            or len(accounts) >= 2
-            or len(routes) >= 2
+            (
+                not listings_only_failure
+                and (
+                    len(recent_rows) >= 3
+                    or len(accounts) >= 2
+                    or len(routes) >= 2
+                )
+            )
             # A failed half-open recovery probe reopens the existing global
             # circuit even when the new 60-second window has only one event.
-            or global_state in {"open", "half_open"}
+            or global_is_active
         )
         first_candidates = [
             value
             for value in (
-                _as_utc(global_existing.get("first_429_at")),
+                (
+                    _as_utc(global_existing.get("first_429_at"))
+                    if global_is_active
+                    else None
+                ),
                 first_429,
                 *(
                     _as_utc(row.get("completed_at") or row.get("last_429_at"))
@@ -714,9 +730,10 @@ class SteamRequestScheduler:
             if value is not None
         ]
         global_first = min(first_candidates) if first_candidates else now
-        already_degraded = (now - global_first).total_seconds() >= GLOBAL_DEGRADED_AFTER_SECONDS
-        if already_degraded and global_existing:
-            should_open_global = True
+        already_degraded = (
+            global_is_active
+            and (now - global_first).total_seconds() >= GLOBAL_DEGRADED_AFTER_SECONDS
+        )
         global_until: datetime | None = None
         if should_open_global:
             global_delay = (
@@ -743,6 +760,7 @@ class SteamRequestScheduler:
                     "eventCount": len(recent_rows),
                     "accountCount": len(accounts),
                     "routeCount": len(routes),
+                    "listingsOnlyFailure": listings_only_failure,
                     "degradedProbe": already_degraded,
                 },
             )
@@ -993,9 +1011,9 @@ class SteamRequestScheduler:
             else [GLOBAL_CIRCUIT_KEY]
         )
         # Only the explicitly bounded Profit Trade listings retry chain may
-        # bypass its account+route cooldown. Its third 429 still opens the
-        # global circuit. All other P1 actions (buy/create/sell/CLI included)
-        # must respect the per-account route cooldown.
+        # bypass its account+route cooldown. Listings-only 429s never open the
+        # global circuit; buy/create/sell routes remain independent. All other
+        # P1 actions must still respect their own account+route cooldown.
         is_bounded_profit_listings_retry = (
             bool(bounded_retry)
             and str(source) == "profit_trade"

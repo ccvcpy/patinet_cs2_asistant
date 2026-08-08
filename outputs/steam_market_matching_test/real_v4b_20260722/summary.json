@@ -1,0 +1,86 @@
+{
+  "generatedAt": "2026-07-22T11:30:33.927445+00:00",
+  "execute": true,
+  "aborted": true,
+  "globalErrors": [],
+  "trials": [
+    {
+      "trial": "late_higher_buy_order",
+      "action": "createbuyorder",
+      "marketHashName": "MAC-10 | Storm Camo (Factory New)",
+      "assetId": "48995006621",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "xiaodigu11",
+        "buyerC": "donkzymeng",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "ropzx55x"
+      },
+      "price": {
+        "floor_cents": 40,
+        "previous_high_bid_cents": 35,
+        "a_bid_cents": 36,
+        "c_bid_cents": 37,
+        "seller_net_cents": 7,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 21,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": "8576572177",
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": {
+        "listingId": "494983200568917585",
+        "purchaseId": "494983200568917586",
+        "timeSold": 1784719783,
+        "receivedAmount": 0.07,
+        "receivedCurrencyId": "2023"
+      },
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.05,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "donkzymeng": {
+          "balance": 92.56,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "vnuzl692": {
+          "balance": 1124.17,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "evidence_conflict_or_request_failure",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": 2.045,
+        "aMylistingsToOrderbookBid": 1.661,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": [
+        "donkzymeng:history_c:Steam request failed: GET /market/myhistory/render/: 429 Client Error: Too Many Requests for url: https://steamcommunity.com/market/myhistory/render/?query=&start=100&count=100&norender=1",
+        "Steam request failed: GET /market/myhistory/render/: 429 Client Error: Too Many Requests for url: https://steamcommunity.com/market/myhistory/render/?query=&start=100&count=100&norender=1"
+      ]
+    }
+  ]
+}

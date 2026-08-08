@@ -22,6 +22,13 @@ class RebuyResult:
     payload: dict[str, Any] | None = None
     out_trade_no: str | None = None
     submitted_at: str | None = None
+    submission_outcome: str = "not_submitted"
+
+
+C5_SUBMISSION_NOT_SUBMITTED = "not_submitted"
+C5_SUBMISSION_CONFIRMED = "confirmed"
+C5_SUBMISSION_UNCONFIRMED = "unconfirmed"
+C5_SUBMISSION_REJECTED = "rejected"
 
 
 def _parse_c5_error(exc: Exception) -> dict[str, Any] | None:
@@ -37,6 +44,28 @@ def _parse_c5_error(exc: Exception) -> dict[str, Any] | None:
 
 def is_retryable_c5_network_error(exc: Exception) -> bool:
     return str(exc).strip().startswith("C5 request failed:")
+
+
+def is_confirmed_c5_quick_buy_payload(payload: dict[str, Any] | None) -> bool:
+    """Return whether C5 supplied both real order identifiers.
+
+    ``payStatus`` is only a snapshot of payment processing.  Once C5 has
+    returned both order identifiers, the engine can safely query the official
+    order detail without guessing that the order does not exist.
+    """
+
+    if not isinstance(payload, dict):
+        return False
+    order_asset_id = str(payload.get("orderAssetId") or "").strip()
+    trade_order_id = str(payload.get("orderId") or "").strip()
+    return bool(order_asset_id and trade_order_id)
+
+
+def _unconfirmed_submission_payload(exc: Exception) -> dict[str, Any]:
+    return {
+        "error": str(exc),
+        "exceptionType": type(exc).__name__,
+    }
 
 
 def fetch_c5_price(client: C5GameClient, market_hash_name: str, app_id: int) -> float | None:
@@ -62,6 +91,7 @@ def execute_rebuy(
     trade_url: str | None = None,
     use_live_price_as_max: bool = False,
     max_price_override: float | None = None,
+    steam_net_amount_override: float | None = None,
 ) -> RebuyResult:
     try:
         live_price = fetch_c5_price(client, market_hash_name, app_id)
@@ -87,7 +117,10 @@ def execute_rebuy(
     # ratio 用实际卖出时记录的 Steam 挂价计算：C5补仓价 / (Steam卖出价 * 税后系数)
     steam_price_now = steam_reference_price
     listing_ratio_now = None
-    if steam_reference_price and steam_reference_price > 0:
+    exact_steam_net_amount = safe_float(steam_net_amount_override)
+    if exact_steam_net_amount is not None and exact_steam_net_amount > 0:
+        listing_ratio_now = live_price / exact_steam_net_amount
+    elif steam_reference_price and steam_reference_price > 0:
         listing_ratio_now = live_price / (steam_reference_price * steam_net_factor)
 
     pricing_steam_list_price = expected_steam_list_price
@@ -95,6 +128,12 @@ def execute_rebuy(
         max_price = float(max_price_override)
     elif use_live_price_as_max:
         max_price = float(live_price) * (1.0 + float(tolerance_pct) / 100.0)
+    elif (
+        guadao_max_listing_ratio is not None
+        and exact_steam_net_amount is not None
+        and exact_steam_net_amount > 0
+    ):
+        max_price = float(exact_steam_net_amount) * float(guadao_max_listing_ratio)
     elif (
         guadao_max_listing_ratio is not None
         and pricing_steam_list_price is not None
@@ -144,19 +183,20 @@ def execute_rebuy(
         )
     except C5GameError as exc:
         payload = _parse_c5_error(exc)
-        if payload is None and is_retryable_c5_network_error(exc):
+        if payload is None:
             return RebuyResult(
                 False,
-                True,
-                "c5_network_error",
+                False,
+                "c5_submission_unconfirmed",
                 actual_price=live_price,
                 max_price=max_price,
                 steam_price_now=steam_price_now,
                 steam_reference_price=steam_reference_price,
                 listing_ratio_now=listing_ratio_now,
-                payload={"error": str(exc)},
+                payload=_unconfirmed_submission_payload(exc),
                 out_trade_no=out_trade_no,
                 submitted_at=submitted_at,
+                submission_outcome=C5_SUBMISSION_UNCONFIRMED,
             )
         if payload and payload.get("errorCode") in {1317, 1014452}:
             return RebuyResult(
@@ -171,6 +211,7 @@ def execute_rebuy(
                 payload=payload,
                 out_trade_no=out_trade_no,
                 submitted_at=submitted_at,
+                submission_outcome=C5_SUBMISSION_REJECTED,
             )
         return RebuyResult(
             False,
@@ -184,19 +225,37 @@ def execute_rebuy(
             payload=payload,
             out_trade_no=out_trade_no,
             submitted_at=submitted_at,
+            submission_outcome=C5_SUBMISSION_REJECTED,
         )
     except Exception as exc:
         return RebuyResult(
             False,
             False,
-            f"c5_api_error: {exc}",
+            "c5_submission_unconfirmed",
             actual_price=live_price,
             max_price=max_price,
             steam_price_now=steam_price_now,
             steam_reference_price=steam_reference_price,
             listing_ratio_now=listing_ratio_now,
+            payload=_unconfirmed_submission_payload(exc),
             out_trade_no=out_trade_no,
             submitted_at=submitted_at,
+            submission_outcome=C5_SUBMISSION_UNCONFIRMED,
+        )
+    if not is_confirmed_c5_quick_buy_payload(payload):
+        return RebuyResult(
+            False,
+            False,
+            "c5_submission_unconfirmed",
+            actual_price=live_price,
+            max_price=max_price,
+            steam_price_now=steam_price_now,
+            steam_reference_price=steam_reference_price,
+            listing_ratio_now=listing_ratio_now,
+            payload=payload,
+            out_trade_no=out_trade_no,
+            submitted_at=submitted_at,
+            submission_outcome=C5_SUBMISSION_UNCONFIRMED,
         )
     return RebuyResult(
         True,
@@ -210,4 +269,5 @@ def execute_rebuy(
         payload=payload,
         out_trade_no=out_trade_no,
         submitted_at=submitted_at,
+        submission_outcome=C5_SUBMISSION_CONFIRMED,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import time
 import uuid
@@ -17,8 +18,11 @@ from cs2_assistant.db import Database
 from cs2_assistant.models import (
     OP_REBUY_C5,
     OP_SELL_STEAM,
+    POOL_STATUS_HOLDING,
+    POOL_STATUS_PENDING_REBUY,
     StrategyConfig,
     looks_like_weapon_case_name,
+    normalize_guadao_item_scope,
 )
 from cs2_assistant.services.executor_engine import (
     C5_DELIVERY_FAILED,
@@ -28,12 +32,37 @@ from cs2_assistant.services.executor_engine import (
     _parse_iso,
     _read_note,
 )
+from cs2_assistant.services.c5_ip_circuit import (
+    is_c5_ip_circuit_open,
+    notify_c5_ip_circuit_if_pending,
+    probe_c5_ip_circuit,
+)
+from cs2_assistant.services.c5_research_scan import (
+    create_c5_research_scan,
+    get_c5_research_scan,
+    run_c5_research_scan_chunk,
+    set_c5_research_scan_action,
+)
+from cs2_assistant.services.guadao_audit import (
+    cancel_guadao_audit_run as cancel_guadao_audit_record,
+    create_guadao_audit_run as create_guadao_audit_record,
+    get_guadao_audit_run as get_guadao_audit_record,
+    retry_guadao_audit_run as retry_guadao_audit_record,
+    run_guadao_audit,
+)
 from cs2_assistant.services.profit_trade import (
+    PROFIT_TRADE_MANUAL_EXECUTION_MAX_QUANTITY,
+    PROFIT_TRADE_CYCLE_INTERVAL_SECONDS,
+    _profit_trade_protection_reason,
+    _profit_trade_type_block_reason,
+    execute_manual_profit_trade_request,
     execute_profit_trade_list_c5,
     recover_unverified_profit_trade_steam_buys,
+    refresh_profit_trade_selection_watch,
     refresh_profit_trade_listings,
     refresh_profit_trade_sales,
     run_profit_trade_once,
+    set_profit_trade_enabled,
 )
 from cs2_assistant.services.strategy import load_strategy_config, save_strategy_config
 from cs2_assistant.utils import safe_float, safe_int, utc_now_iso
@@ -44,27 +73,69 @@ RUNTIME_PROFIT_TRADE = "profit_trade"
 RUNTIME_KEYS = (RUNTIME_GUADAO, RUNTIME_PROFIT_TRADE)
 
 TASK_GUADAO_SCAN = "guadao_scan"
+TASK_STALE_LISTING_RECHECK = "stale_listing_recheck"
 TASK_STEAM_ACCOUNT_SYNC = "steam_account_sync"
 TASK_STEAM_LISTING_CONFIRM = "steam_listing_confirmation"
 TASK_STEAM_SALE_EVIDENCE = "steam_sale_evidence"
 TASK_REBUY_ATTEMPT = "rebuy_attempt"
+TASK_REBUY_BATCH = "rebuy_batch"
 TASK_C5_DELIVERY_CONFIRM = "c5_delivery_confirm"
+TASK_C5_ORDER_RECONCILE = "c5_order_reconcile"
 TASK_PROFIT_CYCLE = "profit_cycle"
+TASK_PROFIT_SELECTION_WATCH = "profit_selection_watch"
+TASK_PROFIT_MANUAL_EXECUTION = "profit_manual_execution"
+TASK_C5_RESEARCH_SCAN = "c5_research_scan"
+TASK_GUADAO_AUDIT = "guadao_audit"
+
+READ_ONLY_AUXILIARY_TASKS = frozenset(
+    {
+        TASK_C5_RESEARCH_SCAN,
+        TASK_GUADAO_AUDIT,
+    }
+)
+
+C5_CIRCUIT_BLOCKED_TASKS = frozenset(
+    {
+        TASK_GUADAO_SCAN,
+        TASK_STALE_LISTING_RECHECK,
+        TASK_REBUY_ATTEMPT,
+        TASK_REBUY_BATCH,
+        TASK_C5_DELIVERY_CONFIRM,
+        TASK_C5_ORDER_RECONCILE,
+        TASK_PROFIT_CYCLE,
+        TASK_PROFIT_SELECTION_WATCH,
+        TASK_PROFIT_MANUAL_EXECUTION,
+        TASK_C5_RESEARCH_SCAN,
+        TASK_GUADAO_AUDIT,
+    }
+)
 
 TASK_PUBLIC_LABELS = {
+    TASK_STALE_LISTING_RECHECK: "挂刀老挂单条件检查",
     TASK_GUADAO_SCAN: "挂刀候选完整扫描",
     TASK_STEAM_ACCOUNT_SYNC: "Steam 账号状态同步",
     TASK_STEAM_LISTING_CONFIRM: "Steam 挂单确认",
     TASK_STEAM_SALE_EVIDENCE: "Steam 卖出证据复核",
     TASK_REBUY_ATTEMPT: "C5 补仓价格复查",
-    TASK_C5_DELIVERY_CONFIRM: "C5 发货确认",
+    TASK_REBUY_BATCH: "C5 同品类批量补仓",
+    TASK_C5_DELIVERY_CONFIRM: "C5 已购买待收货确认",
+    TASK_C5_ORDER_RECONCILE: "C5 补仓证据复核",
     TASK_PROFIT_CYCLE: "Profit Trade 执行轮次",
+    TASK_PROFIT_SELECTION_WATCH: "Profit Trade 选品观察",
+    TASK_PROFIT_MANUAL_EXECUTION: "Profit Trade 一键执行",
+    TASK_C5_RESEARCH_SCAN: "C5 条件研究扫描",
+    TASK_GUADAO_AUDIT: "挂刀执行器只读对账",
 }
 
-COOKIE_BATCH_REUSE_SECONDS = 10 * 60
+STALE_LISTING_MAINTENANCE_AUTHORIZATION_SECONDS = 15 * 60
 COOKIE_RETRY_DELAYS_SECONDS = (30, 60, 120, 300, 900)
-PROFIT_CYCLE_INTERVAL_SECONDS = 10 * 60
+PROFIT_SELECTION_COOKIE_UNAVAILABLE_DELAY_SECONDS = 30 * 60
 WORKER_HEARTBEAT_STALE_SECONDS = 45
+C5_SUBMISSION_UNCONFIRMED_STATUS = "c5_submission_unconfirmed"
+C5_ORDER_RECONCILE_DELAYS_SECONDS = (30.0, 90.0, 180.0, 300.0, 600.0)
+C5_ORDER_RECONCILE_MAX_ATTEMPTS = len(C5_ORDER_RECONCILE_DELAYS_SECONDS)
+C5_ORDER_RECONCILE_DEGRADED_DELAY_SECONDS = 30.0 * 60.0
+C5_DELIVERY_STARTUP_GRACE_SECONDS = 60.0
 
 
 def _now_utc() -> datetime:
@@ -85,6 +156,36 @@ def _row_dict(row: Any) -> dict[str, Any]:
     if row is None:
         return {}
     return {key: row[key] for key in row.keys()}
+
+
+def _has_confirmed_c5_order_evidence(note: dict[str, Any]) -> bool:
+    """Return whether delivery/detail checks have queryable C5 evidence.
+
+    ``payStatus`` remains useful diagnostic data, but it is not proof that an
+    already identified order disappeared.  Delivery/detail checks resolve the
+    order's real current state.  A buyer/status match can safely recognize an
+    order from its asset lookup ID before buyer/detail exposes the trade ID;
+    only the engine may persist that explicit recognition marker.
+    """
+
+    asset_order_id = str(note.get("c5OrderId") or "").strip()
+    trade_order_id = str(note.get("c5TradeOrderId") or "").strip()
+    return bool(
+        (asset_order_id and trade_order_id)
+        or (note.get("c5OrderRecognized") is True and asset_order_id)
+    )
+
+
+def _public_c5_trade_order_id(note: dict[str, Any]) -> str | None:
+    """Prefer the immutable quick-buy trade id over a legacy overwritten value."""
+    payload = note.get("c5OrderPayload")
+    if isinstance(payload, dict):
+        asset_order_id = str(payload.get("orderAssetId") or "").strip()
+        trade_order_id = str(payload.get("orderId") or "").strip()
+        if asset_order_id and trade_order_id:
+            return trade_order_id
+    value = str(note.get("c5TradeOrderId") or "").strip()
+    return value or None
 
 
 def _iso_after(seconds: float, *, now: datetime | None = None) -> str:
@@ -160,6 +261,9 @@ class UnifiedRuntimeController:
         self._steam_scheduler_error: str | None = None
         self._owns_steam_scheduler = False
         self._steam_scheduler_instance: Any | None = None
+        self._delivery_startup_ready_at = _now_utc() + timedelta(
+            seconds=C5_DELIVERY_STARTUP_GRACE_SECONDS
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle and persistent runtime switches
@@ -169,6 +273,9 @@ class UnifiedRuntimeController:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._delivery_startup_ready_at = _now_utc() + timedelta(
+            seconds=C5_DELIVERY_STARTUP_GRACE_SECONDS
+        )
         self._initialize()
         try:
             from cs2_assistant.services.steam_request_scheduler import (
@@ -248,16 +355,72 @@ class UnifiedRuntimeController:
         try:
             db.initialize()
             state = db.get_executor_runtime_state(executor_key)
-            return bool(
+            enabled = bool(
                 self._steam_scheduler_ready
                 and state is not None
                 and bool(state["enabled"])
                 and not bool(state["migration_hold"])
             )
+            if not enabled:
+                return False
+            if is_c5_ip_circuit_open(db):
+                return False
+            if executor_key == RUNTIME_PROFIT_TRADE:
+                config = load_strategy_config(self.settings)
+                return bool(
+                    config.profit_trade_enabled
+                    and config.profit_trade_allow_real_execution
+                )
+            return True
         except Exception:
             return False
         finally:
             db.close()
+
+    def _manual_task_lease_owned(self, task_key: str) -> bool:
+        """Fail closed once this worker no longer owns the manual batch."""
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_scheduled_task(task_key)
+            if (
+                row is None
+                or str(row["status"] or "") != "running"
+                or str(row["lease_owner"] or "") != self.worker_id
+            ):
+                return False
+            expires_at = _parse_iso(str(row["lease_expires_at"] or ""))
+            if expires_at is None:
+                return False
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return expires_at.astimezone(timezone.utc) > _now_utc()
+        except Exception:
+            return False
+        finally:
+            db.close()
+
+    def _renew_manual_task_lease_loop(
+        self,
+        task_key: str,
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.wait(45.0):
+            db = Database(self.settings.db_path)
+            try:
+                db.initialize()
+                renewed = db.renew_scheduled_task_lease(
+                    task_key,
+                    self.worker_id,
+                    lease_seconds=180,
+                )
+            except Exception:
+                renewed = False
+            finally:
+                db.close()
+            if not renewed:
+                return
 
     def _initialize(self) -> None:
         db = Database(self.settings.db_path)
@@ -289,6 +452,12 @@ class UnifiedRuntimeController:
                         gate_reason="等待用户确认迁移",
                         payload=payload,
                     )
+            profit_runtime = db.get_executor_runtime_state(RUNTIME_PROFIT_TRADE)
+            if profit_runtime is not None and not bool(profit_runtime["migration_hold"]):
+                set_profit_trade_enabled(
+                    self.settings,
+                    bool(profit_runtime["enabled"]),
+                )
             self._initialize_issue_notification_baseline(db)
         finally:
             db.close()
@@ -320,6 +489,12 @@ class UnifiedRuntimeController:
         key = str(executor_key or "").strip()
         if key not in RUNTIME_KEYS:
             raise ValueError("executor must be guadao or profit_trade")
+        config_lock_held = False
+        if key == RUNTIME_PROFIT_TRADE:
+            # Keep the persistent runtime switch and the legacy strategy flag
+            # atomic relative to a Profit Trade task entering dispatch.
+            self._config_lock.acquire()
+            config_lock_held = True
         db = Database(self.settings.db_path)
         try:
             db.initialize()
@@ -328,36 +503,33 @@ class UnifiedRuntimeController:
                 raise RuntimeError(f"runtime state missing: {key}")
             if bool(row["migration_hold"]):
                 raise RuntimeError("migration_hold 尚未确认，不能开启执行器")
+            # Profit Trade historically used profitTrade.enabled as its
+            # business switch.  The persistent runtime must not create a
+            # second, contradictory switch: keep both projections identical.
+            if key == RUNTIME_PROFIT_TRADE:
+                set_profit_trade_enabled(self.settings, bool(enabled))
             payload = _runtime_payload(row)
             if enabled:
                 now = utc_now_iso()
-                batch_id = f"cookie-{uuid.uuid4().hex[:12]}"
+                # A normal executor start reuses persisted cookies. Only an
+                # account-scoped authentication failure should invalidate and
+                # refresh that account; the explicit refresh-all action remains
+                # the sole path that resets every account.
+                self._ensure_cookie_rows(db)
+                gate = self._cookie_gate_snapshot(db)
+                valid_count = int(gate.get("validCount") or 0)
+                total_count = int(gate.get("totalCount") or 0)
                 payload["requestedAt"] = now
-                payload["cookieBatchId"] = batch_id
-                payload["cookieBatchStartedAt"] = now
-                payload["cookieGate"] = {
-                    "status": "preparing",
-                    "batchId": batch_id,
-                    "validCount": 0,
-                    "totalCount": len(self._accounts()),
-                    "updatedAt": now,
-                }
-                for account in self._accounts():
-                    current = db.get_steam_cookie_health(account.id)
-                    db.upsert_steam_cookie_health(
-                        account.id,
-                        status="unknown",
-                        account_name=account.name,
-                        steam_id=account.steam_id64,
-                        batch_id=batch_id,
-                        failure_count=(
-                            int(current["failure_count"] or 0) if current is not None else 0
-                        ),
-                        next_retry_at=now,
-                        payload={"message": "执行器开启，等待逐账号刷新 Cookie"},
-                    )
-                status = "preparing"
-                reason = "等待 5/5 Steam Cookie 门禁"
+                payload["cookieGate"] = gate
+                if total_count > 0 and valid_count == total_count:
+                    status = "running"
+                    reason = None
+                elif valid_count > 0:
+                    status = "running"
+                    reason = f"Steam Cookie 部分可用 {valid_count}/{total_count}；失败账号单独刷新"
+                else:
+                    status = "preparing"
+                    reason = f"等待可用 Steam Cookie 0/{total_count}"
             else:
                 payload["disabledAt"] = utc_now_iso()
                 status = "closing_only" if self._has_closure_work(db, key) else "stopped"
@@ -371,8 +543,18 @@ class UnifiedRuntimeController:
                 heartbeat_at=utc_now_iso(),
                 payload=payload,
             )
+            if enabled and key == RUNTIME_PROFIT_TRADE:
+                # Enabling the persistent 10-minute loop must preserve the old
+                # user-facing contract: run one cycle as soon as the Cookie
+                # gate is ready, then continue on the normal interval.
+                db.reschedule_scheduled_task(
+                    TASK_PROFIT_CYCLE,
+                    next_attempt_at=now,
+                )
         finally:
             db.close()
+            if config_lock_held:
+                self._config_lock.release()
         self.wake()
         return self._public_runtime_row(updated)
 
@@ -418,6 +600,175 @@ class UnifiedRuntimeController:
         self.wake()
         return {"ok": bool(changed), "taskKey": TASK_GUADAO_SCAN}
 
+    @staticmethod
+    def _active_stale_maintenance_authorization(
+        payload: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        authorization = payload.get("staleMaintenanceAuthorization")
+        if not isinstance(authorization, dict):
+            return None
+        if str(authorization.get("mode") or "") != "single_run":
+            return None
+        if not str(authorization.get("requestId") or "").strip():
+            return None
+        expires_at = _parse_iso(str(authorization.get("expiresAt") or ""))
+        if expires_at is None:
+            return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at.astimezone(timezone.utc) <= (now or _now_utc()):
+            return None
+        return dict(authorization)
+
+    def _stale_maintenance_authorization_active(self, task_key: str) -> bool:
+        """Re-read the one-shot authorization immediately before cancellation."""
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_scheduled_task(str(task_key))
+            if row is None or str(row["task_type"] or "") != TASK_STALE_LISTING_RECHECK:
+                return False
+            if str(row["status"] or "") != "running":
+                return False
+            if str(row["lease_owner"] or "") != self.worker_id:
+                return False
+            return (
+                self._active_stale_maintenance_authorization(_task_payload(row))
+                is not None
+            )
+        except Exception:
+            return False
+        finally:
+            db.close()
+
+    def _stale_maintenance_actions_enabled(self, task_key: str) -> bool:
+        """Allow only the explicitly authorized stale-listing action lane."""
+
+        if not self._steam_scheduler_ready:
+            return False
+        if not self._stale_maintenance_authorization_active(task_key):
+            return False
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            state = db.get_executor_runtime_state(RUNTIME_GUADAO)
+            if state is None or bool(state["migration_hold"]):
+                return False
+            return not is_c5_ip_circuit_open(db)
+        except Exception:
+            return False
+        finally:
+            db.close()
+
+    @staticmethod
+    def _clear_stale_maintenance_authorization(db: Database, task_key: str) -> None:
+        row = db.get_scheduled_task(str(task_key))
+        if row is None or str(row["task_type"] or "") != TASK_STALE_LISTING_RECHECK:
+            return
+        payload = _task_payload(row)
+        if payload.pop("staleMaintenanceAuthorization", None) is None:
+            return
+        db.conn.execute(
+            "UPDATE scheduled_tasks SET payload_json = ?, updated_at = ? "
+            "WHERE task_key = ? AND status != 'running'",
+            (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                utc_now_iso(),
+                str(task_key),
+            ),
+        )
+        db.conn.commit()
+
+    def stale_listing_recheck_now(self, *, confirmed: bool) -> dict[str, Any]:
+        """Queue one stale-listing maintenance pass without enabling guadao.
+
+        This is deliberately a narrow, one-shot authorization for production
+        validation.  The normal hourly task still obeys the global guadao
+        switch; this path never changes that switch or queues any other task.
+        """
+
+        if not bool(confirmed):
+            raise RuntimeError(
+                "需要明确确认 stale_listing_recheck_only 才能授权一次老挂单维护"
+            )
+        now = utc_now_iso()
+        expires_at = _iso_after(STALE_LISTING_MAINTENANCE_AUTHORIZATION_SECONDS)
+        request_id = f"stale-maint-{uuid.uuid4().hex[:12]}"
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            state = db.get_executor_runtime_state(RUNTIME_GUADAO)
+            if state is None:
+                raise RuntimeError("guadao runtime state missing")
+            if bool(state["migration_hold"]):
+                raise RuntimeError("migration_hold 尚未确认，不能执行老挂单维护")
+            if not self._steam_scheduler_ready:
+                raise RuntimeError("Steam 请求调度器不可用，不能执行老挂单维护")
+            if is_c5_ip_circuit_open(db):
+                raise RuntimeError("C5 IP 熔断开启，不能执行老挂单维护")
+            gate = self._cookie_gate_snapshot(db)
+            # Stale maintenance is account-grouped and fail-safe when an
+            # account cannot provide active-listing evidence. Do not let one
+            # unrelated unhealthy account block every healthy account.
+            if int(gate.get("validCount") or 0) <= 0:
+                raise RuntimeError(
+                    "没有可用 Steam Cookie，不能执行老挂单维护 "
+                    f"({gate.get('validCount', 0)}/{gate.get('totalCount', 0)})"
+                )
+            task = db.get_scheduled_task(TASK_STALE_LISTING_RECHECK)
+            if task is not None and str(task["status"] or "") == "running":
+                return {
+                    "ok": True,
+                    "taskKey": TASK_STALE_LISTING_RECHECK,
+                    "queued": False,
+                    "alreadyRunning": True,
+                    "maintenanceOnly": True,
+                    "fullExecutorEnabled": bool(state["enabled"]),
+                }
+            existing_payload = _task_payload(task) if task is not None else {}
+            existing_payload.pop("staleMaintenanceAuthorization", None)
+            existing_payload["staleMaintenanceAuthorization"] = {
+                "mode": "single_run",
+                "requestId": request_id,
+                "authorizedAt": now,
+                "expiresAt": expires_at,
+            }
+            db.upsert_scheduled_task(
+                TASK_STALE_LISTING_RECHECK,
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STALE_LISTING_RECHECK,
+                next_attempt_at=now,
+                account_id=None,
+                operation_id=None,
+                payload=existing_payload,
+                status="pending",
+                priority=0,
+            )
+        finally:
+            db.close()
+        self._emit_guadao_runtime_event(
+            operation=TASK_STALE_LISTING_RECHECK,
+            message="已授权一次性老挂单维护；不启用普通挂刀执行器",
+            level="WARNING",
+            maintenanceOnly=True,
+            requestId=request_id,
+            expiresAt=expires_at,
+        )
+        self.wake()
+        return {
+            "ok": True,
+            "taskKey": TASK_STALE_LISTING_RECHECK,
+            "queued": True,
+            "alreadyRunning": False,
+            "maintenanceOnly": True,
+            "fullExecutorEnabled": bool(state["enabled"]),
+            "requestId": request_id,
+            "expiresAt": expires_at,
+        }
+
     def profit_cycle_now(self) -> dict[str, Any]:
         db = Database(self.settings.db_path)
         try:
@@ -427,6 +778,14 @@ class UnifiedRuntimeController:
                 raise RuntimeError("Profit Trade 执行器未开启")
             if bool(state["migration_hold"]):
                 raise RuntimeError("migration_hold 尚未确认")
+            task = db.get_scheduled_task(TASK_PROFIT_CYCLE)
+            if task is not None and str(task["status"] or "") == "running":
+                return {
+                    "ok": True,
+                    "taskKey": TASK_PROFIT_CYCLE,
+                    "queued": False,
+                    "alreadyRunning": True,
+                }
             changed = db.reschedule_scheduled_task(
                 TASK_PROFIT_CYCLE,
                 next_attempt_at=utc_now_iso(),
@@ -434,7 +793,638 @@ class UnifiedRuntimeController:
         finally:
             db.close()
         self.wake()
-        return {"ok": bool(changed), "taskKey": TASK_PROFIT_CYCLE, "queued": True}
+        return {
+            "ok": bool(changed),
+            "taskKey": TASK_PROFIT_CYCLE,
+            "queued": bool(changed),
+            "alreadyRunning": False,
+        }
+
+    def profit_selection_watch_now(self) -> dict[str, Any]:
+        """Queue the isolated research watch without enabling real execution."""
+
+        now = utc_now_iso()
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            active_count = db.count_active_profit_trade_selection_watch()
+            if active_count <= 0:
+                raise RuntimeError("选品观察池为空，请先添加需要研究的饰品")
+            task = db.get_scheduled_task(TASK_PROFIT_SELECTION_WATCH)
+            if task is not None and str(task["status"] or "") == "running":
+                return {
+                    "ok": True,
+                    "taskKey": TASK_PROFIT_SELECTION_WATCH,
+                    "queued": False,
+                    "alreadyRunning": True,
+                    "researchOnly": True,
+                    "canExecute": False,
+                }
+            if task is None:
+                self._ensure_task(
+                    db,
+                    TASK_PROFIT_SELECTION_WATCH,
+                    source=RUNTIME_PROFIT_TRADE,
+                    task_type=TASK_PROFIT_SELECTION_WATCH,
+                    next_attempt_at=now,
+                    priority=3,
+                )
+                changed = True
+            else:
+                changed = db.reschedule_scheduled_task(
+                    TASK_PROFIT_SELECTION_WATCH,
+                    next_attempt_at=now,
+                )
+        finally:
+            db.close()
+        self.wake()
+        return {
+            "ok": bool(changed),
+            "taskKey": TASK_PROFIT_SELECTION_WATCH,
+            "queued": bool(changed),
+            "alreadyRunning": False,
+            "researchOnly": True,
+            "canExecute": False,
+        }
+
+    def _queue_c5_research_task(self, request_id: str) -> None:
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_request_id:
+            raise ValueError("requestId is required")
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.upsert_scheduled_task(
+                f"c5-research:{normalized_request_id}",
+                source=RUNTIME_PROFIT_TRADE,
+                task_type=TASK_C5_RESEARCH_SCAN,
+                next_attempt_at=utc_now_iso(),
+                payload={"requestId": normalized_request_id},
+                status="pending",
+                priority=3,
+            )
+        finally:
+            db.close()
+        self.wake()
+
+    def queue_c5_research_scan(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Persist and queue one read-only full-catalog C5 research scan."""
+
+        result = create_c5_research_scan(self.settings, dict(filters or {}))
+        request_id = str(result.get("requestId") or "").strip()
+        if not request_id:
+            raise RuntimeError("C5 research scan did not return a pollable requestId")
+        if str(result.get("status") or "") not in {
+            "paused",
+            "cancelled",
+            "completed",
+            "completed_with_errors",
+            "failed",
+        }:
+            try:
+                self._queue_c5_research_task(request_id)
+            except Exception:
+                # Do not leave an unobservable orphan scan when the scheduler
+                # write fails after the isolated research row was created.
+                set_c5_research_scan_action(self.settings, request_id, "cancel")
+                raise
+        return result
+
+    def control_c5_research_scan(
+        self,
+        request_id: str,
+        action: str,
+    ) -> dict[str, Any]:
+        """Pause, resume, or cancel only the isolated research task."""
+
+        result = set_c5_research_scan_action(
+            self.settings,
+            str(request_id or "").strip(),
+            str(action or "").strip().lower(),
+        )
+        if str(action or "").strip().lower() == "resume":
+            self._queue_c5_research_task(str(result.get("requestId") or request_id))
+        else:
+            self._stop_auxiliary_scheduled_task(
+                f"c5-research:{str(result.get('requestId') or request_id).strip()}",
+                domain_status=str(result.get("status") or action),
+            )
+            self.wake()
+        return result
+
+    def c5_research_scan_status(self, request_id: str) -> dict[str, Any]:
+        result = get_c5_research_scan(self.settings, str(request_id or "").strip())
+        result["runtimeTask"] = self._auxiliary_scheduled_task_status(
+            f"c5-research:{str(request_id or '').strip()}"
+        )
+        return result
+
+    def _queue_guadao_audit_task(self, request_id: str) -> None:
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_request_id:
+            raise ValueError("requestId is required")
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.upsert_scheduled_task(
+                f"guadao-audit:{normalized_request_id}",
+                source=RUNTIME_GUADAO,
+                task_type=TASK_GUADAO_AUDIT,
+                next_attempt_at=utc_now_iso(),
+                payload={"requestId": normalized_request_id},
+                status="pending",
+                priority=3,
+            )
+        finally:
+            db.close()
+        self.wake()
+
+    @staticmethod
+    def _normalized_audit_account_ids(value: Any) -> list[str]:
+        if value in (None, "", "all"):
+            return []
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            raise ValueError("accountIds must be an array or 'all'")
+        return list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in value
+                if str(item or "").strip()
+            )
+        )
+
+    def queue_guadao_audit_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = dict(payload or {})
+        end_at = str(body.get("endAt") or body.get("dateTo") or "").strip()
+        if not end_at:
+            raise ValueError("endAt is required")
+        account_ids = self._normalized_audit_account_ids(
+            body.get("accountIds", body.get("steamAccountIds"))
+        )
+        result = create_guadao_audit_record(
+            self.settings,
+            start_at=str(body.get("startAt") or body.get("dateFrom") or "").strip()
+            or "2026-07-19T15:20:00+08:00",
+            end_at=end_at,
+            initial_balance=body.get("initialBalance", body.get("openingWallet", "2502.92")),
+            initial_real_value=body.get(
+                "initialRealValue", body.get("openingRealValue", "1755.474")
+            ),
+            account_ids=account_ids,
+            expected_account_count=int(
+                body.get("expectedAccountCount") or len(account_ids) or 5
+            ),
+            reported_comprehensive_ratio=body.get("reportedComprehensiveRatio"),
+            balance_tolerance_cents=int(body.get("balanceToleranceCents") or 10),
+        )
+        request_id = str(result.get("requestId") or "").strip()
+        if not request_id:
+            raise RuntimeError("guadao audit did not return a pollable requestId")
+        try:
+            self._queue_guadao_audit_task(request_id)
+        except Exception:
+            cancel_guadao_audit_record(self.settings, request_id)
+            raise
+        return {
+            **result,
+            "httpStatus": 202,
+            "accepted": True,
+            "queued": True,
+            "readOnly": True,
+            "canExecute": False,
+        }
+
+    def retry_guadao_audit_run(self, request_id: str) -> dict[str, Any]:
+        result = retry_guadao_audit_record(
+            self.settings,
+            str(request_id or "").strip(),
+        )
+        new_request_id = str(result.get("requestId") or "").strip()
+        if not new_request_id:
+            raise RuntimeError("guadao audit retry did not return a requestId")
+        try:
+            self._queue_guadao_audit_task(new_request_id)
+        except Exception:
+            cancel_guadao_audit_record(self.settings, new_request_id)
+            raise
+        return {
+            **result,
+            "httpStatus": 202,
+            "accepted": True,
+            "queued": True,
+            "readOnly": True,
+            "canExecute": False,
+        }
+
+    def cancel_guadao_audit_run(self, request_id: str) -> dict[str, Any]:
+        normalized_request_id = str(request_id or "").strip()
+        result = cancel_guadao_audit_record(self.settings, normalized_request_id)
+        self._stop_auxiliary_scheduled_task(
+            f"guadao-audit:{normalized_request_id}",
+            domain_status=str(result.get("status") or "cancelled"),
+        )
+        self.wake()
+        return {**result, "readOnly": True, "canExecute": False}
+
+    def guadao_audit_run_status(self, request_id: str) -> dict[str, Any]:
+        normalized_request_id = str(request_id or "").strip()
+        result = get_guadao_audit_record(self.settings, normalized_request_id)
+        if result is None:
+            raise KeyError(f"guadao audit run not found: {normalized_request_id}")
+        result["runtimeTask"] = self._auxiliary_scheduled_task_status(
+            f"guadao-audit:{normalized_request_id}"
+        )
+        result["readOnly"] = True
+        result["canExecute"] = False
+        return result
+
+    def _stop_auxiliary_scheduled_task(
+        self,
+        task_key: str,
+        *,
+        domain_status: str,
+    ) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_scheduled_task(task_key)
+            if row is None:
+                return
+            # upsert_scheduled_task deliberately preserves an active lease.
+            # A running bounded chunk sees the service-level control flag;
+            # a not-yet-running task becomes unclaimable immediately.
+            db.upsert_scheduled_task(
+                task_key,
+                source=str(row["source"]),
+                task_type=str(row["task_type"]),
+                next_attempt_at=str(row["next_attempt_at"]),
+                account_id=row["account_id"],
+                operation_id=row["operation_id"],
+                payload=_task_payload(row),
+                status="cancelled",
+                priority=int(row["priority"] or 3),
+                last_error=f"domain_status:{str(domain_status or '').strip()}",
+            )
+        finally:
+            db.close()
+
+    def _auxiliary_scheduled_task_status(self, task_key: str) -> dict[str, Any] | None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            row = db.get_scheduled_task(task_key)
+            if row is None:
+                return None
+            return {
+                "taskKey": str(row["task_key"]),
+                "status": str(row["status"]),
+                "priority": int(row["priority"]),
+                "attemptCount": int(row["attempt_count"] or 0),
+                "nextAttemptAt": row["next_attempt_at"],
+                "lastError": str(row["last_error"] or "") or None,
+                "leaseExpiresAt": row["lease_expires_at"],
+            }
+        finally:
+            db.close()
+
+    def queue_profit_trade_manual_execution(
+        self,
+        *,
+        market_hash_name: str,
+        quantity: int,
+        confirmed: bool,
+        expected_roi: float | None = None,
+        scan_id: str | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_name = str(market_hash_name or "").strip()
+        requested_quantity = int(quantity)
+        if not confirmed:
+            raise ValueError("explicit confirmation is required for one-click execution")
+        if not normalized_name:
+            raise ValueError("marketHashName is required")
+        confirmed_expected_roi = safe_float(expected_roi)
+        confirmed_scan_id = str(scan_id or "").strip()
+        confirmed_observed_at = str(observed_at or "").strip()
+        if (
+            confirmed_expected_roi is None
+            or not confirmed_scan_id
+            or not confirmed_observed_at
+        ):
+            raise ValueError(
+                "the confirmed observation snapshot requires expectedRoi, scanId and observedAt"
+            )
+        if (
+            requested_quantity <= 0
+            or requested_quantity > PROFIT_TRADE_MANUAL_EXECUTION_MAX_QUANTITY
+        ):
+            raise ValueError(
+                "quantity must be between 1 and "
+                f"{PROFIT_TRADE_MANUAL_EXECUTION_MAX_QUANTITY}"
+            )
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            runtime = db.get_executor_runtime_state(RUNTIME_PROFIT_TRADE)
+            if runtime is None or not bool(runtime["enabled"]):
+                raise RuntimeError("Profit Trade 执行器未开启，不能创建新的一键执行任务")
+            if bool(runtime["migration_hold"]):
+                raise RuntimeError("Profit Trade 仍处于 migration_hold，不能创建新的一键执行任务")
+            config = load_strategy_config(self.settings)
+            if not config.profit_trade_enabled:
+                raise RuntimeError("Profit Trade 业务开关未开启")
+            if not config.profit_trade_allow_real_execution:
+                raise RuntimeError("Profit Trade 真实执行尚未开放")
+
+            row = db.get_profit_trade_roi_watch(normalized_name)
+            if row is None or not bool(row["active"]):
+                raise RuntimeError("该品类已不在当前库存做 T 观察池")
+            expected_roi = safe_float(row["expected_roi"])
+            if expected_roi is None or expected_roi <= 0:
+                raise RuntimeError("该品类当前没有可人工批准的正 ROI")
+            current_scan_id = str(row["scan_id"] or "").strip()
+            current_observed_at = str(row["last_observed_at"] or "").strip()
+            if (
+                not current_scan_id
+                or not current_observed_at
+                or current_scan_id != confirmed_scan_id
+                or current_observed_at != confirmed_observed_at
+                or round(float(expected_roi), 4)
+                != round(float(confirmed_expected_roi), 4)
+            ):
+                raise RuntimeError(
+                    "观察快照已经变化，请刷新卡片并重新确认最新 ROI 后再执行"
+                )
+            execution_status = str(row["execution_status"] or "").strip()
+            if execution_status not in {
+                "executable",
+                "below_min_roi",
+                "listings_cooldown",
+                "listings_probe_ready",
+            }:
+                raise RuntimeError(
+                    "该品类当前被非 ROI 风控阻断，不能一键执行："
+                    f"{row['execution_reason'] or execution_status or 'unknown'}"
+                )
+            protection_reason = _profit_trade_protection_reason(
+                config,
+                asset_id=None,
+                market_hash_name=normalized_name,
+                steam_id=None,
+            )
+            if protection_reason is None:
+                protection_reason = _profit_trade_type_block_reason(config, normalized_name)
+            if protection_reason is not None:
+                raise RuntimeError(f"该品类当前受保护：{protection_reason}")
+
+            raw = _json_dict(row["raw_json"])
+            saved_executable = safe_int(raw.get("manualExecutableQuantity"))
+            available_assets = [
+                asset
+                for asset in db.list_assets(
+                    market_hash_name=normalized_name,
+                    tradable=True,
+                    status="available",
+                    exclude_reserved=True,
+                )
+                if _profit_trade_protection_reason(
+                    config,
+                    asset_id=str(asset["asset_id"] or "").strip(),
+                    market_hash_name=normalized_name,
+                    steam_id=str(asset["steam_id"] or "").strip(),
+                )
+                is None
+            ]
+            max_quantity = min(
+                max(0, int(row["tradable_count"] or 0)),
+                len(available_assets),
+                (
+                    max(0, int(saved_executable))
+                    if saved_executable is not None
+                    else len(available_assets)
+                ),
+                PROFIT_TRADE_MANUAL_EXECUTION_MAX_QUANTITY,
+            )
+            if max_quantity <= 0:
+                raise RuntimeError("该品类当前没有未锁定、可执行的 C5 资产")
+            if requested_quantity > max_quantity:
+                raise RuntimeError(
+                    f"当前最多只能一键执行 {max_quantity} 件，不能执行 {requested_quantity} 件"
+                )
+
+            request_id = f"PTMAN-{uuid.uuid4().hex}"
+            task_key = f"profit-manual:{request_id}"
+            requested_at = utc_now_iso()
+            payload = {
+                "requestId": request_id,
+                "marketHashName": normalized_name,
+                "name": str(row["name_cn"] or normalized_name),
+                "quantity": requested_quantity,
+                "approvedExpectedRoi": round(float(expected_roi), 4),
+                "approvedExpectedProfit": safe_float(row["expected_profit"]),
+                "approvedSteamBuyPrice": safe_float(row["steam_buy_price"]),
+                "approvedC5ListingPrice": safe_float(row["c5_listing_price"]),
+                "approvedObservedAt": current_observed_at,
+                "approvedScanId": current_scan_id,
+                "requestedAt": requested_at,
+                "confirmed": True,
+            }
+            try:
+                db.conn.execute("BEGIN IMMEDIATE")
+                active_task = db.conn.execute(
+                    """
+                    SELECT *
+                    FROM scheduled_tasks
+                    WHERE source = ?
+                      AND task_type = ?
+                      AND status IN ('pending', 'retry', 'running')
+                      AND json_extract(payload_json, '$.marketHashName') = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        RUNTIME_PROFIT_TRADE,
+                        TASK_PROFIT_MANUAL_EXECUTION,
+                        normalized_name,
+                    ),
+                ).fetchone()
+                if active_task is not None:
+                    raise RuntimeError(
+                        "该品类已经有一批一键执行任务正在排队或执行，请等待当前批次结束"
+                    )
+                db.ensure_scheduled_task(
+                    task_key,
+                    source=RUNTIME_PROFIT_TRADE,
+                    task_type=TASK_PROFIT_MANUAL_EXECUTION,
+                    next_attempt_at=requested_at,
+                    payload=payload,
+                    priority=1,
+                )
+                if db.conn.in_transaction:
+                    db.conn.commit()
+            except Exception:
+                if db.conn.in_transaction:
+                    db.conn.rollback()
+                raise
+        finally:
+            db.close()
+        self.wake()
+        return {
+            "ok": True,
+            "queued": True,
+            "taskKey": task_key,
+            "requestId": request_id,
+            "marketHashName": normalized_name,
+            "quantity": requested_quantity,
+            "maxQuantity": max_quantity,
+            "approvedExpectedRoi": round(float(expected_roi), 4),
+            "approvedExpectedProfit": safe_float(row["expected_profit"]),
+            "requestedAt": requested_at,
+        }
+
+    def profit_trade_manual_execution_status(
+        self,
+        request_id: str,
+    ) -> dict[str, Any]:
+        normalized_request_id = str(request_id or "").strip()
+        if not normalized_request_id:
+            raise ValueError("requestId is required")
+        task_key = f"profit-manual:{normalized_request_id}"
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            task = db.get_scheduled_task(task_key)
+            if (
+                task is None
+                or str(task["source"] or "") != RUNTIME_PROFIT_TRADE
+                or str(task["task_type"] or "") != TASK_PROFIT_MANUAL_EXECUTION
+            ):
+                raise LookupError("Profit Trade one-click execution batch was not found")
+            payload = _task_payload(task)
+            rows = db.list_profit_trades_for_manual_request(
+                normalized_request_id,
+                limit=PROFIT_TRADE_MANUAL_EXECUTION_MAX_QUANTITY,
+            )
+            runtime = db.get_executor_runtime_state(RUNTIME_PROFIT_TRADE)
+            runtime_payload = _runtime_payload(runtime)
+        finally:
+            db.close()
+
+        status = str(task["status"] or "pending").strip() or "pending"
+        terminal = status in {"completed", "failed", "cancelled"}
+        recent_run = next(
+            (
+                entry
+                for entry in list(runtime_payload.get("recentTaskRuns") or [])
+                if isinstance(entry, dict)
+                and str(entry.get("taskKey") or "") == task_key
+            ),
+            None,
+        )
+        run_result = (
+            dict(recent_run.get("result") or {})
+            if isinstance(recent_run, dict)
+            and isinstance(recent_run.get("result"), dict)
+            else {}
+        )
+
+        public_trades: list[dict[str, Any]] = []
+        for row in rows:
+            note = _json_dict(row["note"])
+            trade_error = str(
+                row["error"]
+                or note.get("cancelReason")
+                or note.get("manualExecutionSkipReason")
+                or ""
+            ).strip()
+            public_trades.append(
+                {
+                    "id": int(row["id"]),
+                    "tradeNo": str(row["trade_no"] or ""),
+                    "marketHashName": str(row["market_hash_name"] or ""),
+                    "status": str(row["status"] or ""),
+                    "stepKey": str(row["step_key"] or ""),
+                    "error": trade_error or None,
+                    "purchaseRequestSent": note.get("purchaseRequestSent"),
+                    "listingIdObtained": note.get("listingIdObtained"),
+                    "steamBuyMethod": str(note.get("steamBuyMethod") or "") or None,
+                    "createdAt": row["created_at"],
+                    "updatedAt": row["updated_at"],
+                    "completedAt": row["completed_at"],
+                }
+            )
+
+        bought_statuses = {"steam_bought", "listing_c5", "c5_listed", "completed"}
+        listed_statuses = {"c5_listed", "completed"}
+        bought_count = len(
+            list(run_result.get("boughtTradeIds") or [])
+        ) or sum(
+            1 for trade in public_trades if trade["status"] in bought_statuses
+        )
+        listed_count = len(
+            list(run_result.get("listedTradeIds") or [])
+        ) or sum(
+            1 for trade in public_trades if trade["status"] in listed_statuses
+        )
+        failed_count = sum(
+            1
+            for trade in public_trades
+            if trade["status"] in {"failed", "cancelled", "manual_required"}
+        )
+        requested_quantity = int(payload.get("quantity") or 0)
+        error = str(
+            task["last_error"]
+            or (recent_run.get("error") if isinstance(recent_run, dict) else "")
+            or next(
+                (
+                    trade["error"]
+                    for trade in public_trades
+                    if trade.get("error")
+                ),
+                "",
+            )
+        ).strip()
+        if status == "pending":
+            summary = "一键执行已排队，等待后台领取"
+        elif status == "retry":
+            summary = "一键执行暂时无法开始，后台已安排重试"
+        elif status == "running":
+            summary = "一键执行正在处理，完成后会自动更新结果"
+        elif status == "completed":
+            summary = (
+                f"一键执行已完成：买入 {bought_count}/{requested_quantity} 件，"
+                f"C5 上架 {listed_count} 件"
+            )
+        elif status == "cancelled":
+            summary = f"一键执行已取消：{error or '任务在购买前被安全停止'}"
+        else:
+            summary = f"一键执行失败：{error or '后台返回失败终态'}"
+
+        return {
+            "ok": True,
+            "requestId": normalized_request_id,
+            "taskKey": task_key,
+            "marketHashName": str(payload.get("marketHashName") or ""),
+            "name": str(payload.get("name") or payload.get("marketHashName") or ""),
+            "requestedQuantity": requested_quantity,
+            "status": status,
+            "terminal": terminal,
+            "summary": summary,
+            "error": error or None,
+            "attemptCount": int(task["attempt_count"] or 0),
+            "queuedAt": task["created_at"],
+            "updatedAt": task["updated_at"],
+            "completedAt": task["completed_at"],
+            "nextAttemptAt": task["next_attempt_at"] if status == "retry" else None,
+            "counts": {
+                "created": len(public_trades),
+                "bought": bought_count,
+                "listed": listed_count,
+                "failed": failed_count,
+            },
+            "trades": public_trades,
+        }
 
     def refresh_all_cookies_now(self) -> dict[str, Any]:
         batch_id = f"cookie-{uuid.uuid4().hex[:12]}"
@@ -738,6 +1728,79 @@ class UnifiedRuntimeController:
         )
         return True
 
+    def _notify_stale_listing_recheck_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        """Send one auditable aggregate notification for a maintenance run.
+
+        The stale-listing walk can touch many listings.  Notifications are
+        therefore aggregated per run instead of sending one message per
+        listing.  A run with no removal, failure, or missing evidence is
+        intentionally silent so the hourly maintenance task does not become
+        a notification spam source.
+        """
+
+        removed = safe_int(result.get("removed")) or 0
+        remove_failed = safe_int(result.get("removeFailed")) or 0
+        unmatched = safe_int(result.get("unmatched")) or 0
+        price_deferred = safe_int(result.get("priceDeferred")) or 0
+        if not any((removed, remove_failed, unmatched, price_deferred)):
+            return
+        run_id = str(result.get("runId") or utc_now_iso()).strip()
+        event_key = f"stale-listing-recheck:{run_id}"
+        body_lines = [
+            str(result.get("summary") or "老挂单检查完成"),
+            f"运行 ID: {run_id}",
+            "",
+        ]
+        removed_rows = result.get("removedOperations")
+        if isinstance(removed_rows, list) and removed_rows:
+            body_lines.append("撤单成功（前 20 笔）:")
+            for row in removed_rows[:20]:
+                if not isinstance(row, dict):
+                    continue
+                body_lines.append(
+                    "- "
+                    f"operation={row.get('operationId') or '-'} | "
+                    f"{row.get('marketHashName') or '-'} | "
+                    f"listing={row.get('listingId') or '-'} | "
+                    f"asset={row.get('assetId') or '-'} | "
+                    f"{row.get('reason') or '-'}"
+                )
+        failed_rows = result.get("removeFailedOperations")
+        if isinstance(failed_rows, list) and failed_rows:
+            body_lines.append("撤单失败（前 20 笔）:")
+            for row in failed_rows[:20]:
+                if not isinstance(row, dict):
+                    continue
+                body_lines.append(
+                    "- "
+                    f"operation={row.get('operationId') or '-'} | "
+                    f"{row.get('marketHashName') or '-'} | "
+                    f"listing={row.get('listingId') or '-'} | "
+                    f"原因={row.get('reason') or '-'}"
+                )
+        if unmatched:
+            body_lines.append(
+                f"活跃挂单未匹配 {unmatched} 笔：本轮不判定卖出、不撤单、不恢复资产。"
+            )
+        if price_deferred:
+            body_lines.append(
+                f"盘口/C5 价格证据不足延期 {price_deferred} 笔：本轮不撤单。"
+            )
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self._send_runtime_notification_once(
+                db,
+                event_key=event_key,
+                title=f"[挂刀老挂单] 检查完成：撤单 {removed} 笔",
+                body="\n".join(body_lines),
+            )
+        finally:
+            db.close()
+
     def _record_cookie_health_from_steam_event(self, event: dict[str, Any]) -> None:
         account_id = str(event.get("account_id") or "").strip()
         status_code = safe_int(event.get("status_code"))
@@ -924,17 +1987,98 @@ class UnifiedRuntimeController:
                 ),
             )
 
+    def _guadao_scan_starvation_guard_seconds(
+        self,
+        db: Database,
+        *,
+        gate: dict[str, Any],
+    ) -> float | None:
+        """Return the maximum extra scan lag while preserving the P0 safety lane."""
+
+        state = db.get_executor_runtime_state(RUNTIME_GUADAO)
+        if (
+            state is None
+            or not bool(state["enabled"])
+            or bool(state["migration_hold"])
+            or gate.get("status") not in {"ready", "degraded"}
+            or not self._steam_scheduler_ready
+            or is_c5_ip_circuit_open(db)
+        ):
+            return None
+        schedule = load_strategy_config(self.settings).effective_guadao_task_schedule()
+        interval_seconds = safe_float(schedule.get("scanIntervalSeconds"))
+        if interval_seconds is None or interval_seconds <= 0:
+            return None
+        # The scan keeps its normal P3 priority for one full interval.  Only
+        # after missing an additional complete cycle may it take one atomic
+        # slot ahead of P1; the database priority itself remains P3.
+        return float(interval_seconds)
+
+    def _guadao_steam_sync_deadline_guard_seconds(
+        self,
+        db: Database,
+        *,
+        gate: dict[str, Any],
+    ) -> float | None:
+        """Return the bounded start-lag budget for account sale synchronisation.
+
+        C5 availability is deliberately not part of this gate: discovering a
+        Steam sale and advancing its existing evidence chain remains useful
+        while C5 is temporarily unavailable.  Per-account cookie readiness is
+        still checked immediately before dispatch.
+        """
+
+        state = db.get_executor_runtime_state(RUNTIME_GUADAO)
+        if (
+            state is None
+            or not bool(state["enabled"])
+            or bool(state["migration_hold"])
+            or gate.get("status") not in {"ready", "degraded"}
+            or not self._steam_scheduler_ready
+        ):
+            return None
+        schedule = load_strategy_config(self.settings).effective_guadao_task_schedule()
+        maximum_lag_seconds = safe_float(schedule.get("steamSyncMaxStartLagSeconds"))
+        if maximum_lag_seconds is None or maximum_lag_seconds <= 0:
+            return None
+        return float(maximum_lag_seconds)
+
     def tick(self, *, max_tasks: int = 20) -> dict[str, Any]:
         if not self._tick_lock.acquire(blocking=False):
             return {"ok": False, "busy": True}
         try:
+            guadao_scan_starvation_guard_seconds: float | None = None
+            guadao_steam_sync_deadline_guard_seconds: float | None = None
             db = Database(self.settings.db_path)
             try:
                 db.initialize()
                 self._heartbeat(db)
                 self._ensure_cookie_rows(db)
                 gate = self._cookie_gate_tick(db)
+                c5_circuit = probe_c5_ip_circuit(
+                    self.settings,
+                    db,
+                    worker_id=self.worker_id,
+                    api_key=(
+                        self.settings.c5_api_key
+                        or next(
+                            (
+                                account.c5_api_key
+                                for account in self._accounts()
+                                if account.c5_api_key
+                            ),
+                            None,
+                        )
+                    ),
+                )
+                notify_c5_ip_circuit_if_pending(self.settings, db)
                 self._seed_tasks(db)
+                guadao_scan_starvation_guard_seconds = (
+                    self._guadao_scan_starvation_guard_seconds(db, gate=gate)
+                )
+                guadao_steam_sync_deadline_guard_seconds = (
+                    self._guadao_steam_sync_deadline_guard_seconds(db, gate=gate)
+                )
             finally:
                 db.close()
 
@@ -949,6 +2093,22 @@ class UnifiedRuntimeController:
                         self.worker_id,
                         limit=1,
                         lease_seconds=180,
+                        starvation_guard_task_key=(
+                            TASK_GUADAO_SCAN
+                            if guadao_scan_starvation_guard_seconds is not None
+                            else None
+                        ),
+                        starvation_guard_after_seconds=(
+                            guadao_scan_starvation_guard_seconds
+                        ),
+                        deadline_guard_task_type=(
+                            TASK_STEAM_ACCOUNT_SYNC
+                            if guadao_steam_sync_deadline_guard_seconds is not None
+                            else None
+                        ),
+                        deadline_guard_after_seconds=(
+                            guadao_steam_sync_deadline_guard_seconds
+                        ),
                     )
                 finally:
                     db.close()
@@ -970,7 +2130,12 @@ class UnifiedRuntimeController:
                 self._notify_c5_delivery_timeouts(db)
             finally:
                 db.close()
-            return {"ok": True, "processed": processed, "cookieGate": gate}
+            return {
+                "ok": True,
+                "processed": processed,
+                "cookieGate": gate,
+                "c5Circuit": c5_circuit,
+            }
         finally:
             self._tick_lock.release()
 
@@ -1091,23 +2256,12 @@ class UnifiedRuntimeController:
             self._apply_gate_state(db, ready=False, snapshot=snapshot)
             return snapshot
 
-        now = _now_utc()
         reusable = snapshot["totalCount"] > 0 and snapshot["validCount"] == snapshot["totalCount"]
-        if reusable:
-            for account in snapshot["accounts"]:
-                validated = _parse_iso(str(account.get("lastValidatedAt") or ""))
-                if validated is None:
-                    reusable = False
-                    break
-                if validated.tzinfo is None:
-                    validated = validated.replace(tzinfo=timezone.utc)
-                if (now - validated.astimezone(timezone.utc)).total_seconds() > COOKIE_BATCH_REUSE_SECONDS:
-                    reusable = False
-                    break
         if reusable:
             self._apply_gate_state(db, ready=True, snapshot=snapshot)
             return snapshot
 
+        now = _now_utc()
         batch_id = self._active_cookie_batch(db)
         due_rows = db.list_due_steam_cookie_retries(now=now.isoformat())
         by_id = {account.id: account for account in self._accounts()}
@@ -1334,6 +2488,40 @@ class UnifiedRuntimeController:
                 status=status,
             )
 
+    @staticmethod
+    def _terminate_obsolete_delivery_task(db: Database, operation_id: int) -> None:
+        task_key = f"delivery:{int(operation_id)}"
+        current = db.get_scheduled_task(task_key)
+        if current is None:
+            return
+        if (
+            str(current["status"] or "") == "cancelled"
+            and str(current["last_error"] or "")
+            == "superseded_by_c5_submission_reconcile"
+        ):
+            # Preserve the tombstone for a task that used to own a running
+            # lease. This proves it was deliberately superseded and, more
+            # importantly, keeps it permanently outside the claimable states.
+            return
+        if db.delete_scheduled_task(task_key):
+            return
+        # A stale/running lease may belong to another worker. Mark it
+        # terminal so it cannot be reclaimed. The operation has already been
+        # moved out of delivery_pending, therefore a worker that was already
+        # executing can only observe the new guarded state and exit.
+        now = utc_now_iso()
+        db.conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'cancelled', lease_owner = NULL,
+                lease_expires_at = NULL, completed_at = ?, updated_at = ?,
+                last_error = 'superseded_by_c5_submission_reconcile'
+            WHERE task_key = ? AND status = 'running'
+            """,
+            (now, now, task_key),
+        )
+        db.conn.commit()
+
     def _guadao_operation_account_id(self, op: Any) -> str | None:
         note = _read_note(op["note"])
         account_id = str(note.get("steamAccountId") or "").strip()
@@ -1441,6 +2629,111 @@ class UnifiedRuntimeController:
             ):
                 db.reschedule_scheduled_task(sync_key, next_attempt_at=earliest)
 
+    def _seed_read_only_auxiliary_tasks(self, db: Database, *, now: str) -> None:
+        """Recover isolated research/audit jobs after a backend restart."""
+
+        table_names = {
+            str(row["name"])
+            for row in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+        def lease_is_active(task_key: str) -> bool:
+            task = db.get_scheduled_task(task_key)
+            if task is None or str(task["status"] or "") != "running":
+                return False
+            expires_at = _parse_iso(str(task["lease_expires_at"] or ""))
+            if expires_at is None:
+                return False
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return expires_at.astimezone(timezone.utc) > _now_utc()
+
+        if "c5_research_scan_jobs" in table_names:
+            running_rows = db.conn.execute(
+                "SELECT request_id FROM c5_research_scan_jobs WHERE status = 'running'"
+            ).fetchall()
+            for running_row in running_rows:
+                running_id = str(running_row["request_id"] or "").strip()
+                if not running_id or lease_is_active(f"c5-research:{running_id}"):
+                    continue
+                with db.conn:
+                    db.conn.execute(
+                        """
+                        UPDATE c5_research_scan_jobs
+                        SET status = 'queued', control_action = NULL,
+                            next_attempt_at = NULL, updated_at = ?
+                        WHERE request_id = ? AND status = 'running'
+                        """,
+                        (now, running_id),
+                    )
+            rows = db.conn.execute(
+                """
+                SELECT request_id, status, next_attempt_at
+                FROM c5_research_scan_jobs
+                WHERE status IN ('queued', 'retry')
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+            for row in rows:
+                request_id = str(row["request_id"] or "").strip()
+                if not request_id:
+                    continue
+                db.upsert_scheduled_task(
+                    f"c5-research:{request_id}",
+                    source=RUNTIME_PROFIT_TRADE,
+                    task_type=TASK_C5_RESEARCH_SCAN,
+                    next_attempt_at=str(row["next_attempt_at"] or now),
+                    payload={"requestId": request_id},
+                    status="retry" if str(row["status"]) == "retry" else "pending",
+                    priority=3,
+                )
+
+        if "guadao_audit_runs" in table_names:
+            running_rows = db.conn.execute(
+                """
+                SELECT request_id FROM guadao_audit_runs
+                WHERE status = 'running' AND cancel_requested = 0
+                """
+            ).fetchall()
+            for running_row in running_rows:
+                running_id = str(running_row["request_id"] or "").strip()
+                if not running_id or lease_is_active(f"guadao-audit:{running_id}"):
+                    continue
+                with db.conn:
+                    db.conn.execute(
+                        """
+                        UPDATE guadao_audit_runs
+                        SET status = 'pending', stage = 'pending',
+                            error = NULL, updated_at = ?
+                        WHERE request_id = ? AND status = 'running'
+                          AND cancel_requested = 0
+                        """,
+                        (now, running_id),
+                    )
+            rows = db.conn.execute(
+                """
+                SELECT request_id
+                FROM guadao_audit_runs
+                WHERE status = 'pending' AND cancel_requested = 0
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+            for row in rows:
+                request_id = str(row["request_id"] or "").strip()
+                if not request_id:
+                    continue
+                db.upsert_scheduled_task(
+                    f"guadao-audit:{request_id}",
+                    source=RUNTIME_GUADAO,
+                    task_type=TASK_GUADAO_AUDIT,
+                    next_attempt_at=now,
+                    payload={"requestId": request_id},
+                    status="pending",
+                    priority=3,
+                )
+
     def _seed_tasks(self, db: Database) -> None:
         now = utc_now_iso()
         config = load_strategy_config(self.settings)
@@ -1452,6 +2745,90 @@ class UnifiedRuntimeController:
             next_attempt_at=now,
             priority=3,
         )
+        stale_task = db.get_scheduled_task(TASK_STALE_LISTING_RECHECK)
+        if stale_task is None or str(stale_task["status"] or "") in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            db.upsert_scheduled_task(
+                TASK_STALE_LISTING_RECHECK,
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STALE_LISTING_RECHECK,
+                next_attempt_at=now,
+                payload={},
+                status="pending",
+                priority=0,
+            )
+        else:
+            self._ensure_task(
+                db,
+                TASK_STALE_LISTING_RECHECK,
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STALE_LISTING_RECHECK,
+                next_attempt_at=now,
+                priority=0,
+            )
+            # The task key is global, but old versions (or a corrupted local
+            # row) may leave account-scoped metadata behind.  ``ensure`` is
+            # intentionally insert-only for an existing row, so reconcile the
+            # immutable identity here.  Never rewrite a ``running`` row: the
+            # worker that owns it may already be dispatching the old snapshot.
+            # Even an expired or malformed lease is left alone until the
+            # worker/claim path releases it; this avoids racing a late worker
+            # during startup repair.
+            stale_status = str(stale_task["status"] or "")
+            stale_metadata_needs_repair = (
+                str(stale_task["source"] or "") != RUNTIME_GUADAO
+                or str(stale_task["task_type"] or "") != TASK_STALE_LISTING_RECHECK
+                or stale_task["account_id"] is not None
+                or stale_task["operation_id"] is not None
+            )
+            if stale_status != "running" and stale_metadata_needs_repair:
+                db.conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET source = ?, task_type = ?, account_id = NULL,
+                        operation_id = NULL, updated_at = ?
+                    WHERE task_key = ?
+                      AND status IS ?
+                      AND lease_owner IS ?
+                      AND lease_expires_at IS ?
+                    """,
+                    (
+                        RUNTIME_GUADAO,
+                        TASK_STALE_LISTING_RECHECK,
+                        now,
+                        TASK_STALE_LISTING_RECHECK,
+                        stale_task["status"],
+                        stale_task["lease_owner"],
+                        stale_task["lease_expires_at"],
+                    ),
+                )
+                db.conn.commit()
+            # Repair legacy priority without changing cadence, status, or lease.
+            if int(stale_task["priority"] or 0) != 0:
+                db.conn.execute(
+                    "UPDATE scheduled_tasks SET priority = ?, updated_at = ? WHERE task_key = ?",
+                    (0, now, TASK_STALE_LISTING_RECHECK),
+                )
+                db.conn.commit()
+            # Old operation-task schedulers used ``waiting`` for nonterminal
+            # work, but the generic claimant only accepts pending/retry/running.
+            # This global maintenance job must never remain permanently
+            # unclaimable after an upgrade; preserve its scheduled time while
+            # restoring the claimable status.
+            if str(stale_task["status"] or "") == "waiting":
+                db.conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+                        completed_at = NULL, updated_at = ?
+                    WHERE task_key = ? AND status = 'waiting'
+                    """,
+                    (now, TASK_STALE_LISTING_RECHECK),
+                )
+                db.conn.commit()
         for account in self._accounts():
             self._ensure_task(
                 db,
@@ -1470,18 +2847,23 @@ class UnifiedRuntimeController:
             next_attempt_at=now,
             priority=1,
         )
-        self._seed_steam_operation_tasks(db, config)
-        for op in db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=5000):
+        if db.count_active_profit_trade_selection_watch() > 0:
             self._ensure_task(
                 db,
-                f"rebuy:{op['id']}",
-                source=RUNTIME_GUADAO,
-                task_type=TASK_REBUY_ATTEMPT,
+                TASK_PROFIT_SELECTION_WATCH,
+                source=RUNTIME_PROFIT_TRADE,
+                task_type=TASK_PROFIT_SELECTION_WATCH,
                 next_attempt_at=now,
-                operation_id=int(op["id"]),
-                priority=1,
-                payload={"createdAt": op["created_at"]},
+                priority=3,
             )
+        else:
+            # A removed selection must not leave an otherwise idle P3 task
+            # wakeable forever.  Running leases are deliberately left alone;
+            # they will observe zero active rows and complete safely.
+            db.delete_scheduled_task(TASK_PROFIT_SELECTION_WATCH)
+        self._seed_read_only_auxiliary_tasks(db, now=now)
+        self._seed_steam_operation_tasks(db, config)
+        self._seed_rebuy_batch_tasks(db, config, now=now)
         delivery_rows = db.list_pool_operations_by_type_and_statuses(
             OP_REBUY_C5,
             statuses=["delivery_pending", "completed"],
@@ -1498,7 +2880,55 @@ class UnifiedRuntimeController:
                     op_time = op_time.replace(tzinfo=timezone.utc)
                 if str(op["status"] or "") != "delivery_pending" and op_time < cutoff:
                     continue
-            if not any(note.get(key) for key in ("c5OutTradeNo", "c5OrderId", "c5TradeOrderId")):
+            has_both_order_ids = bool(
+                str(note.get("c5OrderId") or "").strip()
+                and str(note.get("c5TradeOrderId") or "").strip()
+            )
+            if not _has_confirmed_c5_order_evidence(note):
+                if str(op["status"] or "") == "delivery_pending":
+                    migrated_at = utc_now_iso()
+                    note.setdefault("c5SubmissionUnconfirmedAt", migrated_at)
+                    note.setdefault(
+                        "c5SubmissionUnconfirmedReason",
+                        (
+                            "missing_valid_order_evidence"
+                            if has_both_order_ids
+                            else "missing_complete_order_ids"
+                        ),
+                    )
+                    note.setdefault("c5SubmissionPreviousStatus", "delivery_pending")
+                    db.update_pool_operation(
+                        int(op["id"]),
+                        status=C5_SUBMISSION_UNCONFIRMED_STATUS,
+                        note=json.dumps(note, ensure_ascii=False),
+                    )
+                    self._emit_guadao_runtime_event(
+                        operation=TASK_C5_ORDER_RECONCILE,
+                        message="旧补仓流水缺少完整 C5 订单号，已转为提交结果待核对",
+                        level="WARNING",
+                        operationId=int(op["id"]),
+                        marketHashName=str(op["market_hash_name"] or ""),
+                        c5OutTradeNo=note.get("c5OutTradeNo"),
+                        c5OrderId=note.get("c5OrderId"),
+                        c5TradeOrderId=note.get("c5TradeOrderId"),
+                        c5PayStatus=(
+                            note.get("c5PayStatus")
+                            if note.get("c5PayStatus") is not None
+                            else (
+                                note.get("c5OrderPayload", {}).get("payStatus")
+                                if isinstance(note.get("c5OrderPayload"), dict)
+                                else None
+                            )
+                        ),
+                        reason=note.get("c5SubmissionUnconfirmedReason"),
+                    )
+                    # A delivery confirmation cannot query by outTradeNo. A
+                    # non-running legacy task is therefore obsolete. A task
+                    # already holding a lease is left in place so its worker
+                    # can finish safely; its post-run status check will make
+                    # it terminal because the operation is no longer
+                    # delivery_pending.
+                    self._terminate_obsolete_delivery_task(db, int(op["id"]))
                 continue
             self._ensure_task(
                 db,
@@ -1509,6 +2939,123 @@ class UnifiedRuntimeController:
                 operation_id=int(op["id"]),
                 priority=1,
                 payload={"createdAt": op["created_at"]},
+            )
+        for op in db.list_pool_operations_by_type(
+            OP_REBUY_C5,
+            status=C5_SUBMISSION_UNCONFIRMED_STATUS,
+            limit=5000,
+        ):
+            # Never allow an old delivery task and a submission reconcile task
+            # to be claimable for the same operation.
+            self._terminate_obsolete_delivery_task(db, int(op["id"]))
+            self._ensure_task(
+                db,
+                f"reconcile:{op['id']}",
+                source=RUNTIME_GUADAO,
+                task_type=TASK_C5_ORDER_RECONCILE,
+                next_attempt_at=now,
+                operation_id=int(op["id"]),
+                priority=1,
+                payload={"createdAt": op["created_at"]},
+            )
+
+    @staticmethod
+    def _rebuy_batch_task_key(market_hash_name: str) -> str:
+        digest = hashlib.sha256(str(market_hash_name).encode("utf-8")).hexdigest()[:16]
+        return f"rebuy-batch:{digest}"
+
+    def _seed_rebuy_batch_tasks(self, db: Database, config: StrategyConfig, *, now: str) -> None:
+        """Keep per-operation clocks waiting and wake one bounded batch per item.
+
+        A legacy per-operation rebuy task that already owns a lease is never
+        touched.  It can finish under the old implementation once; every
+        other pending operation is migrated to a non-claimable ``waiting``
+        clock and is subsequently owned by its category batch task.
+        """
+
+        pending = db.list_pool_operations_by_type(OP_REBUY_C5, status="pending", limit=5000)
+        earliest_by_name: dict[str, str] = {}
+        active_names: set[str] = set()
+        for op in pending:
+            name = str(op["market_hash_name"] or "").strip()
+            if not name:
+                continue
+            task_key = f"rebuy:{int(op['id'])}"
+            existing = db.get_scheduled_task(task_key)
+            if existing is None:
+                db.upsert_scheduled_task(
+                    task_key,
+                    source=RUNTIME_GUADAO,
+                    task_type=TASK_REBUY_ATTEMPT,
+                    next_attempt_at=now,
+                    operation_id=int(op["id"]),
+                    priority=1,
+                    payload={"createdAt": op["created_at"]},
+                    status="waiting",
+                )
+                scheduled_at = now
+            elif str(existing["status"] or "") == "running":
+                # The owner may be a pre-upgrade quick-buy call.  Exclude it
+                # from the batch until it releases its own final evidence.
+                continue
+            else:
+                scheduled_at = str(existing["next_attempt_at"] or now)
+                db.upsert_scheduled_task(
+                    task_key,
+                    source=RUNTIME_GUADAO,
+                    task_type=TASK_REBUY_ATTEMPT,
+                    next_attempt_at=scheduled_at,
+                    operation_id=int(op["id"]),
+                    priority=1,
+                    payload={"createdAt": op["created_at"]},
+                    status="waiting",
+                )
+            active_names.add(name)
+            current_earliest = earliest_by_name.get(name)
+            if current_earliest is None or scheduled_at < current_earliest:
+                earliest_by_name[name] = scheduled_at
+
+        for task in db.list_scheduled_tasks(
+            source=RUNTIME_GUADAO,
+            task_type=TASK_REBUY_BATCH,
+            limit=5000,
+        ):
+            payload = _task_payload(task)
+            name = str(payload.get("marketHashName") or "").strip()
+            if name not in active_names:
+                db.delete_scheduled_task(str(task["task_key"]))
+
+        # A successful batch moves the operation to delivery_pending.  Its
+        # former waiting clock must not accumulate forever or reappear after a
+        # later migration.  Never remove a running legacy quick-buy task.
+        for task in db.list_scheduled_tasks(
+            source=RUNTIME_GUADAO,
+            task_type=TASK_REBUY_ATTEMPT,
+            limit=5000,
+        ):
+            task_key = str(task["task_key"] or "")
+            if not task_key.startswith("rebuy:") or str(task["status"] or "") == "running":
+                continue
+            operation_id = safe_int(task["operation_id"])
+            op = (
+                db.conn.execute(
+                    "SELECT status FROM pool_operations WHERE id = ?", (operation_id,)
+                ).fetchone()
+                if operation_id is not None
+                else None
+            )
+            if op is None or str(op["status"] or "") != "pending":
+                db.delete_scheduled_task(task_key)
+
+        for name, earliest in earliest_by_name.items():
+            db.upsert_scheduled_task(
+                self._rebuy_batch_task_key(name),
+                source=RUNTIME_GUADAO,
+                task_type=TASK_REBUY_BATCH,
+                next_attempt_at=earliest,
+                payload={"marketHashName": name},
+                priority=1,
+                status="pending",
             )
 
     def _due_steam_operation_tasks(self, db: Database, account_id: str) -> list[dict[str, Any]]:
@@ -1538,7 +3085,10 @@ class UnifiedRuntimeController:
             if state is None:
                 db.complete_scheduled_task(task_key, self.worker_id, status="failed", error="runtime state missing")
                 return
-            if bool(state["migration_hold"]):
+            if (
+                bool(state["migration_hold"])
+                and task_type not in READ_ONLY_AUXILIARY_TASKS
+            ):
                 db.reschedule_scheduled_task(
                     task_key,
                     next_attempt_at=_iso_after(60),
@@ -1547,9 +3097,42 @@ class UnifiedRuntimeController:
                 )
                 return
             enabled = bool(state["enabled"])
+            stale_maintenance_authorized = (
+                task_type == TASK_STALE_LISTING_RECHECK
+                and self._active_stale_maintenance_authorization(_task_payload(task))
+                is not None
+            )
+            if task_type in C5_CIRCUIT_BLOCKED_TASKS and is_c5_ip_circuit_open(db):
+                db.reschedule_scheduled_task(
+                    task_key,
+                    next_attempt_at=_iso_after(60),
+                    worker_id=self.worker_id,
+                    error="c5_ip_whitelist_circuit_open",
+                )
+                return
+            if (
+                task_type == TASK_C5_DELIVERY_CONFIRM
+                and _now_utc() < self._delivery_startup_ready_at
+            ):
+                db.reschedule_scheduled_task(
+                    task_key,
+                    next_attempt_at=self._delivery_startup_ready_at.isoformat(),
+                    worker_id=self.worker_id,
+                    error="delivery_startup_grace",
+                )
+                return
             if (
                 not self._steam_scheduler_ready
-                and task_type in {TASK_GUADAO_SCAN, TASK_STEAM_ACCOUNT_SYNC, TASK_PROFIT_CYCLE}
+                and task_type in {
+                    TASK_GUADAO_SCAN,
+                    TASK_STALE_LISTING_RECHECK,
+                    TASK_STEAM_ACCOUNT_SYNC,
+                    TASK_PROFIT_CYCLE,
+                    TASK_PROFIT_MANUAL_EXECUTION,
+                    TASK_PROFIT_SELECTION_WATCH,
+                    TASK_C5_RESEARCH_SCAN,
+                    TASK_GUADAO_AUDIT,
+                }
             ):
                 db.reschedule_scheduled_task(
                     task_key,
@@ -1558,14 +3141,67 @@ class UnifiedRuntimeController:
                     error="steam_scheduler_unavailable",
                 )
                 return
+            # A research-only selection scan is deliberately not an executor
+            # start: when both executors are stopped, the shared cookie gate
+            # remains ``idle`` and must not begin a five-account auto-login
+            # batch merely to read a P3 orderbook.  It may reuse all already
+            # healthy cookies, otherwise it waits for a user/real executor
+            # refresh rather than silently relogging in the background.
+            if task_type == TASK_PROFIT_SELECTION_WATCH:
+                valid_count = int(gate.get("validCount") or 0)
+                total_count = int(gate.get("totalCount") or 0)
+                selection_cookie_ready = total_count > 0 and valid_count == total_count
+                if not selection_cookie_ready:
+                    retry_at = _parse_iso(str(gate.get("nextRetryAt") or ""))
+                    if retry_at is not None and retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    minimum_retry = _now_utc() + timedelta(
+                        seconds=PROFIT_SELECTION_COOKIE_UNAVAILABLE_DELAY_SECONDS
+                    )
+                    next_attempt_at = max(
+                        minimum_retry,
+                        retry_at.astimezone(timezone.utc) if retry_at is not None else minimum_retry,
+                    ).isoformat()
+                    db.reschedule_scheduled_task(
+                        task_key,
+                        next_attempt_at=next_attempt_at,
+                        worker_id=self.worker_id,
+                        error="selection_cookie_unavailable",
+                    )
+                    return
             gate_ready = gate.get("status") in {"ready", "degraded"}
-            if task_type in {TASK_GUADAO_SCAN, TASK_PROFIT_CYCLE} and enabled and not gate_ready:
+            if (
+                task_type in {
+                    TASK_GUADAO_SCAN,
+                    TASK_STALE_LISTING_RECHECK,
+                    TASK_PROFIT_CYCLE,
+                    TASK_PROFIT_MANUAL_EXECUTION,
+                }
+                and (enabled or stale_maintenance_authorized)
+                and not gate_ready
+            ):
                 db.reschedule_scheduled_task(
                     task_key,
                     next_attempt_at=_iso_after(5),
                     worker_id=self.worker_id,
                     error="cookie_gate_preparing",
                 )
+                return
+            if (
+                task_type == TASK_STALE_LISTING_RECHECK
+                and not enabled
+                and not stale_maintenance_authorized
+            ):
+                schedule = load_strategy_config(self.settings).effective_guadao_task_schedule()
+                db.reschedule_scheduled_task(
+                    task_key,
+                    next_attempt_at=_iso_after(
+                        float(schedule["staleListedCheckIntervalSeconds"])
+                    ),
+                    worker_id=self.worker_id,
+                    error="executor_disabled",
+                )
+                self._clear_stale_maintenance_authorization(db, task_key)
                 return
             if task_type == TASK_GUADAO_SCAN and not enabled:
                 schedule = load_strategy_config(self.settings).effective_guadao_task_schedule()
@@ -1579,11 +3215,26 @@ class UnifiedRuntimeController:
             if task_type == TASK_PROFIT_CYCLE and not enabled and not self._has_closure_work(db, source):
                 db.reschedule_scheduled_task(
                     task_key,
-                    next_attempt_at=_iso_after(PROFIT_CYCLE_INTERVAL_SECONDS),
+                    next_attempt_at=_iso_after(PROFIT_TRADE_CYCLE_INTERVAL_SECONDS),
                     worker_id=self.worker_id,
                     error="executor_disabled_no_closure_work",
                 )
                 return
+            if task_type == TASK_PROFIT_MANUAL_EXECUTION and not enabled:
+                db.complete_scheduled_task(
+                    task_key,
+                    self.worker_id,
+                    status="cancelled",
+                    error="executor_disabled_before_manual_execution",
+                )
+                return
+            if task_type in {TASK_PROFIT_MANUAL_EXECUTION, TASK_GUADAO_AUDIT, TASK_STALE_LISTING_RECHECK}:
+                if not db.renew_scheduled_task_lease(
+                    task_key,
+                    self.worker_id,
+                    lease_seconds=180,
+                ):
+                    return
             if task_type == TASK_STEAM_ACCOUNT_SYNC:
                 account_id = str(task["account_id"] or "")
                 health = db.get_steam_cookie_health(account_id)
@@ -1611,6 +3262,17 @@ class UnifiedRuntimeController:
         finally:
             db.close()
 
+        lease_stop: threading.Event | None = None
+        lease_thread: threading.Thread | None = None
+        if task_type in {TASK_PROFIT_MANUAL_EXECUTION, TASK_GUADAO_AUDIT, TASK_STALE_LISTING_RECHECK}:
+            lease_stop = threading.Event()
+            lease_thread = threading.Thread(
+                target=self._renew_manual_task_lease_loop,
+                args=(task_key, lease_stop),
+                name=f"task-lease-{task_key[-12:]}",
+                daemon=True,
+            )
+            lease_thread.start()
         try:
             result = self._dispatch_task(dispatch_task, enabled=enabled)
         except Exception as exc:
@@ -1624,20 +3286,104 @@ class UnifiedRuntimeController:
                 )
             self._reschedule_after_task(task, error=str(exc))
             return
+        finally:
+            if lease_stop is not None:
+                lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=1.0)
         self._reschedule_after_task(dispatch_task, result=result)
 
     def _dispatch_task(self, task: Any, *, enabled: bool) -> dict[str, Any]:
         task_type = str(task["task_type"])
         if task_type == TASK_PROFIT_CYCLE:
+            # The value captured when the task was claimed can already be
+            # stale if the user toggled the executor meanwhile. Serialize the
+            # final runtime/config projection and always obey the latest
+            # persistent switch before starting the long-running cycle.
+            with self._config_lock:
+                db = Database(self.settings.db_path)
+                try:
+                    db.initialize()
+                    runtime = db.get_executor_runtime_state(RUNTIME_PROFIT_TRADE)
+                    enabled = bool(
+                        runtime is not None
+                        and bool(runtime["enabled"])
+                        and not bool(runtime["migration_hold"])
+                    )
+                finally:
+                    db.close()
+                config = load_strategy_config(self.settings)
+                if enabled and not config.profit_trade_enabled:
+                    # Repair states created by the first runtime migration,
+                    # where runtime.enabled could be true while the legacy
+                    # strategy flag remained false.
+                    config = set_profit_trade_enabled(self.settings, True)
+                elif not enabled and config.profit_trade_enabled:
+                    config = set_profit_trade_enabled(self.settings, False)
             if enabled:
                 report = run_profit_trade_once(
                     self.settings,
+                    config=config,
                     new_action_guard=lambda: self._new_actions_enabled(
                         RUNTIME_PROFIT_TRADE
                     ),
                 )
                 return report.to_dict()
             return self._run_profit_closure_once()
+        if task_type == TASK_PROFIT_MANUAL_EXECUTION:
+            payload = _task_payload(task)
+            with self._config_lock:
+                db = Database(self.settings.db_path)
+                try:
+                    db.initialize()
+                    runtime = db.get_executor_runtime_state(RUNTIME_PROFIT_TRADE)
+                    enabled = bool(
+                        runtime is not None
+                        and bool(runtime["enabled"])
+                        and not bool(runtime["migration_hold"])
+                    )
+                finally:
+                    db.close()
+                config = load_strategy_config(self.settings)
+            if not enabled:
+                raise RuntimeError("Profit Trade runtime was disabled before one-click execution")
+            return execute_manual_profit_trade_request(
+                self.settings,
+                request_id=str(payload.get("requestId") or ""),
+                market_hash_name=str(payload.get("marketHashName") or ""),
+                quantity=int(payload.get("quantity") or 0),
+                approved_expected_roi=float(payload.get("approvedExpectedRoi") or 0),
+                approved_scan_id=str(payload.get("approvedScanId") or "") or None,
+                approved_observed_at=str(payload.get("approvedObservedAt") or "") or None,
+                requested_at=str(payload.get("requestedAt") or "") or None,
+                config=config,
+                new_action_guard=lambda: (
+                    self._manual_task_lease_owned(str(task["task_key"]))
+                    and self._new_actions_enabled(RUNTIME_PROFIT_TRADE)
+                ),
+                refresh_config_each_item=True,
+            )
+        if task_type == TASK_PROFIT_SELECTION_WATCH:
+            # Research selections are an explicit observation authorization,
+            # not a real Profit Trade action.  They must remain usable while
+            # Profit Trade itself is disabled, provided the shared Cookie gate
+            # and Steam scheduler are healthy.
+            return refresh_profit_trade_selection_watch(
+                self.settings,
+                config=load_strategy_config(self.settings),
+            )
+        if task_type == TASK_C5_RESEARCH_SCAN:
+            payload = _task_payload(task)
+            return run_c5_research_scan_chunk(
+                self.settings,
+                str(payload.get("requestId") or ""),
+            )
+        if task_type == TASK_GUADAO_AUDIT:
+            payload = _task_payload(task)
+            return run_guadao_audit(
+                self.settings,
+                str(payload.get("requestId") or ""),
+            )
         self._emit_guadao_runtime_event(
             operation=task_type,
             message="挂刀到期任务开始执行",
@@ -1645,13 +3391,21 @@ class UnifiedRuntimeController:
             accountId=task["account_id"],
             operationId=task["operation_id"],
         )
+        action_guard = None
+        if task_type == TASK_GUADAO_SCAN:
+            action_guard = lambda: self._new_actions_enabled(RUNTIME_GUADAO)
+        elif task_type == TASK_STALE_LISTING_RECHECK:
+            task_key = str(task["task_key"])
+            action_guard = lambda: (
+                self._manual_task_lease_owned(task_key)
+                and (
+                    self._new_actions_enabled(RUNTIME_GUADAO)
+                    or self._stale_maintenance_actions_enabled(task_key)
+                )
+            )
         engine = ExecutionEngine(
             self.settings,
-            new_action_guard=(
-                (lambda: self._new_actions_enabled(RUNTIME_GUADAO))
-                if task_type == TASK_GUADAO_SCAN
-                else None
-            ),
+            new_action_guard=action_guard,
         )
         try:
             if task_type == TASK_GUADAO_SCAN:
@@ -1677,8 +3431,19 @@ class UnifiedRuntimeController:
                 )
             elif task_type == TASK_REBUY_ATTEMPT:
                 result = engine.run_guadao_rebuy_task(int(task["operation_id"]))
+            elif task_type == TASK_REBUY_BATCH:
+                payload = _task_payload(task)
+                result = engine.run_guadao_rebuy_batch_task(
+                    str(payload.get("marketHashName") or "")
+                )
+            elif task_type == TASK_STALE_LISTING_RECHECK:
+                result = engine.run_guadao_stale_listing_recheck_task()
             elif task_type == TASK_C5_DELIVERY_CONFIRM:
                 result = engine.run_guadao_delivery_confirmation_task(int(task["operation_id"]))
+            elif task_type == TASK_C5_ORDER_RECONCILE:
+                result = engine.run_guadao_c5_submission_reconcile_task(
+                    int(task["operation_id"])
+                )
             else:
                 result = {"ok": False, "error": f"unknown task type: {task_type}"}
             self._emit_guadao_runtime_event(
@@ -1688,6 +3453,8 @@ class UnifiedRuntimeController:
                 taskKey=str(task["task_key"]),
                 result=result,
             )
+            if task_type == TASK_STALE_LISTING_RECHECK:
+                self._notify_stale_listing_recheck_result(result)
             return result
         finally:
             engine.close()
@@ -1739,6 +3506,16 @@ class UnifiedRuntimeController:
     ) -> None:
         config = load_strategy_config(self.settings)
         request_failed = bool(error) or (result is not None and not bool(result.get("ok", True)))
+        history_deferred_ids = {
+            int(value)
+            for value in list((result or {}).get("historyDeferredOperationIds") or [])
+            if safe_int(value) is not None
+        }
+        history_retry_at = _parse_iso(
+            str((result or {}).get("historyRetryAt") or "")
+        )
+        if history_retry_at is not None and history_retry_at.tzinfo is None:
+            history_retry_at = history_retry_at.replace(tzinfo=timezone.utc)
         for task in due_tasks:
             task_key = str(task.get("task_key") or "")
             operation_id = safe_int(task.get("operation_id"))
@@ -1754,13 +3531,20 @@ class UnifiedRuntimeController:
                 continue
             note = _read_note(op["note"])
             raw_status = str(op["status"] or "")
+            waiting_for_sale_evidence = (
+                raw_status == "listing_pending"
+                and str(note.get("confirmationStatus") or "")
+                == "listing_missing_unverified"
+            )
             remains_due_kind = (
                 task_type == TASK_STEAM_LISTING_CONFIRM
                 and raw_status == "listing_pending"
+                and not waiting_for_sale_evidence
             ) or (
                 task_type == TASK_STEAM_SALE_EVIDENCE
                 and (
                     raw_status == "listed"
+                    or waiting_for_sale_evidence
                     or (
                         raw_status == "manual_required"
                         and str(note.get("staleListedCleanupStatus") or "") == "manual_required"
@@ -1773,17 +3557,33 @@ class UnifiedRuntimeController:
             payload = _task_payload(task)
             delays = self._operation_task_delays(config, task_type)
             tier_index = max(0, int(payload.get("tierIndex") or 0))
-            if request_failed:
+            history_deferred = (
+                task_type == TASK_STEAM_SALE_EVIDENCE
+                and operation_id in history_deferred_ids
+            )
+            if history_deferred:
+                # A shared account history walk may be delayed while the same
+                # MyListings round already resolved other operations.  Keep
+                # this operation's tier and wait for the next normal evidence
+                # interval or the circuit Retry-After, whichever is later.
+                next_index = tier_index
+                delay = float(delays[min(tier_index + 1, len(delays) - 1)])
+            elif request_failed:
                 next_index = tier_index
                 delay = min(30.0, float(delays[min(tier_index, len(delays) - 1)] or 30.0))
             else:
                 next_index = min(tier_index + 1, len(delays) - 1)
                 delay = float(delays[next_index])
+            next_attempt_at = _iso_after(max(2.0, delay))
+            if history_deferred and history_retry_at is not None:
+                normal_next = _parse_iso(next_attempt_at)
+                if normal_next is None or normal_next < history_retry_at:
+                    next_attempt_at = history_retry_at.astimezone(timezone.utc).isoformat()
             db.upsert_scheduled_task(
                 task_key,
                 source=RUNTIME_GUADAO,
                 task_type=task_type,
-                next_attempt_at=_iso_after(max(2.0, delay)),
+                next_attempt_at=next_attempt_at,
                 account_id=str(task.get("account_id") or "") or None,
                 operation_id=operation_id,
                 payload={
@@ -1794,7 +3594,13 @@ class UnifiedRuntimeController:
                 },
                 status="waiting",
                 priority=int(task.get("priority") or 2),
-                last_error=error or (str(result.get("error") or "") if result else None),
+                last_error=(
+                    str((result or {}).get("historyError") or "")
+                    if history_deferred
+                    else error
+                    or (str(result.get("error") or "") if result else None)
+                )
+                or None,
             )
 
     def _reschedule_after_task(
@@ -1809,6 +3615,7 @@ class UnifiedRuntimeController:
         config = load_strategy_config(self.settings)
         schedule = config.effective_guadao_task_schedule()
         next_seconds: float | None
+        next_attempt_override: str | None = None
         terminal = False
         db = Database(self.settings.db_path)
         try:
@@ -1830,7 +3637,102 @@ class UnifiedRuntimeController:
             elif task_type == TASK_STEAM_ACCOUNT_SYNC:
                 next_seconds = float(schedule["steamSyncIntervalSeconds"])
             elif task_type == TASK_PROFIT_CYCLE:
-                next_seconds = PROFIT_CYCLE_INTERVAL_SECONDS
+                next_seconds = PROFIT_TRADE_CYCLE_INTERVAL_SECONDS
+            elif task_type == TASK_STALE_LISTING_RECHECK:
+                next_seconds = float(schedule["staleListedCheckIntervalSeconds"])
+            elif task_type == TASK_PROFIT_SELECTION_WATCH:
+                active_count = safe_int((result or {}).get("activeCount"))
+                if active_count is not None and active_count <= 0:
+                    terminal = True
+                    next_seconds = None
+                else:
+                    next_due_at = str((result or {}).get("nextDueAt") or "").strip()
+                    if next_due_at:
+                        next_attempt_override = next_due_at
+                        next_seconds = None
+                    else:
+                        # Unexpected local failures should not turn a P3
+                        # research task into a tight retry loop.
+                        next_seconds = PROFIT_TRADE_CYCLE_INTERVAL_SECONDS
+            elif task_type == TASK_C5_RESEARCH_SCAN:
+                scan_status = str((result or {}).get("status") or "").strip().lower()
+                if error:
+                    next_seconds = 30.0
+                elif scan_status in {
+                    "paused",
+                    "cancelled",
+                    "completed",
+                    "completed_with_errors",
+                    "failed",
+                }:
+                    terminal = True
+                    next_seconds = None
+                else:
+                    next_due_at = str((result or {}).get("nextAttemptAt") or "").strip()
+                    if next_due_at:
+                        next_attempt_override = next_due_at
+                        next_seconds = None
+                    else:
+                        # Each invocation handles a bounded chunk.  A short
+                        # hand-off keeps the P3 job moving without monopolizing
+                        # the shared runtime worker.
+                        next_seconds = 1.0
+            elif task_type == TASK_GUADAO_AUDIT:
+                # One audit attempt holds a renewed lease for its complete
+                # read-only evidence walk. Every domain verdict is terminal
+                # for this scheduled attempt.
+                terminal = True
+                next_seconds = None
+            elif task_type == TASK_PROFIT_MANUAL_EXECUTION:
+                terminal = True
+                next_seconds = None
+            elif task_type == TASK_REBUY_BATCH:
+                market_hash_name = str(
+                    _task_payload(task).get("marketHashName") or ""
+                ).strip()
+                next_attempts: list[str] = []
+                if market_hash_name:
+                    for op in db.list_pool_operations_by_type(
+                        OP_REBUY_C5,
+                        status="pending",
+                        limit=5000,
+                    ):
+                        if str(op["market_hash_name"] or "") != market_hash_name:
+                            continue
+                        individual_key = f"rebuy:{int(op['id'])}"
+                        individual = db.get_scheduled_task(individual_key)
+                        if individual is not None and str(individual["status"] or "") == "running":
+                            # A one-time legacy quick-buy caller still owns
+                            # this operation. It cannot be reacquired by the
+                            # batch lane until it releases final evidence.
+                            continue
+                        created = _parse_iso(op["created_at"]) or _now_utc()
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        age = max(0.0, (_now_utc() - created).total_seconds())
+                        interval = _tier_interval_seconds(
+                            schedule.get("rebuyRetryTiers"),
+                            age_seconds=age,
+                            minimum_seconds=30.0,
+                        )
+                        next_attempt_at = _iso_after(interval)
+                        db.upsert_scheduled_task(
+                            individual_key,
+                            source=RUNTIME_GUADAO,
+                            task_type=TASK_REBUY_ATTEMPT,
+                            next_attempt_at=next_attempt_at,
+                            operation_id=int(op["id"]),
+                            payload={"createdAt": op["created_at"]},
+                            status="waiting",
+                            priority=1,
+                        )
+                        next_attempts.append(next_attempt_at)
+                if not next_attempts:
+                    terminal = True
+                    next_seconds = None
+                else:
+                    next_attempt_override = min(next_attempts)
+                    next_seconds = None
             elif task_type == TASK_REBUY_ATTEMPT:
                 op = db.conn.execute(
                     "SELECT * FROM pool_operations WHERE id = ?",
@@ -1862,7 +3764,7 @@ class UnifiedRuntimeController:
                     submitted = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
                     if submitted is not None and submitted.tzinfo is None:
                         submitted = submitted.replace(tzinfo=timezone.utc)
-                    # Missing submission time means the 24-hour clock has not
+                    # Missing submission time means the 12-hour review clock has not
                     # started.  Keep a short confirmation cadence for any
                     # existing remote identifier instead of aging from the
                     # unrelated local operation creation time.
@@ -1876,19 +3778,165 @@ class UnifiedRuntimeController:
                         age_seconds=age,
                         minimum_seconds=30.0,
                     )
+            elif task_type == TASK_C5_ORDER_RECONCILE:
+                operation_id = int(task["operation_id"])
+                op = db.conn.execute(
+                    "SELECT * FROM pool_operations WHERE id = ?",
+                    (operation_id,),
+                ).fetchone()
+                if (
+                    op is None
+                    or str(op["status"] or "") != C5_SUBMISSION_UNCONFIRMED_STATUS
+                ):
+                    terminal = True
+                    next_seconds = None
+                else:
+                    attempt_count = max(1, int(task["attempt_count"] or 0))
+                    if attempt_count >= C5_ORDER_RECONCILE_MAX_ATTEMPTS:
+                        note = _read_note(op["note"])
+                        alerted_at = str(
+                            note.get("c5SubmissionCoverageAlertAt") or ""
+                        ).strip()
+                        first_alert = not alerted_at
+                        if first_alert:
+                            alerted_at = utc_now_iso()
+                        note.update(
+                            {
+                                "c5SubmissionCoverageAlertAt": alerted_at,
+                                "c5SubmissionReconcileSlowRetryAt": alerted_at,
+                                "c5SubmissionReconcileAlertCode": (
+                                    "reconcile_fast_attempts_exhausted"
+                                ),
+                                "c5SubmissionReconcileAttemptCount": attempt_count,
+                                "c5SubmissionReconcileLastError": error
+                                or str((result or {}).get("error") or "")
+                                or None,
+                                "c5SubmissionReconcileNextDelaySeconds": (
+                                    C5_ORDER_RECONCILE_DEGRADED_DELAY_SECONDS
+                                ),
+                            }
+                        )
+                        db.update_pool_operation(
+                            operation_id,
+                            note=json.dumps(note, ensure_ascii=False),
+                        )
+                        if first_alert:
+                            self._emit_guadao_runtime_event(
+                                operation=TASK_C5_ORDER_RECONCILE,
+                                message=(
+                                    "C5 补仓提交结果暂未核对清楚，已转为慢速持续复核；"
+                                    "确认远端终态前不会重复补仓"
+                                ),
+                                level="WARNING",
+                                operationId=operation_id,
+                                marketHashName=str(op["market_hash_name"] or ""),
+                                attemptCount=attempt_count,
+                                c5OutTradeNo=note.get("c5OutTradeNo"),
+                                error=note.get("c5SubmissionReconcileLastError"),
+                                reconcileState="slow_retry",
+                            )
+                        next_seconds = C5_ORDER_RECONCILE_DEGRADED_DELAY_SECONDS
+                    else:
+                        next_seconds = C5_ORDER_RECONCILE_DELAYS_SECONDS[
+                            min(
+                                attempt_count - 1,
+                                len(C5_ORDER_RECONCILE_DELAYS_SECONDS) - 1,
+                            )
+                        ]
             else:
                 terminal = True
                 next_seconds = None
 
             if terminal:
+                terminal_error = error
+                if (
+                    terminal_error is None
+                    and result is not None
+                    and result.get("ok") is False
+                ):
+                    result_errors = [
+                        str(value)
+                        for value in list(result.get("errors") or [])
+                        if str(value).strip()
+                    ]
+                    terminal_error = (
+                        "；".join(result_errors)
+                        or str(result.get("error") or "manual execution failed")
+                    )
+                scheduled_status = "failed" if terminal_error else "completed"
+                domain_status = str((result or {}).get("status") or "").strip().lower()
+                if task_type == TASK_C5_RESEARCH_SCAN:
+                    if domain_status == "cancelled":
+                        scheduled_status = "cancelled"
+                    elif domain_status == "failed":
+                        scheduled_status = "failed"
+                        terminal_error = terminal_error or str(
+                            (result or {}).get("lastError")
+                            or (result or {}).get("error")
+                            or "C5 research scan failed"
+                        )
+                elif task_type == TASK_GUADAO_AUDIT and domain_status == "cancelled":
+                    scheduled_status = "cancelled"
                 db.complete_scheduled_task(
                     task_key,
                     self.worker_id,
-                    status="failed" if error else "completed",
-                    error=error,
+                    status=scheduled_status,
+                    error=terminal_error,
                 )
+                if task_type == TASK_PROFIT_MANUAL_EXECUTION:
+                    state = db.get_executor_runtime_state(str(task["source"]))
+                    if state is not None:
+                        runtime_payload = _runtime_payload(state)
+                        completed_at = utc_now_iso()
+                        result_payload = dict(result or {})
+                        summary = str(
+                            terminal_error
+                            or result_payload.get("summary")
+                            or "Profit Trade 一键执行已完成"
+                        )
+                        runtime_payload["lastRunAt"] = completed_at
+                        runtime_payload["lastRunSummary"] = summary
+                        task_payload = _task_payload(task)
+                        recent_runs = list(
+                            runtime_payload.get("recentTaskRuns") or []
+                        )
+                        recent_runs.insert(
+                            0,
+                            {
+                                "id": f"{task_key}:{completed_at}",
+                                "completedAt": completed_at,
+                                "taskKey": task_key,
+                                "taskType": task_type,
+                                "label": TASK_PUBLIC_LABELS.get(
+                                    task_type,
+                                    task_type.replace("_", " "),
+                                ),
+                                "marketHashName": str(
+                                    result_payload.get("marketHashName")
+                                    or task_payload.get("marketHashName")
+                                    or ""
+                                )
+                                or None,
+                                "ok": not bool(terminal_error)
+                                and bool(result_payload.get("ok", True)),
+                                "summary": summary,
+                                "error": terminal_error
+                                or result_payload.get("error"),
+                                "result": result_payload,
+                            },
+                        )
+                        runtime_payload["recentTaskRuns"] = recent_runs[:60]
+                        db.upsert_executor_runtime_state(
+                            str(task["source"]),
+                            enabled=bool(state["enabled"]),
+                            runtime_status=str(state["runtime_status"]),
+                            migration_hold=bool(state["migration_hold"]),
+                            gate_reason=state["gate_reason"],
+                            heartbeat_at=utc_now_iso(),
+                            payload=runtime_payload,
+                        )
             else:
-                next_attempt_at = _iso_after(float(next_seconds or 60.0))
+                next_attempt_at = next_attempt_override or _iso_after(float(next_seconds or 60.0))
                 db.reschedule_scheduled_task(
                     task_key,
                     next_attempt_at=next_attempt_at,
@@ -1896,15 +3944,139 @@ class UnifiedRuntimeController:
                     error=error or (None if result is None else str(result.get("error") or "") or None),
                     status="retry" if error else "pending",
                 )
+                if task_type == TASK_STALE_LISTING_RECHECK:
+                    self._clear_stale_maintenance_authorization(db, task_key)
                 state = db.get_executor_runtime_state(str(task["source"]))
-                if state is not None:
+                if state is not None and task_type not in READ_ONLY_AUXILIARY_TASKS:
                     runtime_payload = _runtime_payload(state)
-                    runtime_payload["lastRunAt"] = utc_now_iso()
+                    completed_at = utc_now_iso()
+                    runtime_payload["lastRunAt"] = completed_at
                     runtime_payload["lastRunSummary"] = (
                         f"{task_type} 失败：{error}"
                         if error
                         else f"{task_type} 已完成"
                     )
+                    if str(task["source"]) == RUNTIME_GUADAO:
+                        task_payload = _task_payload(task)
+                        operation_id = safe_int(task["operation_id"])
+                        market_hash_name = str(
+                            task_payload.get("marketHashName") or ""
+                        ).strip() or None
+                        if market_hash_name is None and operation_id is not None:
+                            operation_row = db.conn.execute(
+                                "SELECT market_hash_name FROM pool_operations WHERE id = ?",
+                                (operation_id,),
+                            ).fetchone()
+                            if operation_row is not None:
+                                market_hash_name = str(
+                                    operation_row["market_hash_name"] or ""
+                                ).strip() or None
+                        result_payload = dict(result or {})
+                        public_result = {
+                            key: value
+                            for key, value in result_payload.items()
+                            if key != "scanRound"
+                        }
+                        if error:
+                            run_summary = f"执行失败：{error}"
+                        elif task_type == TASK_GUADAO_SCAN:
+                            run_summary = (
+                                f"评估 {int(result_payload.get('evaluated') or 0)} 个，"
+                                f"挂刀候选 {int(result_payload.get('candidateCount') or 0)} 个，"
+                                f"本地可执行 {int(result_payload.get('executableCount') or 0)} 个，"
+                                f"新上架 {int(result_payload.get('listed') or 0)} 件"
+                            )
+                        elif task_type == TASK_STEAM_ACCOUNT_SYNC:
+                            if result_payload.get("partial"):
+                                run_summary = (
+                                    "部分完成："
+                                    f"MyListings 解决 "
+                                    f"{int(result_payload.get('myListingsResolved') or 0)} 笔，"
+                                    f"历史确认卖出 "
+                                    f"{int(result_payload.get('historySold') or 0)} 笔，"
+                                    f"历史延期 "
+                                    f"{int(result_payload.get('historyDeferred') or 0)} 笔"
+                                )
+                            else:
+                                run_summary = (
+                                    f"MyListings 解决 "
+                                    f"{int(result_payload.get('myListingsResolved') or 0)} 笔，"
+                                    f"确认挂单 {int(result_payload.get('confirmed') or 0)} 笔，"
+                                    f"确认卖出 {int(result_payload.get('sold') or 0)} 笔"
+                                )
+                        elif task_type == TASK_REBUY_ATTEMPT:
+                            run_summary = (
+                                f"补仓成功 {int(result_payload.get('rebought') or 0)} 笔，"
+                                f"当前状态 {result_payload.get('status') or '未知'}"
+                            )
+                        elif task_type == TASK_REBUY_BATCH:
+                            price_batch_floor = safe_float(result_payload.get("priceBatchFloor"))
+                            concrete_floor = safe_float(result_payload.get("concreteFloor"))
+                            price_batch_label = (
+                                f"¥{price_batch_floor:.2f}"
+                                if price_batch_floor is not None
+                                else "未知"
+                            )
+                            concrete_floor_label = (
+                                f"¥{concrete_floor:.2f}"
+                                if concrete_floor is not None
+                                else "未知"
+                            )
+                            run_summary = (
+                                f"到期 {int(result_payload.get('dueOperations') or 0)} 笔，"
+                                f"聚合最低 {price_batch_label}，逐单最低 {concrete_floor_label}，"
+                                f"具体在售 {int(result_payload.get('concreteListingsRead') or 0)} 件，"
+                                f"差价快买 {int(result_payload.get('quickBuySuccesses') or 0)}/"
+                                f"{int(result_payload.get('quickBuyAttempts') or 0)} 笔，"
+                                f"批量匹配 {int(result_payload.get('normalBatchMatched') or 0)} 笔，"
+                                f"提交成功 {int(result_payload.get('successes') or 0)} 笔，"
+                                f"C5 请求 {int(result_payload.get('c5RequestCount') or 0)} 次，"
+                                f"耗时 {float(result_payload.get('elapsedMs') or 0) / 1000:.2f}s"
+                            )
+                        elif task_type == TASK_C5_DELIVERY_CONFIRM:
+                            run_summary = (
+                                f"当前状态 {result_payload.get('status') or '未知'}，"
+                                f"创建替换补仓 {int(result_payload.get('replacements') or 0)} 笔"
+                            )
+                        elif task_type == TASK_C5_ORDER_RECONCILE:
+                            run_summary = (
+                                f"提交结果 {result_payload.get('state') or '待核对'}，"
+                                f"创建替换补仓 {int(result_payload.get('replacements') or 0)} 笔"
+                            )
+                        else:
+                            run_summary = str(
+                                result_payload.get("summary")
+                                or result_payload.get("reason")
+                                or "任务已完成"
+                            )
+                        recent_runs = list(runtime_payload.get("recentTaskRuns") or [])
+                        recent_runs.insert(
+                            0,
+                            {
+                                "id": f"{task_key}:{completed_at}",
+                                "completedAt": completed_at,
+                                "taskKey": task_key,
+                                "taskType": task_type,
+                                "label": TASK_PUBLIC_LABELS.get(
+                                    task_type,
+                                    task_type.replace("_", " "),
+                                ),
+                                "accountId": task["account_id"],
+                                "accountName": self._public_account_name(task["account_id"]),
+                                "operationId": operation_id,
+                                "marketHashName": market_hash_name,
+                                "ok": not bool(error) and bool(result_payload.get("ok", True)),
+                                "summary": run_summary,
+                                "error": error or result_payload.get("error"),
+                                "result": public_result,
+                            },
+                        )
+                        runtime_payload["recentTaskRuns"] = recent_runs[:60]
+                        scan_round = result_payload.get("scanRound")
+                        if task_type == TASK_GUADAO_SCAN and isinstance(scan_round, dict):
+                            scan_rounds = list(runtime_payload.get("recentScanRounds") or [])
+                            scan_rounds.insert(0, scan_round)
+                            runtime_payload["recentScanRounds"] = scan_rounds[:12]
                     if task_type == TASK_GUADAO_SCAN:
                         runtime_payload["nextScanAt"] = next_attempt_at
                     db.upsert_executor_runtime_state(
@@ -1929,7 +4101,7 @@ class UnifiedRuntimeController:
                 """
                 SELECT COUNT(*) AS count FROM pool_operations
                 WHERE (operation_type = ? AND status IN ('pending','listed','listing_pending','manual_required'))
-                   OR (operation_type = ? AND status IN ('pending','delivery_pending','failed','c5_failed'))
+                   OR (operation_type = ? AND status IN ('pending','delivery_pending','c5_submission_unconfirmed','manual_required','failed','c5_failed'))
                 """,
                 (OP_SELL_STEAM, OP_REBUY_C5),
             ).fetchone()
@@ -2002,10 +4174,28 @@ class UnifiedRuntimeController:
                 str(row["executor_key"]): self._public_runtime_row(row)
                 for row in db.list_executor_runtime_states()
             }
+            for runtime_key, task_key in (
+                (RUNTIME_GUADAO, TASK_GUADAO_SCAN),
+                (RUNTIME_PROFIT_TRADE, TASK_PROFIT_CYCLE),
+            ):
+                task = db.get_scheduled_task(task_key)
+                if runtime_key in states:
+                    states[runtime_key]["nextAttemptAt"] = (
+                        task["next_attempt_at"] if task is not None else None
+                    )
+                    states[runtime_key]["taskStatus"] = (
+                        str(task["status"] or "") if task is not None else None
+                    )
+                    states[runtime_key]["taskRunning"] = bool(
+                        task is not None and str(task["status"] or "") == "running"
+                    )
             return {
                 "state": states.get(key) if key else None,
                 "states": states,
                 "cookieGate": self._cookie_gate_snapshot(db),
+                "c5ApiCircuit": self._public_c5_api_circuit(
+                    db.get_c5_api_circuit()
+                ),
                 "workerAlive": self.alive,
             }
         finally:
@@ -2020,6 +4210,17 @@ class UnifiedRuntimeController:
                 for row in db.list_executor_runtime_states()
             }
             raw_task_rows = db.list_scheduled_tasks(source=RUNTIME_GUADAO, limit=500)
+            # The queue can contain thousands of per-operation history rows.
+            # Always expose the global stale-listing maintenance task even when
+            # its next-attempt timestamp falls outside that chronological page;
+            # otherwise the new hourly task is invisible in the dashboard while
+            # it is still active and schedulable.
+            stale_task_row = db.get_scheduled_task(TASK_STALE_LISTING_RECHECK)
+            if stale_task_row is not None and not any(
+                str(row["task_key"] or "") == TASK_STALE_LISTING_RECHECK
+                for row in raw_task_rows
+            ):
+                raw_task_rows = [stale_task_row, *raw_task_rows]
             tasks = [self._public_task(row) for row in raw_task_rows]
             operation_ids = sorted(
                 {
@@ -2084,6 +4285,11 @@ class UnifiedRuntimeController:
                 "scheduler_unavailable",
             }:
                 cookie["status"] = runtime_gate_status
+            c5_evidence_pending = self._operation_count(
+                db,
+                OP_REBUY_C5,
+                [C5_SUBMISSION_UNCONFIRMED_STATUS],
+            )
             counts = {
                 "activeListings": self._operation_count(db, OP_SELL_STEAM, ["listed"]),
                 "pendingListingConfirmations": self._operation_count(
@@ -2093,6 +4299,11 @@ class UnifiedRuntimeController:
                 ),
                 "pendingRebuys": self._operation_count(db, OP_REBUY_C5, ["pending"]),
                 "deliveryPending": self._operation_count(db, OP_REBUY_C5, ["delivery_pending"]),
+                # `c5EvidencePending` is the public business name.  Retain
+                # `submissionUnconfirmed` for existing callers while the UI
+                # migrates from the old technical wording.
+                "c5EvidencePending": c5_evidence_pending,
+                "submissionUnconfirmed": c5_evidence_pending,
                 "issues": len(self._issue_rows(db, include_acknowledged=False)),
             }
             queue_snapshot = {}
@@ -2101,6 +4312,7 @@ class UnifiedRuntimeController:
                 queue_snapshot = snapshot_loader()
             circuits_loader = getattr(db, "list_steam_route_circuits", None)
             circuits = [self._public_circuit(row) for row in circuits_loader()] if callable(circuits_loader) else []
+            c5_api_circuit = self._public_c5_api_circuit(db.get_c5_api_circuit())
             config = load_strategy_config(self.settings)
             queue_counts = dict(queue_snapshot.get("counts") or {})
             queue_requests = list(queue_snapshot.get("requests") or [])
@@ -2143,12 +4355,6 @@ class UnifiedRuntimeController:
                 ),
                 default=None,
             )
-            try:
-                from cs2_assistant.services.guadao_logging import get_guadao_event_logger
-
-                recent_events = get_guadao_event_logger().query({"pageSize": 4}).get("events", [])
-            except Exception:
-                recent_events = []
             special_rules = []
             for rule in config.guadao_special_ratio_rules or []:
                 if not isinstance(rule, dict):
@@ -2165,17 +4371,24 @@ class UnifiedRuntimeController:
                     }
                 )
             public_issues = self._issue_rows(db, include_acknowledged=False)
+            guadao_runtime_payload = (
+                guadao_runtime.get("payload", {})
+                if isinstance(guadao_runtime.get("payload"), dict)
+                else {}
+            )
             return {
                 "generatedAt": utc_now_iso(),
                 "backend": {"online": True, "workerAlive": self.alive, "lastError": self._last_error},
                 "runtime": guadao_runtime,
                 "runtimes": runtimes,
                 "cookieGate": cookie,
+                "c5ApiCircuit": c5_api_circuit,
                 "counts": counts,
                 "summary": {
                     "activeListings": counts["activeListings"],
                     "pendingListingConfirmations": counts["pendingListingConfirmations"],
                     "pendingRebuys": counts["pendingRebuys"],
+                    "c5EvidencePending": counts["c5EvidencePending"],
                     "deliveryPending": counts["deliveryPending"],
                     "issueCount": counts["issues"],
                     "steamHeatPct": min(100.0, recent_request_count / 30.0 * 100.0),
@@ -2183,6 +4396,12 @@ class UnifiedRuntimeController:
                 "tasks": tasks,
                 "dueTasks": due_tasks,
                 "taskQueue": task_queue,
+                "recentTaskRuns": list(
+                    guadao_runtime_payload.get("recentTaskRuns") or []
+                ),
+                "scanRounds": list(
+                    guadao_runtime_payload.get("recentScanRounds") or []
+                ),
                 "steamScheduler": {
                     "status": (
                         "unavailable"
@@ -2210,7 +4429,6 @@ class UnifiedRuntimeController:
                 },
                 "issuesPreview": public_issues[:5],
                 "issues": public_issues[:5],
-                "recentLogs": [self._public_guadao_log(event) for event in recent_events],
             }
         finally:
             db.close()
@@ -2304,6 +4522,24 @@ class UnifiedRuntimeController:
             "cooldownUntil": row["cooldown_until"],
             "nextProbeAt": row["next_probe_at"],
             "reason": row["reason"],
+        }
+
+    def _public_c5_api_circuit(self, row: Any | None) -> dict[str, Any]:
+        if row is None:
+            return {"state": "closed", "blocked": False}
+        return {
+            "state": row["state"],
+            "blocked": str(row["state"]) == "open",
+            "errorCode": row["error_code"],
+            "requestIp": row["request_ip"],
+            "triggerSource": row["trigger_source"],
+            "triggerOperation": row["trigger_operation"],
+            "firstErrorAt": row["first_error_at"],
+            "lastErrorAt": row["last_error_at"],
+            "nextProbeAt": row["next_probe_at"],
+            "alertSentAt": row["alert_sent_at"],
+            "recoveredAt": row["recovered_at"],
+            "recoveryAlertSentAt": row["recovery_alert_sent_at"],
         }
 
     def _public_guadao_log(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -2402,6 +4638,7 @@ class UnifiedRuntimeController:
         page_size: int = 10,
         keyword: str | None = None,
         account_name: str | None = None,
+        market_hash_name: str | None = None,
         status: str | None = None,
         start_at: str | None = None,
         end_at: str | None = None,
@@ -2423,6 +4660,13 @@ class UnifiedRuntimeController:
             tasks = db.list_scheduled_tasks(source=RUNTIME_GUADAO, limit=5000)
             task_by_operation: dict[str, Any] = {}
             for task in tasks:
+                if str(task["status"] or "") not in {
+                    "pending",
+                    "retry",
+                    "running",
+                    "waiting",
+                }:
+                    continue
                 operation_id = str(task["operation_id"] or "")
                 if operation_id and operation_id not in task_by_operation:
                     task_by_operation[operation_id] = task
@@ -2438,12 +4682,16 @@ class UnifiedRuntimeController:
                     rebuy_by_sell.setdefault(source_sell_id, []).append(rebuy)
             projected: list[dict[str, Any]] = []
             for sell in sell_rows:
-                children = rebuy_by_sell.get(int(sell["id"]), [])
+                children = sorted(
+                    rebuy_by_sell.get(int(sell["id"]), []),
+                    key=lambda row: int(row["id"]),
+                )
                 child = max(children, key=lambda row: int(row["id"])) if children else None
                 projected.append(
                     self._public_operation(
                         sell,
                         rebuy=child,
+                        rebuy_attempts=children,
                         task=(
                             task_by_operation.get(str(child["id"]))
                             if child is not None
@@ -2460,6 +4708,7 @@ class UnifiedRuntimeController:
                 )
             query = str(keyword or "").strip().lower()
             account_filter = str(account_name or "").strip()
+            item_filter = str(market_hash_name or "").strip()
             status_filter = str(status or "").strip()
             start_filter = _parse_iso(str(start_at or ""))
             end_filter = _parse_iso(str(end_at or ""))
@@ -2510,18 +4759,59 @@ class UnifiedRuntimeController:
                         continue
                     filtered_by_created_at.append(item)
                 projected = filtered_by_created_at
+            # Item options are a facet of the current query.  Apply keyword,
+            # account, status and date filters first, but deliberately exclude
+            # the selected item itself so users can switch between the other
+            # items available under the same conditions.
+            item_option_map: dict[str, dict[str, Any]] = {}
+            for item in projected:
+                item_market_hash_name = str(item.get("marketHashName") or "").strip()
+                if not item_market_hash_name:
+                    continue
+                option = item_option_map.setdefault(
+                    item_market_hash_name,
+                    {
+                        "marketHashName": item_market_hash_name,
+                        "displayName": str(
+                            item.get("displayName") or item_market_hash_name
+                        ),
+                        "count": 0,
+                    },
+                )
+                option["count"] += 1
+            item_options = sorted(
+                item_option_map.values(),
+                key=lambda option: (
+                    -int(option["count"]),
+                    str(option["displayName"]).casefold(),
+                    str(option["marketHashName"]).casefold(),
+                ),
+            )
+            if item_filter:
+                projected = [
+                    row
+                    for row in projected
+                    if row.get("marketHashName") == item_filter
+                ]
             projected.sort(key=lambda row: str(row.get("updatedAt") or row.get("createdAt") or ""), reverse=True)
             total = len(projected)
             safe_page_size = max(1, min(int(page_size), 100))
             safe_page = max(1, int(page))
             start = (safe_page - 1) * safe_page_size
             page_rows = projected[start : start + safe_page_size]
+            c5_evidence_pending = sum(
+                row["status"] == C5_SUBMISSION_UNCONFIRMED_STATUS
+                for row in projected
+            )
             summary = {
                 "total": total,
                 "pendingConfirmation": sum(row["status"] == "listing_pending" for row in projected),
                 "steamListed": sum(row["status"] == "listed" for row in projected),
                 "pendingRebuy": sum(row["status"] == "sold" for row in projected),
                 "deliveryPending": sum(row["status"] == "delivery_pending" for row in projected),
+                "c5EvidencePending": c5_evidence_pending,
+                # Compatibility for clients that still render the old field.
+                "submissionUnconfirmed": c5_evidence_pending,
                 "completed": sum(row["status"] == "completed" for row in projected),
             }
             return {
@@ -2532,6 +4822,7 @@ class UnifiedRuntimeController:
                 "page": safe_page,
                 "pageSize": safe_page_size,
                 "summary": summary,
+                "itemOptions": item_options,
                 "runtime": (
                     self._public_runtime_row(runtime_row)
                     if (runtime_row := db.get_executor_runtime_state(RUNTIME_GUADAO)) is not None
@@ -2551,11 +4842,862 @@ class UnifiedRuntimeController:
         finally:
             db.close()
 
+    @staticmethod
+    def _normalize_guadao_batch_ids(operation_ids: Any) -> list[int]:
+        if not isinstance(operation_ids, list):
+            raise ValueError("operationIds must be an array")
+        normalized: list[int] = []
+        for raw in operation_ids:
+            operation_id = safe_int(raw)
+            if operation_id is None or operation_id <= 0:
+                raise ValueError("operationIds contains an invalid operation ID")
+            if operation_id not in normalized:
+                normalized.append(operation_id)
+        if not normalized:
+            raise ValueError("operationIds must not be empty")
+        if len(normalized) > 100:
+            raise ValueError("a batch may contain at most 100 operations")
+        return normalized
+
+    @staticmethod
+    def _rebuy_has_remote_order_evidence(note: dict[str, Any]) -> bool:
+        return any(
+            note.get(key) not in (None, "", False)
+            for key in (
+                "c5OutTradeNo",
+                "c5OrderId",
+                "c5TradeOrderId",
+                "c5OrderSubmittedAt",
+            )
+        )
+
+    @staticmethod
+    def _rebuy_steam_net_amount(
+        sell_note: dict[str, Any],
+        rebuy_note: dict[str, Any],
+    ) -> float | None:
+        net_amount = safe_float(
+            rebuy_note.get("steamSellerNetPrice")
+            or sell_note.get("steamSellerNetPrice")
+        )
+        if net_amount is not None and net_amount > 0:
+            return net_amount
+        steam_list_price = safe_float(
+            rebuy_note.get("steamListPrice") or sell_note.get("steamListPrice")
+        )
+        steam_net_factor = safe_float(
+            rebuy_note.get("steamNetFactorAtOpen")
+            or sell_note.get("steamNetFactorAtOpen")
+        )
+        if steam_list_price and steam_net_factor and steam_list_price > 0 and steam_net_factor > 0:
+            return steam_list_price * steam_net_factor
+        return None
+
+    @staticmethod
+    def _append_manual_rebuy_history(
+        note: dict[str, Any],
+        event: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        existing = note.get("manualRebuyRefreezeHistory")
+        history = [dict(item) for item in existing if isinstance(item, dict)] if isinstance(existing, list) else []
+        return [*history[-49:], dict(event)]
+
+    def _guadao_batch_pairs(
+        self,
+        db: Database,
+        operation_ids: list[int],
+    ) -> dict[int, tuple[Any | None, Any | None, list[Any]]]:
+        placeholders = ",".join("?" for _ in operation_ids)
+        sell_rows = db.conn.execute(
+            f"SELECT * FROM pool_operations WHERE id IN ({placeholders})",
+            tuple(operation_ids),
+        ).fetchall()
+        sells = {int(row["id"]): row for row in sell_rows}
+        children_by_sell: dict[int, list[Any]] = {}
+        for rebuy in db.list_pool_operations_by_type(OP_REBUY_C5, limit=50_000):
+            source_sell_id = safe_int(
+                _read_note(rebuy["note"]).get("sourceSellOperationId")
+            )
+            if source_sell_id in operation_ids:
+                children_by_sell.setdefault(int(source_sell_id), []).append(rebuy)
+        pairs: dict[int, tuple[Any | None, Any | None, list[Any]]] = {}
+        for operation_id in operation_ids:
+            children = sorted(
+                children_by_sell.get(operation_id, []),
+                key=lambda row: int(row["id"]),
+            )
+            pending_children = [
+                row for row in children if str(row["status"] or "") == "pending"
+            ]
+            current = pending_children[0] if len(pending_children) == 1 else None
+            pairs[operation_id] = (sells.get(operation_id), current, children)
+        return pairs
+
+    @staticmethod
+    def _batch_pair_error(
+        db: Database,
+        sell: Any | None,
+        rebuy: Any | None,
+        children: list[Any],
+    ) -> tuple[str, str] | None:
+        if sell is None:
+            return "operation_not_found", "挂刀流水不存在"
+        if str(sell["strategy"] or "") != RUNTIME_GUADAO or str(
+            sell["operation_type"] or ""
+        ) != OP_SELL_STEAM:
+            return "not_guadao_sell_operation", "不是挂刀 Steam 卖出流水"
+        if str(sell["status"] or "") != "sold":
+            return "not_sold_pending_rebuy", "仅已卖出待补仓流水允许批量操作"
+        pending_children = [
+            row for row in children if str(row["status"] or "") == "pending"
+        ]
+        if len(pending_children) > 1:
+            return "multiple_pending_rebuys", "存在多个待补仓子流水，必须先人工确认唯一当前流水"
+        if any(str(row["status"] or "") == "delivery_pending" for row in children):
+            return "c5_delivery_pending", "同一卖出流水存在 C5 发货确认中的补仓"
+        if any(str(row["status"] or "") == "completed" for row in children):
+            return "rebuy_already_completed", "同一卖出流水已经存在完成的补仓"
+        if rebuy is None:
+            return "pending_rebuy_not_found", "未找到对应的待补仓子流水"
+        if str(rebuy["status"] or "") != "pending":
+            return "rebuy_not_pending", "对应补仓流水已不再处于等待状态"
+        rebuy_note = _read_note(rebuy["note"])
+        if UnifiedRuntimeController._rebuy_has_remote_order_evidence(rebuy_note):
+            return "c5_order_state_unresolved", "存在 C5 订单证据，必须先确认远端终态"
+        task = db.get_scheduled_task(f"rebuy:{int(rebuy['id'])}")
+        if task is not None and str(task["status"] or "") == "running":
+            return "rebuy_task_running", "补仓任务正在执行，请等待本轮结束后再操作"
+        return None
+
+    @staticmethod
+    def _batch_result(
+        operation_id: int,
+        *,
+        ok: bool,
+        code: str,
+        message: str,
+        sell: Any | None = None,
+        rebuy: Any | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        return {
+            "operationId": operation_id,
+            "tradeNo": f"GD-{operation_id}",
+            "rebuyOperationId": int(rebuy["id"]) if rebuy is not None else None,
+            "marketHashName": str(sell["market_hash_name"]) if sell is not None else None,
+            "ok": ok,
+            "code": code,
+            "message": message,
+            **extra,
+        }
+
+    @staticmethod
+    def _existing_guadao_batch_audit(
+        db: Database,
+        *,
+        event_type: str,
+        sell_operation_id: int,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        row = db.conn.execute(
+            """
+            SELECT result_json
+            FROM guadao_operation_audit_events
+            WHERE event_type = ? AND sell_operation_id = ? AND request_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (event_type, int(sell_operation_id), str(request_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["result_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {**payload, "idempotentReplay": True}
+
+    @staticmethod
+    def _insert_guadao_batch_audit(
+        db: Database,
+        *,
+        event_type: str,
+        sell_operation_id: int,
+        rebuy_operation_id: int,
+        batch_id: str,
+        request_id: str,
+        reason: str | None,
+        old_value: dict[str, Any],
+        new_value: dict[str, Any],
+        result: dict[str, Any],
+        created_at: str,
+    ) -> None:
+        db.conn.execute(
+            """
+            INSERT INTO guadao_operation_audit_events (
+                event_type, sell_operation_id, rebuy_operation_id,
+                batch_id, request_id, actor, reason,
+                old_value_json, new_value_json, result_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'web_user', ?, ?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                int(sell_operation_id),
+                int(rebuy_operation_id),
+                str(batch_id),
+                str(request_id),
+                reason,
+                json.dumps(old_value, ensure_ascii=False),
+                json.dumps(new_value, ensure_ascii=False),
+                json.dumps(result, ensure_ascii=False),
+                created_at,
+            ),
+        )
+
+    def batch_refreeze_guadao_rebuys(
+        self,
+        operation_ids: Any,
+        *,
+        rebuy_price: float,
+        execute_now: bool = True,
+        confirmed: bool = False,
+        request_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("confirmed=true is required")
+        price = round(float(rebuy_price), 2)
+        if price <= 0:
+            raise ValueError("rebuyPrice must be positive")
+        ids = self._normalize_guadao_batch_ids(operation_ids)
+        batch_id = f"GDRF-{uuid.uuid4().hex[:12]}"
+        request_key = str(request_id or uuid.uuid4().hex).strip()[:100]
+        safe_reason = str(reason or "").strip()[:300] or "用户批量重设补仓冻结价格"
+        now = utc_now_iso()
+        db = Database(self.settings.db_path)
+        results: list[dict[str, Any]] = []
+        try:
+            db.initialize()
+            pairs = self._guadao_batch_pairs(db, ids)
+            market_hash_names = {
+                str(sell["market_hash_name"])
+                for sell, _rebuy, _children in pairs.values()
+                if sell is not None
+            }
+            if len(market_hash_names) > 1:
+                raise ValueError("批量重设补仓价仅支持同一物品品类")
+            for operation_id in ids:
+                sell, rebuy, children = pairs[operation_id]
+                replay = self._existing_guadao_batch_audit(
+                    db,
+                    event_type="manual_rebuy_refrozen",
+                    sell_operation_id=operation_id,
+                    request_id=request_key,
+                )
+                if replay is not None:
+                    results.append(replay)
+                    continue
+                blocked = self._batch_pair_error(db, sell, rebuy, children)
+                if blocked is not None:
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code=blocked[0],
+                            message=blocked[1],
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                sell_note = _read_note(sell["note"])
+                rebuy_note = _read_note(rebuy["note"])
+                steam_net_amount = self._rebuy_steam_net_amount(sell_note, rebuy_note)
+                if steam_net_amount is None or steam_net_amount <= 0:
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code="steam_net_amount_missing",
+                            message="缺少 Steam 卖出税后到手，无法重算冻结比例",
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                new_ratio = round(price / steam_net_amount, 6)
+                old_price = safe_float(rebuy["expected_price"]) or safe_float(
+                    sell_note.get("rebuyPrice")
+                )
+                old_ratio = safe_float(rebuy_note.get("maxRebuyRatioAtOpen")) or safe_float(
+                    sell_note.get("maxRebuyRatioAtOpen")
+                )
+                event = {
+                    "batchId": batch_id,
+                    "action": "manual_refreeze_and_retry",
+                    "at": now,
+                    "oldFrozenRebuyPrice": old_price,
+                    "newFrozenRebuyPrice": price,
+                    "oldFrozenRebuyRatio": old_ratio,
+                    "newFrozenRebuyRatio": new_ratio,
+                    "steamNetAmount": round(steam_net_amount, 6),
+                    "executeNow": bool(execute_now),
+                    "requestId": request_key,
+                    "reason": safe_reason,
+                }
+                sell_updated = {
+                    **sell_note,
+                    "rebuyPrice": price,
+                    "maxRebuyRatioAtOpen": new_ratio,
+                    "currentRebuyRatio": new_ratio,
+                    "manualRebuyRefrozenPrice": price,
+                    "manualRebuyRefrozenRatio": new_ratio,
+                    "manualRebuySteamNetAmount": round(steam_net_amount, 6),
+                    "manualRebuyRefrozenAt": now,
+                    "manualRebuyRefreezeBatchId": batch_id,
+                    "manualRebuyRefreezeHistory": self._append_manual_rebuy_history(
+                        sell_note, event
+                    ),
+                }
+                rebuy_updated = {
+                    **rebuy_note,
+                    "maxRebuyRatioAtOpen": new_ratio,
+                    "currentRebuyRatio": new_ratio,
+                    "manualRebuyRefrozenPrice": price,
+                    "manualRebuyRefrozenRatio": new_ratio,
+                    "manualRebuySteamNetAmount": round(steam_net_amount, 6),
+                    "manualRebuyRefrozenAt": now,
+                    "manualRebuyRefreezeBatchId": batch_id,
+                    "manualRebuyRefreezeHistory": self._append_manual_rebuy_history(
+                        rebuy_note, event
+                    ),
+                }
+                if safe_int(rebuy_note.get("replacementForRebuyOperationId")) is not None:
+                    rebuy_updated["replacementMaxPrice"] = price
+                    rebuy_updated["replacementPricePolicy"] = "manual_refreeze"
+                task_key = f"rebuy:{int(rebuy['id'])}"
+                success_result = self._batch_result(
+                    operation_id,
+                    ok=True,
+                    code="rebuy_refrozen",
+                    message="已重设冻结价格与比例，并重新安排补仓" if execute_now else "已重设冻结价格与比例",
+                    sell=sell,
+                    rebuy=rebuy,
+                    oldFrozenRebuyPrice=old_price,
+                    newFrozenRebuyPrice=price,
+                    oldFrozenRebuyRatio=old_ratio,
+                    newFrozenRebuyRatio=new_ratio,
+                    steamNetAmount=round(steam_net_amount, 6),
+                    executeNow=bool(execute_now),
+                )
+                try:
+                    db.conn.execute("BEGIN IMMEDIATE")
+                    current_sell, current_rebuy, current_children = self._guadao_batch_pairs(
+                        db, [operation_id]
+                    )[operation_id]
+                    current_blocked = self._batch_pair_error(
+                        db, current_sell, current_rebuy, current_children
+                    )
+                    if current_blocked is not None:
+                        raise RuntimeError(current_blocked[0])
+                    current_task = db.get_scheduled_task(task_key)
+                    if (
+                        int(current_rebuy["id"]) != int(rebuy["id"])
+                        or str(current_sell["note"] or "") != str(sell["note"] or "")
+                        or str(current_rebuy["note"] or "") != str(rebuy["note"] or "")
+                        or safe_float(current_rebuy["expected_price"])
+                        != safe_float(rebuy["expected_price"])
+                    ):
+                        raise RuntimeError("rebuy_data_changed")
+                    db.conn.execute(
+                        "UPDATE pool_operations SET note = ? WHERE id = ?",
+                        (json.dumps(sell_updated, ensure_ascii=False), operation_id),
+                    )
+                    db.conn.execute(
+                        "UPDATE pool_operations SET expected_price = ?, note = ? WHERE id = ?",
+                        (
+                            price,
+                            json.dumps(rebuy_updated, ensure_ascii=False),
+                            int(rebuy["id"]),
+                        ),
+                    )
+                    if execute_now and current_task is not None:
+                        db.conn.execute(
+                            """
+                            UPDATE scheduled_tasks
+                            SET status = 'pending', next_attempt_at = ?, last_error = NULL,
+                                lease_owner = NULL, lease_expires_at = NULL,
+                                completed_at = NULL, updated_at = ?
+                            WHERE task_key = ?
+                            """,
+                            (now, now, task_key),
+                        )
+                    self._insert_guadao_batch_audit(
+                        db,
+                        event_type="manual_rebuy_refrozen",
+                        sell_operation_id=operation_id,
+                        rebuy_operation_id=int(rebuy["id"]),
+                        batch_id=batch_id,
+                        request_id=request_key,
+                        reason=safe_reason,
+                        old_value={
+                            "expectedPrice": old_price,
+                            "listingRatioAtOpen": safe_float(sell_note.get("listingRatioAtOpen")),
+                            "maxRebuyRatioAtOpen": old_ratio,
+                            "guadaoMaxListingRatioAtOpen": safe_float(sell_note.get("guadaoMaxListingRatioAtOpen")),
+                            "replacementMaxPrice": safe_float(rebuy_note.get("replacementMaxPrice")),
+                        },
+                        new_value={
+                            "frozenRebuyPrice": price,
+                            "frozenRebuyRatio": new_ratio,
+                            "steamNetAmount": round(steam_net_amount, 6),
+                            "executeNow": bool(execute_now),
+                        },
+                        result=success_result,
+                        created_at=now,
+                    )
+                    db.conn.commit()
+                except Exception as exc:
+                    db.conn.rollback()
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code="state_changed",
+                            message=f"流水状态刚刚发生变化，请刷新后重试：{exc}",
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                if execute_now and db.get_scheduled_task(task_key) is None:
+                    db.upsert_scheduled_task(
+                        task_key,
+                        source=RUNTIME_GUADAO,
+                        task_type=TASK_REBUY_ATTEMPT,
+                        next_attempt_at=now,
+                        operation_id=int(rebuy["id"]),
+                        priority=1,
+                        payload={"manualRebuyRefreezeBatchId": batch_id},
+                    )
+                self._emit_guadao_runtime_event(
+                    operation="manual_rebuy_refrozen",
+                    message="用户批量重设了本笔补仓冻结价格与冻结比例",
+                    operationId=operation_id,
+                    rebuyOperationId=int(rebuy["id"]),
+                    marketHashName=str(sell["market_hash_name"]),
+                    batchId=batch_id,
+                    oldFrozenRebuyPrice=old_price,
+                    newFrozenRebuyPrice=price,
+                    oldFrozenRebuyRatio=old_ratio,
+                    newFrozenRebuyRatio=new_ratio,
+                    executeNow=bool(execute_now),
+                    requestId=request_key,
+                    reason=safe_reason,
+                )
+                results.append(success_result)
+        finally:
+            db.close()
+        success_count = sum(bool(item["ok"]) for item in results)
+        if success_count and execute_now:
+            self.wake()
+        return {
+            "ok": success_count > 0,
+            "batchId": batch_id,
+            "requestId": request_key,
+            "successCount": success_count,
+            "failedCount": len(results) - success_count,
+            "results": results,
+        }
+
+    def batch_complete_guadao_rebuys_manually(
+        self,
+        operation_ids: Any,
+        *,
+        actual_rebuy_price: float,
+        source: str,
+        completed_at: str,
+        memo: str | None = None,
+        external_order_ref: str | None = None,
+        confirmed: bool = False,
+        request_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("confirmed=true is required")
+        price = round(float(actual_rebuy_price), 2)
+        if price <= 0:
+            raise ValueError("actualRebuyPrice must be positive")
+        normalized_source = str(source or "").strip()
+        if not normalized_source:
+            raise ValueError("source is required")
+        parsed_completed_at = _parse_iso(str(completed_at or ""))
+        if parsed_completed_at is None or parsed_completed_at.tzinfo is None:
+            raise ValueError("completedAt must be an ISO 8601 timestamp with timezone")
+        parsed_completed_at = parsed_completed_at.astimezone(timezone.utc)
+        if parsed_completed_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("completedAt must not be in the future")
+        completed_iso = parsed_completed_at.isoformat()
+        safe_memo = str(memo or "").strip()[:500] or None
+        safe_external_ref = str(external_order_ref or "").strip()[:200] or None
+        if not safe_memo and not safe_external_ref:
+            raise ValueError("memo or externalOrderRef is required")
+        ids = self._normalize_guadao_batch_ids(operation_ids)
+        batch_id = f"GDMC-{uuid.uuid4().hex[:12]}"
+        request_key = str(request_id or uuid.uuid4().hex).strip()[:100]
+        safe_reason = str(reason or "").strip()[:300] or "用户确认已在其他平台完成补仓"
+        recorded_at = utc_now_iso()
+        db = Database(self.settings.db_path)
+        results: list[dict[str, Any]] = []
+        try:
+            db.initialize()
+            pairs = self._guadao_batch_pairs(db, ids)
+            market_hash_names = {
+                str(sell["market_hash_name"])
+                for sell, _rebuy, _children in pairs.values()
+                if sell is not None
+            }
+            if len(market_hash_names) > 1:
+                raise ValueError("批量手动完结仅支持同一物品品类")
+            for operation_id in ids:
+                sell, rebuy, children = pairs[operation_id]
+                replay = self._existing_guadao_batch_audit(
+                    db,
+                    event_type="manual_external_rebuy_completed",
+                    sell_operation_id=operation_id,
+                    request_id=request_key,
+                )
+                if replay is not None:
+                    results.append(replay)
+                    continue
+                blocked = self._batch_pair_error(db, sell, rebuy, children)
+                if blocked is not None:
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code=blocked[0],
+                            message=blocked[1],
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                sell_note = _read_note(sell["note"])
+                rebuy_note = _read_note(rebuy["note"])
+                steam_net_amount = self._rebuy_steam_net_amount(sell_note, rebuy_note)
+                if steam_net_amount is None or steam_net_amount <= 0:
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code="steam_net_amount_missing",
+                            message="缺少 Steam 卖出税后到手，无法计算实际闭环比例",
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                sold_at = _parse_iso(
+                    str(
+                        rebuy_note.get("steamSoldAt")
+                        or sell_note.get("steamSoldAt")
+                        or sell["completed_at"]
+                        or ""
+                    )
+                )
+                if sold_at is not None:
+                    if sold_at.tzinfo is None:
+                        sold_at = sold_at.replace(tzinfo=timezone.utc)
+                    if parsed_completed_at < sold_at.astimezone(timezone.utc):
+                        results.append(
+                            self._batch_result(
+                                operation_id,
+                                ok=False,
+                                code="completed_before_steam_sale",
+                                message="外部补仓完成时间不能早于 Steam 官方卖出时间",
+                                sell=sell,
+                                rebuy=rebuy,
+                            )
+                        )
+                        continue
+                actual_ratio = round(price / steam_net_amount, 6)
+                old_price = safe_float(rebuy["expected_price"]) or safe_float(
+                    sell_note.get("rebuyPrice")
+                )
+                old_ratio = safe_float(rebuy_note.get("maxRebuyRatioAtOpen")) or safe_float(
+                    sell_note.get("maxRebuyRatioAtOpen")
+                )
+                event = {
+                    "batchId": batch_id,
+                    "action": "manual_external_rebuy_completed",
+                    "at": recorded_at,
+                    "completedAt": completed_iso,
+                    "oldFrozenRebuyPrice": old_price,
+                    "newFrozenRebuyPrice": price,
+                    "oldFrozenRebuyRatio": old_ratio,
+                    "newFrozenRebuyRatio": actual_ratio,
+                    "steamNetAmount": round(steam_net_amount, 6),
+                    "source": normalized_source,
+                    "externalOrderRef": safe_external_ref,
+                    "requestId": request_key,
+                    "reason": safe_reason,
+                }
+                common_updates = {
+                    "rebuyPrice": price,
+                    "maxRebuyRatioAtOpen": actual_ratio,
+                    "currentRebuyRatio": actual_ratio,
+                    "manualRebuyRefrozenPrice": price,
+                    "manualRebuyRefrozenRatio": actual_ratio,
+                    "manualRebuySteamNetAmount": round(steam_net_amount, 6),
+                    "manualRebuyRefrozenAt": recorded_at,
+                    "manualRebuyRefreezeBatchId": batch_id,
+                    "manualExternalRebuyCompletedAt": completed_iso,
+                    "manualExternalRebuyRecordedAt": recorded_at,
+                    "manualExternalRebuySource": normalized_source,
+                    "manualExternalRebuyMemo": safe_memo,
+                    "manualExternalOrderRef": safe_external_ref,
+                }
+                sell_updated = {
+                    **sell_note,
+                    **common_updates,
+                    "manualRebuyRefreezeHistory": self._append_manual_rebuy_history(
+                        sell_note, event
+                    ),
+                }
+                rebuy_updated = {
+                    **rebuy_note,
+                    **common_updates,
+                    C5_DELIVERY_STATUS_KEY: "manual_external_completed",
+                    "manualRebuyRefreezeHistory": self._append_manual_rebuy_history(
+                        rebuy_note, event
+                    ),
+                }
+                task_key = f"rebuy:{int(rebuy['id'])}"
+                success_result = self._batch_result(
+                    operation_id,
+                    ok=True,
+                    code="manual_external_completed",
+                    message="已按其他平台实际补仓价格手动完结",
+                    sell=sell,
+                    rebuy=rebuy,
+                    actualRebuyPrice=price,
+                    actualRebuyRatio=actual_ratio,
+                    steamNetAmount=round(steam_net_amount, 6),
+                    source=normalized_source,
+                    completedAt=completed_iso,
+                )
+                try:
+                    db.conn.execute("BEGIN IMMEDIATE")
+                    current_sell, current_rebuy, current_children = self._guadao_batch_pairs(
+                        db, [operation_id]
+                    )[operation_id]
+                    current_blocked = self._batch_pair_error(
+                        db, current_sell, current_rebuy, current_children
+                    )
+                    if current_blocked is not None:
+                        raise RuntimeError(current_blocked[0])
+                    if (
+                        int(current_rebuy["id"]) != int(rebuy["id"])
+                        or str(current_sell["note"] or "") != str(sell["note"] or "")
+                        or str(current_rebuy["note"] or "") != str(rebuy["note"] or "")
+                        or safe_float(current_rebuy["expected_price"])
+                        != safe_float(rebuy["expected_price"])
+                    ):
+                        raise RuntimeError("rebuy_data_changed")
+                    db.conn.execute(
+                        "UPDATE pool_operations SET note = ? WHERE id = ?",
+                        (json.dumps(sell_updated, ensure_ascii=False), operation_id),
+                    )
+                    db.conn.execute(
+                        """
+                        UPDATE pool_operations
+                        SET status = 'completed', expected_price = ?, actual_price = ?,
+                            note = ?, completed_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            price,
+                            price,
+                            json.dumps(rebuy_updated, ensure_ascii=False),
+                            completed_iso,
+                            int(rebuy["id"]),
+                        ),
+                    )
+                    db.conn.execute(
+                        "DELETE FROM scheduled_tasks WHERE task_key = ? AND status != 'running'",
+                        (task_key,),
+                    )
+                    open_rebuy_count = int(
+                        db.conn.execute(
+                            """
+                            SELECT COUNT(*) AS count
+                            FROM pool_operations
+                            WHERE operation_type = ? AND market_hash_name = ?
+                              AND status IN ('pending', 'delivery_pending')
+                            """,
+                            (OP_REBUY_C5, str(sell["market_hash_name"])),
+                        ).fetchone()["count"]
+                    )
+                    next_pool_status = (
+                        POOL_STATUS_PENDING_REBUY
+                        if open_rebuy_count > 0
+                        else POOL_STATUS_HOLDING
+                    )
+                    db.conn.execute(
+                        "UPDATE inventory_pool SET status = ?, updated_at = ? WHERE market_hash_name = ?",
+                        (next_pool_status, recorded_at, str(sell["market_hash_name"])),
+                    )
+                    self._insert_guadao_batch_audit(
+                        db,
+                        event_type="manual_external_rebuy_completed",
+                        sell_operation_id=operation_id,
+                        rebuy_operation_id=int(rebuy["id"]),
+                        batch_id=batch_id,
+                        request_id=request_key,
+                        reason=safe_reason,
+                        old_value={
+                            "expectedPrice": old_price,
+                            "listingRatioAtOpen": safe_float(sell_note.get("listingRatioAtOpen")),
+                            "maxRebuyRatioAtOpen": old_ratio,
+                            "guadaoMaxListingRatioAtOpen": safe_float(sell_note.get("guadaoMaxListingRatioAtOpen")),
+                            "replacementMaxPrice": safe_float(rebuy_note.get("replacementMaxPrice")),
+                        },
+                        new_value={
+                            "actualRebuyPrice": price,
+                            "actualRebuyRatio": actual_ratio,
+                            "steamNetAmount": round(steam_net_amount, 6),
+                            "source": normalized_source,
+                            "completedAt": completed_iso,
+                            "externalOrderRef": safe_external_ref,
+                        },
+                        result=success_result,
+                        created_at=recorded_at,
+                    )
+                    db.conn.commit()
+                except Exception as exc:
+                    db.conn.rollback()
+                    results.append(
+                        self._batch_result(
+                            operation_id,
+                            ok=False,
+                            code="state_changed",
+                            message=f"流水状态刚刚发生变化，请刷新后重试：{exc}",
+                            sell=sell,
+                            rebuy=rebuy,
+                        )
+                    )
+                    continue
+                self._emit_guadao_runtime_event(
+                    operation="manual_external_rebuy_completed",
+                    message="用户确认已在其他平台补仓并批量手动完结",
+                    operationId=operation_id,
+                    rebuyOperationId=int(rebuy["id"]),
+                    marketHashName=str(sell["market_hash_name"]),
+                    batchId=batch_id,
+                    actualRebuyPrice=price,
+                    actualRebuyRatio=actual_ratio,
+                    steamNetAmount=round(steam_net_amount, 6),
+                    source=normalized_source,
+                    completedAt=completed_iso,
+                    externalOrderRef=safe_external_ref,
+                    requestId=request_key,
+                    reason=safe_reason,
+                )
+                results.append(success_result)
+        finally:
+            db.close()
+        success_count = sum(bool(item["ok"]) for item in results)
+        return {
+            "ok": success_count > 0,
+            "batchId": batch_id,
+            "requestId": request_key,
+            "successCount": success_count,
+            "failedCount": len(results) - success_count,
+            "results": results,
+        }
+
+    def _public_rebuy_attempt(self, row: Any, *, is_current: bool) -> dict[str, Any]:
+        note = _read_note(row["note"])
+        status = str(row["status"] or "")
+        is_failed = status == "failed" or status.endswith("_failed")
+        submitted_at = _normalize_timestamp_iso(note.get("c5OrderSubmittedAt"))
+        deadline_at = None
+        submitted = _parse_iso(submitted_at)
+        if (
+            submitted is not None
+            and status in {"delivery_pending", "completed"}
+            and _has_confirmed_c5_order_evidence(note)
+        ):
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+            deadline_at = (
+                submitted.astimezone(timezone.utc) + timedelta(hours=12)
+            ).isoformat()
+        failure_reason = None
+        failure_code = None
+        failure_at = None
+        if is_failed:
+            failure_reason = (
+                note.get("c5OrderFailedDesc")
+                or note.get("failedReason")
+                or note.get("replacementFailedDesc")
+                or note.get("c5OrderStatusName")
+                or "C5 补仓失败"
+            )
+            failure_code = (
+                note.get("c5OrderFailedCode")
+                or note.get("failedCode")
+                or note.get("replacementFailedCode")
+            )
+            failure_at = _normalize_timestamp_iso(
+                note.get("c5DeliveryTimedOutAt")
+                or note.get("c5OrderCheckedAt")
+                or row["completed_at"]
+            )
+        stage = {
+            "pending": "等待补仓价格复查",
+            C5_SUBMISSION_UNCONFIRMED_STATUS: "C5 补仓待查证据",
+            "delivery_pending": "C5 已购买待收货",
+            "completed": "补仓完成",
+            "c5_failed": "C5 发货失败",
+            "failed": "补仓失败",
+        }.get(status, status.replace("_", " ") or "状态未知")
+        return {
+            "id": int(row["id"]),
+            "operationId": f"GD-{int(row['id'])}",
+            "status": status,
+            "stage": stage,
+            "isCurrent": bool(is_current),
+            "createdAt": row["created_at"],
+            "completedAt": row["completed_at"],
+            "expectedPrice": row["expected_price"],
+            "actualPrice": row["actual_price"],
+            "c5OrderId": note.get("c5OrderId"),
+            "c5TradeOrderId": _public_c5_trade_order_id(note),
+            "c5OutTradeNo": note.get("c5OutTradeNo"),
+            "c5OrderSubmittedAt": submitted_at,
+            "c5DeliveryDeadlineAt": deadline_at,
+            "failureAt": failure_at,
+            "failureCode": failure_code,
+            "failureReason": failure_reason,
+            "replacementOperationId": safe_int(
+                note.get("replacementRebuyOperationId")
+            ),
+            "replacementForOperationId": safe_int(
+                note.get("replacementForRebuyOperationId")
+            ),
+            "replacementReason": note.get("replacementReason"),
+            "replacementMaxPrice": safe_float(note.get("replacementMaxPrice")),
+        }
+
     def _public_operation(
         self,
         row: Any,
         *,
         rebuy: Any | None = None,
+        rebuy_attempts: list[Any] | None = None,
         task: Any | None = None,
     ) -> dict[str, Any]:
         note = _read_note(row["note"])
@@ -2565,8 +5707,14 @@ class UnifiedRuntimeController:
         if rebuy is not None:
             if raw_status == "pending":
                 status, step, stage = "sold", 4, "已卖出待补仓"
+            elif raw_status == C5_SUBMISSION_UNCONFIRMED_STATUS:
+                status, step, stage = (
+                    C5_SUBMISSION_UNCONFIRMED_STATUS,
+                    5,
+                    "C5 补仓待查证据",
+                )
             elif raw_status == "delivery_pending":
-                status, step, stage = "delivery_pending", 5, "C5 发货确认"
+                status, step, stage = "delivery_pending", 5, "C5 已购买待收货"
             elif raw_status == "completed":
                 status, step, stage = "completed", 6, "已闭环"
             else:
@@ -2591,9 +5739,17 @@ class UnifiedRuntimeController:
         for key, label in (
             ("activeVerifiedAt", "Steam 挂单已确认"),
             ("steamSoldAt", "Steam 官方确认售出"),
-            ("c5OrderSubmittedAt", "C5 补仓已下单"),
+            ("manualRebuyRefrozenAt", "人工重设补仓冻结价格与比例"),
+            ("manualExternalRebuyCompletedAt", "其他平台补仓手动完结"),
+            (
+                "c5OrderSubmittedAt",
+                "C5 补仓请求已提交"
+                if raw_status == C5_SUBMISSION_UNCONFIRMED_STATUS
+                else "C5 补仓已下单",
+            ),
             ("c5OrderCheckedAt", "C5 发货状态复查"),
-            ("c5DeliveryTimedOutAt", "C5 24小时未发货，自动失败"),
+            ("c5DeliveryOverdueAt", "C5 已超过12小时，继续查询订单详情"),
+            ("c5DeliveryTimedOutAt", "历史记录：C5 24小时未发货，自动失败"),
         ):
             value = rebuy_note.get(key) or note.get(key)
             if value:
@@ -2614,12 +5770,56 @@ class UnifiedRuntimeController:
         )
         c5_delivery_deadline_at = None
         submitted_at = _parse_iso(c5_order_submitted_at)
-        if submitted_at is not None:
+        if (
+            submitted_at is not None
+            and raw_status in {"delivery_pending", "completed"}
+            and _has_confirmed_c5_order_evidence({**note, **rebuy_note})
+        ):
             if submitted_at.tzinfo is None:
                 submitted_at = submitted_at.replace(tzinfo=timezone.utc)
             c5_delivery_deadline_at = (
-                submitted_at.astimezone(timezone.utc) + timedelta(hours=24)
+                submitted_at.astimezone(timezone.utc) + timedelta(hours=12)
             ).isoformat()
+        attempt_rows = list(rebuy_attempts or ([rebuy] if rebuy is not None else []))
+        attempt_rows.sort(key=lambda item: int(item["id"]))
+        current_rebuy_id = int(rebuy["id"]) if rebuy is not None else None
+        public_rebuy_attempts = [
+            self._public_rebuy_attempt(
+                attempt,
+                is_current=(current_rebuy_id is not None and int(attempt["id"]) == current_rebuy_id),
+            )
+            for attempt in attempt_rows
+        ]
+        failed_rebuy_count = sum(
+            attempt["status"] == "failed"
+            or str(attempt["status"]).endswith("_failed")
+            for attempt in public_rebuy_attempts
+        )
+        pending_attempt_count = sum(
+            str(attempt["status"] or "") == "pending" for attempt in attempt_rows
+        )
+        has_terminal_or_delivery_attempt = any(
+            str(attempt["status"] or "") in {"delivery_pending", "completed"}
+            for attempt in attempt_rows
+        )
+        batch_block_reason = None
+        if status != "sold":
+            batch_block_reason = "仅已卖出待补仓流水允许批量操作"
+        elif rebuy is None or pending_attempt_count != 1:
+            batch_block_reason = "待补仓子流水不是唯一当前流水"
+        elif has_terminal_or_delivery_attempt:
+            batch_block_reason = "存在发货确认中或已完成的补仓流水"
+        elif self._rebuy_has_remote_order_evidence(rebuy_note):
+            batch_block_reason = "存在 C5 订单证据，必须先确认远端终态"
+        elif task is not None and str(task["status"] or "") == "running":
+            batch_block_reason = "补仓任务正在执行"
+        current_rebuy_ratio = safe_float(
+            rebuy_note.get("currentRebuyRatio")
+            or note.get("currentRebuyRatio")
+            or rebuy_note.get("maxRebuyRatioAtOpen")
+            or note.get("maxRebuyRatioAtOpen")
+            or note.get("listingRatioAtOpen")
+        )
         return {
             "id": int(row["id"]),
             "operationId": f"GD-{int(row['id'])}",
@@ -2636,11 +5836,16 @@ class UnifiedRuntimeController:
             "actualPrice": row["actual_price"],
             "assetId": row["asset_id"],
             "listingId": note.get("listingId"),
-            "c5OrderId": (
-                rebuy_note.get("c5OrderId")
-                or rebuy_note.get("c5TradeOrderId")
-                or note.get("c5OrderId")
-                or note.get("c5TradeOrderId")
+            # Keep the C5 asset-order id, trade-order id and client-generated
+            # outTradeNo separate.  They have different meanings when
+            # diagnosing an HTTP-200 response that did not create an order.
+            "c5OrderId": rebuy_note.get("c5OrderId") or note.get("c5OrderId"),
+            "c5TradeOrderId": (
+                _public_c5_trade_order_id(rebuy_note)
+                or _public_c5_trade_order_id(note)
+            ),
+            "c5OutTradeNo": (
+                rebuy_note.get("c5OutTradeNo") or note.get("c5OutTradeNo")
             ),
             "steamAccountId": note.get("steamAccountId"),
             "steamAccountName": account_name,
@@ -2648,17 +5853,46 @@ class UnifiedRuntimeController:
             "steamId": note.get("steamId64"),
             "listingRatioAtOpen": note.get("listingRatioAtOpen"),
             "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
+            "currentRebuyRatio": current_rebuy_ratio,
+            "frozenRebuyPrice": (
+                safe_float(rebuy_note.get("manualRebuyRefrozenPrice"))
+                or safe_float(note.get("manualRebuyRefrozenPrice"))
+                or (safe_float(rebuy["expected_price"]) if rebuy is not None else None)
+                or safe_float(note.get("rebuyPrice"))
+            ),
+            "manualRebuyRefrozenAt": (
+                rebuy_note.get("manualRebuyRefrozenAt")
+                or note.get("manualRebuyRefrozenAt")
+            ),
+            "manualRebuyRefreezeHistory": (
+                rebuy_note.get("manualRebuyRefreezeHistory")
+                or note.get("manualRebuyRefreezeHistory")
+                or []
+            ),
+            "manualExternalRebuySource": rebuy_note.get("manualExternalRebuySource"),
+            "actualRebuyRatio": safe_float(
+                rebuy_note.get("manualRebuyRefrozenRatio")
+                if raw_status == "completed"
+                else None
+            ),
             "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
             "ratioRuleSource": note.get("guadaoRatioRuleSource"),
             "ratioRuleId": note.get("guadaoRatioRuleId"),
             "ratioRuleVersion": note.get("guadaoRatioRuleVersion"),
             "steamListPrice": note.get("steamListPrice"),
-            "steamNetAmount": note.get("steamSellerNetPrice"),
+            "steamNetAmount": self._rebuy_steam_net_amount(note, rebuy_note),
             "steamSoldAt": _normalize_timestamp_iso(
                 rebuy_note.get("steamSoldAt") or note.get("steamSoldAt")
             ),
             "c5OrderSubmittedAt": c5_order_submitted_at,
             "c5DeliveryDeadlineAt": c5_delivery_deadline_at,
+            "rebuyAttemptCount": len(public_rebuy_attempts),
+            "failedRebuyCount": failed_rebuy_count,
+            "hasPreviousRebuyFailure": failed_rebuy_count > 0,
+            "rebuyAttempts": public_rebuy_attempts,
+            "rebuyOperationId": int(rebuy["id"]) if rebuy is not None else None,
+            "batchActionEligible": batch_block_reason is None,
+            "batchActionBlockReason": batch_block_reason,
             "c5RebuyPrice": (
                 rebuy["actual_price"] or rebuy["expected_price"]
                 if rebuy is not None
@@ -2692,7 +5926,10 @@ class UnifiedRuntimeController:
             FROM pool_operations o
             LEFT JOIN items i ON i.market_hash_name = o.market_hash_name
             WHERE o.strategy = 'guadao'
-              AND o.status IN ('manual_required','listing_failed','failed')
+              AND o.status IN (
+                  'manual_required','listing_failed','failed',
+                  'c5_submission_unconfirmed'
+              )
             ORDER BY o.created_at DESC, o.id DESC
             LIMIT 1000
             """
@@ -2707,8 +5944,14 @@ class UnifiedRuntimeController:
             note = _read_note(row["note"])
             operation_type = str(row["operation_type"] or "")
             raw_status = str(row["status"] or "")
+            if (
+                raw_status == C5_SUBMISSION_UNCONFIRMED_STATUS
+                and not note.get("c5SubmissionCoverageAlertAt")
+            ):
+                continue
             reason = str(
                 note.get("manualReviewReason")
+                or note.get("c5SubmissionReconcileAlertCode")
                 or note.get("failedReason")
                 or note.get("staleListedManualRequiredReason")
                 or note.get("lastError")
@@ -2748,12 +5991,14 @@ class UnifiedRuntimeController:
                 safe_review_block_reason = "关联流水缺少 Steam 账号，不能自动排队安全复核"
             first_seen_at = str(
                 note.get("manualRequiredAt")
+                or note.get("c5SubmissionCoverageAlertAt")
                 or note.get("staleListedManualRequiredAt")
                 or row["created_at"]
                 or ""
             ) or None
             last_seen_at = str(
                 note.get("lastCheckedAt")
+                or note.get("c5SubmissionLastCheckedAt")
                 or note.get("staleListedCheckedAt")
                 or row["completed_at"]
                 or row["created_at"]
@@ -3035,6 +6280,7 @@ class UnifiedRuntimeController:
                     "steamNetFactorPct": float(config.steam_net_factor) * 100.0,
                     "maxNewListingsPerCycle": int(config.max_list_per_cycle),
                     "caseMaxOpenCount": int(config.case_max_open_guadao_count),
+                    "itemScope": normalize_guadao_item_scope(config.guadao_item_scope),
                     "autoListing": bool(config.auto_list_enabled),
                     "autoRebuy": bool(config.auto_rebuy_enabled),
                     "lastModifiedAt": latest_config_at,
@@ -3043,6 +6289,13 @@ class UnifiedRuntimeController:
                 "timePolicy": {
                     "scanMinutes": float(schedule.get("scanIntervalSeconds") or 300.0) / 60.0,
                     "steamSyncSeconds": float(schedule.get("steamSyncIntervalSeconds") or 120.0),
+                    "steamSyncMaxStartLagSeconds": float(
+                        schedule.get("steamSyncMaxStartLagSeconds") or 60.0
+                    ),
+                    "staleListedCheckHours": float(
+                        schedule.get("staleListedCheckIntervalSeconds") or 86400.0
+                    )
+                    / 3600.0,
                     "actionConfirmSeconds": [
                         float(value)
                         for value in schedule.get("actionConfirmationDelaysSeconds") or []
@@ -3077,6 +6330,7 @@ class UnifiedRuntimeController:
                 "steamNetFactor": config.steam_net_factor,
                 "maxNewListingsPerCycle": config.max_list_per_cycle,
                 "caseMaxOpenCount": config.case_max_open_guadao_count,
+                "guadaoItemScope": normalize_guadao_item_scope(config.guadao_item_scope),
                 "autoListEnabled": config.auto_list_enabled,
                 "autoRebuyEnabled": config.auto_rebuy_enabled,
                 "specialCaseRatioRules": list(config.guadao_special_ratio_rules or []),
@@ -3091,6 +6345,7 @@ class UnifiedRuntimeController:
                 "settings": settings,
                 "runtime": runtime_payload,
                 "guadaoMaxListingRatio": config.guadao_max_listing_ratio,
+                "guadaoItemScope": normalize_guadao_item_scope(config.guadao_item_scope),
                 "autoListEnabled": config.auto_list_enabled,
                 "autoRebuyEnabled": config.auto_rebuy_enabled,
                 "specialCaseRatioRules": list(config.guadao_special_ratio_rules or []),
@@ -3117,6 +6372,8 @@ class UnifiedRuntimeController:
                     "maxListPerCycle": int(nested_global.get("maxNewListingsPerCycle")),
                     "caseMaxOpenGuadaoCount": int(nested_global.get("caseMaxOpenCount")),
                 }
+                if "itemScope" in nested_global:
+                    payload["guadaoItemScope"] = nested_global.get("itemScope")
             if isinstance(nested_rules, list):
                 payload["specialCaseRatioRules"] = [
                     {
@@ -3144,6 +6401,20 @@ class UnifiedRuntimeController:
                     **current_schedule,
                     "scanIntervalSeconds": float(nested_time.get("scanMinutes")) * 60.0,
                     "steamSyncIntervalSeconds": float(nested_time.get("steamSyncSeconds")),
+                    "steamSyncMaxStartLagSeconds": float(
+                        nested_time.get(
+                            "steamSyncMaxStartLagSeconds",
+                            current_schedule["steamSyncMaxStartLagSeconds"],
+                        )
+                    ),
+                    "staleListedCheckIntervalSeconds": float(
+                        nested_time.get(
+                            "staleListedCheckHours",
+                            float(current_schedule["staleListedCheckIntervalSeconds"])
+                            / 3600.0,
+                        )
+                    )
+                    * 3600.0,
                     "actionConfirmationDelaysSeconds": [
                         float(value) for value in nested_time.get("actionConfirmSeconds") or []
                     ],
@@ -3169,6 +6440,10 @@ class UnifiedRuntimeController:
                 config.auto_list_enabled = bool(payload["autoListEnabled"])
             if "autoRebuyEnabled" in payload:
                 config.auto_rebuy_enabled = bool(payload["autoRebuyEnabled"])
+            if "guadaoItemScope" in payload:
+                config.guadao_item_scope = normalize_guadao_item_scope(
+                    payload["guadaoItemScope"]
+                )
             if "maxListPerCycle" in payload:
                 value = int(payload["maxListPerCycle"])
                 if value < 0:
@@ -3249,8 +6524,8 @@ class UnifiedRuntimeController:
                 if not _catalog_item_matches_guadao_case_semantics(item):
                     raise ValueError(f"特殊箱子规则只允许当前挂刀 Case 范围内的物品: {market_hash_name}")
                 ratio = float(raw.get("maxListingRatio"))
-                if ratio < float(global_ratio) or ratio > 0.80:
-                    raise ValueError("特殊箱子比例必须不低于全局比例且不超过 80%")
+                if ratio <= 0 or ratio > 0.80:
+                    raise ValueError("特殊箱子比例必须大于 0 且不超过 80%")
                 if ratio > 0.75 and not confirm_high:
                     raise ValueError("超过 75% 的特殊比例需要二次确认")
                 enabled = bool(raw.get("enabled", True))
@@ -3291,6 +6566,10 @@ class UnifiedRuntimeController:
             raise ValueError("完整扫描间隔不得低于 1 分钟")
         if float(result["steamSyncIntervalSeconds"]) < 30:
             raise ValueError("普通 Steam 同步间隔不得低于 30 秒")
+        if float(result["steamSyncMaxStartLagSeconds"]) < 1:
+            raise ValueError("Steam 同步最长开始等待不得低于 1 秒")
+        if float(result["staleListedCheckIntervalSeconds"]) < 3600:
+            raise ValueError("老挂单候选扫描间隔不得低于 1 小时")
         action = [float(value) for value in result.get("actionConfirmationDelaysSeconds") or []]
         if not action or min(action) < 2 or action != sorted(action):
             raise ValueError("动作确认间隔不得低于 2 秒且必须非递减")
@@ -3311,29 +6590,34 @@ class UnifiedRuntimeController:
                 previous = interval
         result["scanIntervalSeconds"] = float(result["scanIntervalSeconds"])
         result["steamSyncIntervalSeconds"] = float(result["steamSyncIntervalSeconds"])
+        result["steamSyncMaxStartLagSeconds"] = float(result["steamSyncMaxStartLagSeconds"])
+        result["staleListedCheckIntervalSeconds"] = float(
+            result["staleListedCheckIntervalSeconds"]
+        )
         result["actionConfirmationDelaysSeconds"] = action
         result["saleEvidenceDelaysSeconds"] = sale
         return result
 
-    def search_items(self, query: str, *, limit: int = 30) -> dict[str, Any]:
+    def search_items(
+        self,
+        query: str,
+        *,
+        limit: int = 30,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         db = Database(self.settings.db_path)
         try:
             db.initialize()
             safe_limit = max(1, min(int(limit), 100))
+            safe_offset = max(0, int(offset))
             keyword = str(query or "").strip()
-            like = f"%{keyword}%"
-            rows = db.conn.execute(
-                """
-                SELECT market_hash_name, name_cn, c5_item_id, raw_json
-                FROM items
-                WHERE name_cn LIKE ? OR market_hash_name LIKE ?
-                ORDER BY name_cn ASC
-                """,
-                (like, like),
-            ).fetchall()
-            rows = [
+            rows = db.search_items(keyword, limit=None)
+            matching_rows = [
                 row for row in rows if _catalog_item_matches_guadao_case_semantics(row)
-            ][:safe_limit]
+            ]
+            total = len(matching_rows)
+            page_rows = matching_rows[safe_offset : safe_offset + safe_limit]
+            next_offset = safe_offset + len(page_rows)
             return {
                 "items": [
                     {
@@ -3343,8 +6627,15 @@ class UnifiedRuntimeController:
                         "name": row["name_cn"],
                         "c5ItemId": row["c5_item_id"],
                     }
-                    for row in rows
-                ]
+                    for row in page_rows
+                ],
+                "pagination": {
+                    "offset": safe_offset,
+                    "limit": safe_limit,
+                    "total": total,
+                    "hasMore": next_offset < total,
+                    "nextOffset": next_offset if next_offset < total else None,
+                },
             }
         finally:
             db.close()

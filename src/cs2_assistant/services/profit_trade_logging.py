@@ -461,6 +461,7 @@ class ProfitTradeEventLogger:
         account_id: str | None = None,
         trade_no: str | None = None,
         request_id: str | None = None,
+        market_hash_name: str | None = None,
         keyword: str | None = None,
         cursor: str | None = None,
         limit: int | None = None,
@@ -476,6 +477,9 @@ class ProfitTradeEventLogger:
         account_id = account_id if account_id is not None else supplied.get("account_id", supplied.get("accountId"))
         trade_no = trade_no if trade_no is not None else supplied.get("trade_no", supplied.get("tradeNo"))
         request_id = request_id if request_id is not None else supplied.get("request_id", supplied.get("requestId"))
+        market_hash_name = market_hash_name if market_hash_name is not None else supplied.get(
+            "market_hash_name", supplied.get("marketHashName")
+        )
         keyword = keyword if keyword is not None else supplied.get("keyword")
         cursor = cursor if cursor is not None else supplied.get("cursor")
         if limit is None:
@@ -497,6 +501,7 @@ class ProfitTradeEventLogger:
             account_id=account_id,
             trade_no=trade_no,
             request_id=request_id,
+            market_hash_name=market_hash_name,
             keyword=keyword,
         ):
             if not passed_cursor:
@@ -545,6 +550,7 @@ class ProfitTradeEventLogger:
         account_id: str | None = None,
         trade_no: str | None = None,
         request_id: str | None = None,
+        market_hash_name: str | None = None,
         keyword: str | None = None,
     ) -> Iterator[bytes]:
         export_format = str(format or "jsonl").strip().lower()
@@ -561,6 +567,7 @@ class ProfitTradeEventLogger:
             account_id=account_id,
             trade_no=trade_no,
             request_id=request_id,
+            market_hash_name=market_hash_name,
             keyword=keyword,
         ):
             if export_format == "jsonl":
@@ -588,6 +595,7 @@ class ProfitTradeEventLogger:
             account_id=supplied.get("account_id", supplied.get("accountId")),
             trade_no=supplied.get("trade_no", supplied.get("tradeNo")),
             request_id=supplied.get("request_id", supplied.get("requestId")),
+            market_hash_name=supplied.get("market_hash_name", supplied.get("marketHashName")),
             keyword=supplied.get("keyword"),
         )
 
@@ -825,6 +833,7 @@ class ProfitTradeEventLogger:
             "account_id": filters.get("account_id"),
             "trade_no": filters.get("trade_no"),
             "request_id": filters.get("request_id"),
+            "market_hash_name": filters.get("market_hash_name"),
         }
         keyword = str(filters.get("keyword") or "").strip().lower()
         for event in self._iter_events_newest_first():

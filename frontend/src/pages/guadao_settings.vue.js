@@ -12,6 +12,8 @@ const confirmSave = ref(false);
 const search = ref("");
 const suggestions = ref([]);
 const searching = ref(false);
+const searchHasMore = ref(false);
+const searchNextOffset = ref(0);
 let searchTimer = null;
 const ratioWarning = computed(() => Boolean(settings.value?.specialRules.some(rule => rule.enabled && rule.maxRatioPct > 75)));
 const validation = computed(() => { const s = settings.value; if (!s)
@@ -19,13 +21,15 @@ const validation = computed(() => { const s = settings.value; if (!s)
     errors.push("全局最大挂刀比例必须大于 0 且不超过 80%"); for (const rule of s.specialRules) {
     if (!rule.marketHashName.trim())
         errors.push("特殊规则缺少 marketHashName");
-    if (rule.maxRatioPct < s.global.maxListingRatioPct)
-        errors.push(`${rule.marketHashName} 的专用上限不能低于全局上限`);
+    if (!(rule.maxRatioPct > 0))
+        errors.push(`${rule.marketHashName} 的专用上限必须大于 0`);
     if (rule.maxRatioPct > 80)
         errors.push(`${rule.marketHashName} 的专用上限不能超过 80%`);
 } if (s.timePolicy.scanMinutes < 1)
     errors.push("完整扫描不得低于 1 分钟"); if (s.timePolicy.steamSyncSeconds < 30)
-    errors.push("普通 Steam 同步不得低于 30 秒"); if (s.timePolicy.actionConfirmSeconds.some(v => v < 2))
+    errors.push("普通 Steam 同步不得低于 30 秒"); if (s.timePolicy.steamSyncMaxStartLagSeconds < 1)
+    errors.push("Steam 同步最长等待不得低于 1 秒"); if (s.timePolicy.staleListedCheckHours < 1)
+    errors.push("老挂单候选扫描不得低于 1 小时"); if (s.timePolicy.actionConfirmSeconds.some(v => v < 2))
     errors.push("动作确认不得低于 2 秒"); if (s.timePolicy.soldEvidenceMinutes.some(v => v < 0))
     errors.push("卖出证据复核间隔不能为负数"); if (s.timePolicy.rebuyMinutes.some(v => v < .5) || s.timePolicy.deliveryMinutes.some(v => v < .5))
     errors.push("C5 复查不得低于 30 秒"); const sequences = [s.timePolicy.actionConfirmSeconds, s.timePolicy.soldEvidenceMinutes, s.timePolicy.rebuyMinutes, s.timePolicy.deliveryMinutes]; if (sequences.some(values => values.some((value, index) => index > 0 && value < values[index - 1])))
@@ -37,7 +41,7 @@ function durationLabel(seconds) { if (seconds == null)
     return `${seconds / 60} 分钟`; return `${seconds} 秒`; }
 function auditText(value) { if (value == null)
     return "—"; const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 120 ? `${text.slice(0, 117)}…` : text; }
-function adaptSettings(raw) { const task = (raw.taskSchedule && typeof raw.taskSchedule === "object" ? raw.taskSchedule : {}); const nestedGlobal = (raw.global && typeof raw.global === "object" ? raw.global : {}); const rules = (Array.isArray(raw.specialRules) ? raw.specialRules : Array.isArray(raw.specialCaseRatioRules) ? raw.specialCaseRatioRules : []); const audit = (Array.isArray(raw.audit) ? raw.audit : []); const tierMinutes = (key) => (Array.isArray(task[key]) ? task[key] : []).map(tier => numeric(tier.intervalSeconds) / 60); return { runtime: (raw.runtime || undefined), global: { maxListingRatioPct: nestedGlobal.maxListingRatioPct == null ? numeric(raw.guadaoMaxListingRatio) * 100 : numeric(nestedGlobal.maxListingRatioPct), steamNetFactorPct: nestedGlobal.steamNetFactorPct == null ? (raw.steamNetFactor == null ? null : numeric(raw.steamNetFactor) * 100) : numeric(nestedGlobal.steamNetFactorPct), maxNewListingsPerCycle: nestedGlobal.maxNewListingsPerCycle == null ? (raw.maxNewListingsPerCycle == null ? null : numeric(raw.maxNewListingsPerCycle)) : numeric(nestedGlobal.maxNewListingsPerCycle), caseMaxOpenCount: nestedGlobal.caseMaxOpenCount == null ? (raw.caseMaxOpenCount == null ? null : numeric(raw.caseMaxOpenCount)) : numeric(nestedGlobal.caseMaxOpenCount), autoListing: nestedGlobal.autoListing == null ? Boolean(raw.autoListEnabled) : Boolean(nestedGlobal.autoListing), autoRebuy: nestedGlobal.autoRebuy == null ? Boolean(raw.autoRebuyEnabled) : Boolean(nestedGlobal.autoRebuy), lastModifiedAt: String(nestedGlobal.lastModifiedAt || "") || null }, specialRules: rules.map(rule => ({ id: String(rule.id || rule.ruleId || ""), marketHashName: String(rule.marketHashName || ""), displayName: String(rule.displayName || rule.nameCn || "") || null, maxRatioPct: rule.maxRatioPct == null ? numeric(rule.maxListingRatio) * 100 : numeric(rule.maxRatioPct), currentRatioPct: rule.currentRatioPct == null ? null : numeric(rule.currentRatioPct), currentRatioObservedAt: String(rule.currentRatioObservedAt || "") || null, enabled: rule.enabled !== false, version: numeric(rule.version, 1), updatedAt: String(rule.updatedAt || "") || null })), timePolicy: { scanMinutes: numeric(task.scanIntervalSeconds) / 60, steamSyncSeconds: numeric(task.steamSyncIntervalSeconds), actionConfirmSeconds: (Array.isArray(task.actionConfirmationDelaysSeconds) ? task.actionConfirmationDelaysSeconds : []).map(value => numeric(value)), soldEvidenceMinutes: (Array.isArray(task.saleEvidenceDelaysSeconds) ? task.saleEvidenceDelaysSeconds : []).map(value => numeric(value) / 60), rebuyMinutes: tierMinutes("rebuyRetryTiers"), deliveryMinutes: tierMinutes("deliveryConfirmationTiers"), staleListedRecheckHours: raw.staleListedRecheckHours == null ? null : numeric(raw.staleListedRecheckHours), staleListedMaxRatioTolerancePct: raw.staleListedMaxRatioTolerancePct == null ? null : numeric(raw.staleListedMaxRatioTolerancePct) }, rawTaskSchedule: JSON.parse(JSON.stringify(task)), steamScheduler: (raw.steamScheduler || undefined), audit: audit.map(row => ({ id: String(row.id || ""), at: String(row.createdAt || row.at || ""), actor: String(row.actor || ""), summary: String(row.reason || row.summary || ""), changes: row.diff ? JSON.stringify(row.diff) : String(row.changes || ""), oldValue: row.oldValue, newValue: row.newValue, diff: row.diff })) }; }
+function adaptSettings(raw) { const task = (raw.taskSchedule && typeof raw.taskSchedule === "object" ? raw.taskSchedule : {}); const nestedGlobal = (raw.global && typeof raw.global === "object" ? raw.global : {}); const rules = (Array.isArray(raw.specialRules) ? raw.specialRules : Array.isArray(raw.specialCaseRatioRules) ? raw.specialCaseRatioRules : []); const audit = (Array.isArray(raw.audit) ? raw.audit : []); const tierMinutes = (key) => (Array.isArray(task[key]) ? task[key] : []).map(tier => numeric(tier.intervalSeconds) / 60); return { runtime: (raw.runtime || undefined), global: { maxListingRatioPct: nestedGlobal.maxListingRatioPct == null ? numeric(raw.guadaoMaxListingRatio) * 100 : numeric(nestedGlobal.maxListingRatioPct), steamNetFactorPct: nestedGlobal.steamNetFactorPct == null ? (raw.steamNetFactor == null ? null : numeric(raw.steamNetFactor) * 100) : numeric(nestedGlobal.steamNetFactorPct), maxNewListingsPerCycle: nestedGlobal.maxNewListingsPerCycle == null ? (raw.maxNewListingsPerCycle == null ? null : numeric(raw.maxNewListingsPerCycle)) : numeric(nestedGlobal.maxNewListingsPerCycle), caseMaxOpenCount: nestedGlobal.caseMaxOpenCount == null ? (raw.caseMaxOpenCount == null ? null : numeric(raw.caseMaxOpenCount)) : numeric(nestedGlobal.caseMaxOpenCount), autoListing: nestedGlobal.autoListing == null ? Boolean(raw.autoListEnabled) : Boolean(nestedGlobal.autoListing), autoRebuy: nestedGlobal.autoRebuy == null ? Boolean(raw.autoRebuyEnabled) : Boolean(nestedGlobal.autoRebuy), lastModifiedAt: String(nestedGlobal.lastModifiedAt || "") || null }, specialRules: rules.map(rule => ({ id: String(rule.id || rule.ruleId || ""), marketHashName: String(rule.marketHashName || ""), displayName: String(rule.displayName || rule.nameCn || "") || null, maxRatioPct: rule.maxRatioPct == null ? numeric(rule.maxListingRatio) * 100 : numeric(rule.maxRatioPct), currentRatioPct: rule.currentRatioPct == null ? null : numeric(rule.currentRatioPct), currentRatioObservedAt: String(rule.currentRatioObservedAt || "") || null, enabled: rule.enabled !== false, version: numeric(rule.version, 1), updatedAt: String(rule.updatedAt || "") || null })), timePolicy: { scanMinutes: numeric(task.scanIntervalSeconds) / 60, steamSyncSeconds: numeric(task.steamSyncIntervalSeconds), steamSyncMaxStartLagSeconds: numeric(task.steamSyncMaxStartLagSeconds, 60), staleListedCheckHours: numeric(task.staleListedCheckIntervalSeconds, 86400) / 3600, actionConfirmSeconds: (Array.isArray(task.actionConfirmationDelaysSeconds) ? task.actionConfirmationDelaysSeconds : []).map(value => numeric(value)), soldEvidenceMinutes: (Array.isArray(task.saleEvidenceDelaysSeconds) ? task.saleEvidenceDelaysSeconds : []).map(value => numeric(value) / 60), rebuyMinutes: tierMinutes("rebuyRetryTiers"), deliveryMinutes: tierMinutes("deliveryConfirmationTiers"), staleListedRecheckHours: raw.staleListedRecheckHours == null ? null : numeric(raw.staleListedRecheckHours), staleListedMaxRatioTolerancePct: raw.staleListedMaxRatioTolerancePct == null ? null : numeric(raw.staleListedMaxRatioTolerancePct) }, rawTaskSchedule: JSON.parse(JSON.stringify(task)), steamScheduler: (raw.steamScheduler || undefined), audit: audit.map(row => ({ id: String(row.id || ""), at: String(row.createdAt || row.at || ""), actor: String(row.actor || ""), summary: String(row.reason || row.summary || ""), changes: row.diff ? JSON.stringify(row.diff) : String(row.changes || ""), oldValue: row.oldValue, newValue: row.newValue, diff: row.diff })) }; }
 async function load() { loading.value = true; try {
     const response = await fetch("/api/guadao/settings", { cache: "no-store" });
     if (!response.ok)
@@ -54,7 +58,7 @@ finally {
 } }
 function changed() { dirty.value = true; notice.value = ""; }
 async function save() { if (!settings.value || validation.value.length)
-    return; const current = settings.value; const rawTask = { ...current.rawTaskSchedule, scanIntervalSeconds: current.timePolicy.scanMinutes * 60, steamSyncIntervalSeconds: current.timePolicy.steamSyncSeconds, actionConfirmationDelaysSeconds: current.timePolicy.actionConfirmSeconds, saleEvidenceDelaysSeconds: current.timePolicy.soldEvidenceMinutes.map(value => value * 60) }; const rebuyRaw = (Array.isArray(rawTask.rebuyRetryTiers) ? rawTask.rebuyRetryTiers : []); const deliveryRaw = (Array.isArray(rawTask.deliveryConfirmationTiers) ? rawTask.deliveryConfirmationTiers : []); rawTask.rebuyRetryTiers = current.timePolicy.rebuyMinutes.map((value, index) => ({ ...rebuyRaw[index], intervalSeconds: value * 60 })); rawTask.deliveryConfirmationTiers = current.timePolicy.deliveryMinutes.map((value, index) => ({ ...deliveryRaw[index], intervalSeconds: value * 60 })); const body = { guadaoMaxListingRatio: current.global.maxListingRatioPct / 100, autoListEnabled: current.global.autoListing, autoRebuyEnabled: current.global.autoRebuy, maxListPerCycle: current.global.maxNewListingsPerCycle, caseMaxOpenGuadaoCount: current.global.caseMaxOpenCount, staleListedRecheckHours: current.timePolicy.staleListedRecheckHours, staleListedMaxRatioTolerancePct: current.timePolicy.staleListedMaxRatioTolerancePct, specialCaseRatioRules: current.specialRules.map(rule => ({ ruleId: rule.id, version: rule.version, marketHashName: rule.marketHashName, nameCn: rule.displayName, maxListingRatio: rule.maxRatioPct / 100, enabled: rule.enabled })), taskSchedule: rawTask, confirmHighRatio: ratioWarning.value }; saving.value = true; try {
+    return; const current = settings.value; const rawTask = { ...current.rawTaskSchedule, scanIntervalSeconds: current.timePolicy.scanMinutes * 60, steamSyncIntervalSeconds: current.timePolicy.steamSyncSeconds, steamSyncMaxStartLagSeconds: current.timePolicy.steamSyncMaxStartLagSeconds, staleListedCheckIntervalSeconds: current.timePolicy.staleListedCheckHours * 3600, actionConfirmationDelaysSeconds: current.timePolicy.actionConfirmSeconds, saleEvidenceDelaysSeconds: current.timePolicy.soldEvidenceMinutes.map(value => value * 60) }; const rebuyRaw = (Array.isArray(rawTask.rebuyRetryTiers) ? rawTask.rebuyRetryTiers : []); const deliveryRaw = (Array.isArray(rawTask.deliveryConfirmationTiers) ? rawTask.deliveryConfirmationTiers : []); rawTask.rebuyRetryTiers = current.timePolicy.rebuyMinutes.map((value, index) => ({ ...rebuyRaw[index], intervalSeconds: value * 60 })); rawTask.deliveryConfirmationTiers = current.timePolicy.deliveryMinutes.map((value, index) => ({ ...deliveryRaw[index], intervalSeconds: value * 60 })); const body = { guadaoMaxListingRatio: current.global.maxListingRatioPct / 100, autoListEnabled: current.global.autoListing, autoRebuyEnabled: current.global.autoRebuy, maxListPerCycle: current.global.maxNewListingsPerCycle, caseMaxOpenGuadaoCount: current.global.caseMaxOpenCount, staleListedRecheckHours: current.timePolicy.staleListedRecheckHours, staleListedMaxRatioTolerancePct: current.timePolicy.staleListedMaxRatioTolerancePct, specialCaseRatioRules: current.specialRules.map(rule => ({ ruleId: rule.id, version: rule.version, marketHashName: rule.marketHashName, nameCn: rule.displayName, maxListingRatio: rule.maxRatioPct / 100, enabled: rule.enabled })), taskSchedule: rawTask, confirmHighRatio: ratioWarning.value }; saving.value = true; try {
     const response = await fetch("/api/guadao/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!response.ok)
         throw new Error(await responseError(response));
@@ -75,14 +79,29 @@ function requestSave() { if (validation.value.length) {
     return;
 } confirmSave.value = true; }
 watch(search, value => { if (searchTimer)
-    clearTimeout(searchTimer); suggestions.value = []; if (value.trim().length < 2)
+    clearTimeout(searchTimer); suggestions.value = []; searchHasMore.value = false; searchNextOffset.value = 0; if (value.trim().length < 2)
     return; searchTimer = setTimeout(() => void findItems(value.trim()), 300); });
-async function findItems(query) { searching.value = true; try {
-    const response = await fetch(`/api/guadao/items/search?q=${encodeURIComponent(query)}&limit=12`, { cache: "no-store" });
+async function findItems(query, append = false) { searching.value = true; try {
+    const offset = append ? searchNextOffset.value : 0;
+    const response = await fetch(`/api/guadao/items/search?q=${encodeURIComponent(query)}&limit=12&offset=${offset}`, { cache: "no-store" });
     if (!response.ok)
         throw new Error(await responseError(response));
     const payload = unwrapPayload(await response.json());
-    suggestions.value = Array.isArray(payload) ? payload : payload.items || [];
+    const incoming = Array.isArray(payload) ? payload : payload.items || [];
+    if (query !== search.value.trim())
+        return;
+    if (append) {
+        const merged = new Map(suggestions.value.map(item => [item.marketHashName, item]));
+        for (const item of incoming)
+            merged.set(item.marketHashName, item);
+        suggestions.value = [...merged.values()];
+    }
+    else
+        suggestions.value = incoming;
+    if (!Array.isArray(payload)) {
+        searchHasMore.value = Boolean(payload.pagination?.hasMore);
+        searchNextOffset.value = Number(payload.pagination?.nextOffset ?? 0);
+    }
 }
 catch (reason) {
     error.value = `物品搜索失败：${reason instanceof Error ? reason.message : String(reason)}`;
@@ -94,8 +113,9 @@ function addRule(item) { if (!settings.value)
     return; if (settings.value.specialRules.some(rule => rule.marketHashName === item.marketHashName)) {
     search.value = "";
     suggestions.value = [];
+    searchHasMore.value = false;
     return;
-} settings.value.specialRules.push({ marketHashName: item.marketHashName, displayName: item.displayName || item.nameCn || item.name || null, maxRatioPct: settings.value.global.maxListingRatioPct, enabled: true }); search.value = ""; suggestions.value = []; changed(); }
+} settings.value.specialRules.push({ marketHashName: item.marketHashName, displayName: item.displayName || item.nameCn || item.name || null, maxRatioPct: settings.value.global.maxListingRatioPct, enabled: true }); search.value = ""; suggestions.value = []; searchHasMore.value = false; changed(); }
 function removeRule(index) { settings.value?.specialRules.splice(index, 1); changed(); }
 onMounted(load);
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
@@ -175,6 +195,30 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['audit-table']} */ ;
 /** @type {__VLS_StyleScopedClasses['audit-table']} */ ;
 /** @type {__VLS_StyleScopedClasses['audit-table']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['multi']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['delivery-boundary-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['delivery-boundary-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['multi']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['delivery-boundary-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
@@ -379,6 +423,23 @@ if (__VLS_ctx.settings) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
             (item.marketHashName);
         }
+        if (__VLS_ctx.searchHasMore) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.settings))
+                            return;
+                        if (!(__VLS_ctx.suggestions.length))
+                            return;
+                        if (!(__VLS_ctx.searchHasMore))
+                            return;
+                        __VLS_ctx.findItems(__VLS_ctx.search.trim(), true);
+                    } },
+                ...{ class: "catalog-load-more" },
+                type: "button",
+                disabled: (__VLS_ctx.searching),
+            });
+            (__VLS_ctx.searching ? "加载中…" : "加载更多结果");
+        }
     }
     if (__VLS_ctx.settings.specialRules.length) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
@@ -424,7 +485,7 @@ if (__VLS_ctx.settings) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
                 ...{ onInput: (__VLS_ctx.changed) },
                 type: "number",
-                min: (__VLS_ctx.settings.global.maxListingRatioPct),
+                min: "0.01",
                 max: "80",
                 step: "0.01",
             });
@@ -506,6 +567,16 @@ if (__VLS_ctx.settings) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
+        ...{ onInput: (__VLS_ctx.changed) },
+        min: "1",
+        type: "number",
+    });
+    (__VLS_ctx.settings.timePolicy.steamSyncMaxStartLagSeconds);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "multi" },
     });
@@ -569,6 +640,16 @@ if (__VLS_ctx.settings) {
         (__VLS_ctx.settings.timePolicy.deliveryMinutes[index]);
     }
     __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
+        ...{ onInput: (__VLS_ctx.changed) },
+        min: "1",
+        type: "number",
+    });
+    (__VLS_ctx.settings.timePolicy.staleListedCheckHours);
     __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -820,6 +901,7 @@ if (__VLS_ctx.confirmSave) {
 /** @type {__VLS_StyleScopedClasses['card-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['item-search']} */ ;
 /** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 /** @type {__VLS_StyleScopedClasses['rules-table']} */ ;
 /** @type {__VLS_StyleScopedClasses['rule-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['rule-row']} */ ;
@@ -878,6 +960,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             search: search,
             suggestions: suggestions,
             searching: searching,
+            searchHasMore: searchHasMore,
             ratioWarning: ratioWarning,
             validation: validation,
             durationLabel: durationLabel,
@@ -886,6 +969,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             changed: changed,
             save: save,
             requestSave: requestSave,
+            findItems: findItems,
             addRule: addRule,
             removeRule: removeRule,
         };

@@ -1,6 +1,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import FolioIcon from "../components/FolioIcon.vue";
+import { formatProfitTradePercentagePoints } from "../components/profit_trade_roi_format";
 const steps = [
     { key: "discovered", label: "发现机会", index: 0 }, { key: "audited", label: "审计", index: 1 },
     { key: "asset_locked", label: "锁定 A", index: 2 }, { key: "steam_bought", label: "买入 B", index: 3 },
@@ -31,6 +32,7 @@ const acknowledgeReason = ref("");
 const actionBusy = ref(false);
 const actionMessage = ref("");
 const listingsCircuit = ref({ status: "closed", isBlocking: false });
+const listingsCooling = computed(() => listingsCircuit.value.status === "open");
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 function stepCount(index) {
     return Number(stepCounts.value.find(item => Number(item.stepIndex) === index)?.count) || 0;
@@ -56,7 +58,7 @@ function apiTime(value) {
 function pct(value) {
     if (typeof value !== "number" || !Number.isFinite(value))
         return "-";
-    return `${(Math.abs(value) <= 1 ? value * 100 : value).toFixed(2)}%`;
+    return formatProfitTradePercentagePoints(value);
 }
 function money(value) {
     return typeof value === "number" && Number.isFinite(value) ? `¥${value.toFixed(2)}` : "-";
@@ -90,6 +92,37 @@ function evidenceLabel(trade, field) {
     if (field === "purchaseRequestSent")
         return resolved ? "已发送" : "未发送";
     return resolved ? "已取得" : "未取得";
+}
+function crossedObserved(trade) {
+    return trade.steamOrderbookEvidence?.crossedObserved === true;
+}
+function orderbookSnapshots(trade) {
+    return Array.isArray(trade.steamOrderbookEvidence?.snapshots)
+        ? trade.steamOrderbookEvidence.snapshots
+        : [];
+}
+function stageLabel(stage) {
+    return {
+        scan: "扫描发现", pre_buy: "购买前",
+        after_listings_400: "listings 400 后重查",
+        after_listings_429: "listings 429 后重查",
+        buy_retry: "求购重试前", account_change: "切换账号后",
+    }[String(stage || "")] || String(stage || "盘口快照");
+}
+function eventLabel(event) {
+    return {
+        created: "流水创建", transition: "状态推进",
+        orderbook_snapshot: "Steam 盘口快照",
+        steam_purchase_requested: "Steam 购买请求已发送",
+        steam_purchase_request_returned: "Steam 购买请求已返回",
+        steam_buy_order_cancelled: "Steam 求购已撤销",
+        historical_snapshot: "历史状态快照",
+    }[String(event.eventType || "")]
+        || event.eventType
+        || (event.isSnapshot ? "历史快照" : "状态迁移");
+}
+function eventOrderbook(event) {
+    return event.context?.steamOrderbook || null;
 }
 function isListings429Interruption(trade) {
     const source = String(trade.cancelSource || trade.note?.cancelSource || "").toLowerCase();
@@ -262,6 +295,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['detail-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['log-link']} */ ;
+/** @type {__VLS_StyleScopedClasses['crossed-warning']} */ ;
 /** @type {__VLS_StyleScopedClasses['process']} */ ;
 /** @type {__VLS_StyleScopedClasses['process']} */ ;
 /** @type {__VLS_StyleScopedClasses['process']} */ ;
@@ -276,6 +310,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-heading']} */ ;
@@ -420,7 +461,7 @@ if (__VLS_ctx.actionMessage) {
     });
     (__VLS_ctx.actionMessage);
 }
-if (__VLS_ctx.listingsCircuit.isBlocking) {
+if (__VLS_ctx.listingsCooling) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
         ...{ class: "interruption-circuit" },
     });
@@ -439,7 +480,7 @@ if (__VLS_ctx.listingsCircuit.isBlocking) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-    (__VLS_ctx.time(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
+    (__VLS_ctx.time(__VLS_ctx.listingsCircuit.cooldownUntil));
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "master-detail" },
@@ -498,6 +539,11 @@ else {
         if (trade.acknowledged) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
         }
+        if (__VLS_ctx.crossedObserved(trade)) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: "crossed-warning compact" },
+            });
+        }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
         (__VLS_ctx.reason(trade));
     }
@@ -544,6 +590,11 @@ else {
     (__VLS_ctx.statusLabel(__VLS_ctx.selected.status));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     (__VLS_ctx.selected.stepIndex + 1);
+    if (__VLS_ctx.crossedObserved(__VLS_ctx.selected)) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+            ...{ class: "crossed-warning" },
+        });
+    }
     if (__VLS_ctx.selected.acknowledged) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     }
@@ -635,14 +686,42 @@ else {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
     (__VLS_ctx.evidenceLabel(__VLS_ctx.selected, "purchaseRequestSent"));
+    if (__VLS_ctx.orderbookSnapshots(__VLS_ctx.selected).length) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+            ...{ class: "orderbook-evidence" },
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "orderbook-grid" },
+        });
+        for (const [snapshot, index] of __VLS_getVForSourceType((__VLS_ctx.orderbookSnapshots(__VLS_ctx.selected)))) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+                key: (`${snapshot.stage}-${snapshot.observedAt}-${index}`),
+                ...{ class: ({ crossed: snapshot.crossed }) },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+            (__VLS_ctx.stageLabel(snapshot.stage));
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
+            (__VLS_ctx.time(snapshot.observedAt));
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+            (__VLS_ctx.money(snapshot.sellerFloorPrice));
+            (__VLS_ctx.money(snapshot.buyerMaxPrice));
+            if (snapshot.crossed) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            }
+        }
+    }
     if (__VLS_ctx.isListings429Interruption(__VLS_ctx.selected)) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
             ...{ class: "listings-evidence" },
         });
         __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-        if (__VLS_ctx.listingsCircuit.isBlocking) {
+        if (__VLS_ctx.listingsCooling) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-            (__VLS_ctx.time(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
+            (__VLS_ctx.time(__VLS_ctx.listingsCircuit.cooldownUntil));
         }
         else {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -684,16 +763,26 @@ else {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
             __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
             __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-            (event.eventType || (event.isSnapshot ? "历史快照" : "状态迁移"));
+            (__VLS_ctx.eventLabel(event));
             __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
             (__VLS_ctx.time(event.createdAt));
-            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
-            (event.statusFrom || "-");
-            (event.statusTo || "-");
-            (event.stepKeyFrom || "-");
-            (event.stepKeyTo || "-");
+            if (__VLS_ctx.eventOrderbook(event)) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+                (__VLS_ctx.money(__VLS_ctx.eventOrderbook(event)?.sellerFloorPrice));
+                (__VLS_ctx.money(__VLS_ctx.eventOrderbook(event)?.buyerMaxPrice));
+                (__VLS_ctx.stageLabel(event.context?.stage));
+            }
+            else {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+                (event.statusFrom || "-");
+                (event.statusTo || "-");
+                (event.stepKeyFrom || "-");
+                (event.stepKeyTo || "-");
+            }
             __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
             (event.reason || "未记录补充原因");
+            if (event.isProjected) {
+            }
         }
     }
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
@@ -760,6 +849,8 @@ else {
 /** @type {__VLS_StyleScopedClasses['empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-item-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-line']} */ ;
+/** @type {__VLS_StyleScopedClasses['crossed-warning']} */ ;
+/** @type {__VLS_StyleScopedClasses['compact']} */ ;
 /** @type {__VLS_StyleScopedClasses['list-pagination']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
@@ -767,9 +858,12 @@ else {
 /** @type {__VLS_StyleScopedClasses['large']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['detail-badges']} */ ;
+/** @type {__VLS_StyleScopedClasses['crossed-warning']} */ ;
 /** @type {__VLS_StyleScopedClasses['log-link']} */ ;
 /** @type {__VLS_StyleScopedClasses['process']} */ ;
 /** @type {__VLS_StyleScopedClasses['stop-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-evidence']} */ ;
+/** @type {__VLS_StyleScopedClasses['orderbook-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['listings-evidence']} */ ;
 /** @type {__VLS_StyleScopedClasses['timeline']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-heading']} */ ;
@@ -806,6 +900,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             actionBusy: actionBusy,
             actionMessage: actionMessage,
             listingsCircuit: listingsCircuit,
+            listingsCooling: listingsCooling,
             totalPages: totalPages,
             stepCount: stepCount,
             statusLabel: statusLabel,
@@ -816,6 +911,11 @@ const __VLS_self = (await import('vue')).defineComponent({
             reason: reason,
             note: note,
             evidenceLabel: evidenceLabel,
+            crossedObserved: crossedObserved,
+            orderbookSnapshots: orderbookSnapshots,
+            stageLabel: stageLabel,
+            eventLabel: eventLabel,
+            eventOrderbook: eventOrderbook,
             isListings429Interruption: isListings429Interruption,
             load: load,
             search: search,

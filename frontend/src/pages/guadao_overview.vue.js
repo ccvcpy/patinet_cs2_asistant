@@ -1,4 +1,4 @@
-import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import FolioIcon from "../components/FolioIcon.vue";
 import { formatCountdown, formatLocal, responseError, unwrapPayload } from "./guadao_shared";
@@ -8,6 +8,8 @@ const actionBusy = ref(false);
 const error = ref("");
 const notice = ref("");
 const confirmAction = ref(null);
+const cookieExpanded = ref(false);
+const expandedScanAt = ref(null);
 let timer = null;
 const runtime = computed(() => dashboard.value?.runtime || {});
 const cookieGate = computed(() => dashboard.value?.steamAuthHealth || dashboard.value?.cookieGate || {});
@@ -15,6 +17,7 @@ const cookieAccounts = computed(() => cookieGate.value.accounts || []);
 const enabled = computed(() => Boolean(runtime.value.enabled));
 const gateReady = computed(() => (cookieGate.value.totalCount || 0) > 0 && cookieGate.value.validCount === cookieGate.value.totalCount);
 const failedCookieAccounts = computed(() => cookieAccounts.value.filter(account => !account.valid && account.status !== "refreshing"));
+const cookieHealthy = computed(() => gateReady.value && failedCookieAccounts.value.length === 0 && cookieGate.value.status !== "degraded");
 const cookieProgress = computed(() => {
     const total = Number(cookieGate.value.totalCount || 0);
     return total > 0 ? Math.min(100, Math.max(0, Number(cookieGate.value.validCount || 0) / total * 100)) : 0;
@@ -45,11 +48,53 @@ const runtimeMessage = computed(() => {
 const quietWindow = computed(() => (dashboard.value?.steamScheduler?.circuits || []).find(row => row.scope === "quiet" && row.state === "open"));
 const activeCircuits = computed(() => (dashboard.value?.steamScheduler?.circuits || []).filter(row => row.scope !== "quiet" && (row.state === "open" || row.state === "half_open")));
 const routeCooldownUntil = computed(() => activeCircuits.value.map(row => row.nextProbeAt || row.cooldownUntil).filter(Boolean).sort()[0] || null);
+watch(cookieHealthy, healthy => {
+    if (!healthy)
+        cookieExpanded.value = true;
+});
+function scanDecisionLabel(value) {
+    if (value === "executable_candidate")
+        return "可执行候选";
+    if (value === "ratio_above_limit")
+        return "比例高于上限";
+    if (value === "no_local_executable_asset")
+        return "本地无可执行资产";
+    if (value === "waiting_existing_cycle")
+        return "等待旧流水闭环";
+    if (value === "queue_deferred")
+        return "Steam 队列顺延";
+    if (value === "steam_price_missing")
+        return "Steam 卖盘确实缺价";
+    if (value === "c5_price_missing")
+        return "C5 补仓价缺失";
+    if (value === "request_failed")
+        return "行情请求失败";
+    if (value === "market_state_missing")
+        return "行情状态缺失";
+    if (value === "steam_price_not_orderbook")
+        return "非官方 Steam 价格";
+    if (value === "below_min_price")
+        return "低于扫描下限";
+    if (value === "calculation_failed")
+        return "指标计算失败";
+    return value || "未分类";
+}
+function accountInventoryLabel(item) {
+    const rows = item.accountInventory || [];
+    if (!rows.length)
+        return "无";
+    return rows.map(row => `${row.accountName || "未命名"} ${row.count || 0}件`).join("、");
+}
+function scanNotEvaluatedCount(round) {
+    if (round.notEvaluatedCount != null)
+        return Number(round.notEvaluatedCount);
+    return Number(round.missingPriceCount || 0);
+}
 const confirmCopy = computed(() => {
     if (confirmAction.value === "enable")
         return { title: "开启挂刀执行器", text: "后端将先刷新并验证全部 Steam 账号 Cookie。只有达到全部有效后，才会开放新扫描与新挂刀。", button: "确认开启" };
     if (confirmAction.value === "disable")
-        return { title: "关闭挂刀执行器", text: "关闭后停止新扫描、新上架和新的非必要动作；已有挂单同步、卖出确认、补仓、C5 发货确认和结算仍会继续，并可能产生真实 Steam/C5 写操作。", button: "确认关闭" };
+        return { title: "关闭挂刀执行器", text: "关闭后停止新扫描、新上架和新的非必要动作；已有挂单同步、卖出确认、补仓证据复核、已购待收货确认和结算仍会继续，并可能产生真实 Steam/C5 写操作。", button: "确认关闭" };
     if (confirmAction.value === "retry-auth")
         return { title: "立即重试失败账号", text: "只把当前认证失败或网络状态未知的账号重新排到 Steam Cookie 恢复队列；不会刷新已经有效的账号，也不会绕过共享 Steam 请求调度。", button: "确认重试" };
     return { title: "刷新全部 Steam Cookie", text: "这会为全部本地 Steam 账号重新建立认证刷新批次，并通过共享请求调度依次执行。期间新扫描和新上架仍服从 Cookie 门禁。", button: "确认全部刷新" };
@@ -201,6 +246,38 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['log-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['log-preview']} */ ;
 /** @type {__VLS_StyleScopedClasses['error']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['upcoming-tasks']} */ ;
+/** @type {__VLS_StyleScopedClasses['upcoming-tasks']} */ ;
+/** @type {__VLS_StyleScopedClasses['task-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-rounds']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scheduler-layout']} */ ;
+/** @type {__VLS_StyleScopedClasses['circuit-section']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
@@ -324,7 +401,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElement
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+(__VLS_ctx.dashboard?.summary?.pendingListingConfirmations ?? "—");
+__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
 (__VLS_ctx.dashboard?.summary?.pendingRebuys ?? "—");
+__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+(__VLS_ctx.dashboard?.summary?.c5EvidencePending ?? "—");
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -341,11 +426,13 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElemen
     ...{ class: "panel cookie-panel" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "section-title" },
+    ...{ class: "section-title cookie-title" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+(__VLS_ctx.cookieHealthy ? "全部账号有效，详情已折叠" : "存在准备中或异常账号，详情已展开");
+(__VLS_ctx.formatLocal(__VLS_ctx.cookieGate.lastCompletedAt));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "cookie-summary" },
 });
@@ -392,72 +479,142 @@ const __VLS_10 = __VLS_9({
     name: "refresh",
     size: (14),
 }, ...__VLS_functionalComponentArgsRest(__VLS_9));
-if (__VLS_ctx.cookieAccounts.length) {
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.cookieExpanded = !__VLS_ctx.cookieExpanded;
+        } },
+    ...{ class: "fold-button" },
+    type: "button",
+    'aria-expanded': (__VLS_ctx.cookieExpanded),
+    'aria-controls': "cookie-health-detail",
+});
+(__VLS_ctx.cookieExpanded ? "收起详情" : "展开详情");
+/** @type {[typeof FolioIcon, ]} */ ;
+// @ts-ignore
+const __VLS_12 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+    name: (__VLS_ctx.cookieExpanded ? 'chevron-up' : 'chevron-down'),
+    size: (14),
+}));
+const __VLS_13 = __VLS_12({
+    name: (__VLS_ctx.cookieExpanded ? 'chevron-up' : 'chevron-down'),
+    size: (14),
+}, ...__VLS_functionalComponentArgsRest(__VLS_12));
+if (__VLS_ctx.cookieExpanded) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "table-wrap" },
+        id: "cookie-health-detail",
+        ...{ class: "cookie-detail" },
     });
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.table, __VLS_intrinsicElements.table)({
-        ...{ class: "data-table cookie-table" },
+    if (__VLS_ctx.cookieAccounts.length) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "table-wrap" },
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.table, __VLS_intrinsicElements.table)({
+            ...{ class: "data-table cookie-table" },
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.thead, __VLS_intrinsicElements.thead)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.tr, __VLS_intrinsicElements.tr)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.tbody, __VLS_intrinsicElements.tbody)({});
+        for (const [account] of __VLS_getVForSourceType((__VLS_ctx.cookieAccounts))) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.tr, __VLS_intrinsicElements.tr)({
+                key: (account.accountId || account.steamId),
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            (account.accountName || account.name || "未命名");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({
+                ...{ class: "mono" },
+            });
+            (account.steamId || "—");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: (['pill', account.valid ? 'success' : account.status === 'unknown' ? 'neutral' : 'warning']) },
+            });
+            (account.valid ? "有效" : account.status || "未知");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            (__VLS_ctx.formatLocal(account.lastCheckedAt));
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({
+                ...{ class: ({ 'danger-text': account.error }) },
+            });
+            (account.error || account.lastResult || "—");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            (account.failureCount || 0);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            (account.nextRetryAt ? __VLS_ctx.formatCountdown(account.nextRetryAt) : "运行中监测");
+        }
+    }
+    else {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "empty-state" },
+        });
+        (__VLS_ctx.loading ? "正在读取 Cookie 健康状态…" : "后端暂未返回账号 Cookie 状态。");
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "cookie-legend" },
     });
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.thead, __VLS_intrinsicElements.thead)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.tr, __VLS_intrinsicElements.tr)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.tbody, __VLS_intrinsicElements.tbody)({});
-    for (const [account] of __VLS_getVForSourceType((__VLS_ctx.cookieAccounts))) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.tr, __VLS_intrinsicElements.tr)({
-            key: (account.accountId || account.steamId),
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+    ...{ class: "panel execution-panel" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "section-title" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+    ...{ class: "panel-count" },
+});
+(__VLS_ctx.dashboard?.recentTaskRuns?.length || 0);
+if (__VLS_ctx.dashboard?.recentTaskRuns?.length) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "execution-scroll" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "run-head" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    for (const [run] of __VLS_getVForSourceType((__VLS_ctx.dashboard.recentTaskRuns))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            key: (run.id),
         });
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
-        (account.accountName || account.name || "未命名");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({
-            ...{ class: "mono" },
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
+        (__VLS_ctx.formatLocal(run.completedAt));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (run.label || run.taskType || "未命名任务");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        ([run.accountName, run.marketHashName, run.operationId ? `GD-${run.operationId}` : ""].filter(Boolean).join(" · ") || "全局");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+        (run.error || run.summary || "任务已完成");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({
+            ...{ class: (run.ok ? 'success-text' : 'danger-text') },
         });
-        (account.steamId || "—");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
-            ...{ class: (['pill', account.valid ? 'success' : account.status === 'unknown' ? 'neutral' : 'warning']) },
-        });
-        (account.valid ? "有效" : account.status || "未知");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
-        (__VLS_ctx.formatLocal(account.lastCheckedAt));
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({
-            ...{ class: ({ 'danger-text': account.error }) },
-        });
-        (account.error || account.lastResult || "—");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
-        (account.nextRetryAt ? __VLS_ctx.formatCountdown(account.nextRetryAt) : "运行中监测");
+        (run.ok ? "完成" : "失败");
     }
 }
 else {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "empty-state" },
     });
-    (__VLS_ctx.loading ? "正在读取 Cookie 健康状态…" : "后端暂未返回账号 Cookie 状态。");
 }
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "cookie-legend" },
+__VLS_asFunctionalElement(__VLS_intrinsicElements.details, __VLS_intrinsicElements.details)({
+    ...{ class: "upcoming-tasks" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
-    ...{ class: "two-column" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
-    ...{ class: "panel" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "section-title compact" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.summary, __VLS_intrinsicElements.summary)({});
+(__VLS_ctx.dashboard?.taskQueue?.length || 0);
 if (__VLS_ctx.dashboard?.taskQueue?.length) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "task-list" },
@@ -470,7 +627,7 @@ if (__VLS_ctx.dashboard?.taskQueue?.length) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    for (const [task] of __VLS_getVForSourceType((__VLS_ctx.dashboard.taskQueue.slice(0, 8)))) {
+    for (const [task] of __VLS_getVForSourceType((__VLS_ctx.dashboard.taskQueue))) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             key: (task.id),
         });
@@ -488,7 +645,255 @@ if (__VLS_ctx.dashboard?.taskQueue?.length) {
 }
 else {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "empty-state small" },
+    });
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+    ...{ class: "panel scan-panel" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "section-title" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+    ...{ class: "panel-count" },
+});
+(__VLS_ctx.dashboard?.scanRounds?.length || 0);
+if (__VLS_ctx.dashboard?.scanRounds?.length) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "scan-rounds" },
+    });
+    for (const [round] of __VLS_getVForSourceType((__VLS_ctx.dashboard.scanRounds))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+            key: (round.generatedAt),
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.dashboard?.scanRounds?.length))
+                        return;
+                    __VLS_ctx.expandedScanAt = __VLS_ctx.expandedScanAt === round.generatedAt ? null : (round.generatedAt || null);
+                } },
+            ...{ class: "scan-round-summary" },
+            type: "button",
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
+        (__VLS_ctx.formatLocal(round.generatedAt));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (round.evaluatedCount || 0);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (round.candidateCount || 0);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (round.executableCount || 0);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (__VLS_ctx.scanNotEvaluatedCount(round));
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+        (round.listedCount || 0);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({
+            ...{ class: (round.blockedByOpenCycle ? 'warning-text' : 'success-text') },
+        });
+        (round.blockedByOpenCycle ? "等待旧流水" : "扫描完成");
+        /** @type {[typeof FolioIcon, ]} */ ;
+        // @ts-ignore
+        const __VLS_15 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+            name: (__VLS_ctx.expandedScanAt === round.generatedAt ? 'chevron-up' : 'chevron-down'),
+            size: (15),
+        }));
+        const __VLS_16 = __VLS_15({
+            name: (__VLS_ctx.expandedScanAt === round.generatedAt ? 'chevron-up' : 'chevron-down'),
+            size: (15),
+        }, ...__VLS_functionalComponentArgsRest(__VLS_15));
+        if (__VLS_ctx.expandedScanAt === round.generatedAt) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                ...{ class: "scan-detail" },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                ...{ class: "scan-meta" },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            (round.inventorySource || "未知");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            (round.poolTypeCount || 0);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            (round.outcomeCounts ? "真实缺价" : "历史缺价计数");
+            (round.missingPriceCount || 0);
+            if (round.outcomeCounts) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                (round.queueDeferredCount || 0);
+            }
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            (round.globalMaxListingRatioPct?.toFixed(2) || "—");
+            for (const [count, reason] of __VLS_getVForSourceType((round.decisionCounts))) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                    key: (reason),
+                });
+                (__VLS_ctx.scanDecisionLabel(reason));
+                (count);
+            }
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                ...{ class: "scan-items" },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                ...{ class: "scan-item-head" },
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+            for (const [item] of __VLS_getVForSourceType((round.items))) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+                    key: (item.marketHashName),
+                });
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+                (item.name || item.marketHashName);
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                (item.marketHashName);
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                (item.steamListPrice?.toFixed(2) || "—");
+                (item.steamNetAmount?.toFixed(2) || "—");
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                (item.c5RebuyPrice?.toFixed(2) || "—");
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+                (item.listingRatioPct?.toFixed(2) || "—");
+                (item.maxListingRatioPct?.toFixed(2) || "—");
+                if (item.decision === 'executable_candidate' || item.decision === 'ratio_above_limit' || item.decision === 'no_local_executable_asset' || item.decision === 'waiting_existing_cycle') {
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+                    (item.c5TradableCount || 0);
+                    (item.localExecutableCount || 0);
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                    (__VLS_ctx.accountInventoryLabel(item));
+                }
+                else {
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                        ...{ class: "muted-text" },
+                    });
+                    (item.requestSent === false ? "未发送 Steam HTTP" : "行情阶段");
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                    (item.stage || "—");
+                }
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                    ...{ class: "scan-result" },
+                });
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({
+                    ...{ class: (item.decision === 'executable_candidate' ? 'success-text' : (item.decision === 'request_failed' || item.decision === 'market_state_missing' ? 'danger-text' : 'muted-text')) },
+                });
+                (__VLS_ctx.scanDecisionLabel(item.decision));
+                if (item.reason) {
+                    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                    (item.reason);
+                }
+            }
+            if (round.itemsTruncated) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+                    ...{ class: "scan-truncated" },
+                });
+            }
+        }
+    }
+}
+else {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "empty-state" },
+    });
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+    ...{ class: "overview-two-column" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+    ...{ class: "panel mini-panel special-rules-panel" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "section-title compact" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+const __VLS_18 = {}.RouterLink;
+/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
+// @ts-ignore
+const __VLS_19 = __VLS_asFunctionalComponent(__VLS_18, new __VLS_18({
+    to: "/guadao/settings",
+}));
+const __VLS_20 = __VLS_19({
+    to: "/guadao/settings",
+}, ...__VLS_functionalComponentArgsRest(__VLS_19));
+__VLS_21.slots.default;
+var __VLS_21;
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+    ...{ class: "global-ratio" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+(__VLS_ctx.dashboard?.settingsSummary?.guadaoMaxListingRatio == null ? "—" : `${(__VLS_ctx.dashboard.settingsSummary.guadaoMaxListingRatio * 100).toFixed(2)}%`);
+if (__VLS_ctx.dashboard?.specialRules?.length) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "mini-list" },
+    });
+    for (const [rule] of __VLS_getVForSourceType((__VLS_ctx.dashboard.specialRules.slice(0, 4)))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            key: (rule.id),
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        (rule.displayName || rule.marketHashName);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        (rule.currentRatioPct == null ? "最近观测 —" : `最近观测 ${rule.currentRatioPct.toFixed(2)}% · ${__VLS_ctx.formatLocal(rule.currentRatioObservedAt)}`);
+        (rule.enabled === false ? "已停用" : "专用规则");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (rule.maxRatioPct?.toFixed(2));
+    }
+}
+else {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "empty-state small" },
+    });
+}
+__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+    ...{ class: "panel mini-panel" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "section-title compact" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+const __VLS_22 = {}.RouterLink;
+/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
+// @ts-ignore
+const __VLS_23 = __VLS_asFunctionalComponent(__VLS_22, new __VLS_22({
+    to: "/guadao/issues",
+}));
+const __VLS_24 = __VLS_23({
+    to: "/guadao/issues",
+}, ...__VLS_functionalComponentArgsRest(__VLS_23));
+__VLS_25.slots.default;
+var __VLS_25;
+if (__VLS_ctx.dashboard?.issues?.length) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "mini-list" },
+    });
+    for (const [issue] of __VLS_getVForSourceType((__VLS_ctx.dashboard.issues.slice(0, 3)))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            key: (issue.id || issue.issueId),
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        (issue.title || issue.issueType || issue.reason || issue.status || "待处理问题");
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (issue.severity || issue.status || "待处理");
+    }
+}
+else {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "empty-state small" },
     });
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
@@ -500,10 +905,27 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "scheduler-heading-actions" },
+});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: (['pill', __VLS_ctx.dashboard?.steamScheduler?.status === 'healthy' ? 'success' : 'neutral']) },
 });
 (__VLS_ctx.dashboard?.steamScheduler?.status || "状态未知");
+const __VLS_26 = {}.RouterLink;
+/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
+// @ts-ignore
+const __VLS_27 = __VLS_asFunctionalComponent(__VLS_26, new __VLS_26({
+    to: "/guadao/logs?includeSteamScheduler=true",
+}));
+const __VLS_28 = __VLS_27({
+    to: "/guadao/logs?includeSteamScheduler=true",
+}, ...__VLS_functionalComponentArgsRest(__VLS_27));
+__VLS_29.slots.default;
+var __VLS_29;
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "scheduler-layout" },
+});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({
     ...{ class: "scheduler-summary" },
 });
@@ -523,6 +945,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
 (__VLS_ctx.formatLocal(__VLS_ctx.routeCooldownUntil));
+__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "quiet-window-state" },
 });
@@ -596,141 +1019,6 @@ if (__VLS_ctx.activeCircuits.length) {
         (__VLS_ctx.formatLocal(row.nextProbeAt));
     }
 }
-__VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
-    ...{ class: "three-column" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
-    ...{ class: "panel mini-panel special-rules-panel" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "section-title compact" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-const __VLS_12 = {}.RouterLink;
-/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
-// @ts-ignore
-const __VLS_13 = __VLS_asFunctionalComponent(__VLS_12, new __VLS_12({
-    to: "/guadao/settings",
-}));
-const __VLS_14 = __VLS_13({
-    to: "/guadao/settings",
-}, ...__VLS_functionalComponentArgsRest(__VLS_13));
-__VLS_15.slots.default;
-var __VLS_15;
-__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
-    ...{ class: "global-ratio" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-(__VLS_ctx.dashboard?.settingsSummary?.guadaoMaxListingRatio == null ? "—" : `${(__VLS_ctx.dashboard.settingsSummary.guadaoMaxListingRatio * 100).toFixed(2)}%`);
-if (__VLS_ctx.dashboard?.specialRules?.length) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "mini-list" },
-    });
-    for (const [rule] of __VLS_getVForSourceType((__VLS_ctx.dashboard.specialRules.slice(0, 4)))) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-            key: (rule.id),
-        });
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-        (rule.displayName || rule.marketHashName);
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
-        (rule.currentRatioPct == null ? "最近观测 —" : `最近观测 ${rule.currentRatioPct.toFixed(2)}% · ${__VLS_ctx.formatLocal(rule.currentRatioObservedAt)}`);
-        (rule.enabled === false ? "已停用" : "专用规则");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-        (rule.maxRatioPct?.toFixed(2));
-    }
-}
-else {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "empty-state small" },
-    });
-}
-__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
-    ...{ class: "panel mini-panel" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "section-title compact" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-const __VLS_16 = {}.RouterLink;
-/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
-// @ts-ignore
-const __VLS_17 = __VLS_asFunctionalComponent(__VLS_16, new __VLS_16({
-    to: "/guadao/issues",
-}));
-const __VLS_18 = __VLS_17({
-    to: "/guadao/issues",
-}, ...__VLS_functionalComponentArgsRest(__VLS_17));
-__VLS_19.slots.default;
-var __VLS_19;
-if (__VLS_ctx.dashboard?.issues?.length) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "mini-list" },
-    });
-    for (const [issue] of __VLS_getVForSourceType((__VLS_ctx.dashboard.issues.slice(0, 3)))) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-            key: (issue.id || issue.issueId),
-        });
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-        (issue.title || issue.issueType || issue.reason || issue.status || "待处理问题");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-        (issue.severity || issue.status || "待处理");
-    }
-}
-else {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "empty-state small" },
-    });
-}
-__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
-    ...{ class: "panel mini-panel" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "section-title compact" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-const __VLS_20 = {}.RouterLink;
-/** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
-// @ts-ignore
-const __VLS_21 = __VLS_asFunctionalComponent(__VLS_20, new __VLS_20({
-    to: "/guadao/logs",
-}));
-const __VLS_22 = __VLS_21({
-    to: "/guadao/logs",
-}, ...__VLS_functionalComponentArgsRest(__VLS_21));
-__VLS_23.slots.default;
-var __VLS_23;
-if (__VLS_ctx.dashboard?.recentLogs?.length) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "log-preview" },
-    });
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "log-head" },
-    });
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    for (const [log] of __VLS_getVForSourceType((__VLS_ctx.dashboard.recentLogs.slice(0, 4)))) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-            key: (log.id),
-        });
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
-        (__VLS_ctx.formatLocal(log.timestamp));
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-        (log.operation || log.service);
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-        (log.accountName || log.marketHashName || log.message);
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({
-            ...{ class: ({ error: (log.httpStatus || 0) >= 400 }) },
-        });
-        (log.httpStatus || "—");
-    }
-}
-else {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ class: "empty-state small" },
-    });
-}
 if (__VLS_ctx.confirmAction) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ onClick: (...[$event]) => {
@@ -750,14 +1038,14 @@ if (__VLS_ctx.confirmAction) {
     });
     /** @type {[typeof FolioIcon, ]} */ ;
     // @ts-ignore
-    const __VLS_24 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+    const __VLS_30 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
         name: (__VLS_ctx.confirmAction === 'disable' ? 'warning' : 'shield'),
         size: (22),
     }));
-    const __VLS_25 = __VLS_24({
+    const __VLS_31 = __VLS_30({
         name: (__VLS_ctx.confirmAction === 'disable' ? 'warning' : 'shield'),
         size: (22),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_24));
+    }, ...__VLS_functionalComponentArgsRest(__VLS_30));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
     (__VLS_ctx.confirmCopy.title);
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
@@ -801,34 +1089,45 @@ if (__VLS_ctx.confirmAction) {
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['cookie-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['cookie-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['fold-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['cookie-detail']} */ ;
 /** @type {__VLS_StyleScopedClasses['table-wrap']} */ ;
 /** @type {__VLS_StyleScopedClasses['data-table']} */ ;
 /** @type {__VLS_StyleScopedClasses['cookie-table']} */ ;
 /** @type {__VLS_StyleScopedClasses['mono']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['cookie-legend']} */ ;
-/** @type {__VLS_StyleScopedClasses['two-column']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-title']} */ ;
-/** @type {__VLS_StyleScopedClasses['compact']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel-count']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['run-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
+/** @type {__VLS_StyleScopedClasses['upcoming-tasks']} */ ;
 /** @type {__VLS_StyleScopedClasses['task-list']} */ ;
 /** @type {__VLS_StyleScopedClasses['task-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
+/** @type {__VLS_StyleScopedClasses['small']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
-/** @type {__VLS_StyleScopedClasses['scheduler-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-title']} */ ;
-/** @type {__VLS_StyleScopedClasses['compact']} */ ;
-/** @type {__VLS_StyleScopedClasses['scheduler-summary']} */ ;
-/** @type {__VLS_StyleScopedClasses['quiet-window-state']} */ ;
-/** @type {__VLS_StyleScopedClasses['priority-list']} */ ;
-/** @type {__VLS_StyleScopedClasses['circuit-section']} */ ;
-/** @type {__VLS_StyleScopedClasses['circuit-heading']} */ ;
-/** @type {__VLS_StyleScopedClasses['circuit-list']} */ ;
-/** @type {__VLS_StyleScopedClasses['mono']} */ ;
-/** @type {__VLS_StyleScopedClasses['three-column']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel-count']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-rounds']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-detail']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-item-head']} */ ;
+/** @type {__VLS_StyleScopedClasses['muted-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-result']} */ ;
+/** @type {__VLS_StyleScopedClasses['scan-truncated']} */ ;
+/** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
+/** @type {__VLS_StyleScopedClasses['overview-two-column']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['mini-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['special-rules-panel']} */ ;
@@ -846,13 +1145,18 @@ if (__VLS_ctx.confirmAction) {
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['small']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
-/** @type {__VLS_StyleScopedClasses['mini-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['scheduler-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['compact']} */ ;
-/** @type {__VLS_StyleScopedClasses['log-preview']} */ ;
-/** @type {__VLS_StyleScopedClasses['log-head']} */ ;
-/** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
-/** @type {__VLS_StyleScopedClasses['small']} */ ;
+/** @type {__VLS_StyleScopedClasses['scheduler-heading-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['scheduler-layout']} */ ;
+/** @type {__VLS_StyleScopedClasses['scheduler-summary']} */ ;
+/** @type {__VLS_StyleScopedClasses['quiet-window-state']} */ ;
+/** @type {__VLS_StyleScopedClasses['priority-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['circuit-section']} */ ;
+/** @type {__VLS_StyleScopedClasses['circuit-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['circuit-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['mono']} */ ;
 /** @type {__VLS_StyleScopedClasses['modal-backdrop']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-dialog']} */ ;
 /** @type {__VLS_StyleScopedClasses['dialog-icon']} */ ;
@@ -871,18 +1175,24 @@ const __VLS_self = (await import('vue')).defineComponent({
             error: error,
             notice: notice,
             confirmAction: confirmAction,
+            cookieExpanded: cookieExpanded,
+            expandedScanAt: expandedScanAt,
             runtime: runtime,
             cookieGate: cookieGate,
             cookieAccounts: cookieAccounts,
             enabled: enabled,
             gateReady: gateReady,
             failedCookieAccounts: failedCookieAccounts,
+            cookieHealthy: cookieHealthy,
             cookieProgress: cookieProgress,
             runtimeLabel: runtimeLabel,
             runtimeMessage: runtimeMessage,
             quietWindow: quietWindow,
             activeCircuits: activeCircuits,
             routeCooldownUntil: routeCooldownUntil,
+            scanDecisionLabel: scanDecisionLabel,
+            accountInventoryLabel: accountInventoryLabel,
+            scanNotEvaluatedCount: scanNotEvaluatedCount,
             confirmCopy: confirmCopy,
             submitConfirmed: submitConfirmed,
         };

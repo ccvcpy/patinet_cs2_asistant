@@ -14,6 +14,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cs2_assistant.db import Database, RUNTIME_COORDINATION_TABLES
+from cs2_assistant.models import CatalogItem
 
 
 T0 = "2026-07-16T00:00:00+00:00"
@@ -31,6 +32,49 @@ class RuntimeDatabaseTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.temp_dir.cleanup()
+
+    def test_catalog_search_ranks_normal_and_stattrak_together_and_pages_completely(self) -> None:
+        items = [
+            CatalogItem(
+                "★ Flip Knife | Gamma Doppler (Factory New)",
+                "折叠刀（★） | 伽玛多普勒 (崭新出厂)",
+            ),
+            CatalogItem(
+                "★ StatTrak™ Flip Knife | Gamma Doppler (Factory New)",
+                "折叠刀（★ StatTrak™） | 伽玛多普勒 (崭新出厂)",
+            ),
+        ]
+        items.extend(
+            CatalogItem(
+                f"★ StatTrak™ Flip Knife | Test Finish {index:03d} (Factory New)",
+                f"折叠刀（★ StatTrak™） | 测试涂装 {index:03d} (崭新出厂)",
+            )
+            for index in range(60)
+        )
+        self.db.upsert_items(items)
+
+        first_page, total = self.db.search_items_page("折叠刀", limit=20, offset=0)
+        first_names = [str(row["market_hash_name"]) for row in first_page]
+        self.assertEqual(62, total)
+        self.assertIn("★ Flip Knife | Gamma Doppler (Factory New)", first_names)
+        self.assertIn("★ StatTrak™ Flip Knife | Gamma Doppler (Factory New)", first_names)
+
+        normal_rows, normal_total = self.db.search_items_page(
+            "折叠刀 普通版 伽马多普勒",
+            limit=20,
+            offset=0,
+        )
+        self.assertEqual(1, normal_total)
+        self.assertEqual(
+            ["★ Flip Knife | Gamma Doppler (Factory New)"],
+            [str(row["market_hash_name"]) for row in normal_rows],
+        )
+
+        second_page, _ = self.db.search_items_page("折叠刀", limit=20, offset=20)
+        self.assertFalse(
+            {str(row["market_hash_name"]) for row in first_page}
+            & {str(row["market_hash_name"]) for row in second_page}
+        )
 
     def test_runtime_tables_defaults_wal_and_memory_compatibility(self) -> None:
         tables = {
@@ -91,6 +135,25 @@ class RuntimeDatabaseTest(unittest.TestCase):
         self.assertEqual(0, updated["migration_hold"])
         self.assertIsNone(updated["gate_reason"])
         self.assertEqual(original["created_at"], updated["created_at"])
+
+    def test_profit_trade_completed_at_is_only_automatic_for_completed_status(self) -> None:
+        trade_ids: dict[str, int] = {}
+        for status in ("completed", "failed", "manual_required", "cancelled"):
+            trade_id = self.db.add_profit_trade(
+                trade_no=f"PT-completed-at-{status}",
+                market_hash_name="Dreams & Nightmares Case",
+            )
+            self.db.update_profit_trade(trade_id, status=status)
+            trade_ids[status] = trade_id
+
+        self.assertIsNotNone(
+            self.db.get_profit_trade(trade_ids["completed"])["completed_at"]
+        )
+        for status in ("failed", "manual_required", "cancelled"):
+            with self.subTest(status=status):
+                self.assertIsNone(
+                    self.db.get_profit_trade(trade_ids[status])["completed_at"]
+                )
 
     def test_scheduled_task_claim_priority_lease_reschedule_and_completion(self) -> None:
         self.db.upsert_scheduled_task(
@@ -178,6 +241,181 @@ class RuntimeDatabaseTest(unittest.TestCase):
         )
         self.assertEqual(1, replacement["attempt_count"])
         self.assertEqual({"full": False}, json.loads(replacement["payload_json"]))
+
+    def test_scheduled_task_starvation_guard_preserves_p0_and_runs_overdue_scan(self) -> None:
+        self.db.upsert_scheduled_task(
+            "old-background-scan",
+            source="guadao",
+            task_type="guadao_scan",
+            next_attempt_at=T0,
+            priority=3,
+        )
+        self.db.upsert_scheduled_task(
+            "new-trade-retry",
+            source="guadao",
+            task_type="rebuy_attempt",
+            next_attempt_at=T1,
+            priority=1,
+        )
+        self.db.upsert_scheduled_task(
+            "new-safety-check",
+            source="guadao",
+            task_type="terminal_check",
+            next_attempt_at=T1,
+            priority=0,
+        )
+
+        safety = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T2,
+            starvation_guard_task_key="old-background-scan",
+            starvation_guard_after_seconds=30,
+        )
+        self.assertEqual(["new-safety-check"], [row["task_key"] for row in safety])
+        self.assertTrue(
+            self.db.complete_scheduled_task("new-safety-check", "worker-a", now=T2)
+        )
+
+        guarded = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T2,
+            starvation_guard_task_key="old-background-scan",
+            starvation_guard_after_seconds=30,
+        )
+        self.assertEqual(["old-background-scan"], [row["task_key"] for row in guarded])
+
+    def test_deadline_guard_runs_overdue_steam_sync_before_p1_but_after_p0(self) -> None:
+        """An overdue Steam account sync owns the next fair slot, not every slot."""
+
+        self.db.upsert_scheduled_task(
+            "p0-maintenance",
+            source="guadao",
+            task_type="stale_listing_recheck",
+            next_attempt_at=T0,
+            priority=0,
+        )
+        self.db.upsert_scheduled_task(
+            "steam-sync:overdue",
+            source="guadao",
+            task_type="steam_account_sync",
+            next_attempt_at=T0,
+            priority=2,
+        )
+        for index in range(107):
+            self.db.upsert_scheduled_task(
+                f"rebuy-{index}",
+                source="guadao",
+                task_type="rebuy_attempt",
+                next_attempt_at=T1,
+                priority=1,
+            )
+
+        first = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T2,
+            deadline_guard_task_type="steam_account_sync",
+            deadline_guard_after_seconds=60,
+        )
+        self.assertEqual(["p0-maintenance"], [row["task_key"] for row in first])
+        self.assertTrue(self.db.complete_scheduled_task("p0-maintenance", "worker-a", now=T2))
+
+        second = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T2,
+            deadline_guard_task_type="steam_account_sync",
+            deadline_guard_after_seconds=60,
+        )
+        self.assertEqual(["steam-sync:overdue"], [row["task_key"] for row in second])
+
+    def test_deadline_guard_does_not_promote_a_steam_sync_inside_its_60_second_budget(self) -> None:
+        self.db.upsert_scheduled_task(
+            "steam-sync:not-overdue",
+            source="guadao",
+            task_type="steam_account_sync",
+            next_attempt_at=T1,
+            priority=2,
+        )
+        self.db.upsert_scheduled_task(
+            "rebuy-due",
+            source="guadao",
+            task_type="rebuy_attempt",
+            next_attempt_at=T1,
+            priority=1,
+        )
+
+        claimed = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T2,
+            deadline_guard_task_type="steam_account_sync",
+            deadline_guard_after_seconds=120,
+        )
+        self.assertEqual(["rebuy-due"], [row["task_key"] for row in claimed])
+
+    def test_scheduled_task_starvation_guard_waits_for_full_grace_period(self) -> None:
+        self.db.upsert_scheduled_task(
+            "background-scan",
+            source="guadao",
+            task_type="guadao_scan",
+            next_attempt_at=T0,
+            priority=3,
+        )
+        self.db.upsert_scheduled_task(
+            "trade-retry",
+            source="guadao",
+            task_type="rebuy_attempt",
+            next_attempt_at=T1,
+            priority=1,
+        )
+
+        claimed = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            now=T1,
+            starvation_guard_task_key="background-scan",
+            starvation_guard_after_seconds=120,
+        )
+        self.assertEqual(["trade-retry"], [row["task_key"] for row in claimed])
+
+    def test_scheduled_task_starvation_guard_does_not_steal_valid_lease(self) -> None:
+        self.db.upsert_scheduled_task(
+            "leased-background-scan",
+            source="guadao",
+            task_type="guadao_scan",
+            next_attempt_at=T0,
+            priority=3,
+        )
+        leased = self.db.claim_due_scheduled_tasks(
+            "worker-a",
+            limit=1,
+            lease_seconds=300,
+            now=T0,
+        )
+        self.assertEqual(["leased-background-scan"], [row["task_key"] for row in leased])
+        self.db.upsert_scheduled_task(
+            "trade-while-scan-leased",
+            source="guadao",
+            task_type="rebuy_attempt",
+            next_attempt_at=T1,
+            priority=1,
+        )
+
+        claimed = self.db.claim_due_scheduled_tasks(
+            "worker-b",
+            limit=1,
+            now=T2,
+            starvation_guard_task_key="leased-background-scan",
+            starvation_guard_after_seconds=30,
+        )
+        self.assertEqual(["trade-while-scan-leased"], [row["task_key"] for row in claimed])
+        scan = self.db.get_scheduled_task("leased-background-scan")
+        self.assertEqual("running", scan["status"])
+        self.assertEqual("worker-a", scan["lease_owner"])
+        self.assertEqual(1, scan["attempt_count"])
 
     def test_scheduled_task_expired_lease_is_reclaimed_across_connections(self) -> None:
         self.db.upsert_scheduled_task(
@@ -416,7 +654,9 @@ class RuntimeDatabaseTest(unittest.TestCase):
         self.db.conn.executescript(
             """
             DROP TABLE strategy_config_audit;
+            DROP TABLE guadao_operation_audit_events;
             DROP TABLE guadao_issue_acknowledgements;
+            DROP TABLE c5_api_circuits;
             DROP TABLE steam_route_circuits;
             DROP TABLE steam_request_queue;
             DROP TABLE steam_cookie_health;

@@ -3,7 +3,6 @@
   "config": {
     "enabled": true,
     "allowRealExecution": true,
-    "allowRepriceExecution": false,
     "balanceDiscount": 0.72,
     "balanceDiscountPct": 72.0,
     "minRoi": 0.03,

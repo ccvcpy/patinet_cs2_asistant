@@ -9,6 +9,7 @@ import struct
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, unquote
@@ -133,6 +134,61 @@ class SteamListing:
     status: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class SteamSaleReceiptLookupResult:
+    """Outcome of one account-scoped Steam market-history traversal.
+
+    ``coverage_complete`` only becomes true when the traversal reached the
+    history end.  It is deliberately separate from an empty ``receipts`` map:
+    a bounded walk that has more pages left cannot prove that an old sale
+    receipt is absent.
+    """
+
+    receipts: dict[str, dict[str, Any]]
+    coverage_complete: bool
+    pages_scanned: int
+    lookup_succeeded: bool = True
+    error: str | None = None
+    retry_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SteamPurchaseReceiptLookupResult:
+    receipts: dict[str, tuple[dict[str, Any], ...]]
+    coverage_complete: bool
+    pages_scanned: int
+    lookup_succeeded: bool = True
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SteamMyListingsSnapshot:
+    """One account-scoped, pagination-aware Steam MyListings observation.
+
+    Positive rows remain useful when a later page fails.  ``complete`` is the
+    separate authority required before callers may infer that an absent
+    listing is not present remotely.
+    """
+
+    active_listings: tuple[SteamListing, ...]
+    pending_listings: tuple[SteamListing, ...]
+    official_active_count: int | None
+    actual_active_count: int
+    pages_scanned: int
+    complete: bool
+    observed_at: str
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SteamInventoryAssetLookupResult:
+    """Outcome of an official Steam inventory traversal for exact asset IDs."""
+
+    found_asset_ids: frozenset[str]
+    coverage_complete: bool
+    pages_scanned: int
+
+
 _STEAM_CURRENCY_CODES = {
     1: "USD",
     3: "EUR",
@@ -197,6 +253,15 @@ def _safe_int(raw: Any) -> int | None:
         return int(Decimal(str(raw)))
     except Exception:
         return None
+
+
+def _steam_history_currency_id(raw: Any) -> int | None:
+    """Normalize Steam history's 2000-prefixed currency encoding."""
+
+    value = _safe_int(raw)
+    if value is not None and 2000 <= value < 3000:
+        return value - 2000
+    return value
 
 
 def _first_int(raw: dict[str, Any], keys: tuple[str, ...]) -> int | None:
@@ -376,6 +441,7 @@ class SteamMarketClient:
         telemetry_callback: SteamTelemetryCallback | None = None,
         telemetry_context: Mapping[str, Any] | None = None,
         request_source: str | None = None,
+        allow_account_relogin: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity_secret = _normalize_identity_secret(identity_secret) if identity_secret else identity_secret
@@ -391,6 +457,7 @@ class SteamMarketClient:
         }
         self._telemetry_client_instance_id = f"steam_{uuid.uuid4().hex}"
         self._request_source = str(request_source or "cli").strip() or "cli"
+        self._allow_account_relogin = bool(allow_account_relogin)
 
         self._session = requests.Session()
         self._session.headers.update(
@@ -449,6 +516,8 @@ class SteamMarketClient:
     @staticmethod
     def _telemetry_operation(path: str) -> str:
         normalized = str(path or "").lower()
+        if normalized.startswith("/inventory/"):
+            return "official_inventory"
         if "/market/buylisting/" in normalized:
             return "buy_listing"
         if "/market/createbuyorder" in normalized:
@@ -524,6 +593,7 @@ class SteamMarketClient:
         request: Callable[[], requests.Response],
         safe_context: Mapping[str, Any] | None = None,
         priority_override: int | None = None,
+        admission_timeout_seconds: float | None = None,
         execution_guard: Callable[[], bool] | None = None,
     ) -> requests.Response:
         request_id = f"steam_req_{uuid.uuid4().hex}"
@@ -562,7 +632,7 @@ class SteamMarketClient:
                 "get_trade_url",
             }:
                 priority = SteamRequestPriority.P1_EXECUTION
-            elif operation in {"my_listings", "market_history"}:
+            elif operation in {"my_listings", "market_history", "official_inventory"}:
                 priority = SteamRequestPriority.P2_SYNC
             if self._request_source in {"cli", "account_balance"}:
                 priority = min(priority, SteamRequestPriority.P1_EXECUTION)
@@ -578,6 +648,7 @@ class SteamMarketClient:
                 source=self._request_source,
                 operation=operation,
                 metadata={"attempt": int(attempt), **context},
+                timeout_seconds=admission_timeout_seconds,
                 quiet_before=self._request_source == "profit_trade" and operation == "search_listings",
                 bounded_retry=bool(context.get("boundedRetry")),
                 execution_guard=execution_guard,
@@ -633,6 +704,7 @@ class SteamMarketClient:
         _allow_retry: bool = True,
         _scheduler_bounded_retry: bool = False,
         _scheduler_priority: int | None = None,
+        _scheduler_timeout_seconds: float | None = None,
         _scheduler_execution_guard: Callable[[], bool] | None = None,
         _scheduler_metadata: Mapping[str, Any] | None = None,
     ) -> requests.Response:
@@ -662,6 +734,7 @@ class SteamMarketClient:
                         ),
                         safe_context=request_context or None,
                         priority_override=_scheduler_priority,
+                        admission_timeout_seconds=_scheduler_timeout_seconds,
                         execution_guard=_scheduler_execution_guard,
                     )
                     break
@@ -672,7 +745,12 @@ class SteamMarketClient:
                     time.sleep(1.0 + attempt)
             if response is None:
                 raise last_exc or SteamMarketError("Steam request failed without response")
-            if response.status_code in (400, 401) and _allow_retry and self._try_account_relogin():
+            if (
+                response.status_code in (400, 401)
+                and _allow_retry
+                and self._allow_account_relogin
+                and self._try_account_relogin()
+            ):
                 response = self._request_with_telemetry(
                     method=method,
                     path=path,
@@ -692,6 +770,7 @@ class SteamMarketClient:
                         **({"boundedRetry": True} if _scheduler_bounded_retry else {}),
                     },
                     priority_override=_scheduler_priority,
+                    admission_timeout_seconds=_scheduler_timeout_seconds,
                     execution_guard=_scheduler_execution_guard,
                 )
             response.raise_for_status()
@@ -724,11 +803,20 @@ class SteamMarketClient:
             return match.group(0)
         raise SteamMarketError("无法从页面提取交易链接，请确认账号已登录且交易链接已启用")
 
-    def wallet_balance(self, *, safety_terminal: bool = False) -> dict[str, Any]:
+    def wallet_balance(
+        self,
+        *,
+        safety_terminal: bool = False,
+        execution_priority: bool = False,
+    ) -> dict[str, Any]:
         # Steam's market home page is a desktop HTML flow. It can redirect via
         # /market/eligibilitycheck/ before returning g_rgWalletInfo. Reusing the
         # client's mobile/API headers here causes Steam to return a 429 page.
-        scheduler_options = {"_scheduler_priority": 0} if safety_terminal else {}
+        scheduler_options = (
+            {"_scheduler_priority": 0}
+            if safety_terminal
+            else ({"_scheduler_priority": 1} if execution_priority else {})
+        )
         response = self._request(
             "GET",
             "/market/",
@@ -757,13 +845,25 @@ class SteamMarketClient:
             "raw": wallet_info,
         }
 
-    def remove_listing(self, listing_id: str) -> bool:
-        """Cancel a Steam market listing by listing ID."""
+    def remove_listing(
+        self,
+        listing_id: str,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Cancel a Steam market listing by listing ID.
+
+        ``execution_guard`` is evaluated by the shared Steam scheduler after
+        this request reaches the front of the queue, immediately before the
+        HTTP callback.  Destructive callers must pass their latest runtime
+        gate here rather than relying only on a check made before enqueueing.
+        """
         response = self._request(
             "POST",
             f"/market/removelisting/{listing_id}",
             data={"sessionid": self.sessionid},
             headers={"Referer": f"{self.base_url}/market"},
+            _scheduler_execution_guard=execution_guard,
         )
         try:
             payload = response.json()
@@ -1058,7 +1158,12 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(second_payload, ensure_ascii=False), payload=second_payload)
         return second_payload
 
-    def cancel_buy_order(self, *, buy_order_id: str) -> dict[str, Any]:
+    def cancel_buy_order(
+        self,
+        *,
+        buy_order_id: str,
+        execution_guard: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         buy_order_id = str(buy_order_id or "").strip()
         if not buy_order_id:
             raise SteamMarketError("buy_order_id is required")
@@ -1086,6 +1191,7 @@ class SteamMarketClient:
                 timeout=self.timeout,
                 allow_redirects=False,
             ),
+            execution_guard=execution_guard,
         )
         try:
             payload = response.json()
@@ -1107,6 +1213,7 @@ class SteamMarketClient:
         country: str = "CN",
         language: str = "schinese",
         bounded_retry: bool = False,
+        auth_retry: bool = True,
     ) -> dict[str, Any]:
         encoded_name = quote(market_hash_name, safe="")
         params = {
@@ -1147,6 +1254,7 @@ class SteamMarketClient:
                 "X-Valve-Action-Type": "4OPT6VBA:Search",
             },
             _scheduler_metadata={"marketHashName": market_hash_name},
+            _allow_retry=bool(auth_retry),
             **scheduler_options,
         )
         try:
@@ -1203,7 +1311,20 @@ class SteamMarketClient:
         *,
         app_id: int,
         market_hash_name: str,
+        execution_priority: bool = False,
+        safety_terminal: bool = False,
+        admission_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
+        scheduler_options = (
+            {"_scheduler_priority": 0}
+            if safety_terminal
+            else ({"_scheduler_priority": 1} if execution_priority else {})
+        )
+        if admission_timeout_seconds is not None:
+            scheduler_options["_scheduler_timeout_seconds"] = max(
+                0.0,
+                float(admission_timeout_seconds),
+            )
         response = self._request(
             "GET",
             "/market/orderbook",
@@ -1223,6 +1344,7 @@ class SteamMarketClient:
                 ),
             },
             _scheduler_metadata={"marketHashName": market_hash_name},
+            **scheduler_options,
         )
         try:
             payload = response.json()
@@ -1311,11 +1433,98 @@ class SteamMarketClient:
             raise SteamMarketError(json.dumps(payload, ensure_ascii=False))
         return payload
 
+    def find_inventory_asset_ids(
+        self,
+        asset_ids: Iterable[str],
+        *,
+        app_id: int = 730,
+        context_id: int = 2,
+        count: int = 2000,
+        max_pages: int = 20,
+    ) -> SteamInventoryAssetLookupResult:
+        """Check exact asset IDs in the account's official Steam inventory.
+
+        This is intentionally an ownership/recovery helper, not a normal
+        inventory synchronization source.  It follows Steam's
+        ``start_assetid`` pagination and may return early only when every
+        requested asset has been found.  If an asset is absent, callers must
+        require ``coverage_complete`` before treating that absence as useful
+        diagnostic information.
+        """
+
+        targets = {
+            str(asset_id or "").strip()
+            for asset_id in asset_ids
+            if str(asset_id or "").strip()
+        }
+        if not targets:
+            return SteamInventoryAssetLookupResult(frozenset(), True, 0)
+
+        found: set[str] = set()
+        start_assetid: str | None = None
+        pages_scanned = 0
+        for _ in range(max(1, int(max_pages))):
+            params: dict[str, Any] = {
+                "l": "schinese",
+                "count": max(1, int(count)),
+            }
+            if start_assetid:
+                params["start_assetid"] = start_assetid
+            response = self._request(
+                "GET",
+                f"/inventory/{self.steam_id64}/{int(app_id)}/{int(context_id)}",
+                params=params,
+                _scheduler_metadata={
+                    "appId": int(app_id),
+                    "contextId": int(context_id),
+                    "assetIdCount": len(targets),
+                },
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise SteamMarketError(
+                    f"Steam official inventory invalid JSON: {response.text}"
+                ) from exc
+            if not isinstance(payload, dict) or payload.get("success") not in (1, True, None):
+                raise SteamMarketError(
+                    "Steam official inventory returned an unsuccessful payload"
+                )
+            assets = payload.get("assets")
+            if not isinstance(assets, list):
+                raise SteamMarketError("Steam official inventory assets payload is invalid")
+            pages_scanned += 1
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                asset_id = str(asset.get("assetid") or asset.get("id") or "").strip()
+                if asset_id in targets:
+                    found.add(asset_id)
+            if found == targets:
+                return SteamInventoryAssetLookupResult(
+                    frozenset(found),
+                    False,
+                    pages_scanned,
+                )
+            more_items = payload.get("more_items")
+            if more_items in (False, 0, "0", None):
+                return SteamInventoryAssetLookupResult(
+                    frozenset(found),
+                    True,
+                    pages_scanned,
+                )
+            next_start = str(payload.get("last_assetid") or "").strip()
+            if not next_start or next_start == start_assetid:
+                raise SteamMarketError("Steam official inventory pagination is incomplete")
+            start_assetid = next_start
+        return SteamInventoryAssetLookupResult(frozenset(found), False, pages_scanned)
+
     def find_purchase_receipt(
         self,
         *,
         market_hash_name: str,
         expected_total: float | None = None,
+        maximum_total: float | None = None,
         earliest_time: int | float | None = None,
         total_tolerance: float = 0.02,
         count: int = 100,
@@ -1325,9 +1534,10 @@ class SteamMarketClient:
         """Find an official Steam Market purchase event (event_type=4).
 
         This is intentionally a narrow reconciliation helper.  It matches the
-        exact market hash name and, when supplied, the paid total and earliest
-        event time so an unrelated historical purchase cannot prove a current
-        profit-trade buy.
+        exact market hash name and earliest event time. ``expected_total`` is
+        an exact paid-total match for direct purchases. ``maximum_total`` is
+        the highest authorized spend for a buy order; Steam may fill that
+        order at any lower seller listing price.
         """
 
         target_name = str(market_hash_name or "").strip()
@@ -1336,6 +1546,11 @@ class SteamMarketClient:
         expected_total_cents = (
             int(round(float(expected_total) * 100.0))
             if expected_total is not None
+            else None
+        )
+        maximum_total_cents = (
+            int(round(float(maximum_total) * 100.0))
+            if maximum_total is not None
             else None
         )
         tolerance_cents = max(0, int(round(float(total_tolerance) * 100.0)))
@@ -1418,6 +1633,11 @@ class SteamMarketClient:
                     and abs(paid_total_cents - expected_total_cents) > tolerance_cents
                 ):
                     continue
+                if maximum_total_cents is not None and (
+                    paid_total_cents <= 0
+                    or paid_total_cents > maximum_total_cents + tolerance_cents
+                ):
+                    continue
                 purchase_asset = purchase.get("asset") if isinstance(purchase.get("asset"), dict) else {}
                 asset_row = purchase_asset_row(assets, purchase_asset)
                 receipt_name = str(
@@ -1445,6 +1665,253 @@ class SteamMarketClient:
             if total is not None and start >= total:
                 return None
         return None
+
+    def find_purchase_receipts_for_targets_with_coverage(
+        self,
+        targets: list[dict[str, Any]],
+        *,
+        count: int = 500,
+        max_pages: int = 10,
+        safety_terminal: bool = True,
+    ) -> SteamPurchaseReceiptLookupResult:
+        """Match all managed buy-order fills in one account history walk."""
+
+        normalized: dict[str, dict[str, Any]] = {}
+        earliest_times: list[int] = []
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            key = str(target.get("key") or "").strip()
+            name = str(target.get("marketHashName") or "").strip()
+            maximum_total = target.get("maximumTotal")
+            try:
+                maximum_total_cents = int(
+                    Decimal(str(maximum_total))
+                    .scaleb(2)
+                    .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                )
+            except Exception:
+                maximum_total_cents = 0
+            earliest_raw = target.get("earliestTime")
+            earliest: int | None = None
+            if earliest_raw not in (None, ""):
+                try:
+                    earliest = int(float(earliest_raw))
+                except (TypeError, ValueError, OverflowError):
+                    try:
+                        parsed = datetime.fromisoformat(
+                            str(earliest_raw).replace("Z", "+00:00")
+                        )
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        earliest = int(parsed.timestamp())
+                    except (TypeError, ValueError, OverflowError):
+                        earliest = None
+            if not key or not name or maximum_total_cents <= 0:
+                continue
+            try:
+                max_receipts = max(1, int(target.get("maxReceipts") or 1))
+            except (TypeError, ValueError, OverflowError):
+                max_receipts = 1
+            normalized[key] = {
+                "marketHashName": name,
+                "maximumTotalCents": maximum_total_cents,
+                "earliestTime": earliest,
+                "maxReceipts": max_receipts,
+            }
+            if earliest is not None:
+                earliest_times.append(earliest)
+        if not normalized:
+            return SteamPurchaseReceiptLookupResult({}, True, 0)
+
+        def purchase_asset_row(
+            assets: Any,
+            purchase_asset: dict[str, Any],
+        ) -> dict[str, Any]:
+            if not isinstance(assets, dict):
+                return {}
+            app_id = str(purchase_asset.get("appid") or "730")
+            app_assets = assets.get(app_id) or assets.get(_safe_int(app_id)) or {}
+            if not isinstance(app_assets, dict):
+                return {}
+            target_asset_ids = {
+                str(value)
+                for value in (
+                    purchase_asset.get("id"),
+                    purchase_asset.get("new_id"),
+                )
+                if value not in (None, "")
+            }
+            for rows in app_assets.values():
+                if not isinstance(rows, dict):
+                    continue
+                for row_key, row in rows.items():
+                    if not isinstance(row, dict):
+                        continue
+                    row_asset_id = str(row.get("id") or row_key or "").strip()
+                    if row_asset_id in target_asset_ids:
+                        return row
+            return {}
+
+        receipts: dict[str, list[dict[str, Any]]] = {
+            key: [] for key in normalized
+        }
+        seen_purchase_ids: set[str] = set()
+        start = 0
+        pages_scanned = 0
+        page_size = max(1, min(500, int(count)))
+        earliest_cutoff = min(earliest_times) - 5 * 60 if earliest_times else None
+        for _ in range(max(1, int(max_pages))):
+            try:
+                payload = self.market_history(
+                    start=start,
+                    count=page_size,
+                    safety_terminal=safety_terminal,
+                )
+            except Exception as exc:
+                return SteamPurchaseReceiptLookupResult(
+                    {
+                        key: tuple(values)
+                        for key, values in receipts.items()
+                    },
+                    False,
+                    pages_scanned,
+                    False,
+                    str(exc),
+                )
+            pages_scanned += 1
+            events = payload.get("events") or []
+            purchases = payload.get("purchases") or {}
+            assets = payload.get("assets") or {}
+            if not isinstance(events, list):
+                return SteamPurchaseReceiptLookupResult(
+                    {
+                        key: tuple(values)
+                        for key, values in receipts.items()
+                    },
+                    False,
+                    pages_scanned,
+                    False,
+                    "Steam market history events payload is invalid",
+                )
+            readable_times: list[int] = []
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_time = _safe_int(event.get("time_event"))
+                if event_time is not None:
+                    readable_times.append(event_time)
+                if int(event.get("event_type") or 0) != 4:
+                    continue
+                listing_id = str(event.get("listingid") or "").strip()
+                purchase_id = str(event.get("purchaseid") or "").strip()
+                if not purchase_id or purchase_id in seen_purchase_ids:
+                    continue
+                purchase: dict[str, Any] = {}
+                if isinstance(purchases, dict):
+                    candidate = (
+                        purchases.get(f"{listing_id}_{purchase_id}")
+                        or purchases.get(listing_id)
+                    )
+                    if isinstance(candidate, dict):
+                        purchase = candidate
+                paid_amount_cents = _safe_int(purchase.get("paid_amount")) or 0
+                paid_fee_cents = _safe_int(purchase.get("paid_fee")) or 0
+                paid_total_cents = paid_amount_cents + paid_fee_cents
+                raw_currency_id = purchase.get("currencyid")
+                currency_id = _steam_history_currency_id(raw_currency_id)
+                purchase_asset = (
+                    purchase.get("asset")
+                    if isinstance(purchase.get("asset"), dict)
+                    else {}
+                )
+                asset_row = purchase_asset_row(assets, purchase_asset)
+                receipt_name = str(
+                    asset_row.get("market_hash_name")
+                    or purchase.get("market_hash_name")
+                    or purchase_asset.get("market_hash_name")
+                    or ""
+                ).strip()
+                if not receipt_name or paid_total_cents <= 0:
+                    continue
+                for key, target in normalized.items():
+                    if len(receipts[key]) >= int(target["maxReceipts"]):
+                        continue
+                    if receipt_name != target["marketHashName"]:
+                        continue
+                    if currency_id != 23:
+                        continue
+                    earliest = target["earliestTime"]
+                    if earliest is not None and (
+                        event_time is None or event_time < int(earliest)
+                    ):
+                        continue
+                    if paid_total_cents > int(target["maximumTotalCents"]):
+                        continue
+                    receipts[key].append(
+                        {
+                            "listingId": listing_id,
+                            "purchaseId": purchase_id,
+                            "timePurchased": event_time,
+                            "paidAmount": round(paid_amount_cents / 100.0, 2),
+                            "paidFee": round(paid_fee_cents / 100.0, 2),
+                            "paidTotal": round(paid_total_cents / 100.0, 2),
+                            "currencyId": currency_id,
+                            "currencyIdRaw": raw_currency_id,
+                            "marketHashName": receipt_name,
+                            "assetId": (
+                                str(
+                                    purchase_asset.get("id")
+                                    or asset_row.get("id")
+                                    or ""
+                                )
+                                or None
+                            ),
+                            "newAssetId": (
+                                str(purchase_asset.get("new_id") or "") or None
+                            ),
+                        }
+                    )
+                    seen_purchase_ids.add(purchase_id)
+                    break
+
+            total = _safe_int(payload.get("total_count"))
+            start += page_size
+            reached_end = (
+                not events
+                or (total is not None and start >= total)
+                or len(events) < page_size
+            )
+            reached_time_boundary = bool(
+                earliest_cutoff is not None
+                and readable_times
+                and min(readable_times) <= earliest_cutoff
+            )
+            if reached_end or reached_time_boundary:
+                return SteamPurchaseReceiptLookupResult(
+                    {
+                        key: tuple(
+                            sorted(
+                                values,
+                                key=lambda row: (
+                                    int(row.get("timePurchased") or 0),
+                                    str(row.get("purchaseId") or ""),
+                                ),
+                            )
+                        )
+                        for key, values in receipts.items()
+                    },
+                    True,
+                    pages_scanned,
+                )
+        return SteamPurchaseReceiptLookupResult(
+            {
+                key: tuple(values)
+                for key, values in receipts.items()
+            },
+            False,
+            pages_scanned,
+        )
 
     def find_sale_receipt(
         self,
@@ -1478,24 +1945,27 @@ class SteamMarketClient:
             max_pages=max_pages,
         ).get("target")
 
-    def find_sale_receipts_for_targets(
+    def find_sale_receipts_for_targets_with_coverage(
         self,
         targets: list[dict[str, str]],
         *,
-        count: int = 100,
+        count: int = 500,
         max_pages: int = 3,
-    ) -> dict[str, dict[str, Any]]:
-        """Find multiple sale receipts from one shared market-history walk.
+    ) -> SteamSaleReceiptLookupResult:
+        """Find sale receipts and report whether history absence is conclusive.
 
         Steam market history is account-scoped, so fetching the same pages once
         and matching every due operation avoids multiplying requests by the
-        number of local listings.  A caller-provided key keeps the result
-        stable even when either the listing id or asset id is missing.
+        number of local listings.  Empty results are only terminally useful
+        after the traversal reached the real end of Steam's history; an
+        arbitrary ``max_pages`` boundary is not evidence that a receipt does
+        not exist.
         """
 
         normalized: dict[str, tuple[str, str]] = {}
         listing_keys: dict[str, set[str]] = {}
         asset_keys: dict[str, set[str]] = {}
+        target_created_times: list[int] = []
         for target in targets:
             if not isinstance(target, dict):
                 continue
@@ -1509,20 +1979,95 @@ class SteamMarketClient:
                 listing_keys.setdefault(listing_id, set()).add(key)
             if asset_id:
                 asset_keys.setdefault(asset_id, set()).add(key)
+            created_at = target.get("createdAt")
+            if created_at not in (None, ""):
+                parsed_created_at: int | None = None
+                try:
+                    parsed_created_at = int(float(str(created_at)))
+                except (TypeError, ValueError):
+                    try:
+                        parsed = datetime.fromisoformat(
+                            str(created_at).replace("Z", "+00:00")
+                        )
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        parsed_created_at = int(parsed.timestamp())
+                    except (TypeError, ValueError):
+                        parsed_created_at = None
+                if parsed_created_at is not None:
+                    target_created_times.append(parsed_created_at)
         if not normalized:
-            return {}
+            return SteamSaleReceiptLookupResult({}, True, 0)
 
         receipts: dict[str, dict[str, Any]] = {}
         start = 0
+        pages_scanned = 0
+        page_size = max(1, min(500, int(count)))
+        target_history_cutoff = (
+            min(target_created_times) - 5 * 60 if target_created_times else None
+        )
         for _ in range(max(1, int(max_pages))):
-            payload = self.market_history(start=start, count=count)
+            try:
+                payload = self.market_history(start=start, count=page_size)
+            except Exception as exc:
+                retry_at = getattr(exc, "retry_at", None)
+                if isinstance(retry_at, datetime):
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    retry_at_value = retry_at.astimezone(timezone.utc).isoformat()
+                else:
+                    retry_at_value = None
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_at_value is None and retry_after not in (None, ""):
+                    try:
+                        retry_at_value = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=max(0.0, float(retry_after)))
+                        ).isoformat()
+                    except (TypeError, ValueError):
+                        retry_at_value = None
+                return SteamSaleReceiptLookupResult(
+                    receipts,
+                    False,
+                    pages_scanned,
+                    False,
+                    str(exc),
+                    retry_at_value,
+                )
+            pages_scanned += 1
             events = payload.get("events") or []
             purchases = payload.get("purchases") or {}
-            if not isinstance(events, list) or not events:
-                return receipts
+            if not isinstance(events, list):
+                return SteamSaleReceiptLookupResult(
+                    receipts,
+                    False,
+                    pages_scanned,
+                    False,
+                    "Steam market history events payload is invalid",
+                )
+            total_raw = payload.get("total_count")
+            total = _safe_int(total_raw)
+            if not events:
+                # A response claiming more rows while returning no events is
+                # internally incomplete.  It must not authorize an inventory
+                # fallback merely because the first page looked empty.
+                coverage_complete = total_raw in (None, "") or (
+                    total is not None and start >= total
+                )
+                return SteamSaleReceiptLookupResult(
+                    receipts,
+                    coverage_complete,
+                    pages_scanned,
+                )
+            readable_event_times: list[int] = []
+            event_row_count = 0
             for event in events:
                 if not isinstance(event, dict):
                     continue
+                event_row_count += 1
+                event_time = _safe_int(event.get("time_event"))
+                if event_time is not None:
+                    readable_event_times.append(event_time)
                 if int(event.get("event_type") or 0) != 3:
                     continue
                 listing_id = str(event.get("listingid") or "")
@@ -1559,12 +2104,39 @@ class SteamMarketClient:
                 for key in matching_keys:
                     receipts[key] = dict(receipt)
                 if len(receipts) >= len(normalized):
-                    return receipts
-            start += int(count)
-            total = payload.get("total_count")
-            if total is not None and start >= int(total):
-                return receipts
-        return receipts
+                    # Every requested receipt has been proven, so the caller
+                    # does not need a complete absence proof for this batch.
+                    return SteamSaleReceiptLookupResult(receipts, False, pages_scanned)
+            if (
+                target_history_cutoff is not None
+                and event_row_count > 0
+                and len(readable_event_times) == event_row_count
+                and min(readable_event_times) <= target_history_cutoff
+            ):
+                return SteamSaleReceiptLookupResult(receipts, True, pages_scanned)
+            start += page_size
+            if total is not None and start >= total:
+                return SteamSaleReceiptLookupResult(receipts, True, pages_scanned)
+            if total_raw not in (None, "") and total is None:
+                return SteamSaleReceiptLookupResult(receipts, False, pages_scanned)
+            if total_raw in (None, "") and len(events) < page_size:
+                return SteamSaleReceiptLookupResult(receipts, True, pages_scanned)
+        return SteamSaleReceiptLookupResult(receipts, False, pages_scanned)
+
+    def find_sale_receipts_for_targets(
+        self,
+        targets: list[dict[str, str]],
+        *,
+        count: int = 500,
+        max_pages: int = 3,
+    ) -> dict[str, dict[str, Any]]:
+        """Backward-compatible receipt-only view of the shared history walk."""
+
+        return self.find_sale_receipts_for_targets_with_coverage(
+            targets,
+            count=count,
+            max_pages=max_pages,
+        ).receipts
 
     def _parse_my_listing_rows(self, payload: dict[str, Any], listings_raw: Any) -> list[SteamListing]:
         assets: dict[str, Any] = payload.get("assets") or {}
@@ -1624,13 +2196,225 @@ class SteamMarketClient:
             )
         return parsed
 
-    def list_active_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
-        payload = self.my_listings(start=start, count=count)
-        return self._parse_my_listing_rows(payload, payload.get("listings") or {})
+    @staticmethod
+    def _my_listings_official_active_count(payload: Mapping[str, Any]) -> int | None:
+        counts = [
+            value
+            for value in (
+                _safe_int(payload.get("total_count")),
+                _safe_int(payload.get("num_active_listings")),
+            )
+            if value is not None and value >= 0
+        ]
+        if not counts:
+            return None
+        return max(counts)
 
-    def list_confirmation_pending_listings(self, *, start: int = 0, count: int = 100) -> list[SteamListing]:
-        payload = self.my_listings(start=start, count=count)
-        return self._parse_my_listing_rows(payload, payload.get("listings_to_confirm") or [])
+    def _read_my_listings_snapshot_once(
+        self,
+        *,
+        start: int,
+        count: int | None,
+        safety_terminal: bool,
+    ) -> SteamMyListingsSnapshot:
+        page_size = 100
+        requested_limit = max(0, int(count)) if count is not None else None
+        active_by_id: dict[str, SteamListing] = {}
+        pending_by_id: dict[str, SteamListing] = {}
+        official_active_count: int | None = None
+        pages_scanned = 0
+        page_start = max(0, int(start))
+        error: str | None = None
+        complete = False
+
+        if requested_limit == 0:
+            return SteamMyListingsSnapshot(
+                (),
+                (),
+                0,
+                0,
+                0,
+                True,
+                datetime.now(timezone.utc).isoformat(),
+            )
+
+        while True:
+            remaining = (
+                None
+                if requested_limit is None
+                else max(0, requested_limit - len(active_by_id))
+            )
+            if remaining == 0:
+                complete = (
+                    start == 0
+                    and official_active_count is not None
+                    and len(active_by_id) >= official_active_count
+                )
+                break
+            request_count = page_size if remaining is None else min(page_size, remaining)
+            try:
+                payload = self.my_listings(
+                    start=page_start,
+                    count=request_count,
+                    safety_terminal=safety_terminal,
+                )
+            except Exception as exc:
+                error = str(exc)
+                break
+            pages_scanned += 1
+            if not isinstance(payload, dict) or payload.get("success") not in (
+                None,
+                1,
+                True,
+            ):
+                error = "Steam mylistings returned an unsuccessful payload"
+                break
+
+            page_official_count = self._my_listings_official_active_count(payload)
+            if official_active_count is None:
+                official_active_count = page_official_count
+            elif (
+                page_official_count is not None
+                and page_official_count != official_active_count
+            ):
+                error = (
+                    "Steam mylistings active total changed during pagination: "
+                    f"{official_active_count} -> {page_official_count}"
+                )
+
+            page_active = self._parse_my_listing_rows(
+                payload,
+                payload.get("listings") or {},
+            )
+            page_pending = self._parse_my_listing_rows(
+                payload,
+                payload.get("listings_to_confirm") or [],
+            )
+            for listing in page_active:
+                key = str(listing.listing_id or "").strip()
+                if key:
+                    active_by_id[key] = listing
+            for listing in page_pending:
+                key = str(listing.listing_id or "").strip()
+                if key:
+                    pending_by_id[key] = listing
+
+            if error:
+                break
+            next_start = page_start + request_count
+            if official_active_count is not None:
+                if next_start >= official_active_count:
+                    complete = (
+                        start == 0
+                        and len(active_by_id) >= official_active_count
+                    )
+                    if not complete:
+                        error = (
+                            "Steam mylistings pagination ended before all unique "
+                            f"active rows were read ({len(active_by_id)}/"
+                            f"{official_active_count})"
+                        )
+                    break
+                if not page_active:
+                    error = (
+                        "Steam mylistings returned an empty intermediate page "
+                        f"at start={page_start} with total={official_active_count}"
+                    )
+                    break
+            elif len(page_active) < request_count:
+                complete = start == 0
+                break
+            page_start = next_start
+
+        active_rows = tuple(active_by_id.values())
+        if requested_limit is not None:
+            active_rows = active_rows[:requested_limit]
+        return SteamMyListingsSnapshot(
+            active_rows,
+            tuple(pending_by_id.values()),
+            official_active_count,
+            len(active_rows),
+            pages_scanned,
+            complete,
+            datetime.now(timezone.utc).isoformat(),
+            error,
+        )
+
+    def my_listings_snapshot(
+        self,
+        *,
+        start: int = 0,
+        count: int | None = None,
+        safety_terminal: bool = False,
+    ) -> SteamMyListingsSnapshot:
+        """Read MyListings with pagination and a separately auditable boundary.
+
+        A full-state caller omits ``count``.  Explicit ``count=N`` remains a
+        bounded lightweight view and therefore may be intentionally incomplete.
+        An unstable full walk is retried once from the first page; if both
+        attempts fail, the best positive snapshot is returned with
+        ``complete=False``.
+        """
+
+        attempts = 2 if count is None else 1
+        best: SteamMyListingsSnapshot | None = None
+        for _ in range(attempts):
+            snapshot = self._read_my_listings_snapshot_once(
+                start=start,
+                count=count,
+                safety_terminal=safety_terminal,
+            )
+            if snapshot.complete or count is not None:
+                return snapshot
+            if (
+                best is None
+                or snapshot.actual_active_count > best.actual_active_count
+                or (
+                    snapshot.actual_active_count == best.actual_active_count
+                    and snapshot.pages_scanned > best.pages_scanned
+                )
+            ):
+                best = snapshot
+        assert best is not None
+        return best
+
+    def list_active_listings(
+        self,
+        *,
+        start: int = 0,
+        count: int | None = None,
+        safety_terminal: bool = False,
+    ) -> list[SteamListing]:
+        snapshot = self.my_listings_snapshot(
+            start=start,
+            count=count,
+            safety_terminal=safety_terminal,
+        )
+        if count is None and not snapshot.complete:
+            raise SteamMarketError(
+                snapshot.error
+                or "Steam mylistings pagination did not produce a complete snapshot"
+            )
+        return list(snapshot.active_listings)
+
+    def list_confirmation_pending_listings(
+        self,
+        *,
+        start: int = 0,
+        count: int | None = None,
+        safety_terminal: bool = False,
+    ) -> list[SteamListing]:
+        snapshot = self.my_listings_snapshot(
+            start=start,
+            count=count,
+            safety_terminal=safety_terminal,
+        )
+        if count is None and not snapshot.complete:
+            raise SteamMarketError(
+                snapshot.error
+                or "Steam mylistings pagination did not produce a complete snapshot"
+            )
+        return list(snapshot.pending_listings)
 
     def fetch_confirmations(self) -> list[dict[str, Any]]:
         if not self.identity_secret or not self.device_id:
@@ -1741,13 +2525,19 @@ class SteamMarketClient:
         *,
         asset_ids: Iterable[Any],
         listing_ids: Iterable[Any] | None = None,
+        pending_listings: Iterable[SteamListing] | None = None,
     ) -> int:
         expected_asset_ids = self._normalize_id_set(asset_ids)
         if not expected_asset_ids:
             return 0
         expected_listing_ids = self._normalize_id_set(listing_ids)
         pending_listing_ids: set[str] = set()
-        for listing in self.list_confirmation_pending_listings():
+        source_pending_listings = (
+            list(pending_listings)
+            if pending_listings is not None
+            else self.list_confirmation_pending_listings()
+        )
+        for listing in source_pending_listings:
             pending_asset_id = str(getattr(listing, "asset_id", "") or "").strip()
             pending_listing_id = str(getattr(listing, "listing_id", "") or "").strip()
             if not pending_asset_id or not pending_listing_id:

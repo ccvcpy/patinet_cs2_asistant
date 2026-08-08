@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 from cs2_assistant.accounts import AccountStore
 from cs2_assistant.catalog import is_csgo_api_weapon_case
@@ -25,6 +26,12 @@ DEFAULT_RATIO_BUCKET_SIZE = 0.005
 DEFAULT_REPORT_HOURS = 24
 DEFAULT_COLLECTION_INTERVAL_MINUTES = 5.0
 STEAM_ORDERBOOK_PRICE_PARSER_VERSION = 2
+# Steam's legacy /market/pricehistory/ labels end in ``+0``, but a full
+# point-by-point comparison against the Market Beta Unix timestamps showed
+# that those labels are consistently one hour ahead of the canonical instant
+# (3762/3762 points from 2016-11 through 2026-07, including winter and summer).
+# This is a source-format correction, not a local timezone or DST offset.
+STEAM_LEGACY_PRICE_HISTORY_LABEL_SHIFT = timedelta(hours=1)
 
 CRATE_TYPE_WEAPON_CASE = "weapon_case"
 CRATE_TYPE_CAPSULE = "capsule"
@@ -513,6 +520,7 @@ def collect_case_ratio_snapshots(
     steam_clients: list[SteamMarketClient],
     observed_at: str | None = None,
     max_workers: int = 1,
+    progress_callback: Callable[[int, int, CaseRatioSnapshot], None] | None = None,
 ) -> list[CaseRatioSnapshot]:
     if not targets:
         return []
@@ -612,11 +620,25 @@ def collect_case_ratio_snapshots(
             raw_json=raw,
         )
 
+    progress_lock = Lock()
+    progress_current = 0
+    progress_total = len(targets)
+
+    def tracked_snapshot(target: CaseMonitorTarget) -> CaseRatioSnapshot:
+        nonlocal progress_current
+        snapshot = build_snapshot(target)
+        if progress_callback is not None:
+            with progress_lock:
+                progress_current += 1
+                current = progress_current
+            progress_callback(current, progress_total, snapshot)
+        return snapshot
+
     workers = max(1, int(max_workers))
     if workers == 1:
-        return [build_snapshot(target) for target in targets]
+        return [tracked_snapshot(target) for target in targets]
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(build_snapshot, targets))
+        return list(executor.map(tracked_snapshot, targets))
 
 
 def save_case_ratio_snapshots(db: Database, snapshots: list[CaseRatioSnapshot]) -> int:
@@ -751,11 +773,30 @@ def _timeline_rows(
 
 
 def _parse_price_history_time(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
     text = str(value or "").strip()
     if not text:
         return None
     if text.endswith(" +0"):
-        text = f"{text[:-3]} +0000"
+        legacy_text = text[:-3].strip()
+        for fmt in ("%b %d %Y %H:", "%b %d %Y %H:%M", "%b %d %Y"):
+            try:
+                parsed = datetime.strptime(legacy_text, fmt)
+            except ValueError:
+                continue
+            return (
+                parsed.replace(tzinfo=timezone.utc)
+                - STEAM_LEGACY_PRICE_HISTORY_LABEL_SHIFT
+            )
+        return None
     for fmt in (
         "%b %d %Y %H: %z",
         "%b %d %Y %H:%M %z",
@@ -884,6 +925,7 @@ def enrich_case_ratio_report_with_steam_liquidity(
     recommendation_crate_type: str | None = "all",
     top_n: int = 10,
     max_workers: int = 4,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     if not steam_clients:
         report["steamLiquidityStatus"] = "skipped_no_steam_client"
@@ -934,12 +976,26 @@ def enrich_case_ratio_report_with_steam_liquidity(
             }
         return market_hash_name, {"steamLiquidityError": " | ".join(errors) if errors else "unavailable"}
 
+    progress_lock = Lock()
+    progress_current = 0
+    progress_total = len(candidates)
+
+    def tracked_liquidity(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        nonlocal progress_current
+        result = fetch_liquidity(item)
+        if progress_callback is not None:
+            with progress_lock:
+                progress_current += 1
+                current = progress_current
+            progress_callback(current, progress_total, result[0])
+        return result
+
     workers = max(1, int(max_workers))
     if workers == 1:
-        results = [fetch_liquidity(item) for item in candidates]
+        results = [tracked_liquidity(item) for item in candidates]
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(fetch_liquidity, candidates))
+            results = list(executor.map(tracked_liquidity, candidates))
     by_name = {name: payload for name, payload in results}
 
     for item in items:

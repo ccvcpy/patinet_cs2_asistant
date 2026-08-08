@@ -5,6 +5,7 @@ import math
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -42,9 +43,18 @@ from cs2_assistant.models import (
     StrategyConfig,
     guadao_scope_allows_item,
 )
-from cs2_assistant.services.executor_buy import execute_rebuy, is_retryable_c5_network_error
+from cs2_assistant.services.executor_buy import RebuyResult, execute_rebuy, is_retryable_c5_network_error
+from cs2_assistant.services.c5_ip_circuit import (
+    bind_c5_ip_circuit_telemetry,
+    build_c5_ip_request_guard,
+)
 from cs2_assistant.services.market import calculate_listing_ratio, calculate_transfer_real_ratio
-from cs2_assistant.services.pricing import PricingDecision, fetch_listing_price, summarize_orderbook_prices
+from cs2_assistant.services.pricing import (
+    PricingDecision,
+    choose_orderbook_price,
+    fetch_listing_price,
+    summarize_orderbook_prices,
+)
 from cs2_assistant.services.steam_request_scheduler import SteamRequestGuardRejected
 from cs2_assistant.services.strategy import classify_strategies, load_strategy_config, scan_strategies
 from cs2_assistant.services.t_yield_scan import fetch_all_c5_inventories, summarize_inventory_types
@@ -99,15 +109,20 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _guadao_client_telemetry_callback(**context: Any) -> Any:
+def _guadao_client_telemetry_callback(settings: Settings, **context: Any) -> Any:
     """Bind an explicit guadao source without making logging a dependency."""
 
     try:
         from cs2_assistant.services.guadao_logging import get_guadao_event_logger
 
-        return get_guadao_event_logger().bind_telemetry(**context)
+        downstream = get_guadao_event_logger().bind_telemetry(**context)
     except Exception:
-        return None
+        downstream = None
+    return bind_c5_ip_circuit_telemetry(
+        settings,
+        source="guadao",
+        downstream=downstream,
+    )
 
 
 LISTING_CONFIRMATION_PENDING_STATUSES = {
@@ -120,12 +135,22 @@ LISTING_CONFIRMATION_PENDING_STATUSES = {
     "confirm_sent_waiting_active_listing",
     "listing_missing_unverified",
 }
+CASE_NONBLOCKING_LISTING_PENDING_STATUSES = {
+    "confirm_sent_waiting_active_listing",
+    "listing_missing_unverified",
+}
 REBUY_NO_MATCHING_TIMEOUT_SECONDS = 3 * 60 * 60
 REBUY_ORDER_AUDIT_LOOKBACK_DAYS = 7
-C5_DELIVERY_DEADLINE_SECONDS = 24 * 60 * 60
+C5_DELIVERY_DEADLINE_SECONDS = 12 * 60 * 60
 C5_DELIVERY_STATUS_KEY = "c5FinalStatus"
 C5_DELIVERY_SUCCESS = "c5_success"
 C5_DELIVERY_FAILED = "c5_failed"
+C5_SUBMISSION_UNCONFIRMED = "c5_submission_unconfirmed"
+C5_SUBMISSION_ABSENCE_CONFIRMATIONS = 3
+C5_SUBMISSION_MATCH_WINDOW_SECONDS = 2 * 60
+C5_SUBMISSION_RECONCILE_INITIAL_PAGE_BUDGET = 100
+C5_SUBMISSION_RECONCILE_MAX_PAGE_BUDGET = 1000
+C5_SUBMISSION_NOT_CREATED_MAX_CHAIN = 3
 REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY = "autoReplacementEligible"
 STEAM_LISTING_RETRY_DELAY_SECONDS = 3.0
 STEAM_LISTING_SUCCESS_DELAY_SECONDS = 0.0
@@ -133,16 +158,33 @@ STEAM_LISTING_MAX_ATTEMPTS = 10
 STEAM_LISTING_TRANSIENT_COOLDOWN_SECONDS = 30 * 60
 STEAM_LISTING_ACCOUNT_ATTEMPT_INTERVAL_SECONDS = 1.0
 STEAM_LISTING_ACCOUNT_BACKOFF_SECONDS = 3 * 60
+GUADAO_SCAN_ORDERBOOK_ADMISSION_SECONDS = 90.0
 GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS = 48 * 60 * 60
+GUADAO_STALE_LISTED_DEFERRED_RETRY_SECONDS = 10 * 60
 STEAM_SALE_RECEIPT_FAST_LOOKUP_MAX_PAGES = 2
 STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES = 30
 STEAM_SALE_RECEIPT_DEEP_LOOKUP_INITIAL_DELAY_SECONDS = 30 * 60
 STEAM_SALE_RECEIPT_DEEP_LOOKUP_INTERVAL_SECONDS = 6 * 60 * 60
-C5_INVENTORY_REFERENCE_CACHE_MAX_AGE_SECONDS = 180 * 60
+CASE_CAPACITY_OBSERVATION_PAYLOAD_KEY = "caseListingCapacityObservation"
+EXECUTION_PROCESS_SESSION_ID = uuid.uuid4().hex
 
 
 class _NewGuadaoActionBlocked(RuntimeError):
     """Internal control-flow signal used before a new real Steam listing."""
+
+
+@dataclass(frozen=True)
+class _SteamSaleReceiptLookupOutcome:
+    """Keep Steam-history absence distinct from an unreadable history route."""
+
+    receipts: dict[int, dict[str, Any] | None]
+    deep_attempt_ids: set[int]
+    deep_attempted_at: str | None
+    lookup_succeeded: bool
+    coverage_complete: bool
+    error: str | None = None
+    retry_at: str | None = None
+    pages_scanned: int = 0
 
 
 def _format_decimal(value: Any, *, digits: int = 3) -> str:
@@ -291,6 +333,87 @@ def _extract_c5_trade_order_id(payload: Any) -> str | None:
     return None
 
 
+def _c5_submission_credentials(payload: Any) -> tuple[str | None, str | None, int | None]:
+    return (
+        _extract_c5_order_id(payload),
+        _extract_c5_trade_order_id(payload),
+        safe_int(payload.get("payStatus")) if isinstance(payload, dict) else None,
+    )
+
+
+def _has_confirmed_c5_submission(payload: Any) -> bool:
+    asset_order_id, trade_order_id, _pay_status = _c5_submission_credentials(payload)
+    # payStatus describes payment/delivery progress, not whether C5 created the
+    # order. Two real identifiers are sufficient existence evidence; the
+    # detail endpoint owns the terminal-state decision.
+    return bool(asset_order_id and trade_order_id)
+
+
+def _has_confirmed_c5_order_note(note: dict[str, Any]) -> bool:
+    has_asset_id = bool(str(note.get("c5OrderId") or "").strip())
+    has_trade_id = bool(str(note.get("c5TradeOrderId") or "").strip())
+    # A safe unique buyer/status match may expose only the asset lookup id
+    # until buyer/detail becomes readable. Preserve that recognized order
+    # instead of migrating it back to submission absence reconciliation.
+    return bool(
+        (has_asset_id and has_trade_id)
+        or (note.get("c5OrderRecognized") and has_asset_id)
+    )
+
+
+def _c5_buyer_status_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    for key in ("list", "records", "rows", "orderList"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return _c5_buyer_status_rows(data)
+    return []
+
+
+def _c5_buyer_status_has_list(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if any(isinstance(payload.get(key), list) for key in ("list", "records", "rows", "orderList")):
+        return True
+    return _c5_buyer_status_has_list(payload.get("data"))
+
+
+def _c5_buyer_status_pages(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    pages = safe_int(payload.get("pages"))
+    if pages is not None:
+        return pages
+    return _c5_buyer_status_pages(payload.get("data"))
+
+
+def _c5_buyer_row_asset_order_id(row: dict[str, Any]) -> str | None:
+    # buyer/status commonly exposes its asset-level identifier as ``orderId``.
+    # quick-buy uses ``orderAssetId`` for the same lookup identifier.
+    return _extract_c5_order_id(row) or (
+        str(row.get("orderId")) if row.get("orderId") not in (None, "") else None
+    )
+
+
+def _c5_buyer_row_trade_order_id(row: dict[str, Any]) -> str | None:
+    value = (
+        row.get("tradeOrderId")
+        or row.get("trade_order_id")
+        or row.get("parentOrderId")
+        or row.get("parent_order_id")
+    )
+    if value not in (None, ""):
+        return str(value)
+    # When both explicit quick-buy names are present, orderId is the trade id.
+    if _extract_c5_order_id(row) and row.get("orderId") not in (None, ""):
+        return str(row.get("orderId"))
+    return None
+
+
 def _is_c5_insufficient_balance_rebuy_result(result: RebuyResult) -> bool:
     payload = getattr(result, "payload", None)
     if isinstance(payload, dict):
@@ -349,7 +472,7 @@ def _c5_delivery_final_status(detail: dict[str, Any]) -> str | None:
     failed_desc = str(detail.get("failedDesc") or "").strip()
     if status == 11 or status_name in {"failed", "fail", "failure", "失败", "已失败"} or failed_code or failed_desc:
         return C5_DELIVERY_FAILED
-    if status_name in {
+    if status == 10 or status_name in {
         "success",
         "succeeded",
         "complete",
@@ -490,8 +613,12 @@ class ExecutionEngine:
         self.c5_client = C5GameClient(
             self._c5_api_key,
             settings.c5_base_url,
-            telemetry_callback=_guadao_client_telemetry_callback(**c5_telemetry_context),
+            telemetry_callback=_guadao_client_telemetry_callback(
+                settings,
+                **c5_telemetry_context,
+            ),
             telemetry_context={"source": "guadao", **c5_telemetry_context},
+            request_guard=build_c5_ip_request_guard(settings),
         )
         self.serverchan = (
             ServerChanClient(settings.serverchan_sendkey, settings.serverchan_base_url)
@@ -521,6 +648,7 @@ class ExecutionEngine:
         self._stop_reason: str | None = None
         self._new_action_guard = new_action_guard
         self._case_open_guadao_limit_notified = False
+        self._process_session_id = EXECUTION_PROCESS_SESSION_ID
         self._rebuy_wait_started_at: dict[int, datetime] = {}
         self._recent_rebuy_delivery_failures_checked = False
         self._listing_account_next_attempt_at: dict[str, float] = {}
@@ -1176,6 +1304,25 @@ class ExecutionEngine:
             return client
         return None
 
+    @staticmethod
+    def _steam_client_relogin_policy_matches(
+        client: SteamMarketClient | None,
+        allow_relogin: bool,
+    ) -> bool:
+        """Keep cached clients from widening a no-relogin maintenance read.
+
+        Older injected/fake clients do not expose the private policy flag; in
+        that compatibility case there is no internal relogin path to widen and
+        the cache remains usable.  Production ``SteamMarketClient`` instances
+        always expose the flag, so a stale-listing read cannot reuse a client
+        created by a normal sync path with relogin enabled.
+        """
+
+        configured = getattr(client, "_allow_account_relogin", None)
+        if configured is None:
+            return True
+        return bool(configured) == bool(allow_relogin)
+
     def _steam_client_matches(self, steam_id64: str | None, account: Account | None = None) -> bool:
         if not self.steam_client:
             return False
@@ -1191,16 +1338,28 @@ class ExecutionEngine:
         self,
         account: Account | None,
         steam_id64: str | None = None,
+        *,
+        validate_session: bool = True,
+        allow_relogin: bool = True,
     ) -> SteamMarketClient | None:
         expected_steam_id = str(steam_id64 or (account.steam_id64 if account else "") or "").strip() or None
         cached = self._cached_steam_client(account, expected_steam_id)
-        if cached is not None:
-            return self._ensure_market_client_ready(cached, account)
+        if cached is not None and self._steam_client_relogin_policy_matches(
+            cached,
+            allow_relogin,
+        ):
+            return self._ensure_market_client_ready(cached, account) if validate_session else cached
 
         if account is None:
-            if self._steam_client_matches(expected_steam_id):
+            if (
+                self._steam_client_matches(expected_steam_id)
+                and self._steam_client_relogin_policy_matches(
+                    self.steam_client,
+                    allow_relogin,
+                )
+            ):
                 self._cache_steam_client(self.steam_client, self.account)
-                return self._ensure_market_client_ready(self.steam_client, self.account)
+                return self._ensure_market_client_ready(self.steam_client, self.account) if validate_session else self.steam_client
             print(f"[跳过] steam={expected_steam_id or '-'} 未匹配到 config/accounts.json 中的 Steam 账号。")
             return None
         if not getattr(self, "account_store", None):
@@ -1209,6 +1368,8 @@ class ExecutionEngine:
 
         refreshed_account = account
         if not refreshed_account.cookies:
+            if not allow_relogin:
+                return None
             ok, status, updated = try_steam_auto_relogin(
                 self.account_store,
                 account_id=refreshed_account.id,
@@ -1228,8 +1389,11 @@ class ExecutionEngine:
                 account_id=refreshed_account.id,
                 base_url=self.settings.steam_market_base_url,
                 request_source="guadao",
+                allow_account_relogin=allow_relogin,
             )
         except SteamMarketError as exc:
+            if not allow_relogin:
+                return None
             ok, status, updated = try_steam_auto_relogin(
                 self.account_store,
                 account_id=refreshed_account.id,
@@ -1247,16 +1411,22 @@ class ExecutionEngine:
                     account_id=updated.id,
                     base_url=self.settings.steam_market_base_url,
                     request_source="guadao",
+                    allow_account_relogin=allow_relogin,
                 )
                 refreshed_account = updated
             except SteamMarketError as relogin_exc:
                 print(f"[跳过] Steam账号 {refreshed_account.name} relogin 后仍无法初始化: {relogin_exc}")
                 return None
 
-        client = self._ensure_market_client_ready(client, refreshed_account)
+        if validate_session:
+            client = self._ensure_market_client_ready(client, refreshed_account)
         if client is None:
             return None
-        self._cache_steam_client(client, refreshed_account)
+        # A no-relogin maintenance client is intentionally not cached.  The
+        # normal account-sync client may need to refresh a later 400/401, and a
+        # one-off safety read must not permanently disable that behavior.
+        if allow_relogin:
+            self._cache_steam_client(client, refreshed_account)
         print(
             f"[账号] 已准备 Steam client: {refreshed_account.name} | "
             f"steam={getattr(client, 'steam_id64', expected_steam_id) or '-'}"
@@ -1929,12 +2099,15 @@ class ExecutionEngine:
         rebought = 0
 
         if self._has_open_guadao_cycle(status_map):
-            print("[等待] 检测到挂刀待确认/失败状态，或箱子活跃挂单槽已满，本轮暂停新上架。")
+            print("[等待] 检测到挂刀硬阻断状态，或广义箱子风险占用槽已满，本轮暂停新上架。")
         else:
-            case_open_count = self._open_case_guadao_count()
-            if case_open_count > 0:
+            active_count = self._open_case_guadao_count()
+            unverified_count = self._nonblocking_case_listing_pending_count()
+            occupied_count = active_count + unverified_count
+            if occupied_count > 0:
                 print(
-                    f"[继续] 箱子活跃挂单槽 {case_open_count}/{self._case_max_open_guadao_count()}，"
+                    f"[继续] 广义箱子风险占用槽 {occupied_count}/{self._case_max_open_guadao_count()} "
+                    f"（确认在售 {active_count}，待确认/终态复查 {unverified_count}），"
                     "未达上限，本轮继续开启新挂刀。"
                 )
             listed = self._execute_guadao_listings(report, status_map)
@@ -2004,6 +2177,20 @@ class ExecutionEngine:
         case_open_count = self._open_case_guadao_count()
         if case_open_count:
             counts["case_open_guadao.active_listings"] = case_open_count
+        unverified_count = self._listing_missing_unverified_case_guadao_count()
+        if unverified_count:
+            counts["case_open_guadao.listing_missing_unverified"] = unverified_count
+        confirm_sent_count = self._confirm_sent_waiting_case_guadao_count()
+        if confirm_sent_count:
+            counts["case_open_guadao.confirm_sent_waiting_active"] = confirm_sent_count
+        nonblocking_pending_count = unverified_count + confirm_sent_count
+        if nonblocking_pending_count:
+            counts["case_open_guadao.nonblocking_listing_pending"] = (
+                nonblocking_pending_count
+            )
+        occupied_count = case_open_count + nonblocking_pending_count
+        if occupied_count:
+            counts["case_open_guadao.occupied_slots"] = occupied_count
         return counts
 
     def _has_open_guadao_cycle(self, status_map: dict[str, str] | None = None) -> bool:
@@ -2022,16 +2209,17 @@ class ExecutionEngine:
         if self._has_non_case_open_guadao_operation():
             return True
 
-        case_open_count = self._open_case_guadao_count()
-        case_has_blocking_pool_status = any(
-            status in {POOL_STATUS_LISTING_PENDING, POOL_STATUS_REBUY_FAILED}
-            and self._is_weapon_case(market_hash_name)
+        if any(
+            status == POOL_STATUS_REBUY_FAILED and self._is_weapon_case(market_hash_name)
             for market_hash_name, status in current_status_map.items()
-        )
-        if case_has_blocking_pool_status:
+        ):
             return True
-        if self._case_open_guadao_limit_reached(case_open_count):
-            self._notify_case_open_guadao_limit(case_open_count)
+        if self._has_blocking_case_listing_pending_operation(current_status_map):
+            return True
+
+        occupied_count = self._occupied_case_guadao_slot_count()
+        if self._case_open_guadao_limit_reached(occupied_count):
+            self._notify_case_open_guadao_limit(occupied_count)
             return True
         return False
 
@@ -2048,6 +2236,90 @@ class ExecutionEngine:
             count += max(1, quantity)
         return count
 
+    def _listing_missing_unverified_case_guadao_count(self) -> int:
+        return self._case_listing_pending_count_for_confirmation_statuses(
+            {"listing_missing_unverified"}
+        )
+
+    def _confirm_sent_waiting_case_guadao_count(self) -> int:
+        return self._case_listing_pending_count_for_confirmation_statuses(
+            {"confirm_sent_waiting_active_listing"}
+        )
+
+    def _nonblocking_case_listing_pending_count(self) -> int:
+        return self._case_listing_pending_count_for_confirmation_statuses(
+            CASE_NONBLOCKING_LISTING_PENDING_STATUSES
+        )
+
+    def _case_listing_pending_count_for_confirmation_statuses(
+        self,
+        confirmation_statuses: set[str],
+    ) -> int:
+        count = 0
+        limit = max(500, self._case_max_open_guadao_count() + 10)
+        for op in self.db.list_pool_operations_by_type(
+            OP_SELL_STEAM,
+            status=POOL_STATUS_LISTING_PENDING,
+            limit=limit,
+        ):
+            if not self._is_weapon_case(op["market_hash_name"]):
+                continue
+            note = _read_note(op["note"])
+            if (
+                str(note.get("confirmationStatus") or "").strip()
+                not in confirmation_statuses
+            ):
+                continue
+            quantity = safe_int(op["quantity"]) or 1
+            count += max(1, quantity)
+        return count
+
+    def _occupied_case_guadao_slot_count(self) -> int:
+        """Return slots that must be reserved before opening another crates listing.
+
+        A listing whose remote terminal state is missing still consumes capacity risk,
+        but it is not proof of an active Steam listing and therefore must not be used
+        by the three-hour full-capacity release timer.
+        """
+
+        return (
+            self._open_case_guadao_count()
+            + self._nonblocking_case_listing_pending_count()
+        )
+
+    def _has_blocking_case_listing_pending_operation(
+        self,
+        status_map: dict[str, str],
+    ) -> bool:
+        """Keep unknown case listing states blocking except the bounded slot exception."""
+
+        limit = max(500, self._case_max_open_guadao_count() + 10)
+        pending_names: set[str] = set()
+        for op in self.db.list_pool_operations_by_type(
+            OP_SELL_STEAM,
+            status=POOL_STATUS_LISTING_PENDING,
+            limit=limit,
+        ):
+            market_hash_name = str(op["market_hash_name"] or "").strip()
+            if not market_hash_name or not self._is_weapon_case(market_hash_name):
+                continue
+            pending_names.add(market_hash_name)
+            note = _read_note(op["note"])
+            if (
+                str(note.get("confirmationStatus") or "").strip()
+                not in CASE_NONBLOCKING_LISTING_PENDING_STATUSES
+            ):
+                return True
+
+        # A pool-level pending state without its operation evidence is inconsistent.
+        # It must stay blocked rather than being silently treated as a reserved slot.
+        return any(
+            status == POOL_STATUS_LISTING_PENDING
+            and self._is_weapon_case(market_hash_name)
+            and market_hash_name not in pending_names
+            for market_hash_name, status in status_map.items()
+        )
+
     def _has_non_case_open_guadao_operation(self) -> bool:
         for operation_type, status in (
             (OP_SELL_STEAM, "listed"),
@@ -2062,7 +2334,7 @@ class ExecutionEngine:
         return False
 
     def _case_open_guadao_limit_reached(self, count: int | None = None) -> bool:
-        count = self._open_case_guadao_count() if count is None else count
+        count = self._occupied_case_guadao_slot_count() if count is None else count
         reached = count > 0 and count >= self._case_max_open_guadao_count()
         if not reached:
             self._case_open_guadao_limit_notified = False
@@ -2070,7 +2342,7 @@ class ExecutionEngine:
 
     def _notify_case_open_guadao_limit(self, count: int) -> None:
         limit = self._case_max_open_guadao_count()
-        message = f"箱子活跃挂单槽已达到 {count}/{limit} 个，已暂停新上架；程序会继续每轮扫描卖出和补仓。"
+        message = f"广义箱子风险占用槽已达到 {count}/{limit} 个，已暂停新上架；程序会继续每轮扫描卖出和补仓。"
         if getattr(self, "_case_open_guadao_limit_notified", False):
             return
         self._case_open_guadao_limit_notified = True
@@ -2080,12 +2352,14 @@ class ExecutionEngine:
             return
         try:
             serverchan.send(
-                "[挂刀暂停] 箱子活跃挂单槽已满",
+                "[挂刀暂停] 广义箱子风险占用槽已满",
                 (
-                    f"箱子活跃挂单槽: {count}/{limit}\n"
+                    f"广义箱子风险占用槽: {count}/{limit}\n"
                     "状态: 已暂停新上架，程序仍会继续扫描卖出和补仓\n"
-                    f"处理: 连续满载 {self.config.case_full_release_after_hours:g} 小时后，"
-                    f"随机撤销 {self.config.case_full_release_fraction * 100:g}% 的远端活跃挂单"
+                    "处理: 已发送确认但尚未见活跃挂单、以及 listing_missing_unverified "
+                    "都只保留风险槽并继续后台复查；只有 Steam 远端确认在售也满载，"
+                    f"并连续 {self.config.case_full_release_after_hours:g} 小时后，才随机撤销 "
+                    f"{self.config.case_full_release_fraction * 100:g}% 的远端活跃挂单"
                 ),
             )
         except Exception as exc:
@@ -2124,40 +2398,43 @@ class ExecutionEngine:
         active_client = client or self.steam_client
         if not active_client:
             return None
-        price_offset = self._listing_price_offset_for_candidate(candidate)
-        pricing = fetch_listing_price(
-            active_client,
-            app_id=self.settings.app_id,
-            market_hash_name=candidate.market_hash_name,
-            wall_min_count=self._listing_wall_min_count_for_candidate(candidate),
-            price_offset=price_offset,
-            min_price=0.01,
-            country=self.config.steam_country,
-            language=self.config.steam_language,
-            currency=self.config.steam_currency,
-            force_refresh=False,
-            cache_ttl=self.config.steam_price_cache_ttl,
-        )
-        if pricing is None:
-            if not self.config.dry_run:
-                print(
-                    f"[上架跳过] {candidate.market_hash_name} | "
-                    "真实执行必须获取 Steam 实时挂单墙价格，当前取价失败"
-                )
-                return None
-            fallback_price = safe_float(candidate.steam_sell_price)
-            if fallback_price is None or fallback_price <= 0:
-                return None
-            pricing = PricingDecision(
-                list_price=float(fallback_price),
-                wall_price=None,
-                reason="scan_price_fallback",
-            )
+        if (
+            not self.config.dry_run
+            and str(candidate.steam_price_source or "") != "steam_orderbook"
+        ):
             print(
-                f"[上架定价] {candidate.market_hash_name} | "
-                f"Steam 实时挂单墙取价失败，dry-run 使用扫描价 CNY {fallback_price:.2f}"
+                f"[上架跳过] {candidate.market_hash_name} | "
+                "扫描阶段没有取得 Steam orderbook 官方卖盘价"
             )
+            return None
+        scan_price = safe_float(candidate.steam_sell_price)
+        if scan_price is None or scan_price <= 0:
+            return None
+        # The scan already parsed the official orderbook with this item's
+        # actual wall/offset rule. Reuse that snapshot here. The irreversible
+        # listing boundary still performs exactly one force-refresh below.
+        pricing = PricingDecision(
+            list_price=float(scan_price),
+            wall_price=None,
+            reason="scan_orderbook_snapshot",
+        )
         return self._decision_from_list_price(candidate, pricing.list_price, pricing=pricing)
+
+    def _guadao_scan_orderbook_price(
+        self,
+        market_hash_name: str,
+        payload: dict[str, Any],
+    ) -> PricingDecision | None:
+        return choose_orderbook_price(
+            payload,
+            wall_min_count=self._listing_wall_min_count_for_market_hash_name(
+                market_hash_name
+            ),
+            price_offset=self._listing_price_offset_for_market_hash_name(
+                market_hash_name
+            ),
+            min_price=0.01,
+        )
 
     def _is_weapon_case(self, market_hash_name: str) -> bool:
         item = self.db.get_item(market_hash_name)
@@ -2350,6 +2627,12 @@ class ExecutionEngine:
         if frozen_ratio is None:
             frozen_ratio = safe_float(note.get("listingRatioAtOpen"))
         if frozen_ratio is not None and frozen_ratio > 0:
+            # A user-approved per-operation refreeze explicitly replaces the
+            # original hard ceiling for this sold-but-not-yet-rebought flow.
+            # The old values remain in ``manualRebuyRefreezeHistory``; the
+            # global strategy and unrelated operations are unchanged.
+            if note.get("manualRebuyRefrozenAt"):
+                return frozen_ratio
             hard_max_at_open = safe_float(note.get("guadaoMaxListingRatioAtOpen"))
             if hard_max_at_open is not None and hard_max_at_open > 0:
                 return min(frozen_ratio, hard_max_at_open)
@@ -2389,9 +2672,9 @@ class ExecutionEngine:
             if getattr(self, "_stop_requested", False):
                 break
             if self._is_weapon_case(candidate.market_hash_name):
-                case_open_count = self._open_case_guadao_count()
-                if self._case_open_guadao_limit_reached(case_open_count):
-                    self._notify_case_open_guadao_limit(case_open_count)
+                occupied_count = self._occupied_case_guadao_slot_count()
+                if self._case_open_guadao_limit_reached(occupied_count):
+                    self._notify_case_open_guadao_limit(occupied_count)
                     break
             if not self._can_execute_guadao(status_map.get(candidate.market_hash_name)):
                 continue
@@ -2499,9 +2782,9 @@ class ExecutionEngine:
             if list_count >= self.config.max_list_per_cycle:
                 break
             if self._is_weapon_case(candidate.market_hash_name):
-                case_open_count = self._open_case_guadao_count()
-                if self._case_open_guadao_limit_reached(case_open_count):
-                    self._notify_case_open_guadao_limit(case_open_count)
+                occupied_count = self._occupied_case_guadao_slot_count()
+                if self._case_open_guadao_limit_reached(occupied_count):
+                    self._notify_case_open_guadao_limit(occupied_count)
                     break
             if not self._can_execute_guadao(status_map.get(candidate.market_hash_name)):
                 continue
@@ -2549,9 +2832,9 @@ class ExecutionEngine:
                     )
                     break
                 if self._is_weapon_case(candidate.market_hash_name):
-                    case_open_count = self._open_case_guadao_count()
-                    if self._case_open_guadao_limit_reached(case_open_count):
-                        self._notify_case_open_guadao_limit(case_open_count)
+                    occupied_count = self._occupied_case_guadao_slot_count()
+                    if self._case_open_guadao_limit_reached(occupied_count):
+                        self._notify_case_open_guadao_limit(occupied_count)
                         break
                 if wait_before_next_listing:
                     time.sleep(STEAM_LISTING_SUCCESS_DELAY_SECONDS)
@@ -2920,16 +3203,15 @@ class ExecutionEngine:
             candidate_ops = [op for op in candidate_ops if int(op["id"]) in selected_ids]
 
         if sale_receipt_results is None:
-            (
-                sale_receipt_results,
-                sale_receipt_deep_attempt_ids,
-                sale_receipt_deep_attempted_at,
-            ) = self._lookup_steam_sale_receipts_for_operations(
+            receipt_lookup = self._lookup_steam_sale_receipts_for_operations(
                 active_client,
                 candidate_ops,
                 active_listing_ids=active_listing_ids,
                 active_asset_ids=active_asset_ids,
             )
+            sale_receipt_results = receipt_lookup.receipts
+            sale_receipt_deep_attempt_ids = receipt_lookup.deep_attempt_ids
+            sale_receipt_deep_attempted_at = receipt_lookup.deep_attempted_at
         deep_attempt_ids = set(sale_receipt_deep_attempt_ids or set())
 
         # Confirm every due operation first, then refresh mylistings exactly
@@ -3104,6 +3386,27 @@ class ExecutionEngine:
                             f"automatic remove failed: {remove_error}"
                         )
                         self._market_pending_cleanup_failed_count += 1
+                    if (
+                        str(note.get("confirmationStatus") or "")
+                        == "confirm_sent_waiting_active_listing"
+                        and confirmation_retry_error is None
+                        and (confirmation_retry_count or 0) <= 0
+                        and pending_market_listing is None
+                        and (
+                            operation_id in deep_attempt_ids
+                            or bool(note.get("saleEvidenceDeepLastAttemptAt"))
+                        )
+                    ):
+                        retry_note["listingMissingRecoveryFrom"] = (
+                            "confirm_sent_waiting_active_listing"
+                        )
+                        retry_note["listingMissingRecoveryAt"] = utc_now_iso()
+                        self._mark_steam_listing_pending(
+                            op,
+                            retry_note,
+                            reason="listing_missing_unverified",
+                        )
+                        continue
                     self.db.update_pool_operation(
                         op["id"],
                         status=POOL_STATUS_LISTING_PENDING,
@@ -3233,7 +3536,9 @@ class ExecutionEngine:
 
     def _mark_steam_listing_pending(self, op: Any, note: dict[str, Any], *, reason: str) -> None:
         note["confirmationStatus"] = reason
-        note["listingPendingAt"] = utc_now_iso()
+        note["listingPendingAt"] = note.get("listingPendingAt") or utc_now_iso()
+        if reason == "listing_missing_unverified":
+            self._record_listing_missing_observation(note, first_observation=True)
         self.db.update_pool_operation(
             op["id"],
             status=POOL_STATUS_LISTING_PENDING,
@@ -3269,6 +3574,71 @@ class ExecutionEngine:
         ).fetchone()
         return rows is not None
 
+    def _reconcile_guadao_pool_status_after_listing_release(
+        self,
+        market_hash_name: str,
+    ) -> str:
+        """Rebuild the item-level pool state from remaining guadao operations."""
+
+        rows = self.db.conn.execute(
+            """
+            SELECT operation_type, status, note
+            FROM pool_operations
+            WHERE market_hash_name = ?
+              AND strategy = ?
+              AND (
+                (operation_type = ? AND status IN (?, 'listed', 'manual_required'))
+                OR (
+                    operation_type = ?
+                    AND status IN ('pending', 'delivery_pending', ?, 'failed', 'manual_required')
+                )
+              )
+            ORDER BY id ASC
+            """,
+            (
+                market_hash_name,
+                STRATEGY_GUADAO,
+                OP_SELL_STEAM,
+                POOL_STATUS_LISTING_PENDING,
+                OP_REBUY_C5,
+                C5_SUBMISSION_UNCONFIRMED,
+            ),
+        ).fetchall()
+
+        has_blocking_rebuy = any(
+            row["operation_type"] == OP_REBUY_C5
+            and (
+                row["status"] == "manual_required"
+                or (row["status"] == "failed" and self._failed_rebuy_counts_as_open(row))
+            )
+            for row in rows
+        )
+        if has_blocking_rebuy:
+            pool_status = POOL_STATUS_REBUY_FAILED
+        elif any(
+            row["operation_type"] == OP_SELL_STEAM
+            and row["status"] == POOL_STATUS_LISTING_PENDING
+            for row in rows
+        ):
+            pool_status = POOL_STATUS_LISTING_PENDING
+        elif any(
+            row["operation_type"] == OP_SELL_STEAM
+            and row["status"] in {"listed", "manual_required"}
+            for row in rows
+        ):
+            pool_status = POOL_STATUS_LISTED
+        elif any(
+            row["operation_type"] == OP_REBUY_C5
+            and row["status"] in {"pending", "delivery_pending", C5_SUBMISSION_UNCONFIRMED}
+            for row in rows
+        ):
+            pool_status = POOL_STATUS_PENDING_REBUY
+        else:
+            pool_status = POOL_STATUS_HOLDING
+
+        self.db.set_pool_status(market_hash_name, pool_status)
+        return pool_status
+
     def _release_removed_market_pending_listing(self, op: Any, note: dict[str, Any]) -> None:
         asset_id = str(op["asset_id"] or "").strip()
         listing_id = str(note.get("marketPendingListingId") or note.get("listingId") or "").strip()
@@ -3278,15 +3648,249 @@ class ExecutionEngine:
         self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
         if asset_id:
             self.db.set_asset_status(asset_id, "available")
-        if not self._has_other_open_guadao_operation(
-            op["market_hash_name"],
-            exclude_op_id=int(op["id"]),
-        ):
-            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+        self._reconcile_guadao_pool_status_after_listing_release(
+            str(op["market_hash_name"]),
+        )
         print(
             f"[挂单待确认清理] {op['market_hash_name']} | asset={asset_id or '-'} | "
             f"listing={listing_id or '-'} | "
             "Steam 网页待确认挂单已撤下，资产已释放，下轮可重新上架"
+        )
+
+    @staticmethod
+    def _listing_missing_observation_count(note: dict[str, Any]) -> int:
+        return max(0, safe_int(note.get("activeListingMissingObservationCount")) or 0)
+
+    def _record_listing_missing_observation(
+        self,
+        note: dict[str, Any],
+        *,
+        first_observation: bool = False,
+    ) -> int:
+        """Persist distinct active-listing absence observations conservatively."""
+
+        observed_at = utc_now_iso()
+        count = self._listing_missing_observation_count(note)
+        if first_observation:
+            # A transition from listed -> listing_missing_unverified is itself
+            # the first complete mylistings absence observation.
+            count = max(1, count)
+            note["activeListingMissingFirstObservedAt"] = (
+                note.get("activeListingMissingFirstObservedAt") or observed_at
+            )
+        else:
+            # Older rows predate the counter.  Their persisted
+            # listing_missing_unverified state is proof of one previous
+            # absence, so the current fresh snapshot becomes observation two.
+            count = max(1, count) + 1
+            note["activeListingMissingFirstObservedAt"] = (
+                note.get("activeListingMissingFirstObservedAt")
+                or note.get("listingPendingAt")
+                or observed_at
+            )
+        note["activeListingMissingObservationCount"] = count
+        note["activeListingMissingLastObservedAt"] = observed_at
+        return count
+
+    def _steam_inventory_return_check_due(
+        self,
+        note: dict[str, Any],
+        *,
+        operation_id: int,
+        deep_attempt_ids: set[int],
+    ) -> bool:
+        """Avoid retrying official inventory on every routine 10-minute check."""
+
+        if self._listing_missing_observation_count(note) < 2:
+            return False
+        if not note.get("steamInventoryReturnCheckAt"):
+            return True
+        # After a real inventory response (missing, incomplete, or failed),
+        # wait for a new bounded deep history traversal before spending another
+        # official inventory read.  A historical receipt may have appeared in
+        # the meantime, and must win over any inventory fallback.
+        return int(operation_id) in deep_attempt_ids
+
+    @staticmethod
+    def _listing_matches_identity(listing: Any, *, listing_id: str, asset_id: str) -> bool:
+        candidate_listing_id = str(getattr(listing, "listing_id", "") or "").strip()
+        candidate_asset_id = str(getattr(listing, "asset_id", "") or "").strip()
+        return bool(
+            (listing_id and candidate_listing_id == listing_id)
+            or (asset_id and candidate_asset_id == asset_id)
+        )
+
+    def _prepare_official_inventory_return_checks(
+        self,
+        client: SteamMarketClient,
+        operations: list[Any],
+        *,
+        active_listing_ids: set[str],
+        active_asset_ids: set[str],
+        sale_receipt_results: dict[int, dict[str, Any] | None],
+        sale_receipt_lookup_succeeded: bool,
+        sale_receipt_coverage_complete: bool,
+        deep_attempt_ids: set[int],
+    ) -> dict[int, dict[str, Any]]:
+        """Prepare one account-batched official inventory recovery check.
+
+        A missing market listing is ambiguous.  This helper runs only after a
+        successful official market-history read has not matched a receipt, and
+        after a second independent active-listing absence.  A partial history
+        page is still insufficient to prove a sale, but an exact asset found
+        in Steam's official inventory is independently decisive evidence that
+        the asset was not sold.  Inventory absence never converts into a sale.
+        """
+
+        if not sale_receipt_lookup_succeeded:
+            return {}
+
+        candidates: list[tuple[Any, dict[str, Any], str, str]] = []
+        for op in operations:
+            note = _read_note(op["note"])
+            if (
+                str(op["status"] or "") != POOL_STATUS_LISTING_PENDING
+                or str(note.get("confirmationStatus") or "")
+                != "listing_missing_unverified"
+            ):
+                continue
+            operation_id = int(op["id"])
+            if sale_receipt_results.get(operation_id) is not None:
+                continue
+            listing_id = str(note.get("listingId") or "").strip()
+            asset_id = str(op["asset_id"] or "").strip()
+            if not asset_id or self._listing_is_active(
+                active_listing_ids=active_listing_ids,
+                active_asset_ids=active_asset_ids,
+                listing_id=listing_id,
+                asset_id=asset_id,
+            ):
+                continue
+            projected_observations = max(1, self._listing_missing_observation_count(note)) + 1
+            if projected_observations < 2 or not self._steam_inventory_return_check_due(
+                {**note, "activeListingMissingObservationCount": projected_observations},
+                operation_id=operation_id,
+                deep_attempt_ids=deep_attempt_ids,
+            ):
+                continue
+            candidates.append((op, note, listing_id, asset_id))
+        if not candidates:
+            return {}
+
+        pending_loader = getattr(client, "list_confirmation_pending_listings", None)
+        if not callable(pending_loader):
+            return {}
+        try:
+            pending_listings = list(pending_loader())
+        except Exception as exc:
+            return {
+                int(op["id"]): {
+                    "status": "market_pending_lookup_failed",
+                    "message": str(exc),
+                }
+                for op, _, _, _ in candidates
+            }
+
+        checks: dict[int, dict[str, Any]] = {}
+        inventory_candidates: list[tuple[Any, dict[str, Any], str]] = []
+        for op, _note, listing_id, asset_id in candidates:
+            if any(
+                self._listing_matches_identity(
+                    listing,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                )
+                for listing in pending_listings
+            ):
+                checks[int(op["id"])] = {"status": "market_pending_visible"}
+                continue
+            inventory_candidates.append((op, _note, asset_id))
+        if not inventory_candidates:
+            return checks
+
+        finder = getattr(client, "find_inventory_asset_ids", None)
+        if not callable(finder):
+            return checks
+        checked_at = utc_now_iso()
+        try:
+            result = finder([asset_id for _, _, asset_id in inventory_candidates])
+            found_asset_ids = {
+                str(value or "").strip()
+                for value in getattr(result, "found_asset_ids", frozenset())
+                if str(value or "").strip()
+            }
+            coverage_complete = bool(getattr(result, "coverage_complete", False))
+            pages_scanned = max(0, safe_int(getattr(result, "pages_scanned", 0)) or 0)
+        except Exception as exc:
+            return {
+                **checks,
+                **{
+                    int(op["id"]): {
+                        "status": "request_failed",
+                        "checkedAt": checked_at,
+                        "message": str(exc),
+                    }
+                    for op, _, _ in inventory_candidates
+                },
+            }
+
+        for op, _note, asset_id in inventory_candidates:
+            checks[int(op["id"])] = {
+                "status": (
+                    "found_same_asset"
+                    if asset_id in found_asset_ids
+                    else "not_found_complete"
+                    if coverage_complete
+                    else "not_found_incomplete"
+                ),
+                "checkedAt": checked_at,
+                "pagesScanned": pages_scanned,
+                "coverageComplete": coverage_complete,
+                "historyCoverageComplete": sale_receipt_coverage_complete,
+                "assetId": asset_id,
+            }
+        return checks
+
+    def _release_listing_missing_asset_returned(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        inventory_check: dict[str, Any],
+    ) -> None:
+        """Release an exact asset proven present in Steam's official inventory."""
+
+        asset_id = str(op["asset_id"] or "").strip()
+        note["needsConfirmation"] = False
+        note["confirmationStatus"] = "listing_missing_unsold_asset_returned"
+        note["terminalEvidence"] = "official_steam_inventory_same_asset"
+        note["steamInventoryAssetReturnedAt"] = utc_now_iso()
+        note["steamInventoryReturnCheckAt"] = inventory_check.get("checkedAt") or utc_now_iso()
+        note["steamInventoryReturnCheckStatus"] = "found_same_asset"
+        note["steamInventoryReturnCheckAssetId"] = asset_id
+        note["steamInventoryReturnCheckAccountId"] = note.get("steamAccountId") or getattr(
+            self.account,
+            "id",
+            None,
+        )
+        note["steamSaleEvidenceChecked"] = True
+        note["steamSaleReceiptFound"] = False
+        note["steamSaleEvidenceHistoryCoverageComplete"] = inventory_check.get(
+            "historyCoverageComplete"
+        )
+        note["releasedForRelisting"] = True
+        note["steamInventoryReturnPagesScanned"] = inventory_check.get("pagesScanned")
+        note["steamInventoryReturnCoverageComplete"] = inventory_check.get("coverageComplete")
+        self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
+        if asset_id:
+            self.db.set_asset_status(asset_id, "available")
+        self.db.delete_scheduled_task(f"sale-evidence:{int(op['id'])}")
+        self._reconcile_guadao_pool_status_after_listing_release(
+            str(op["market_hash_name"]),
+        )
+        print(
+            f"[挂单待确认恢复] {op['market_hash_name']} | asset={asset_id or '-'} | "
+            "Steam 官方库存确认同一 asset 仍在，未判卖出，已释放供下轮重新定价"
         )
 
     def _case_full_release_after_seconds(self) -> float:
@@ -3319,47 +3923,147 @@ class ExecutionEngine:
             if self._is_weapon_case(op["market_hash_name"])
         ]
 
-    def _case_listing_capacity_full_since(self, listed_ops: list[Any]) -> datetime | None:
-        capacity = self._case_max_open_guadao_count()
-        if capacity <= 0:
-            return None
-        dated_ops: list[tuple[datetime, Any]] = []
-        for op in listed_ops:
-            note = _read_note(op["note"])
-            slot_started_at = _parse_iso(str(note.get("activeVerifiedAt") or "")) or _parse_iso(
-                op["created_at"]
-            )
-            if slot_started_at is None:
-                continue
-            if slot_started_at.tzinfo is None:
-                slot_started_at = slot_started_at.replace(tzinfo=timezone.utc)
-            dated_ops.append((slot_started_at.astimezone(timezone.utc), op))
-        dated_ops.sort(key=lambda entry: (entry[0], int(entry[1]["id"])))
+    def _case_capacity_observation(self) -> dict[str, Any]:
+        row = self.db.get_executor_runtime_state("guadao")
+        if row is None:
+            return {}
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        state = payload.get(CASE_CAPACITY_OBSERVATION_PAYLOAD_KEY)
+        return dict(state) if isinstance(state, dict) else {}
 
-        occupied = 0
-        for created_at, op in dated_ops:
-            occupied += max(1, safe_int(op["quantity"]) or 1)
-            if occupied >= capacity:
-                return created_at
-        return None
+    def _save_case_capacity_observation(self, state: dict[str, Any]) -> None:
+        row = self.db.get_executor_runtime_state("guadao")
+        if row is None:
+            return
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        payload[CASE_CAPACITY_OBSERVATION_PAYLOAD_KEY] = dict(state)
+        self.db.upsert_executor_runtime_state(
+            "guadao",
+            enabled=bool(row["enabled"]),
+            runtime_status=str(row["runtime_status"]),
+            migration_hold=bool(row["migration_hold"]),
+            gate_reason=row["gate_reason"],
+            heartbeat_at=row["heartbeat_at"],
+            payload=payload,
+        )
+
+    def _case_capacity_max_observation_gap_seconds(self) -> float:
+        schedule = self.config.effective_guadao_task_schedule()
+        scan_seconds = max(1.0, safe_float(schedule.get("scanIntervalSeconds")) or 300.0)
+        sync_seconds = max(1.0, safe_float(schedule.get("steamSyncIntervalSeconds")) or 120.0)
+        # A normal scan/sync may drift slightly while another due task owns the
+        # worker. More than 2.5 normal intervals is no longer continuous proof.
+        return max(60.0, max(scan_seconds, sync_seconds) * 2.5)
+
+    def _observe_case_listing_capacity(
+        self,
+        *,
+        occupied: int,
+        capacity: int,
+        snapshot_complete: bool,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = (now or _now_utc()).astimezone(timezone.utc)
+        previous = self._case_capacity_observation()
+        state: dict[str, Any] = {
+            "observedAt": current.isoformat(),
+            "lastObservedAt": current.isoformat(),
+            "processSessionId": self._process_session_id,
+            "occupied": max(0, int(occupied)),
+            "capacity": max(0, int(capacity)),
+            "snapshotComplete": bool(snapshot_complete),
+        }
+        if not snapshot_complete:
+            state.update(
+                {
+                    "isFull": None,
+                    "fullSince": None,
+                    "continuityResetReason": "snapshot_unavailable",
+                }
+            )
+            self._save_case_capacity_observation(state)
+            return state
+        if capacity <= 0 or occupied < capacity:
+            state.update(
+                {
+                    "isFull": False,
+                    "fullSince": None,
+                    "continuityResetReason": "capacity_not_full",
+                }
+            )
+            self._save_case_capacity_observation(state)
+            return state
+
+        previous_last = _parse_iso(str(previous.get("lastObservedAt") or ""))
+        if previous_last is not None and previous_last.tzinfo is None:
+            previous_last = previous_last.replace(tzinfo=timezone.utc)
+        same_session = previous.get("processSessionId") == self._process_session_id
+        gap_seconds = (
+            max(0.0, (current - previous_last.astimezone(timezone.utc)).total_seconds())
+            if previous_last is not None
+            else None
+        )
+        gap_ok = gap_seconds is not None and gap_seconds <= self._case_capacity_max_observation_gap_seconds()
+        continue_full = bool(previous.get("isFull")) and same_session and gap_ok
+        if continue_full:
+            full_since = _parse_iso(str(previous.get("fullSince") or ""))
+            if full_since is None:
+                full_since = current
+                reset_reason = "missing_full_since"
+            else:
+                if full_since.tzinfo is None:
+                    full_since = full_since.replace(tzinfo=timezone.utc)
+                full_since = full_since.astimezone(timezone.utc)
+                reset_reason = None
+        else:
+            full_since = current
+            if previous.get("processSessionId") and not same_session:
+                reset_reason = "process_restart"
+            elif bool(previous.get("isFull")) and not gap_ok:
+                reset_reason = "observation_gap"
+            elif previous.get("isFull") is False:
+                reset_reason = "previously_not_full"
+            elif previous:
+                reset_reason = "continuity_unproven"
+            else:
+                reset_reason = "first_full_observation"
+        state.update(
+            {
+                "isFull": True,
+                "fullSince": full_since.isoformat(),
+                "continuityResetReason": reset_reason,
+                "observationGapSeconds": gap_seconds,
+            }
+        )
+        self._save_case_capacity_observation(state)
+        return state
 
     def _release_full_case_listing_capacity(self) -> int:
         listed_ops = self._listed_case_guadao_operations()
         capacity = self._case_max_open_guadao_count()
         occupied = sum(max(1, safe_int(op["quantity"]) or 1) for op in listed_ops)
         if capacity <= 0 or occupied < capacity:
+            self._observe_case_listing_capacity(
+                occupied=occupied,
+                capacity=capacity,
+                snapshot_complete=True,
+            )
             return 0
 
         release_after_seconds = self._case_full_release_after_seconds()
         release_fraction = self._case_full_release_fraction()
         if release_after_seconds <= 0 or release_fraction <= 0:
-            return 0
-        full_since = self._case_listing_capacity_full_since(listed_ops)
-        if full_since is None:
-            return 0
-        now = _now_utc()
-        full_seconds = max(0.0, (now - full_since).total_seconds())
-        if full_seconds < release_after_seconds:
+            self._observe_case_listing_capacity(
+                occupied=occupied,
+                capacity=capacity,
+                snapshot_complete=False,
+            )
             return 0
 
         targets = self._open_guadao_steam_targets()
@@ -3368,13 +4072,16 @@ class ExecutionEngine:
 
         active_records: list[tuple[Any, dict[str, Any], SteamMarketClient, str]] = []
         seen_operation_ids: set[int] = set()
+        snapshot_complete = True
         for steam_id, account in targets:
             client = self._steam_client_for_account(account, steam_id)
             if client is None:
+                snapshot_complete = False
                 continue
             try:
                 active = client.list_active_listings()
             except Exception as exc:
+                snapshot_complete = False
                 print(
                     f"[警告] 满载随机释放读取 Steam 活跃挂单失败 | "
                     f"steam={steam_id or '-'} | 原因: {exc}"
@@ -3404,7 +4111,24 @@ class ExecutionEngine:
                 seen_operation_ids.add(operation_id)
                 active_records.append((op, note, client, listing_id))
 
-        if not active_records:
+        remote_occupied = sum(
+            max(1, safe_int(record[0]["quantity"]) or 1) for record in active_records
+        )
+        observation = self._observe_case_listing_capacity(
+            occupied=remote_occupied,
+            capacity=capacity,
+            snapshot_complete=snapshot_complete,
+        )
+        if not snapshot_complete or not observation.get("isFull"):
+            return 0
+        full_since = _parse_iso(str(observation.get("fullSince") or ""))
+        if full_since is None:
+            return 0
+        if full_since.tzinfo is None:
+            full_since = full_since.replace(tzinfo=timezone.utc)
+        now = _now_utc()
+        full_seconds = max(0.0, (now - full_since.astimezone(timezone.utc)).total_seconds())
+        if full_seconds < release_after_seconds:
             return 0
         active_records.sort(key=lambda record: int(record[0]["id"]))
         release_count = min(
@@ -3413,6 +4137,7 @@ class ExecutionEngine:
         )
         selected_records = random.sample(active_records, release_count)
         released = 0
+        released_quantity = 0
         for op, note, client, listing_id in selected_records:
             remover = getattr(client, "remove_listing", None)
             try:
@@ -3446,10 +4171,18 @@ class ExecutionEngine:
             ):
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
             released += 1
+            released_quantity += max(1, safe_int(op["quantity"]) or 1)
             print(
                 f"[满载随机释放] {op['market_hash_name']} | asset={asset_id or '-'} | "
                 f"listing={listing_id} | 活跃挂单槽连续满载 {full_seconds / 3600.0:.2f} 小时 | "
                 f"随机释放比例 {release_fraction * 100:g}% | Steam撤单成功，资产已恢复可上架"
+            )
+        if released:
+            remaining_occupied = max(0, remote_occupied - released_quantity)
+            self._observe_case_listing_capacity(
+                occupied=remaining_occupied,
+                capacity=capacity,
+                snapshot_complete=True,
             )
         return released
 
@@ -3468,6 +4201,307 @@ class ExecutionEngine:
         age_seconds = self._guadao_listed_age_seconds(op, now=now)
         return age_seconds is not None and age_seconds >= GUADAO_STALE_LISTED_CANCEL_AFTER_SECONDS
 
+    def run_guadao_stale_listing_recheck_task(self) -> dict[str, Any]:
+        """Independently recheck old Steam listings without running full sync.
+
+        This maintenance path deliberately consumes only positive ``MyListings``
+        evidence.  An absent listing is inconclusive here: sale history,
+        inventory and confirmation reconciliation remain the responsibility of
+        the regular account-sync state machine.
+        """
+
+        now = _now_utc()
+        due_by_account: dict[str, dict[str, Any]] = {}
+        due_count = 0
+        for op in self.db.list_pool_operations_by_type(
+            OP_SELL_STEAM,
+            status="listed",
+            limit=5000,
+        ):
+            if not self._is_stale_guadao_listed_operation(op, now=now):
+                continue
+            age_seconds = self._guadao_listed_age_seconds(op, now=now)
+            if age_seconds is None:
+                continue
+            note = _read_note(op["note"])
+            if not self._stale_listed_recheck_due(note, now=now):
+                continue
+
+            steam_id64 = self._operation_steam_id64(op)
+            requested_account_id = str(note.get("steamAccountId") or "").strip() or None
+            account = self._account_by_id(requested_account_id) if requested_account_id else None
+            attribution_error: str | None = None
+            if requested_account_id and account is None:
+                attribution_error = "Steam account attribution is unavailable"
+            elif account is None and steam_id64:
+                account = self._account_by_steam_id64(steam_id64)
+                if account is None and getattr(self, "account_store", None) is not None:
+                    # A SteamID by itself is not enough to select a client:
+                    # the current client may belong to another account.  The
+                    # maintenance task must fail closed rather than guessing
+                    # which account owns this old listing.
+                    attribution_error = "Steam account attribution is unavailable"
+
+            account_id = account.id if account is not None else None
+            if account is not None:
+                account_steam_id64 = str(account.steam_id64 or "").strip() or None
+                if steam_id64 and account_steam_id64 and steam_id64 != account_steam_id64:
+                    attribution_error = "Steam account attribution does not match operation SteamID"
+                elif not steam_id64:
+                    steam_id64 = account_steam_id64
+                if not steam_id64:
+                    attribution_error = "Steam account attribution is unavailable"
+            elif not steam_id64:
+                attribution_error = "Steam account attribution is unavailable"
+
+            group_key = (
+                f"attribution-error:{int(op['id'])}"
+                if attribution_error
+                else f"account:{account_id}"
+                if account_id
+                else f"steam:{steam_id64}"
+                if steam_id64
+                else f"unattributed:{int(op['id'])}"
+            )
+            group = due_by_account.setdefault(
+                group_key,
+                {
+                    "account": account,
+                    "accountId": account_id,
+                    "steamId64": steam_id64,
+                    "attributionError": attribution_error,
+                    "operations": [],
+                },
+            )
+            group["operations"].append((op, note, age_seconds))
+            due_count += 1
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "runId": f"stale-{uuid.uuid4().hex[:16]}",
+            "startedAt": now.astimezone(timezone.utc).isoformat(),
+            "accounts": sum(
+                1 for group in due_by_account.values() if not group.get("attributionError")
+            ),
+            "due": due_count,
+            "checked": 0,
+            "kept": 0,
+            "removeAttempts": 0,
+            "removed": 0,
+            "removeFailed": 0,
+            "unmatched": 0,
+            "deferred": 0,
+            "priceDeferred": 0,
+            "attributionDeferred": 0,
+            "removedOperations": [],
+            "removeFailedOperations": [],
+            "unmatchedOperations": [],
+        }
+        def defer(
+            op: Any,
+            note: dict[str, Any],
+            age_seconds: float,
+            reason: str,
+            *,
+            now_value: datetime = now,
+        ) -> None:
+            checked_at = now_value.astimezone(timezone.utc)
+            note["staleListedAgeHours"] = round(max(0.0, age_seconds) / 3600.0, 4)
+            note["staleListedAgeSource"] = "pool_operations.created_at"
+            note["staleListedCheckedAt"] = checked_at.isoformat()
+            note["staleListedNextCheckAt"] = (
+                checked_at + timedelta(seconds=self._stale_listed_deferred_retry_after_seconds())
+            ).isoformat()
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = str(reason)[:500]
+            self._merge_stale_listing_note_if_still_listed(op, note)
+
+        for group in due_by_account.values():
+            operations = list(group["operations"])
+            account = group.get("account")
+            account_id = str(group.get("accountId") or "").strip() or None
+            steam_id64 = str(group.get("steamId64") or "").strip() or None
+            attribution_error = str(group.get("attributionError") or "").strip() or None
+            if attribution_error:
+                for op, note, age_seconds in operations:
+                    defer(op, note, age_seconds, attribution_error)
+                result["deferred"] += len(operations)
+                result["attributionDeferred"] += len(operations)
+                continue
+
+            # The runtime cookie gate normally prevents this branch.  The
+            # explicit health check keeps this standalone entry point fail-safe
+            # for direct callers and avoids an implicit relogin from
+            # ``_steam_client_for_account``.
+            if account_id:
+                health_loader = getattr(self.db, "get_steam_cookie_health", None)
+                try:
+                    health = health_loader(account_id) if callable(health_loader) else None
+                except Exception as exc:
+                    for op, note, age_seconds in operations:
+                        defer(op, note, age_seconds, f"Steam Cookie health unavailable: {exc}")
+                    result["deferred"] += len(operations)
+                    continue
+                if callable(health_loader):
+                    if health is None:
+                        for op, note, age_seconds in operations:
+                            defer(op, note, age_seconds, "Steam Cookie health is unavailable")
+                        result["deferred"] += len(operations)
+                        continue
+                    if str(health["status"] or "") != "valid":
+                        for op, note, age_seconds in operations:
+                            defer(op, note, age_seconds, "Steam Cookie is not ready")
+                        result["deferred"] += len(operations)
+                        continue
+                if account is not None and not str(account.cookies or "").strip():
+                    for op, note, age_seconds in operations:
+                        defer(op, note, age_seconds, "Steam Cookie is not ready")
+                    result["deferred"] += len(operations)
+                    continue
+
+            try:
+                client = self._steam_client_for_account(
+                    account,
+                    steam_id64,
+                    validate_session=False,
+                    allow_relogin=False,
+                )
+            except Exception as exc:
+                client = None
+                client_error = f"Steam client unavailable: {exc}"
+            else:
+                client_error = "Steam client unavailable"
+            if client is None:
+                for op, note, age_seconds in operations:
+                    defer(op, note, age_seconds, client_error)
+                result["deferred"] += len(operations)
+                continue
+
+            try:
+                # This read is evidence for a possible destructive stale-listing
+                # action.  Keep it in the scheduler's P0 safety lane so a large
+                # P1 rebuy backlog cannot leave the maintenance task waiting in
+                # the ordinary P2 account-sync queue.  A few isolated test or
+                # plugin clients still expose the old no-argument method; keep
+                # those clients usable without weakening the production path.
+                active_loader = getattr(client, "list_active_listings")
+                try:
+                    active = list(active_loader(safety_terminal=True))
+                except TypeError as exc:
+                    if "safety_terminal" not in str(exc):
+                        raise
+                    active = list(active_loader())
+            except Exception as exc:
+                for op, note, age_seconds in operations:
+                    defer(op, note, age_seconds, f"Steam active listings unavailable: {exc}")
+                result["deferred"] += len(operations)
+                continue
+
+            active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active)
+            market_snapshot_cache: dict[
+                str, tuple[float | None, float | None, str | None]
+            ] = {}
+            for op, note, age_seconds in operations:
+                listing_id = str(note.get("listingId") or "").strip()
+                asset_id = str(op["asset_id"] or "").strip()
+                if not self._listing_is_active(
+                    active_listing_ids=active_listing_ids,
+                    active_asset_ids=active_asset_ids,
+                    listing_id=listing_id,
+                    asset_id=asset_id,
+                ):
+                    defer(
+                        op,
+                        note,
+                        age_seconds,
+                        "本轮 Steam 活跃挂单中未取得对应 listing 证据；等待完整卖出/状态复查",
+                    )
+                    result["unmatched"] += 1
+                    result["unmatchedOperations"].append(
+                        {
+                            "operationId": int(op["id"]),
+                            "marketHashName": str(op["market_hash_name"] or ""),
+                            "assetId": str(op["asset_id"] or "") or None,
+                            "listingId": listing_id or None,
+                        }
+                    )
+                    continue
+
+                result["checked"] += 1
+                note["staleListedAgeHours"] = round(max(0.0, age_seconds) / 3600.0, 4)
+                note["staleListedAgeSource"] = "pool_operations.created_at"
+                keep_decision = self._keep_stale_active_listing_if_still_competitive(
+                    op,
+                    note,
+                    client=client,
+                    now=now,
+                    market_snapshot_cache=market_snapshot_cache,
+                )
+                if keep_decision is True:
+                    if str(note.get("staleListedCleanupStatus") or "") == "check_deferred":
+                        result["deferred"] += 1
+                        result["priceDeferred"] += 1
+                    else:
+                        result["kept"] += 1
+                    continue
+                if keep_decision is None:
+                    # The normal sync won the local race while evidence was
+                    # being read.  Do not classify the newer terminal state as
+                    # a price failure or trigger a false ServerChan warning.
+                    result["deferred"] += 1
+                    continue
+
+                removed = self._remove_stale_active_guadao_listing(
+                    op,
+                    note,
+                    client=client,
+                    active=active,
+                    active_listing_ids=active_listing_ids,
+                )
+                if removed is None:
+                    result["deferred"] += 1
+                elif removed:
+                    result["removeAttempts"] += 1
+                    result["removed"] += 1
+                    result["removedOperations"].append(
+                        {
+                            "operationId": int(op["id"]),
+                            "marketHashName": str(op["market_hash_name"] or ""),
+                            "assetId": asset_id or None,
+                            "listingId": str(note.get("listingId") or "") or None,
+                            "reason": str(note.get("staleListedRemoveReason") or ""),
+                        }
+                    )
+                else:
+                    result["removeAttempts"] += 1
+                    result["removeFailed"] += 1
+                    result["removeFailedOperations"].append(
+                        {
+                            "operationId": int(op["id"]),
+                            "marketHashName": str(op["market_hash_name"] or ""),
+                            "assetId": asset_id or None,
+                            "listingId": str(note.get("listingId") or "") or None,
+                            "reason": str(note.get("staleListedCleanupReason") or ""),
+                        }
+                    )
+
+        summary = (
+            f"账号 {result['accounts']} 个 | 到期 {result['due']} 笔 | 实查 {result['checked']} 笔 | "
+            f"最低价保护保留 {result['kept']} 笔 | 撤单成功 {result['removed']} 笔 | "
+            f"撤单失败 {result['removeFailed']} 笔 | 活跃挂单未匹配 {result['unmatched']} 笔 | "
+            f"价格读取延期 {result['priceDeferred']} 笔"
+            f" | 撤单尝试 {result['removeAttempts']} 笔"
+        )
+        result["summary"] = summary
+        print(f"[老挂单检查完成] {summary}")
+        self._emit_guadao_local_event(
+            operation="stale_listing_recheck",
+            message="老挂单检查完成",
+            level="INFO",
+            context=result,
+        )
+        return result
+
     def _stale_listed_recheck_after_seconds(self) -> float:
         try:
             hours = float(self.config.stale_listed_recheck_hours)
@@ -3476,6 +4510,12 @@ class ExecutionEngine:
         if not math.isfinite(hours) or hours <= 0:
             return 24.0 * 3600.0
         return hours * 3600.0
+
+    def _stale_listed_deferred_retry_after_seconds(self) -> float:
+        return min(
+            self._stale_listed_recheck_after_seconds(),
+            float(GUADAO_STALE_LISTED_DEFERRED_RETRY_SECONDS),
+        )
 
     def _stale_listed_ratio_tolerance(self) -> float:
         try:
@@ -3488,41 +4528,43 @@ class ExecutionEngine:
 
     def _stale_listed_recheck_due(self, note: dict[str, Any], *, now: datetime) -> bool:
         next_check_at = _parse_iso(str(note.get("staleListedNextCheckAt") or ""))
+        if str(note.get("staleListedCleanupStatus") or "") == "check_deferred":
+            checked_at = _parse_iso(str(note.get("staleListedCheckedAt") or ""))
+            if checked_at is not None:
+                if checked_at.tzinfo is None:
+                    checked_at = checked_at.replace(tzinfo=timezone.utc)
+                deferred_check_at = checked_at.astimezone(timezone.utc) + timedelta(
+                    seconds=self._stale_listed_deferred_retry_after_seconds()
+                )
+                if next_check_at is None or deferred_check_at < next_check_at:
+                    next_check_at = deferred_check_at
         if next_check_at is None:
             return True
         if next_check_at.tzinfo is None:
             next_check_at = next_check_at.replace(tzinfo=timezone.utc)
         return now.astimezone(timezone.utc) >= next_check_at.astimezone(timezone.utc)
 
-    def _current_inventory_reference_price(self, market_hash_name: str) -> float | None:
-        cache_path = self.settings.db_path.parent / "c5_inventory_all_cache.json"
+    def _current_c5_market_price(self, market_hash_name: str) -> tuple[float | None, str | None]:
+        """Read the current category market price, not an account inventory asset price."""
         try:
-            cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            cached_payload = None
-        if isinstance(cached_payload, dict):
-            cached_at = _parse_iso(str(cached_payload.get("cachedAt") or ""))
-            if cached_at is not None:
-                if cached_at.tzinfo is None:
-                    cached_at = cached_at.replace(tzinfo=timezone.utc)
-                cache_age = (_now_utc() - cached_at.astimezone(timezone.utc)).total_seconds()
-            else:
-                cache_age = None
-            if cache_age is None or cache_age <= C5_INVENTORY_REFERENCE_CACHE_MAX_AGE_SECONDS:
-                for summary in summarize_inventory_types(list(cached_payload.get("list") or [])):
-                    if str(summary.get("market_hash_name") or "") != market_hash_name:
-                        continue
-                    price = safe_float(summary.get("reference_price"))
-                    if price is not None and price > 0:
-                        return price
-
-        summaries = summarize_inventory_types(list(self._last_inventory_payload.get("list") or []))
-        for summary in summaries:
-            if str(summary.get("market_hash_name") or "") != market_hash_name:
-                continue
-            price = safe_float(summary.get("reference_price"))
-            return price if price is not None and price > 0 else None
-        return None
+            payload = self.c5_client.price_batch(
+                [market_hash_name],
+                app_id=self.settings.app_id,
+            )
+        except Exception as exc:
+            return None, f"C5 price_batch unavailable: {exc}"
+        if not isinstance(payload, dict):
+            return None, "current C5 market price is unavailable"
+        item = payload.get(market_hash_name)
+        price = safe_float(item.get("price")) if isinstance(item, dict) else None
+        # A stale-listing check is destructive.  ``float('nan')`` and
+        # infinities are not usable market evidence: comparisons with NaN
+        # would otherwise evaluate as false and fall through to cancellation.
+        if price is None or price <= 0:
+            return None, "current C5 market price is unavailable"
+        if not math.isfinite(price):
+            return None, "current C5 market price is unavailable (non-finite)"
+        return price, None
 
     def _stale_listed_market_snapshot(
         self,
@@ -3535,14 +4577,30 @@ class ExecutionEngine:
         if cached is not None:
             return cached
 
-        c5_price = self._current_inventory_reference_price(market_hash_name)
         try:
-            payload = client.order_book(
-                app_id=self.settings.app_id,
-                market_hash_name=market_hash_name,
-            )
+            orderbook_loader = getattr(client, "order_book")
+            try:
+                # This is destructive-action evidence for the independent
+                # maintenance lane. Keep it in P0 so a large P1 rebuy queue
+                # cannot make the price check expire before it is read.
+                payload = orderbook_loader(
+                    app_id=self.settings.app_id,
+                    market_hash_name=market_hash_name,
+                    safety_terminal=True,
+                )
+            except TypeError as exc:
+                # A few legacy injected test/plugin clients still expose the
+                # old two-argument method. Production SteamMarketClient has
+                # the safety_terminal parameter; retaining this compatibility
+                # fallback does not weaken the production request path.
+                if "safety_terminal" not in str(exc):
+                    raise
+                payload = orderbook_loader(
+                    app_id=self.settings.app_id,
+                    market_hash_name=market_hash_name,
+                )
         except Exception as exc:
-            result = (None, c5_price, f"Steam orderbook unavailable: {exc}")
+            result = (None, None, f"Steam orderbook unavailable: {exc}")
             cache[market_hash_name] = result
             return result
 
@@ -3550,10 +4608,21 @@ class ExecutionEngine:
         if not isinstance(data, dict):
             data = payload if isinstance(payload, dict) else {}
         actual_currency = safe_int(data.get("eCurrency"))
-        if actual_currency is not None and actual_currency != int(self.config.steam_currency):
+        # A missing currency marker is incomplete evidence, just like a
+        # mismatched currency.  The stale-listing task is destructive and
+        # must never infer CNY prices from an unlabelled Steam response.
+        if actual_currency is None:
             result = (
                 None,
-                c5_price,
+                None,
+                f"Steam orderbook currency unavailable: expected={self.config.steam_currency}",
+            )
+            cache[market_hash_name] = result
+            return result
+        if actual_currency != int(self.config.steam_currency):
+            result = (
+                None,
+                None,
                 f"Steam orderbook currency mismatch: expected={self.config.steam_currency} actual={actual_currency}",
             )
             cache[market_hash_name] = result
@@ -3571,11 +4640,65 @@ class ExecutionEngine:
         if floor_price is None or floor_price <= 0:
             error = "Steam compact sell orderbook has no floor price"
             floor_price = None
-        elif c5_price is None:
-            error = "current C5 inventory reference price is unavailable"
+            c5_price = None
+        elif not math.isfinite(floor_price):
+            error = "Steam compact sell orderbook has no floor price (non-finite)"
+            floor_price = None
+            c5_price = None
+        else:
+            c5_price, error = self._current_c5_market_price(market_hash_name)
         result = (floor_price, c5_price, error)
         cache[market_hash_name] = result
         return result
+
+    def _merge_stale_listing_note_if_still_listed(
+        self,
+        op: Any,
+        note: dict[str, Any],
+    ) -> bool:
+        """Merge maintenance fields without overwriting a concurrent terminal note.
+
+        A stale-listing evidence walk can overlap the regular Steam sync.  The
+        sync may record a sale or confirmation while this task is waiting on
+        Steam/C5.  Only merge fields owned by this maintenance task, and only
+        while the authoritative operation row is still ``listed``.
+        """
+
+        conn = self.db.conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, note FROM pool_operations WHERE id = ?",
+                (int(op["id"]),),
+            ).fetchone()
+            if current is None or str(current["status"] or "") != "listed":
+                conn.rollback()
+                return False
+
+            latest_note = _read_note(current["note"])
+            for key, value in note.items():
+                if key.startswith("staleListed"):
+                    latest_note[key] = value
+                elif key == "listingId" and not str(latest_note.get(key) or "").strip():
+                    # Backfill a missing ID, but never replace a newer ID that
+                    # another reconciliation path may already have recorded.
+                    latest_note[key] = value
+            cursor = conn.execute(
+                """
+                UPDATE pool_operations
+                SET note = ?
+                WHERE id = ? AND status = 'listed'
+                """,
+                (_build_note(latest_note), int(op["id"])),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
     def _keep_stale_active_listing_if_still_competitive(
         self,
@@ -3585,7 +4708,7 @@ class ExecutionEngine:
         client: SteamMarketClient,
         now: datetime,
         market_snapshot_cache: dict[str, tuple[float | None, float | None, str | None]],
-    ) -> bool:
+    ) -> bool | None:
         if not self._stale_listed_recheck_due(note, now=now):
             return True
 
@@ -3596,58 +4719,115 @@ class ExecutionEngine:
             cache=market_snapshot_cache,
         )
         checked_at = now.astimezone(timezone.utc)
-        next_check_at = checked_at + timedelta(seconds=self._stale_listed_recheck_after_seconds())
         note["staleListedCheckedAt"] = checked_at.isoformat()
-        note["staleListedNextCheckAt"] = next_check_at.isoformat()
         note["staleListedCurrentFloorPrice"] = floor_price
         note["staleListedCurrentC5Price"] = c5_price
 
+        raw_list_price = note.get("steamListPrice")
+        if raw_list_price is None:
+            raw_list_price = op["expected_price"]
+        list_price = safe_float(raw_list_price)
+        next_check_at = checked_at + timedelta(
+            seconds=self._stale_listed_recheck_after_seconds()
+        )
+        note["staleListedNextCheckAt"] = next_check_at.isoformat()
+
+        raw_steam_net_factor = note.get("steamNetFactorAtOpen")
+        steam_net_factor = (
+            safe_float(raw_steam_net_factor)
+            if raw_steam_net_factor is not None
+            else safe_float(self.config.steam_net_factor)
+        )
+        raw_hard_max_ratio = note.get("guadaoMaxListingRatioAtOpen")
+        hard_max_ratio = (
+            safe_float(raw_hard_max_ratio)
+            if raw_hard_max_ratio is not None
+            else safe_float(self.config.guadao_max_listing_ratio)
+        )
+        tolerance = safe_float(self._stale_listed_ratio_tolerance())
+        allowed_ratio = (
+            hard_max_ratio + tolerance
+            if hard_max_ratio is not None
+            and tolerance is not None
+            and math.isfinite(hard_max_ratio)
+            and math.isfinite(tolerance)
+            and hard_max_ratio > 0
+            and tolerance >= 0
+            else None
+        )
+        steam_after_tax = (
+            list_price * steam_net_factor
+            if list_price is not None
+            and steam_net_factor is not None
+            and math.isfinite(list_price)
+            and math.isfinite(steam_net_factor)
+            and list_price > 0
+            and steam_net_factor > 0
+            else None
+        )
+        current_ratio = (
+            c5_price / steam_after_tax
+            if c5_price is not None
+            and steam_after_tax is not None
+            and math.isfinite(c5_price)
+            and math.isfinite(steam_after_tax)
+            and steam_after_tax > 0
+            else None
+        )
+        if current_ratio is not None and not math.isfinite(current_ratio):
+            current_ratio = None
+        note["staleListedCurrentRatio"] = current_ratio
+        note["staleListedAllowedMaxRatio"] = allowed_ratio
+        note["staleListedRatioTolerancePct"] = self.config.stale_listed_max_ratio_tolerance_pct
+
         if snapshot_error:
+            next_check_at = checked_at + timedelta(
+                seconds=self._stale_listed_deferred_retry_after_seconds()
+            )
+            note["staleListedNextCheckAt"] = next_check_at.isoformat()
             note["staleListedCleanupStatus"] = "check_deferred"
             note["staleListedCleanupReason"] = snapshot_error
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            if not self._merge_stale_listing_note_if_still_listed(op, note):
+                return None
             print(
                 f"[挂刀老挂单复查延后] {market_hash_name} | "
                 f"无法安全读取当前最低价/补仓价，保留挂单，下次复查 {next_check_at.isoformat()} | "
                 f"原因: {snapshot_error}"
             )
             return True
-
-        list_price = safe_float(note.get("steamListPrice")) or safe_float(op["expected_price"])
-        steam_net_factor = safe_float(note.get("steamNetFactorAtOpen"))
-        if steam_net_factor is None or steam_net_factor <= 0:
-            steam_net_factor = float(self.config.steam_net_factor)
-        hard_max_ratio = safe_float(note.get("guadaoMaxListingRatioAtOpen"))
-        if hard_max_ratio is None or hard_max_ratio <= 0:
-            hard_max_ratio = float(self.config.guadao_max_listing_ratio)
-        allowed_ratio = hard_max_ratio + self._stale_listed_ratio_tolerance()
-        steam_after_tax = (
-            list_price * steam_net_factor
-            if list_price is not None and list_price > 0 and steam_net_factor > 0
-            else None
-        )
-        current_ratio = (
-            c5_price / steam_after_tax
-            if c5_price is not None and steam_after_tax is not None and steam_after_tax > 0
-            else None
-        )
-        note["staleListedCurrentRatio"] = current_ratio
-        note["staleListedAllowedMaxRatio"] = allowed_ratio
-        note["staleListedRatioTolerancePct"] = self.config.stale_listed_max_ratio_tolerance_pct
-
-        if list_price is None or floor_price is None or current_ratio is None:
+        if list_price is not None and floor_price is not None:
+            # 本单价格低于盘口第一档时同样位于最前面，不能因为盘口短时未包含本单而误撤。
+            is_at_market_floor = list_price <= floor_price + 0.005
+            note["staleListedAtMarketFloor"] = is_at_market_floor
+        if (
+            list_price is None
+            or not math.isfinite(list_price)
+            or floor_price is None
+            or not math.isfinite(floor_price)
+            or c5_price is None
+            or not math.isfinite(c5_price)
+            or steam_net_factor is None
+            or not math.isfinite(steam_net_factor)
+            or allowed_ratio is None
+            or not math.isfinite(allowed_ratio)
+            or current_ratio is None
+            or not math.isfinite(current_ratio)
+        ):
+            next_check_at = checked_at + timedelta(
+                seconds=self._stale_listed_deferred_retry_after_seconds()
+            )
+            note["staleListedNextCheckAt"] = next_check_at.isoformat()
             note["staleListedCleanupStatus"] = "check_deferred"
-            note["staleListedCleanupReason"] = "listing price or ratio is unavailable"
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            note["staleListedCleanupReason"] = "listing price, ratio, or protection factor is unavailable or non-finite"
+            if not self._merge_stale_listing_note_if_still_listed(op, note):
+                return None
             return True
-
-        # 本单价格低于盘口第一档时同样位于最前面，不能因为盘口短时未包含本单而误撤。
-        is_at_market_floor = list_price <= floor_price + 0.005
-        note["staleListedAtMarketFloor"] = is_at_market_floor
+        is_at_market_floor = bool(note.get("staleListedAtMarketFloor"))
         if is_at_market_floor and current_ratio <= allowed_ratio:
             note["staleListedCleanupStatus"] = "kept_at_market_floor"
             note["staleListedCleanupReason"] = "still at market floor and ratio remains acceptable"
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            if not self._merge_stale_listing_note_if_still_listed(op, note):
+                return None
             print(
                 f"[挂刀老挂单继续等待] {market_hash_name} | 挂价 {list_price:.2f} | "
                 f"当前最低价 {floor_price:.2f} | C5价 {c5_price:.2f} | "
@@ -3657,10 +4837,100 @@ class ExecutionEngine:
             return True
 
         if not is_at_market_floor:
-            note["staleListedRemoveReason"] = "listed more than 48 hours and no longer at market floor"
+            note["staleListedRemoveReason"] = (
+                "listed more than 48 hours and no longer at market floor"
+            )
         else:
             note["staleListedRemoveReason"] = "stale listing ratio exceeds tolerated maximum"
         return False
+
+    def _finalize_stale_listing_removal_if_still_listed(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        asset_id: str,
+        asset_restore_status: str,
+    ) -> tuple[bool, str | None]:
+        """Commit a successful remote cancel only if the operation is still listed.
+
+        The Steam request can wait in a shared queue while the normal account
+        sync advances the same operation.  Use one SQLite transaction to read
+        the latest row, merge only this task's stale-listing fields, and update
+        both the operation and asset conditionally.  A concurrent terminal
+        state therefore wins and its note/evidence is never overwritten.
+        """
+
+        conn = self.db.conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, note FROM pool_operations WHERE id = ?",
+                (int(op["id"]),),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                return False, "missing"
+            current_status = str(current["status"] or "")
+            if current_status != "listed":
+                conn.rollback()
+                return False, current_status
+
+            latest_note = _read_note(current["note"])
+            requested_listing_id = str(note.get("listingId") or "").strip()
+            latest_listing_id = str(latest_note.get("listingId") or "").strip()
+            if (
+                requested_listing_id
+                and latest_listing_id
+                and requested_listing_id != latest_listing_id
+            ):
+                conn.rollback()
+                return False, "listing_id_changed"
+            # Keep concurrent sale/confirmation fields from the latest note;
+            # only merge fields owned by this stale-maintenance decision.
+            for key, value in note.items():
+                if key.startswith("staleListed") or key == "assetRestoredStatus":
+                    latest_note[key] = value
+                elif key == "listingId" and not latest_listing_id:
+                    latest_note[key] = value
+            latest_note["staleListedCleanupStatus"] = "removed"
+            latest_note["staleListedRemovedAt"] = utc_now_iso()
+            latest_note["staleListedRemoveReason"] = (
+                note.get("staleListedRemoveReason") or "listed more than 48 hours"
+            )
+            latest_note["assetRestoredStatus"] = asset_restore_status
+
+            cursor = conn.execute(
+                """
+                UPDATE pool_operations
+                SET status = 'canceled', note = ?
+                WHERE id = ? AND status = 'listed'
+                """,
+                (_build_note(latest_note), int(op["id"])),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                latest = conn.execute(
+                    "SELECT status FROM pool_operations WHERE id = ?",
+                    (int(op["id"]),),
+                ).fetchone()
+                return False, str(latest["status"] or "") if latest is not None else "missing"
+
+            if asset_id:
+                conn.execute(
+                    """
+                    UPDATE inventory_assets
+                    SET status = ?, last_seen_at = ?
+                    WHERE asset_id = ?
+                    """,
+                    (asset_restore_status, utc_now_iso(), asset_id),
+                )
+            conn.commit()
+            return True, None
+        except Exception:
+            conn.rollback()
+            raise
+
 
     def _remove_stale_active_guadao_listing(
         self,
@@ -3670,24 +4940,128 @@ class ExecutionEngine:
         client: SteamMarketClient,
         active: list[Any],
         active_listing_ids: set[str],
-    ) -> bool:
+    ) -> bool | None:
         asset_id = str(op["asset_id"] or "").strip()
         listing_id = str(note.get("listingId") or "").strip()
+
+        def defer_identity_conflict(reason: str) -> None:
+            checked_at = _now_utc()
+            next_check_at = checked_at + timedelta(
+                seconds=self._stale_listed_deferred_retry_after_seconds()
+            )
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = reason
+            note["staleListedCheckedAt"] = checked_at.isoformat()
+            note["staleListedNextCheckAt"] = next_check_at.isoformat()
+            self._merge_stale_listing_note_if_still_listed(op, note)
+            print(
+                f"[挂刀老挂单撤单延后] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                f"{reason}；下次复查 {next_check_at.isoformat()}"
+            )
+
+        # A listing ID must not be treated as authoritative for a different
+        # asset.  Steam listing IDs should be unique, but a stale/corrupted
+        # local association is destructive-action ambiguity, not proof that
+        # the other asset's listing should be removed.
+        if listing_id and asset_id:
+            for active_listing in active:
+                active_listing_id = str(
+                    getattr(active_listing, "listing_id", "") or ""
+                ).strip()
+                if active_listing_id != listing_id:
+                    continue
+                active_asset_id = str(
+                    getattr(active_listing, "asset_id", "") or ""
+                ).strip()
+                if active_asset_id and active_asset_id != asset_id:
+                    defer_identity_conflict(
+                        "active listing asset id conflicts with local operation; refusing to cancel"
+                    )
+                    return None
+                break
+
+        # An asset can be relisted while the local operation note still holds
+        # the previous listing ID.  Matching by asset is useful when the note
+        # has no ID at all, but it is unsafe when a different ID is explicitly
+        # recorded: cancelling the replacement listing would destroy the new
+        # order and leave the old operation unresolved.  Defer until the normal
+        # reconciliation path records the new ID.
+        if listing_id and listing_id not in active_listing_ids and asset_id:
+            active_asset_listing_id = self._active_listing_id_for_asset(active, asset_id)
+            if active_asset_listing_id and active_asset_listing_id != listing_id:
+                defer_identity_conflict(
+                    "active listing id changed for asset; refusing to cancel replacement listing"
+                )
+                return None
         removable_listing_id = listing_id if listing_id and listing_id in active_listing_ids else None
         if removable_listing_id is None and asset_id:
             removable_listing_id = self._active_listing_id_for_asset(active, asset_id)
             if removable_listing_id:
                 note["listingId"] = removable_listing_id
         if not removable_listing_id:
-            note["staleListedCleanupStatus"] = "manual_required"
-            note["staleListedCleanupReason"] = "active listing matched asset but listing id is unavailable"
-            note["staleListedCheckedAt"] = utc_now_iso()
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
-            print(
-                f"[挂刀老挂单待处理] {op['market_hash_name']} | asset={asset_id or '-'} | "
-                "远端仍在售但缺少可撤单 listingId，未恢复本地资产"
+            checked_at = _now_utc()
+            next_check_at = checked_at + timedelta(
+                seconds=self._stale_listed_deferred_retry_after_seconds()
             )
-            return False
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = (
+                "active listing matched asset but listing id is unavailable"
+            )
+            note["staleListedCheckedAt"] = checked_at.isoformat()
+            note["staleListedNextCheckAt"] = next_check_at.isoformat()
+            self._merge_stale_listing_note_if_still_listed(op, note)
+            print(
+                f"[stale listing recheck deferred] {op['market_hash_name']} | asset={asset_id or '-'} | "
+                f"active listing has no removable listingId; retry {next_check_at.isoformat()}"
+            )
+            return None
+
+        # The regular Steam sync and sale-evidence workers can advance this
+        # operation while the maintenance task is reading market evidence.
+        # Re-read the authoritative row immediately before the destructive
+        # request; a stale snapshot must never cancel a listing that has
+        # already left the 'listed' state.
+        current = self.db.conn.execute(
+            "SELECT status FROM pool_operations WHERE id = ?",
+            (int(op["id"]),),
+        ).fetchone()
+        current_status = str(current["status"] or "") if current is not None else ""
+        if current is None or current_status != "listed":
+            print(
+                f"[stale listing recheck skipped] {op['market_hash_name']} | "
+                f"operation is no longer listed (current={current_status or 'missing'})"
+            )
+            return None
+
+        # Re-check the live runtime gate immediately before the destructive
+        # Steam request. A task may have been claimed while enabled and then
+        # the user may disable the executor while its evidence walk is still
+        # running. Fail closed: defer the operation and leave it listed.
+        guard = getattr(self, "_new_action_guard", None)
+        gate_blocked = bool(getattr(self.config, "dry_run", False))
+        gate_reason = "dry-run mode before stale listing removal" if gate_blocked else None
+        if not gate_blocked and guard is not None:
+            try:
+                gate_blocked = not bool(guard())
+            except Exception:
+                gate_blocked = True
+            if gate_blocked:
+                gate_reason = "executor disabled before stale listing removal"
+        if gate_blocked:
+            checked_at = _now_utc()
+            next_check_at = checked_at + timedelta(
+                seconds=self._stale_listed_deferred_retry_after_seconds()
+            )
+            note["staleListedCheckedAt"] = checked_at.isoformat()
+            note["staleListedNextCheckAt"] = next_check_at.isoformat()
+            note["staleListedCleanupStatus"] = "check_deferred"
+            note["staleListedCleanupReason"] = gate_reason
+            self._merge_stale_listing_note_if_still_listed(op, note)
+            print(
+                f"[stale listing recheck deferred] {op['market_hash_name']} | "
+                f"{gate_reason}; Steam cancellation was not sent; retry {next_check_at.isoformat()}"
+            )
+            return None
 
         remover = getattr(client, "remove_listing", None)
         if not callable(remover):
@@ -3695,29 +5069,95 @@ class ExecutionEngine:
             removed = False
         else:
             try:
-                removed = bool(remover(removable_listing_id))
+                execution_guard = guard if callable(guard) else None
+                if execution_guard is None:
+                    removed = bool(remover(removable_listing_id))
+                else:
+                    # The shared scheduler evaluates this guard again after
+                    # queue admission, closing the check-then-enqueue race.
+                    removed = bool(
+                        remover(
+                            removable_listing_id,
+                            execution_guard=execution_guard,
+                        )
+                    )
                 remove_error = None if removed else "Steam remove_listing returned false"
+            except SteamRequestGuardRejected as exc:
+                # The runtime may be disabled (or the C5 circuit may open)
+                # while the request waits in Steam's queue. No remote action
+                # ran in this case; classify it as a deferred check, not a
+                # failed/removed listing, and retry on the normal short delay.
+                checked_at = _now_utc()
+                next_check_at = checked_at + timedelta(
+                    seconds=self._stale_listed_deferred_retry_after_seconds()
+                )
+                note["staleListedCleanupStatus"] = "check_deferred"
+                note["staleListedCleanupReason"] = (
+                    "execution gate changed before Steam stale-listing removal: "
+                    f"{exc}"
+                )[:500]
+                note["staleListedCheckedAt"] = checked_at.isoformat()
+                note["staleListedNextCheckAt"] = next_check_at.isoformat()
+                self._merge_stale_listing_note_if_still_listed(op, note)
+                print(
+                    f"[挂刀老挂单撤单延后] {op['market_hash_name']} | "
+                    f"执行闸门在 Steam 请求执行前关闭，保留挂单；下次复查 {next_check_at.isoformat()}"
+                )
+                return None
             except Exception as exc:
                 removed = False
                 remove_error = str(exc)
 
         if not removed:
+            checked_at = _now_utc()
             note["staleListedCleanupStatus"] = "remove_failed"
             note["staleListedCleanupReason"] = remove_error
-            note["staleListedCheckedAt"] = utc_now_iso()
-            self.db.update_pool_operation(op["id"], note=_build_note(note))
+            note["staleListedCheckedAt"] = checked_at.isoformat()
+            note["staleListedNextCheckAt"] = (
+                checked_at + timedelta(seconds=self._stale_listed_deferred_retry_after_seconds())
+            ).isoformat()
+            if not self._merge_stale_listing_note_if_still_listed(op, note):
+                print(
+                    f"[stale listing recheck skipped] {op['market_hash_name']} | "
+                    "remote removal failed after the operation left listed; preserving newer state"
+                )
+                return None
             print(
                 f"[挂刀老挂单撤单失败] {op['market_hash_name']} | asset={asset_id or '-'} | "
                 f"listing={removable_listing_id} | 原因: {remove_error}"
             )
             return False
 
+        asset_restore_status = "available"
+        if asset_id:
+            asset_row = self.db.get_asset(asset_id)
+            # A successfully removed listing releases the local reservation,
+            # but a non-tradable asset must remain locked until the next
+            # inventory sync marks it tradable.  Marking every asset
+            # ``available`` here would make a trade-locked item look eligible
+            # for immediate relisting.
+            if asset_row is None or not bool(asset_row["tradable"]):
+                asset_restore_status = "locked"
         note["staleListedCleanupStatus"] = "removed"
         note["staleListedRemovedAt"] = utc_now_iso()
         note["staleListedRemoveReason"] = note.get("staleListedRemoveReason") or "listed more than 48 hours"
-        self.db.update_pool_operation(op["id"], status="canceled", note=_build_note(note))
-        if asset_id:
-            self.db.set_asset_status(asset_id, "available")
+        note["assetRestoredStatus"] = asset_restore_status
+        finalized, conflict_status = self._finalize_stale_listing_removal_if_still_listed(
+            op,
+            note,
+            asset_id=asset_id,
+            asset_restore_status=asset_restore_status,
+        )
+        if not finalized:
+            # The remote cancel succeeded, but another state-machine worker
+            # won the local race. Do not overwrite its terminal state or
+            # restore its asset; the next normal reconciliation will observe
+            # the remote result.
+            print(
+                f"[挂刀老挂单本地终态冲突] {op['market_hash_name']} | "
+                f"Steam撤单已成功，但本地流水已变为 {conflict_status or 'missing'}；保留并发终态"
+            )
+            return None
         if not self._has_other_open_guadao_operation(
             op["market_hash_name"],
             exclude_op_id=int(op["id"]),
@@ -3730,19 +5170,66 @@ class ExecutionEngine:
         )
         return True
 
-    def _mark_stale_listed_manual_required(self, op: Any, note: dict[str, Any], *, reason: str) -> None:
+    def _mark_stale_listed_manual_required(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        reason: str,
+    ) -> bool:
+        """Move a stale listing to manual review only if it is still listed.
+
+        The full sync can overlap the independent stale-listing task.  A
+        newer ``sold``/``canceled`` state must win instead of being reverted to
+        ``manual_required`` by this older snapshot.
+        """
+
         asset_id = str(op["asset_id"] or "").strip()
         listing_id = str(note.get("listingId") or "").strip()
+        checked_at = utc_now_iso()
         note["staleListedCleanupStatus"] = "manual_required"
-        note["staleListedManualRequiredAt"] = utc_now_iso()
+        note["staleListedManualRequiredAt"] = checked_at
         note["staleListedManualRequiredReason"] = reason
         note["manualReviewReason"] = reason
-        self.db.update_pool_operation(op["id"], status="manual_required", note=_build_note(note))
+        conn = self.db.conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, note FROM pool_operations WHERE id = ?",
+                (int(op["id"]),),
+            ).fetchone()
+            if current is None or str(current["status"] or "") != "listed":
+                conn.rollback()
+                print(
+                    f"[挂刀老挂单人工检查跳过] {op['market_hash_name']} | "
+                    f"流水已变为 {str(current['status'] or '') if current is not None else 'missing'}，保留更新后的状态"
+                )
+                return False
+            latest_note = _read_note(current["note"])
+            for key, value in note.items():
+                if key.startswith("staleListed") or key == "manualReviewReason":
+                    latest_note[key] = value
+            cursor = conn.execute(
+                """
+                UPDATE pool_operations
+                SET status = 'manual_required', note = ?
+                WHERE id = ? AND status = 'listed'
+                """,
+                (_build_note(latest_note), int(op["id"])),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_LISTED)
         print(
             f"[挂刀老挂单人工检查] {op['market_hash_name']} | asset={asset_id or '-'} | "
             f"listing={listing_id or '-'} | 已超过48小时，远端不在售且无Steam卖出回执；未恢复本地资产"
         )
+        return True
 
     def _backfill_listing_ids(
         self,
@@ -3921,7 +5408,10 @@ class ExecutionEngine:
             active_listings = active_client.list_active_listings()
             active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active_listings)
         except Exception as exc:
+            confirmation_sent_at = note.get("confirmationSentAt") or utc_now_iso()
             note["confirmationStatus"] = "confirm_sent_waiting_active_listing"
+            note["confirmationSentAt"] = confirmation_sent_at
+            note["listingPendingAt"] = note.get("listingPendingAt") or confirmation_sent_at
             note["confirmationMessage"] = f"confirmed but active listing check failed: {exc}"
             self._pending_confirmation_count += 1
             return note, POOL_STATUS_LISTING_PENDING
@@ -3931,7 +5421,10 @@ class ExecutionEngine:
             listing_id=listing_id,
             asset_id=asset_id,
         ):
+            confirmation_sent_at = note.get("confirmationSentAt") or utc_now_iso()
             note["confirmationStatus"] = "confirm_sent_waiting_active_listing"
+            note["confirmationSentAt"] = confirmation_sent_at
+            note["listingPendingAt"] = note.get("listingPendingAt") or confirmation_sent_at
             note["confirmationMessage"] = "confirmed but listing is not visible in Steam active listings yet"
             self._pending_confirmation_count += 1
             return note, POOL_STATUS_LISTING_PENDING
@@ -4441,10 +5934,21 @@ class ExecutionEngine:
     ) -> bool:
         """Return whether an unresolved listing is due for a bounded deep walk."""
 
-        pending_since = (
-            _parse_iso(str(note.get("listingPendingAt") or ""))
-            or _parse_iso(str(note.get("staleListedManualRequiredAt") or ""))
-        )
+        confirmation_status = str(note.get("confirmationStatus") or "")
+        if confirmation_status == "confirm_sent_waiting_active_listing":
+            # Confirmation is sent before the operation row is inserted. Old
+            # rows only gained listingPendingAt during a later retry, so the
+            # operation creation time is the truthful conservative fallback.
+            pending_since = (
+                _parse_iso(str(note.get("confirmationSentAt") or ""))
+                or _parse_iso(str(op["created_at"] or ""))
+                or _parse_iso(str(note.get("listingPendingAt") or ""))
+            )
+        else:
+            pending_since = (
+                _parse_iso(str(note.get("listingPendingAt") or ""))
+                or _parse_iso(str(note.get("staleListedManualRequiredAt") or ""))
+            )
         if pending_since is None:
             return False
         if pending_since.tzinfo is None:
@@ -4470,7 +5974,8 @@ class ExecutionEngine:
         active_listing_ids: set[str],
         active_asset_ids: set[str],
         now: datetime | None = None,
-    ) -> tuple[dict[int, dict[str, Any] | None], set[int], str | None]:
+        raise_on_error: bool = False,
+    ) -> _SteamSaleReceiptLookupOutcome:
         """Read one account history snapshot for every unresolved due operation.
 
         Routine checks stay on the first two pages.  Once an unresolved
@@ -4502,7 +6007,7 @@ class ExecutionEngine:
             if self._steam_sale_receipt_deep_lookup_due(op, note, now=checked_at):
                 deep_due_ids.add(int(op["id"]))
         if not missing:
-            return {}, set(), None
+            return _SteamSaleReceiptLookupOutcome({}, set(), None, True, True)
 
         max_pages = (
             STEAM_SALE_RECEIPT_DEEP_LOOKUP_MAX_PAGES
@@ -4512,23 +6017,56 @@ class ExecutionEngine:
         results: dict[int, dict[str, Any] | None] = {
             int(op["id"]): None for op, _ in missing
         }
+        coverage_complete = False
+        lookup_succeeded = False
+        rich_batch_finder = getattr(client, "find_sale_receipts_for_targets_with_coverage", None)
         batch_finder = getattr(client, "find_sale_receipts_for_targets", None)
         try:
-            if callable(batch_finder):
-                targets = [
-                    {
-                        "key": str(int(op["id"])),
-                        "listingId": str(note.get("listingId") or "").strip(),
-                        "assetId": str(op["asset_id"] or "").strip(),
-                    }
-                    for op, note in missing
-                ]
+            targets = [
+                {
+                    "key": str(int(op["id"])),
+                    "listingId": str(note.get("listingId") or "").strip(),
+                    "assetId": str(op["asset_id"] or "").strip(),
+                    "createdAt": str(op["created_at"] or "").strip(),
+                }
+                for op, note in missing
+            ]
+            if callable(rich_batch_finder):
+                rich_result = rich_batch_finder(targets, max_pages=max_pages)
+                batch_results = getattr(rich_result, "receipts", None)
+                if not isinstance(batch_results, dict):
+                    raise SteamMarketError("Steam sale history coverage result is invalid")
+                coverage_complete = bool(getattr(rich_result, "coverage_complete", False))
+                for operation_id in results:
+                    receipt = batch_results.get(str(operation_id))
+                    if isinstance(receipt, dict):
+                        results[operation_id] = receipt
+                lookup_succeeded = bool(
+                    getattr(rich_result, "lookup_succeeded", True)
+                )
+                lookup_error = str(getattr(rich_result, "error", "") or "") or None
+                retry_at = str(getattr(rich_result, "retry_at", "") or "") or None
+                pages_scanned = max(
+                    0,
+                    int(getattr(rich_result, "pages_scanned", 0) or 0),
+                )
+            elif callable(batch_finder):
                 batch_results = batch_finder(targets, max_pages=max_pages)
                 if isinstance(batch_results, dict):
                     for operation_id in results:
                         receipt = batch_results.get(str(operation_id))
                         if isinstance(receipt, dict):
                             results[operation_id] = receipt
+                    # Legacy injected clients do not say whether their page
+                    # walk reached history's real end.  They remain usable
+                    # for receipt-positive transitions, but cannot authorize
+                    # an inventory-based asset release.
+                    lookup_succeeded = True
+                    lookup_error = None
+                    retry_at = None
+                    pages_scanned = max_pages
+                else:
+                    raise SteamMarketError("Steam sale history batch result is invalid")
             else:
                 # Compatibility for tests and older injected clients.  The
                 # production Steam client supports the account-level batch
@@ -4540,13 +6078,40 @@ class ExecutionEngine:
                         asset_id=str(op["asset_id"] or "").strip(),
                         max_pages=max_pages,
                     )
-        except Exception:
-            return results, set(), None
+                lookup_succeeded = True
+                lookup_error = None
+                retry_at = None
+                pages_scanned = max_pages
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            return _SteamSaleReceiptLookupOutcome(
+                results,
+                set(),
+                None,
+                False,
+                False,
+                str(exc),
+                (
+                    getattr(exc, "retry_at").isoformat()
+                    if isinstance(getattr(exc, "retry_at", None), datetime)
+                    else None
+                ),
+            )
         attempted_at = checked_at.astimezone(timezone.utc).isoformat()
-        return results, deep_due_ids, attempted_at if deep_due_ids else None
+        return _SteamSaleReceiptLookupOutcome(
+            results,
+            deep_due_ids,
+            attempted_at if deep_due_ids else None,
+            lookup_succeeded,
+            coverage_complete,
+            lookup_error,
+            retry_at,
+            pages_scanned,
+        )
 
-    @staticmethod
     def _record_sale_receipt_deep_attempt(
+        self,
         note: dict[str, Any],
         *,
         attempted_at: str | None,
@@ -4697,6 +6262,8 @@ class ExecutionEngine:
         sale_receipt_results: dict[int, dict[str, Any] | None] | None = None,
         sale_receipt_deep_attempt_ids: set[int] | None = None,
         sale_receipt_deep_attempted_at: str | None = None,
+        sale_receipt_lookup_succeeded: bool | None = None,
+        sale_receipt_coverage_complete: bool | None = None,
     ) -> int:
         active_client = client or self.steam_client
         if not active_client:
@@ -4719,30 +6286,66 @@ class ExecutionEngine:
         existing_rebuy_sources, existing_rebuy_sell_ops = self._load_existing_rebuy_source_keys()
         stale_market_snapshot_cache: dict[str, tuple[float | None, float | None, str | None]] = {}
 
-        listed_ops = [
-            op
-            for op in self.db.list_pool_operations_by_type(OP_SELL_STEAM, status="listed", limit=200)
-            if self._operation_matches_client(op, active_client)
-            and (operation_ids is None or int(op["id"]) in operation_ids)
-        ]
+        sale_evidence_ops = []
+        for op in self.db.list_pool_operations_by_type_and_statuses(
+            OP_SELL_STEAM,
+            statuses=["listed", POOL_STATUS_LISTING_PENDING, "manual_required"],
+            limit=5000,
+        ):
+            note = _read_note(op["note"])
+            raw_status = str(op["status"] or "")
+            is_listing_missing_unverified = (
+                raw_status == POOL_STATUS_LISTING_PENDING
+                and str(note.get("confirmationStatus") or "") == "listing_missing_unverified"
+            )
+            is_stale_manual_recheck = (
+                raw_status == "manual_required"
+                and str(note.get("staleListedCleanupStatus") or "") == "manual_required"
+            )
+            if raw_status != "listed" and not (
+                is_listing_missing_unverified or is_stale_manual_recheck
+            ):
+                continue
+            if not self._operation_matches_client(op, active_client):
+                continue
+            if operation_ids is not None and int(op["id"]) not in operation_ids:
+                continue
+            sale_evidence_ops.append(op)
         if sale_receipt_results is None:
-            (
-                sale_receipt_results,
-                sale_receipt_deep_attempt_ids,
-                sale_receipt_deep_attempted_at,
-            ) = self._lookup_steam_sale_receipts_for_operations(
+            receipt_lookup = self._lookup_steam_sale_receipts_for_operations(
                 active_client,
-                listed_ops,
+                sale_evidence_ops,
                 active_listing_ids=active_listing_ids,
                 active_asset_ids=active_asset_ids,
                 now=now,
             )
+            sale_receipt_results = receipt_lookup.receipts
+            sale_receipt_deep_attempt_ids = receipt_lookup.deep_attempt_ids
+            sale_receipt_deep_attempted_at = receipt_lookup.deep_attempted_at
+            sale_receipt_lookup_succeeded = receipt_lookup.lookup_succeeded
+            sale_receipt_coverage_complete = receipt_lookup.coverage_complete
         deep_attempt_ids = set(sale_receipt_deep_attempt_ids or set())
-        for op in listed_ops:
-            pool_status = pool_status_map.get(op["market_hash_name"], POOL_STATUS_HOLDING)
-            if pool_status == POOL_STATUS_LISTING_PENDING:
-                continue
+        sale_receipt_results = dict(sale_receipt_results or {})
+        inventory_return_checks = self._prepare_official_inventory_return_checks(
+            active_client,
+            sale_evidence_ops,
+            active_listing_ids=active_listing_ids,
+            active_asset_ids=active_asset_ids,
+            sale_receipt_results=sale_receipt_results,
+            sale_receipt_lookup_succeeded=bool(sale_receipt_lookup_succeeded),
+            sale_receipt_coverage_complete=bool(sale_receipt_coverage_complete),
+            deep_attempt_ids=deep_attempt_ids,
+        )
+        for op in sale_evidence_ops:
             note = _read_note(op["note"])
+            raw_status = str(op["status"] or "")
+            is_listing_missing_unverified = (
+                raw_status == POOL_STATUS_LISTING_PENDING
+                and str(note.get("confirmationStatus") or "") == "listing_missing_unverified"
+            )
+            pool_status = pool_status_map.get(op["market_hash_name"], POOL_STATUS_HOLDING)
+            if pool_status == POOL_STATUS_LISTING_PENDING and not is_listing_missing_unverified:
+                continue
             operation_id = int(op["id"])
             if operation_id in deep_attempt_ids:
                 self._record_sale_receipt_deep_attempt(
@@ -4759,14 +6362,20 @@ class ExecutionEngine:
                 listing_id=listing_id,
                 asset_id=asset_id,
             ):
+                if is_listing_missing_unverified:
+                    note["confirmationStatus"] = "listing_active_reverified"
+                    note["confirmationRecoveredAt"] = utc_now_iso()
+                    self._mark_steam_listing_active(op, note)
+                    continue
                 if is_stale_listed:
-                    if self._keep_stale_active_listing_if_still_competitive(
+                    keep_decision = self._keep_stale_active_listing_if_still_competitive(
                         op,
                         note,
                         client=active_client,
                         now=now,
                         market_snapshot_cache=stale_market_snapshot_cache,
-                    ):
+                    )
+                    if keep_decision is True or keep_decision is None:
                         continue
                     self._remove_stale_active_guadao_listing(
                         op,
@@ -4781,6 +6390,8 @@ class ExecutionEngine:
                     self.db.update_pool_operation(op["id"], note=_build_note(note))
                 continue
 
+            if is_listing_missing_unverified:
+                self._record_listing_missing_observation(note)
             sale_receipt = sale_receipt_results.get(operation_id)
             if sale_receipt is not None:
                 self._mark_steam_listing_sold(
@@ -4792,6 +6403,40 @@ class ExecutionEngine:
                 )
                 sold_count += 1
                 continue
+            inventory_check = inventory_return_checks.get(operation_id)
+            if inventory_check is not None:
+                check_status = str(inventory_check.get("status") or "")
+                if check_status == "found_same_asset":
+                    self._release_listing_missing_asset_returned(
+                        op,
+                        note,
+                        inventory_check=inventory_check,
+                    )
+                    continue
+                if inventory_check.get("checkedAt"):
+                    note["steamInventoryReturnCheckAt"] = inventory_check["checkedAt"]
+                    note["steamInventoryReturnCheckStatus"] = check_status
+                    note["steamInventoryReturnCheckAssetId"] = asset_id
+                    note["steamInventoryReturnPagesScanned"] = inventory_check.get("pagesScanned")
+                    note["steamInventoryReturnCoverageComplete"] = inventory_check.get(
+                        "coverageComplete"
+                    )
+                    note["steamSaleEvidenceHistoryCoverageComplete"] = inventory_check.get(
+                        "historyCoverageComplete"
+                    )
+                    if inventory_check.get("message"):
+                        note["steamInventoryReturnCheckMessage"] = str(
+                            inventory_check["message"]
+                        )
+                elif check_status:
+                    # This records why the inventory call was deliberately
+                    # skipped without pretending that Steam inventory itself
+                    # was successfully queried.
+                    note["steamInventoryReturnPrecondition"] = check_status
+                    if inventory_check.get("message"):
+                        note["steamInventoryReturnPreconditionMessage"] = str(
+                            inventory_check["message"]
+                        )
             if is_stale_listed:
                 self._mark_stale_listed_manual_required(
                     op,
@@ -4950,6 +6595,17 @@ class ExecutionEngine:
         if account is None:
             return self._resolve_trade_url()
 
+        expected_steam_id = str(steam_id64 or account.steam_id64 or "").strip() or None
+        if account.trade_url and self._is_trade_url_for_steam_id(
+            account.trade_url,
+            expected_steam_id,
+        ):
+            # A persisted, locally attributable trade URL is sufficient for
+            # C5 delivery.  Constructing a Steam client here used to trigger
+            # one MyListings validation per receiving account before every
+            # category batch, even though no Steam evidence was needed.
+            return account.trade_url
+
         client = self._steam_client_for_account(account, steam_id64)
         return self._resolve_trade_url_for_account(
             account=account,
@@ -5017,8 +6673,754 @@ class ExecutionEngine:
             op_time = op_time.replace(tzinfo=timezone.utc)
         return op_time >= cutoff
 
+    def _persist_c5_submission_unconfirmed(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        result: Any,
+    ) -> None:
+        payload = getattr(result, "payload", None)
+        submitted_at = (
+            _parse_iso(str(getattr(result, "submitted_at", None) or ""))
+            or _now_utc()
+        )
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+        submitted_at = submitted_at.astimezone(timezone.utc)
+        asset_order_id, trade_order_id, pay_status = _c5_submission_credentials(payload)
+        uncertain_note = {
+            **note,
+            "c5OutTradeNo": getattr(result, "out_trade_no", None),
+            "c5OrderId": asset_order_id,
+            "c5TradeOrderId": trade_order_id,
+            "c5PayStatus": pay_status,
+            "c5OrderStatus": C5_SUBMISSION_UNCONFIRMED,
+            C5_DELIVERY_STATUS_KEY: C5_SUBMISSION_UNCONFIRMED,
+            "c5OrderSubmittedAt": submitted_at.isoformat(),
+            "c5OrderPayload": payload,
+            "c5SubmissionUnconfirmedAt": utc_now_iso(),
+            "c5SubmissionUnconfirmedReason": str(getattr(result, "reason", "") or "unknown"),
+            "c5SubmissionReconcileAbsenceCount": 0,
+        }
+        # A delivery deadline is meaningful only after both C5 order ids are
+        # proven.  Remove a stale deadline when migrating an old bad state.
+        uncertain_note.pop("c5DeliveryDeadlineAt", None)
+        self.db.update_pool_operation(
+            op["id"],
+            status=C5_SUBMISSION_UNCONFIRMED,
+            actual_price=getattr(result, "actual_price", None),
+            note=_build_note(uncertain_note),
+        )
+        self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_submission_unconfirmed",
+            message="C5 补仓提交结果待核对，确认远端终态前不会重复购买",
+            level="WARNING",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=uncertain_note,
+            context={
+                "state": C5_SUBMISSION_UNCONFIRMED,
+                "c5OutTradeNo": uncertain_note.get("c5OutTradeNo"),
+                "c5OrderId": asset_order_id,
+                "c5TradeOrderId": trade_order_id,
+                "payStatus": pay_status,
+                "reason": uncertain_note.get("c5SubmissionUnconfirmedReason"),
+            },
+        )
+
+    def _read_c5_buyer_order_rows(
+        self,
+        *,
+        submitted_at: datetime | None,
+        page_budget: int,
+    ) -> tuple[list[dict[str, Any]], bool, int, str | None]:
+        rows: list[dict[str, Any]] = []
+        coverage_complete = False
+        seen_row_keys: set[tuple[str, ...]] = set()
+        previous_page_keys: tuple[tuple[str, ...], ...] | None = None
+        last_row_time: datetime | None = None
+        time_order_is_monotonic = True
+        page_num = 1
+        pages_read = 0
+        stop_reason: str | None = None
+        if submitted_at is not None:
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+            submitted_at = submitted_at.astimezone(timezone.utc)
+        coverage_boundary = (
+            submitted_at - timedelta(seconds=C5_SUBMISSION_MATCH_WINDOW_SECONDS)
+            if submitted_at is not None
+            else None
+        )
+
+        # There is intentionally no fixed business page limit here.  Stop only
+        # when C5 declares the last page, the fetched order times cover the
+        # local submission window, or the API stops making progress.  An
+        # abnormal/repeated page ends this attempt as incomplete, so absence is
+        # never inferred from a truncated prefix.
+        while True:
+            if pages_read >= max(1, int(page_budget)):
+                stop_reason = "single_run_page_budget_exhausted"
+                break
+            payload = self.c5_client.buyer_order_status(
+                page_num=page_num,
+                page_size=100,
+                status=None,
+            )
+            pages_read += 1
+            if not _c5_buyer_status_has_list(payload):
+                raise RuntimeError("C5 buyer order response has no order list")
+            page_rows = _c5_buyer_status_rows(payload)
+            pages = _c5_buyer_status_pages(payload)
+
+            page_keys: list[tuple[str, ...]] = []
+            page_times: list[datetime] = []
+            new_rows = 0
+            for row in page_rows:
+                asset_order_id = _c5_buyer_row_asset_order_id(row) or ""
+                trade_order_id = _c5_buyer_row_trade_order_id(row) or ""
+                out_trade_no = str(
+                    row.get("outTradeNo") or row.get("out_trade_no") or ""
+                ).strip()
+                created_text = str(
+                    _normalize_timestamp_iso(row.get("createTime") or row.get("createdAt"))
+                    or ""
+                )
+                row_key = (
+                    asset_order_id,
+                    trade_order_id,
+                    out_trade_no,
+                    created_text,
+                    _c5_order_detail_market_hash_name(row),
+                    str(row.get("receiveSteamId") or row.get("steamId") or ""),
+                    str(row.get("actualPay") or row.get("price") or ""),
+                )
+                page_keys.append(row_key)
+                if row_key not in seen_row_keys:
+                    seen_row_keys.add(row_key)
+                    rows.append(row)
+                    new_rows += 1
+                parsed_time = _parse_iso(created_text)
+                if parsed_time is not None:
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+                    parsed_time = parsed_time.astimezone(timezone.utc)
+                    if last_row_time is not None and parsed_time > last_row_time:
+                        time_order_is_monotonic = False
+                    last_row_time = parsed_time
+                    page_times.append(parsed_time)
+
+            if pages is not None and page_num >= pages:
+                coverage_complete = True
+                stop_reason = "api_last_page"
+                break
+            if not page_rows:
+                # Empty before an API-declared later page is an abnormal gap.
+                # Without page metadata an empty list is the endpoint's only
+                # explicit end-of-list signal.
+                coverage_complete = pages is None
+                stop_reason = "api_empty_last_page" if pages is None else "unexpected_empty_page"
+                break
+            if (
+                coverage_boundary is not None
+                and time_order_is_monotonic
+                and page_times
+                and min(page_times) <= coverage_boundary
+            ):
+                coverage_complete = True
+                stop_reason = "submitted_time_window_covered"
+                break
+
+            normalized_page_keys = tuple(page_keys)
+            if new_rows == 0 or normalized_page_keys == previous_page_keys:
+                coverage_complete = False
+                stop_reason = "buyer_order_page_no_progress"
+                break
+            previous_page_keys = normalized_page_keys
+            page_num += 1
+        return rows, coverage_complete, pages_read, stop_reason
+
+    def _c5_submission_candidate_rows(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        (
+            claimed_order_ids,
+            claimed_out_trade_nos,
+            ambiguous_order_ids,
+            ambiguous_out_trade_nos,
+            claim_evidence_available,
+            pending_sweeper_submissions,
+        ) = self._claimed_c5_order_evidence(
+            exclude_operation_id=int(op["id"])
+        )
+        expected_out_trade_no = str(note.get("c5OutTradeNo") or "").strip()
+        submitted_at = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
+        if submitted_at is not None and submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+        expected_price = safe_float(op["actual_price"]) or safe_float(op["expected_price"])
+        expected_steam_id = str(note.get("steamId64") or "").strip()
+        exact_candidates: list[dict[str, Any]] = []
+        fuzzy_candidates: list[dict[str, Any]] = []
+        for row in rows:
+            row_out_trade_no = str(row.get("outTradeNo") or row.get("out_trade_no") or "").strip()
+            exact_out_trade_match = bool(
+                expected_out_trade_no and row_out_trade_no == expected_out_trade_no
+            )
+            fuzzy_match = False
+            if exact_out_trade_match:
+                fuzzy_match = True
+            elif not (expected_out_trade_no and row_out_trade_no):
+                row_name = _c5_order_detail_market_hash_name(row)
+                row_price = safe_float(row.get("actualPay")) or safe_float(row.get("price"))
+                row_steam_id = str(
+                    row.get("receiveSteamId") or row.get("steamId") or row.get("steamId64") or ""
+                ).strip()
+                row_created_at = _parse_iso(
+                    str(_normalize_timestamp_iso(row.get("createTime") or row.get("createdAt")) or "")
+                )
+                if row_created_at is not None and row_created_at.tzinfo is None:
+                    row_created_at = row_created_at.replace(tzinfo=timezone.utc)
+                # Fuzzy ownership is allowed only with a complete evidence
+                # tuple.  Missing either timestamp or Steam account used to
+                # broaden the match and could steal an unrelated C5 sweeper
+                # order whose buyer/status row omitted outTradeNo.
+                time_matches = bool(
+                    submitted_at is not None
+                    and row_created_at is not None
+                    and abs((row_created_at - submitted_at).total_seconds())
+                    <= C5_SUBMISSION_MATCH_WINDOW_SECONDS
+                )
+                fuzzy_match = bool(
+                    row_name == str(op["market_hash_name"])
+                    and expected_price is not None
+                    and row_price is not None
+                    and abs(row_price - expected_price) <= 0.02
+                    and bool(expected_steam_id)
+                    and bool(row_steam_id)
+                    and row_steam_id == expected_steam_id
+                    and time_matches
+                )
+            if not fuzzy_match:
+                continue
+
+            if not exact_out_trade_match:
+                for pending_submission in pending_sweeper_submissions:
+                    pending_at = _parse_iso(
+                        str(pending_submission.get("submittedAt") or "")
+                    )
+                    if pending_at is not None and pending_at.tzinfo is None:
+                        pending_at = pending_at.replace(tzinfo=timezone.utc)
+                    pending_price = safe_float(pending_submission.get("buyPrice"))
+                    if (
+                        pending_submission.get("marketHashName") == row_name
+                        and str(pending_submission.get("receivingSteamId") or "").strip()
+                        == row_steam_id
+                        and pending_at is not None
+                        and row_created_at is not None
+                        and abs((row_created_at - pending_at).total_seconds())
+                        <= C5_SUBMISSION_MATCH_WINDOW_SECONDS
+                        and pending_price is not None
+                        and row_price is not None
+                        and abs(pending_price - row_price) <= 0.02
+                    ):
+                        return (
+                            [],
+                            "remote_order_overlaps_unconfirmed_c5_sweeper_submission",
+                            claim_evidence_available,
+                        )
+
+            row_order_ids = {
+                value
+                for value in (
+                    _c5_buyer_row_asset_order_id(row),
+                    _c5_buyer_row_trade_order_id(row),
+                )
+                if value
+            }
+            if row_order_ids.intersection(ambiguous_order_ids) or (
+                row_out_trade_no and row_out_trade_no in ambiguous_out_trade_nos
+            ):
+                return [], "remote_order_claimed_by_incomplete_local_evidence", claim_evidence_available
+            if exact_out_trade_match and (
+                row_order_ids.intersection(claimed_order_ids)
+                or row_out_trade_no in claimed_out_trade_nos
+            ):
+                return [], "exact_out_trade_no_claimed_by_other_operation", claim_evidence_available
+            if row_order_ids.intersection(claimed_order_ids):
+                continue
+            if row_out_trade_no and row_out_trade_no in claimed_out_trade_nos:
+                continue
+            if exact_out_trade_match:
+                exact_candidates.append(row)
+            else:
+                fuzzy_candidates.append(row)
+        return (exact_candidates or fuzzy_candidates), None, claim_evidence_available
+
+    def _claimed_c5_order_evidence(
+        self,
+        *,
+        exclude_operation_id: int,
+    ) -> tuple[set[str], set[str], set[str], set[str], bool, list[dict[str, Any]]]:
+        order_ids: set[str] = set()
+        out_trade_nos: set[str] = set()
+        ambiguous_order_ids: set[str] = set()
+        ambiguous_out_trade_nos: set[str] = set()
+        for row in self.db.list_pool_operations_by_type(OP_REBUY_C5, limit=50_000):
+            if int(row["id"]) == int(exclude_operation_id):
+                continue
+            other_note = _read_note(row["note"])
+            evidence_complete = _has_confirmed_c5_order_note(other_note)
+            target_order_ids = order_ids if evidence_complete else ambiguous_order_ids
+            target_out_trade_nos = out_trade_nos if evidence_complete else ambiguous_out_trade_nos
+            for value in (
+                other_note.get("c5OrderId"),
+                other_note.get("c5TradeOrderId"),
+                _extract_c5_order_id(other_note.get("c5OrderPayload")),
+                _extract_c5_trade_order_id(other_note.get("c5OrderPayload")),
+            ):
+                if value not in (None, ""):
+                    target_order_ids.add(str(value))
+            out_trade_no = str(other_note.get("c5OutTradeNo") or "").strip()
+            if out_trade_no:
+                target_out_trade_nos.add(out_trade_no)
+        (
+            sweeper_order_ids,
+            sweeper_out_trade_nos,
+            sweeper_ambiguous_order_ids,
+            sweeper_ambiguous_out_trade_nos,
+            sweeper_evidence_available,
+            pending_sweeper_submissions,
+        ) = self._c5_sweeper_claimed_order_evidence()
+        order_ids.update(sweeper_order_ids)
+        out_trade_nos.update(sweeper_out_trade_nos)
+        ambiguous_order_ids.update(sweeper_ambiguous_order_ids)
+        ambiguous_out_trade_nos.update(sweeper_ambiguous_out_trade_nos)
+        return (
+            order_ids,
+            out_trade_nos,
+            ambiguous_order_ids,
+            ambiguous_out_trade_nos,
+            sweeper_evidence_available,
+            pending_sweeper_submissions,
+        )
+
+    def _c5_sweeper_claimed_order_evidence(
+        self,
+    ) -> tuple[set[str], set[str], set[str], set[str], bool, list[dict[str, Any]]]:
+        state_path = PROJECT_ROOT / "data" / "c5_case_sweeper_v2_state.json"
+        if not state_path.exists():
+            return set(), set(), set(), set(), True, []
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return set(), set(), set(), set(), False, []
+        if not isinstance(state, dict):
+            return set(), set(), set(), set(), False, []
+
+        order_ids: set[str] = set()
+        out_trade_nos: set[str] = set()
+        ambiguous_order_ids: set[str] = set()
+        ambiguous_out_trade_nos: set[str] = set()
+        pending_submissions: list[dict[str, Any]] = []
+        rounds = state.get("rounds")
+        if not isinstance(rounds, list):
+            return set(), set(), set(), set(), False, []
+        for round_row in rounds:
+            if not isinstance(round_row, dict):
+                return set(), set(), set(), set(), False, []
+            orders = round_row.get("orders")
+            if orders is not None and not isinstance(orders, list):
+                return set(), set(), set(), set(), False, []
+            if isinstance(orders, list):
+                for order in orders:
+                    if not isinstance(order, dict):
+                        return set(), set(), set(), set(), False, []
+                    asset_order_id = str(order.get("orderAssetId") or "").strip()
+                    trade_order_id = str(order.get("tradeOrderId") or "").strip()
+                    out_trade_no = str(order.get("outTradeNo") or "").strip()
+                    evidence_complete = bool(asset_order_id and trade_order_id)
+                    target_ids = order_ids if evidence_complete else ambiguous_order_ids
+                    target_out = out_trade_nos if evidence_complete else ambiguous_out_trade_nos
+                    if asset_order_id:
+                        target_ids.add(asset_order_id)
+                    if trade_order_id:
+                        target_ids.add(trade_order_id)
+                    if out_trade_no:
+                        target_out.add(out_trade_no)
+            submissions = round_row.get("submissions")
+            if submissions is not None and not isinstance(submissions, list):
+                return set(), set(), set(), set(), False, []
+            if not isinstance(submissions, list):
+                continue
+            for submission in submissions:
+                if not isinstance(submission, dict):
+                    return set(), set(), set(), set(), False, []
+                submission_out_trade_no = str(submission.get("outTradeNo") or "").strip()
+                if submission_out_trade_no:
+                    ambiguous_out_trade_nos.add(submission_out_trade_no)
+                products = submission.get("products")
+                if products is not None and not isinstance(products, list):
+                    return set(), set(), set(), set(), False, []
+                if not isinstance(products, list):
+                    continue
+                for product in products:
+                    if not isinstance(product, dict):
+                        return set(), set(), set(), set(), False, []
+                    out_trade_no = str(product.get("outTradeNo") or "").strip()
+                    if out_trade_no:
+                        ambiguous_out_trade_nos.add(out_trade_no)
+                    if submission.get("status") in {"submitting", "uncertain"}:
+                        pending_submissions.append(
+                            {
+                                "marketHashName": str(
+                                    submission.get("marketHashName")
+                                    or round_row.get("marketHashName")
+                                    or ""
+                                ).strip(),
+                                "receivingSteamId": str(
+                                    submission.get("receivingSteamId")
+                                    or round_row.get("receivingSteamId")
+                                    or ""
+                                ).strip(),
+                                "submittedAt": (
+                                    submission.get("submittedAt")
+                                    or submission.get("createdAt")
+                                    or round_row.get("createdAt")
+                                ),
+                                "buyPrice": safe_float(product.get("buyPrice")),
+                            }
+                        )
+        return (
+            order_ids,
+            out_trade_nos,
+            ambiguous_order_ids,
+            ambiguous_out_trade_nos,
+            True,
+            pending_submissions,
+        )
+
+    def _c5_submission_window_is_covered(
+        self,
+        note: dict[str, Any],
+        rows: list[dict[str, Any]],
+        *,
+        pagination_complete: bool,
+    ) -> bool:
+        if pagination_complete:
+            return True
+        submitted_at = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
+        if submitted_at is None:
+            return False
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+        row_times: list[datetime] = []
+        for row in rows:
+            parsed = _parse_iso(
+                str(_normalize_timestamp_iso(row.get("createTime") or row.get("createdAt")) or "")
+            )
+            if parsed is None:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            row_times.append(parsed.astimezone(timezone.utc))
+        if not row_times:
+            return False
+        return min(row_times) <= submitted_at.astimezone(timezone.utc) - timedelta(
+            seconds=C5_SUBMISSION_MATCH_WINDOW_SECONDS
+        )
+
+    def _mark_c5_submission_manual_required(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        *,
+        reason: str,
+        candidate_count: int,
+    ) -> None:
+        manual_note = {
+            **note,
+            "c5SubmissionManualRequiredAt": utc_now_iso(),
+            "c5SubmissionManualReason": reason,
+            "c5SubmissionCandidateCount": candidate_count,
+        }
+        self.db.update_pool_operation(
+            op["id"],
+            status="manual_required",
+            note=_build_note(manual_note),
+        )
+        self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_REBUY_FAILED)
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_submission_manual_required",
+            message="C5 补仓提交对账证据冲突，已停止自动重复购买",
+            level="ERROR",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=manual_note,
+            context={
+                "state": "manual_required",
+                "reason": reason,
+                "candidateCount": candidate_count,
+                "c5OutTradeNo": note.get("c5OutTradeNo"),
+            },
+        )
+
+    def _reconcile_c5_submission(self, op: Any, note: dict[str, Any]) -> tuple[str, int, int]:
+        submitted_at = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
+        page_budget = int(
+            safe_int(note.get("c5SubmissionReconcileNextPageBudget"))
+            or C5_SUBMISSION_RECONCILE_INITIAL_PAGE_BUDGET
+        )
+        page_budget = min(
+            C5_SUBMISSION_RECONCILE_MAX_PAGE_BUDGET,
+            max(C5_SUBMISSION_RECONCILE_INITIAL_PAGE_BUDGET, page_budget),
+        )
+        try:
+            (
+                remote_rows,
+                pagination_complete,
+                pages_read,
+                pagination_stop_reason,
+            ) = self._read_c5_buyer_order_rows(
+                submitted_at=submitted_at,
+                page_budget=page_budget,
+            )
+        except Exception as exc:
+            updated_note = {
+                **note,
+                "c5SubmissionLastCheckedAt": utc_now_iso(),
+                "c5SubmissionLastCheckError": str(exc),
+            }
+            self.db.update_pool_operation(op["id"], note=_build_note(updated_note))
+            return C5_SUBMISSION_UNCONFIRMED, 0, 0
+
+        note = {
+            **note,
+            "c5SubmissionReconcilePagesRead": pages_read,
+            "c5SubmissionReconcileStopReason": pagination_stop_reason,
+        }
+        if pagination_complete:
+            note.pop("c5SubmissionReconcileNextPageBudget", None)
+        else:
+            if pagination_stop_reason == "single_run_page_budget_exhausted":
+                note["c5SubmissionReconcileNextPageBudget"] = min(
+                    C5_SUBMISSION_RECONCILE_MAX_PAGE_BUDGET,
+                    max(C5_SUBMISSION_RECONCILE_INITIAL_PAGE_BUDGET, page_budget * 2),
+                )
+                if page_budget >= C5_SUBMISSION_RECONCILE_MAX_PAGE_BUDGET:
+                    # This cap is a request-storm fuse, never evidence that the
+                    # remote order range was fully checked. Runtime keeps the
+                    # operation unconfirmed and moves repeated failures to its
+                    # existing slow-retry/one-time-alert path.
+                    note["c5SubmissionReconcileSafetyCapReachedAt"] = (
+                        note.get("c5SubmissionReconcileSafetyCapReachedAt") or utc_now_iso()
+                    )
+                    note["c5SubmissionReconcileAlertCode"] = (
+                        "max_page_budget_exhausted_without_coverage"
+                    )
+            else:
+                note["c5SubmissionReconcileNextPageBudget"] = page_budget
+
+        candidates, evidence_conflict, claim_evidence_available = self._c5_submission_candidate_rows(
+            op, note, remote_rows
+        )
+        checked_at = utc_now_iso()
+        if not claim_evidence_available:
+            unavailable_note = {
+                **note,
+                "c5SubmissionLastCheckedAt": checked_at,
+                "c5SubmissionLastCheckError": "c5_sweeper_claim_evidence_unavailable",
+            }
+            self.db.update_pool_operation(op["id"], note=_build_note(unavailable_note))
+            return C5_SUBMISSION_UNCONFIRMED, 0, 1
+        if evidence_conflict:
+            self._mark_c5_submission_manual_required(
+                op,
+                note,
+                reason=evidence_conflict,
+                candidate_count=0,
+            )
+            return "manual_required", 0, 1
+        if len(candidates) > 1:
+            self._mark_c5_submission_manual_required(
+                op,
+                note,
+                reason="multiple_matching_c5_orders",
+                candidate_count=len(candidates),
+            )
+            return "manual_required", 0, 1
+
+        if len(candidates) == 1 and not pagination_complete:
+            expected_out_trade_no = str(note.get("c5OutTradeNo") or "").strip()
+            candidate_out_trade_no = str(
+                candidates[0].get("outTradeNo")
+                or candidates[0].get("out_trade_no")
+                or ""
+            ).strip()
+            if not (
+                expected_out_trade_no
+                and candidate_out_trade_no == expected_out_trade_no
+            ):
+                # A fuzzy match is "unique" only after the fetched order range
+                # covers the local submission window. A later page may contain
+                # another same-item/same-account/same-price candidate.
+                coverage_note = {
+                    **note,
+                    "c5SubmissionLastCheckedAt": checked_at,
+                    "c5SubmissionLastCheckError": "buyer_order_window_not_covered",
+                    "c5SubmissionFetchedRows": len(remote_rows),
+                    "c5SubmissionPaginationComplete": False,
+                    "c5SubmissionCandidateCount": 1,
+                }
+                self.db.update_pool_operation(op["id"], note=_build_note(coverage_note))
+                return C5_SUBMISSION_UNCONFIRMED, 0, 1
+
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            asset_order_id = _c5_buyer_row_asset_order_id(candidate)
+            trade_order_id = _c5_buyer_row_trade_order_id(candidate)
+            pay_status = safe_int(candidate.get("payStatus"))
+            if not asset_order_id:
+                # A row without any usable C5 lookup id cannot be taken into
+                # the delivery state machine, even when its outTradeNo matched.
+                updated_note = {
+                    **note,
+                    "c5SubmissionLastCheckedAt": checked_at,
+                    "c5SubmissionLastCheckError": "matched_c5_order_missing_lookup_id",
+                    "c5SubmissionCandidateCount": 1,
+                }
+                self.db.update_pool_operation(op["id"], note=_build_note(updated_note))
+                return C5_SUBMISSION_UNCONFIRMED, 0, 1
+
+            recognized_submitted_at = submitted_at or _now_utc()
+            if recognized_submitted_at.tzinfo is None:
+                recognized_submitted_at = recognized_submitted_at.replace(tzinfo=timezone.utc)
+            recognized_submitted_at = recognized_submitted_at.astimezone(timezone.utc)
+            deadline = recognized_submitted_at + timedelta(seconds=C5_DELIVERY_DEADLINE_SECONDS)
+            expected_out_trade_no = str(note.get("c5OutTradeNo") or "").strip()
+            candidate_out_trade_no = str(
+                candidate.get("outTradeNo") or candidate.get("out_trade_no") or ""
+            ).strip()
+            recognized_base_note = dict(note)
+            recognized_base_note.pop("c5SubmissionReconcileNextPageBudget", None)
+            recognized_note = {
+                **recognized_base_note,
+                "c5OrderId": asset_order_id,
+                "c5TradeOrderId": trade_order_id,
+                "c5PayStatus": pay_status,
+                "c5OrderRecognized": True,
+                "c5OrderRecognizedAt": checked_at,
+                "c5OrderMatchMode": (
+                    "exact_out_trade_no"
+                    if expected_out_trade_no
+                    and candidate_out_trade_no == expected_out_trade_no
+                    else "safe_unique_fuzzy"
+                ),
+                "c5SubmissionNotCreatedCount": 0,
+                "c5OrderStatus": "ordered",
+                C5_DELIVERY_STATUS_KEY: "pending",
+                "c5OrderReconciledAt": checked_at,
+                "c5OrderReconcileSource": "buyer_order_status",
+                "c5OrderReconcilePayload": candidate,
+                "c5DeliveryDeadlineAt": deadline.isoformat(),
+            }
+            self.db.update_pool_operation(
+                op["id"],
+                status="delivery_pending",
+                note=_build_note(recognized_note),
+            )
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
+            state, replacements = self._confirm_recognized_c5_order_detail(int(op["id"]))
+            return state, replacements, 1
+
+        if not self._c5_submission_window_is_covered(
+            note,
+            remote_rows,
+            pagination_complete=pagination_complete,
+        ):
+            coverage_note = {
+                **note,
+                "c5SubmissionLastCheckedAt": checked_at,
+                "c5SubmissionLastCheckError": "buyer_order_window_not_covered",
+                "c5SubmissionFetchedRows": len(remote_rows),
+                "c5SubmissionPaginationComplete": pagination_complete,
+            }
+            self.db.update_pool_operation(op["id"], note=_build_note(coverage_note))
+            return C5_SUBMISSION_UNCONFIRMED, 0, 1
+
+        absence_count = int(safe_int(note.get("c5SubmissionReconcileAbsenceCount")) or 0) + 1
+        if absence_count < C5_SUBMISSION_ABSENCE_CONFIRMATIONS:
+            waiting_note = {
+                **note,
+                "c5SubmissionReconcileAbsenceCount": absence_count,
+                "c5SubmissionLastCheckedAt": checked_at,
+                "c5SubmissionLastCheckError": None,
+            }
+            self.db.update_pool_operation(op["id"], note=_build_note(waiting_note))
+            return C5_SUBMISSION_UNCONFIRMED, 0, 1
+
+        not_created_count = int(safe_int(note.get("c5SubmissionNotCreatedCount")) or 0) + 1
+        failed_note = {
+            **note,
+            C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED,
+            "c5OrderInvalidated": True,
+            "c5OrderFailedCode": "submission_not_created",
+            "c5OrderFailedDesc": "C5 补仓提交经多次买家订单对账仍不存在，确认未创建订单",
+            "c5SubmissionReconcileAbsenceCount": absence_count,
+            "c5SubmissionNotCreatedCount": not_created_count,
+            "c5SubmissionLastCheckedAt": checked_at,
+            REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+        }
+        if not_created_count >= C5_SUBMISSION_NOT_CREATED_MAX_CHAIN:
+            manual_note = {
+                **failed_note,
+                REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: False,
+                "c5SubmissionManualRequiredAt": checked_at,
+                "c5SubmissionManualReason": "submission_not_created_chain_limit",
+            }
+            self.db.update_pool_operation(
+                op["id"],
+                status="manual_required",
+                note=_build_note(manual_note),
+            )
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_REBUY_FAILED)
+            self._emit_guadao_local_event(
+                operation="c5_rebuy_submission_chain_limited",
+                message="C5 连续三次确认未创建补仓订单，已停止自动替换",
+                level="ERROR",
+                market_hash_name=str(op["market_hash_name"]),
+                operation_id=int(op["id"]),
+                asset_id=str(op["asset_id"] or "") or None,
+                note=manual_note,
+                context={
+                    "state": "manual_required",
+                    "reason": "submission_not_created_chain_limit",
+                    "notCreatedCount": not_created_count,
+                    "c5OutTradeNo": note.get("c5OutTradeNo"),
+                },
+            )
+            return "manual_required", 0, 1
+        self.db.update_pool_operation(
+            op["id"],
+            status=C5_DELIVERY_FAILED,
+            note=_build_note(failed_note),
+        )
+        replacements = self._create_replacement_rebuy_for_failed_op(
+            self._get_pool_operation_by_id(int(op["id"])) or op,
+            failed_note,
+            replacement_reason="c5_submission_not_created",
+            failed_status=C5_DELIVERY_FAILED,
+            created_by="c5_submission_reconcile",
+        )
+        return C5_DELIVERY_FAILED, replacements, 1
+
     def _rebuy_delivery_deadline(self, op: Any, note: dict[str, Any]) -> datetime | None:
-        # The 24-hour delivery clock starts only after a real C5 order was
+        # The 12-hour delivery review clock starts only after a real C5 order was
         # submitted.  Local operation timestamps describe our state machine,
         # not C5's seller-delivery obligation, and must never start this clock.
         submitted = _parse_iso(str(note.get("c5OrderSubmittedAt") or ""))
@@ -5028,59 +7430,48 @@ class ExecutionEngine:
             submitted = submitted.replace(tzinfo=timezone.utc)
         return submitted.astimezone(timezone.utc) + timedelta(seconds=C5_DELIVERY_DEADLINE_SECONDS)
 
-    def _expire_rebuy_delivery_if_due(
+    def _mark_rebuy_delivery_overdue_if_due(
         self,
         op: Any,
         note: dict[str, Any],
         *,
         now: datetime | None = None,
-    ) -> bool:
+    ) -> dict[str, Any]:
         deadline = self._rebuy_delivery_deadline(op, note)
         current = now or _now_utc()
         if deadline is None or current < deadline:
-            return False
-        failed_note = {
+            return note
+        overdue_note = {
             **note,
-            C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED,
-            "c5OrderInvalidated": True,
-            "c5OrderFailedCode": "delivery_timeout_24h",
-            "c5OrderFailedDesc": "C5 补仓下单后 24 小时仍未发货，按补仓失败处理",
+            C5_DELIVERY_STATUS_KEY: "pending",
+            "c5DeliveryOverdue": True,
             "c5DeliveryDeadlineAt": deadline.isoformat(),
-            "c5DeliveryTimedOutAt": current.isoformat(),
-            REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+            "c5DeliveryOverdueAt": note.get("c5DeliveryOverdueAt") or current.isoformat(),
+            "c5DeliveryOverdueReason": "delivery_detail_requires_authoritative_recheck",
         }
         self.db.update_pool_operation(
             op["id"],
-            status=C5_DELIVERY_FAILED,
-            note=_build_note(failed_note),
+            status="delivery_pending",
+            note=_build_note(overdue_note),
         )
-        self._emit_guadao_local_event(
-            operation="c5_rebuy_delivery_timeout_24h",
-            message="C5 补仓满 24 小时仍未发货，已按失败处理",
-            level="ERROR",
-            market_hash_name=str(op["market_hash_name"]),
-            operation_id=int(op["id"]),
-            asset_id=str(op["asset_id"] or "") or None,
-            note=failed_note,
-            context={
-                "state": C5_DELIVERY_FAILED,
-                "c5OrderId": failed_note.get("c5OrderId"),
-                "c5OutTradeNo": failed_note.get("c5OutTradeNo"),
-                "c5ActualPrice": safe_float(op["actual_price"]),
-                "c5ExpectedPrice": safe_float(op["expected_price"]),
-                "deliveryDeadlineAt": deadline.isoformat(),
-                "timedOutAt": current.isoformat(),
-                "maxRebuyRatioAtOpen": failed_note.get("maxRebuyRatioAtOpen"),
-            },
-        )
-        self._create_replacement_rebuy_for_failed_op(
-            self._get_pool_operation_by_id(int(op["id"])) or op,
-            failed_note,
-            replacement_reason="c5_delivery_failed",
-            failed_status=C5_DELIVERY_FAILED,
-            created_by="c5_delivery_timeout_24h",
-        )
-        return True
+        if not note.get("c5DeliveryOverdueAt"):
+            self._emit_guadao_local_event(
+                operation="c5_rebuy_delivery_overdue_recheck",
+                message="C5 补仓已超过 12 小时，继续以订单详情终态为准",
+                level="WARNING",
+                market_hash_name=str(op["market_hash_name"]),
+                operation_id=int(op["id"]),
+                asset_id=str(op["asset_id"] or "") or None,
+                note=overdue_note,
+                context={
+                    "state": "delivery_pending",
+                    "c5OrderId": overdue_note.get("c5OrderId"),
+                    "c5OutTradeNo": overdue_note.get("c5OutTradeNo"),
+                    "deliveryDeadlineAt": deadline.isoformat(),
+                    "overdueAt": overdue_note.get("c5DeliveryOverdueAt"),
+                },
+            )
+        return overdue_note
 
     def _create_replacement_rebuy_for_failed_op(
         self,
@@ -5092,108 +7483,232 @@ class ExecutionEngine:
         force_rebuy_replacement: bool | None = None,
         created_by: str = "rebuy_delivery_audit",
     ) -> int:
-        if note.get(C5_DELIVERY_STATUS_KEY) == C5_DELIVERY_SUCCESS:
-            return 0
-        if self._has_replacement_child(note):
-            return 0
+        parent_id = int(op["id"])
+        conn = self.db.conn
+        replacement_id: int | None = None
+        effective_note: dict[str, Any] = {}
+        market_hash_name = str(op["market_hash_name"])
+        asset_id = str(op["asset_id"] or "") or None
+        order_id = ""
+        failed_reason: Any = "rebuy_failed"
+        expected_price = 0.01
 
-        order_id = str(note.get("c5OrderId") or "").strip()
-        failed_reason = (
-            note.get("c5OrderFailedDesc")
-            or note.get("failedReason")
-            or note.get("c5OrderStatusName")
-            or "rebuy_failed"
-        )
-        if replacement_reason is None:
-            replacement_reason = (
-                "c5_delivery_failed"
-                if note.get(C5_DELIVERY_STATUS_KEY) == C5_DELIVERY_FAILED
-                else "rebuy_operation_failed"
+        # Replacement creation is a cross-runner idempotency boundary.  A
+        # note-only pre-check leaves a race in which two workers both observe
+        # no child and insert one.  BEGIN IMMEDIATE serializes the re-read,
+        # child search, insert and parent-link update as one SQLite write unit.
+        # Do not call Database helpers here: they commit midway through this
+        # critical section.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            fresh_op = conn.execute(
+                "SELECT * FROM pool_operations WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if fresh_op is None:
+                conn.rollback()
+                return 0
+
+            fresh_note = _read_note(fresh_op["note"])
+            # Preserve caller-derived failure evidence that has not yet been
+            # persisted (for example canceled audit metadata), while allowing
+            # the transactional re-read to win for every current DB field.
+            effective_note = {**note, **fresh_note}
+            if effective_note.get(C5_DELIVERY_STATUS_KEY) == C5_DELIVERY_SUCCESS:
+                conn.rollback()
+                return 0
+
+            existing_child_id: int | None = None
+            child_rows = conn.execute(
+                """
+                SELECT id, note FROM pool_operations
+                WHERE strategy = ? AND operation_type = ?
+                """,
+                (STRATEGY_GUADAO, OP_REBUY_C5),
+            ).fetchall()
+            for child_row in child_rows:
+                child_note = _read_note(child_row["note"])
+                if safe_int(child_note.get("replacementForRebuyOperationId")) == parent_id:
+                    existing_child_id = int(child_row["id"])
+                    break
+
+            resolved_replacement_reason = replacement_reason
+            if resolved_replacement_reason is None:
+                resolved_replacement_reason = (
+                    "c5_delivery_failed"
+                    if effective_note.get(C5_DELIVERY_STATUS_KEY) == C5_DELIVERY_FAILED
+                    else "rebuy_operation_failed"
+                )
+            resolved_failed_status = failed_status
+            if resolved_failed_status is None:
+                resolved_failed_status = (
+                    C5_DELIVERY_FAILED
+                    if resolved_replacement_reason == "c5_delivery_failed"
+                    else "failed"
+                )
+            resolved_force_replacement = bool(force_rebuy_replacement)
+            market_hash_name = str(fresh_op["market_hash_name"])
+            asset_id = str(fresh_op["asset_id"] or "") or None
+
+            if existing_child_id is not None:
+                # Repair a missing parent link left by an older partial write,
+                # but never insert another child.
+                if safe_int(effective_note.get("replacementRebuyOperationId")) != existing_child_id:
+                    repaired_note = {
+                        **effective_note,
+                        "replacementRebuyOperationId": existing_child_id,
+                        "replacementReason": resolved_replacement_reason,
+                        REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+                    }
+                    conn.execute(
+                        "UPDATE pool_operations SET status = ?, note = ? WHERE id = ?",
+                        (resolved_failed_status, _build_note(repaired_note), parent_id),
+                    )
+                conn.commit()
+                return 0
+
+            order_id = str(effective_note.get("c5OrderId") or "").strip()
+            failed_reason = (
+                effective_note.get("c5OrderFailedDesc")
+                or effective_note.get("failedReason")
+                or effective_note.get("c5OrderStatusName")
+                or "rebuy_failed"
             )
-        if failed_status is None:
-            failed_status = C5_DELIVERY_FAILED if replacement_reason == "c5_delivery_failed" else "failed"
-        if force_rebuy_replacement is None:
-            force_rebuy_replacement = False
-        expected_price = safe_float(op["actual_price"]) or safe_float(op["expected_price"]) or 0.01
-        replacement_note = {
-            "replacementForRebuyOperationId": int(op["id"]),
-            "replacementForC5OrderId": order_id,
-            "replacementReason": replacement_reason,
-            "replacementFailedCode": note.get("c5OrderFailedCode"),
-            "replacementFailedDesc": failed_reason,
-            "forceRebuyReplacement": bool(force_rebuy_replacement),
-            "sourceSellOperationId": note.get("sourceSellOperationId"),
-            "sourceListing": note.get("sourceListing"),
-            "steamListPrice": note.get("steamListPrice"),
-            "listingRatioAtOpen": note.get("listingRatioAtOpen"),
-            "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
-            "guadaoMaxListingRatioAtOpen": note.get("guadaoMaxListingRatioAtOpen"),
-            "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
-            "guadaoRatioRuleSource": note.get("guadaoRatioRuleSource"),
-            "guadaoRatioRuleId": note.get("guadaoRatioRuleId"),
-            "guadaoRatioRuleVersion": note.get("guadaoRatioRuleVersion"),
-            "steamAccountId": note.get("steamAccountId"),
-            "steamAccountName": note.get("steamAccountName"),
-            "steamId64": note.get("steamId64"),
-            "createdBy": created_by,
-            **(
-                {
-                    "replacementMaxPrice": expected_price,
-                    "replacementPricePolicy": "original_failed_order_price",
-                }
-                if replacement_reason == "c5_delivery_failed"
-                else {}
-            ),
-        }
-        replacement_id = self.db.add_pool_operation(
-            market_hash_name=op["market_hash_name"],
-            strategy=STRATEGY_GUADAO,
-            operation_type=OP_REBUY_C5,
-            quantity=1,
-            expected_price=expected_price,
-            note=_build_note(replacement_note),
-        )
-        self.db.update_pool_operation(
-            op["id"],
-            status=failed_status,
-            note=_build_note(
-                {
-                    **note,
-                    "replacementRebuyOperationId": replacement_id,
-                    "replacementReason": replacement_reason,
-                    REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
-                    **(
-                        {C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED}
-                        if replacement_reason == "c5_delivery_failed"
-                        else {}
-                    ),
-                }
-            ),
-        )
-        self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
+            expected_price = (
+                safe_float(fresh_op["actual_price"])
+                or safe_float(fresh_op["expected_price"])
+                or 0.01
+            )
+            # This counter tracks consecutive C5 submissions proven not to
+            # have created an order.  Delivery failures, cancellations and
+            # other replacement causes break that chain.
+            not_created_count = (
+                int(safe_int(effective_note.get("c5SubmissionNotCreatedCount")) or 0)
+                if resolved_replacement_reason == "c5_submission_not_created"
+                else 0
+            )
+            replacement_note = {
+                "replacementForRebuyOperationId": parent_id,
+                "replacementForC5OrderId": order_id,
+                "replacementReason": resolved_replacement_reason,
+                "replacementFailedCode": effective_note.get("c5OrderFailedCode"),
+                "replacementFailedDesc": failed_reason,
+                "forceRebuyReplacement": resolved_force_replacement,
+                "sourceSellOperationId": effective_note.get("sourceSellOperationId"),
+                "sourceListing": effective_note.get("sourceListing"),
+                "steamListPrice": effective_note.get("steamListPrice"),
+                "listingRatioAtOpen": effective_note.get("listingRatioAtOpen"),
+                "maxRebuyRatioAtOpen": effective_note.get("maxRebuyRatioAtOpen"),
+                "guadaoMaxListingRatioAtOpen": effective_note.get("guadaoMaxListingRatioAtOpen"),
+                "steamNetFactorAtOpen": effective_note.get("steamNetFactorAtOpen"),
+                "guadaoRatioRuleSource": effective_note.get("guadaoRatioRuleSource"),
+                "guadaoRatioRuleId": effective_note.get("guadaoRatioRuleId"),
+                "guadaoRatioRuleVersion": effective_note.get("guadaoRatioRuleVersion"),
+                "steamAccountId": effective_note.get("steamAccountId"),
+                "steamAccountName": effective_note.get("steamAccountName"),
+                "steamId64": effective_note.get("steamId64"),
+                "c5SubmissionNotCreatedCount": not_created_count,
+                "createdBy": created_by,
+                **(
+                    {
+                        "replacementMaxPrice": expected_price,
+                        "replacementPricePolicy": "original_failed_order_price",
+                    }
+                    if resolved_replacement_reason
+                    in {"c5_delivery_failed", "c5_submission_not_created"}
+                    else {}
+                ),
+            }
+            now = utc_now_iso()
+            cursor = conn.execute(
+                """
+                INSERT INTO pool_operations (
+                    market_hash_name, strategy, operation_type, status,
+                    quantity, expected_price, asset_id, note, created_at
+                ) VALUES (?, ?, ?, 'pending', 1, ?, NULL, ?, ?)
+                """,
+                (
+                    market_hash_name,
+                    STRATEGY_GUADAO,
+                    OP_REBUY_C5,
+                    expected_price,
+                    _build_note(replacement_note),
+                    now,
+                ),
+            )
+            replacement_id = int(cursor.lastrowid)
+            parent_note = {
+                **effective_note,
+                "replacementRebuyOperationId": replacement_id,
+                "replacementReason": resolved_replacement_reason,
+                REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+                **(
+                    {C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED}
+                    if resolved_replacement_reason
+                    in {"c5_delivery_failed", "c5_submission_not_created"}
+                    else {}
+                ),
+            }
+            completed_at = now if resolved_failed_status in {
+                "completed",
+                "failed",
+                "skipped",
+                "dry_run",
+                "sold",
+            } else fresh_op["completed_at"]
+            conn.execute(
+                """
+                UPDATE pool_operations
+                SET status = ?, note = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    resolved_failed_status,
+                    _build_note(parent_note),
+                    completed_at,
+                    parent_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE inventory_pool
+                SET status = ?, updated_at = ?
+                WHERE market_hash_name = ?
+                """,
+                (POOL_STATUS_PENDING_REBUY, now, market_hash_name),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        assert replacement_id is not None
         print(
-            f"[补仓失效] {op['market_hash_name']} | 原补仓 op={op['id']} 已失败，"
+            f"[补仓失效] {market_hash_name} | 原补仓 op={parent_id} 已失败，"
             f"已创建替换补仓 op={replacement_id} | 原因: {failed_reason}"
         )
         self._emit_guadao_local_event(
             operation="c5_rebuy_replacement_created",
             message="C5 失败补仓已创建替换补仓任务",
             level="WARNING",
-            market_hash_name=str(op["market_hash_name"]),
-            operation_id=int(op["id"]),
-            asset_id=str(op["asset_id"] or "") or None,
-            note=note,
+            market_hash_name=market_hash_name,
+            operation_id=parent_id,
+            asset_id=asset_id,
+            note=effective_note,
             context={
                 "state": "replacement_pending",
                 "replacementOperationId": replacement_id,
-                "replacementReason": replacement_reason,
+                "replacementReason": resolved_replacement_reason,
                 "failedReason": failed_reason,
                 "originalC5OrderId": order_id or None,
                 "replacementMaxPrice": (
-                    expected_price if replacement_reason == "c5_delivery_failed" else None
+                    expected_price
+                    if resolved_replacement_reason
+                    in {"c5_delivery_failed", "c5_submission_not_created"}
+                    else None
                 ),
-                "maxRebuyRatioAtOpen": note.get("maxRebuyRatioAtOpen"),
-                "steamNetFactorAtOpen": note.get("steamNetFactorAtOpen"),
+                "maxRebuyRatioAtOpen": effective_note.get("maxRebuyRatioAtOpen"),
+                "steamNetFactorAtOpen": effective_note.get("steamNetFactorAtOpen"),
             },
         )
         return 1
@@ -5235,6 +7750,177 @@ class ExecutionEngine:
         )
         return None, None, updated_note
 
+    def _apply_recognized_c5_order_detail(
+        self,
+        op: Any,
+        note: dict[str, Any],
+        detail: dict[str, Any],
+        order_id: str | None,
+    ) -> tuple[str, int]:
+        """Apply buyer/detail as the sole delivery terminal-state authority."""
+
+        checked_at = utc_now_iso()
+        asset_order_id = _extract_c5_order_id(detail) or note.get("c5OrderId")
+        # buyer_order_detail commonly returns the asset-order id in its generic
+        # ``orderId`` field.  The quick-buy response is the authoritative
+        # source for the parent trade-order id, so never overwrite it with the
+        # detail lookup id.  Only backfill from detail when no trade id was
+        # previously recorded and the detail exposes both identifier roles.
+        trade_order_id = note.get("c5TradeOrderId") or _c5_buyer_row_trade_order_id(detail)
+        detail_pay_status = safe_int(detail.get("payStatus"))
+        checked_note = {
+            **note,
+            "c5OrderId": asset_order_id,
+            "c5TradeOrderId": trade_order_id,
+            "c5PayStatus": (
+                detail_pay_status
+                if detail_pay_status is not None
+                else safe_int(note.get("c5PayStatus"))
+            ),
+            "c5OrderRecognized": True,
+            "c5SubmissionNotCreatedCount": 0,
+            "c5OrderStatus": safe_int(detail.get("status")),
+            "c5OrderStatusName": detail.get("statusName"),
+            "c5OrderCheckedAt": checked_at,
+            "c5OrderDetailPayload": detail,
+            "c5OrderDetailLastError": None,
+        }
+        detail_market_hash_name = _c5_order_detail_market_hash_name(detail)
+        if detail_market_hash_name and detail_market_hash_name != op["market_hash_name"]:
+            checked_note["c5OrderDetailLastError"] = "c5_order_market_hash_name_mismatch"
+            checked_note["c5OrderDetailMarketHashName"] = detail_market_hash_name
+            checked_note["c5SubmissionManualRequiredAt"] = checked_at
+            checked_note["c5SubmissionManualReason"] = "c5_order_market_hash_name_mismatch"
+            self.db.update_pool_operation(
+                op["id"],
+                status="manual_required",
+                note=_build_note(checked_note),
+            )
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_REBUY_FAILED)
+            return "manual_required", 0
+
+        final_status = _c5_delivery_final_status(detail)
+        if final_status is None:
+            deadline = self._rebuy_delivery_deadline(op, checked_note)
+            checked_note["c5DeliveryDeadlineAt"] = deadline.isoformat() if deadline else None
+            checked_note[C5_DELIVERY_STATUS_KEY] = "pending"
+            checked_note = self._mark_rebuy_delivery_overdue_if_due(op, checked_note)
+            self.db.update_pool_operation(
+                op["id"],
+                status="delivery_pending",
+                note=_build_note(checked_note),
+            )
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
+            return "delivery_pending", 0
+
+        if final_status == C5_DELIVERY_SUCCESS:
+            completed_note = {
+                **checked_note,
+                C5_DELIVERY_STATUS_KEY: C5_DELIVERY_SUCCESS,
+                "c5OrderInvalidated": False,
+            }
+            self.db.update_pool_operation(
+                op["id"],
+                status="completed",
+                note=_build_note(completed_note),
+            )
+            self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
+            self._emit_guadao_local_event(
+                operation="c5_rebuy_completed",
+                message="C5 补仓已确认发货完成",
+                market_hash_name=str(op["market_hash_name"]),
+                operation_id=int(op["id"]),
+                asset_id=str(op["asset_id"] or "") or None,
+                note=completed_note,
+                context={
+                    "state": "completed",
+                    "c5ActualPrice": safe_float(op["actual_price"]),
+                    "c5ExpectedPrice": safe_float(op["expected_price"]),
+                    "c5OrderId": order_id or completed_note.get("c5OrderId"),
+                    "c5OutTradeNo": completed_note.get("c5OutTradeNo"),
+                    "deliveryStatus": C5_DELIVERY_SUCCESS,
+                },
+            )
+            return "completed", 0
+
+        failed_note = {
+            **checked_note,
+            C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED,
+            "c5OrderFailedCode": detail.get("failedCode"),
+            "c5OrderFailedDesc": detail.get("failedDesc"),
+            "c5OrderInvalidated": True,
+            REBUY_AUTO_REPLACEMENT_ELIGIBLE_KEY: True,
+        }
+        self.db.update_pool_operation(
+            op["id"],
+            status=C5_DELIVERY_FAILED,
+            note=_build_note(failed_note),
+        )
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_delivery_failed",
+            message="C5 补仓订单已明确发货失败",
+            level="ERROR",
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=failed_note,
+            context={
+                "state": C5_DELIVERY_FAILED,
+                "c5OrderId": order_id or failed_note.get("c5OrderId"),
+                "failedCode": failed_note.get("c5OrderFailedCode"),
+                "failedReason": failed_note.get("c5OrderFailedDesc"),
+            },
+        )
+        replacements = self._create_replacement_rebuy_for_failed_op(
+            self._get_pool_operation_by_id(int(op["id"])) or op,
+            failed_note,
+            replacement_reason="c5_delivery_failed",
+            failed_status=C5_DELIVERY_FAILED,
+            created_by="c5_order_detail_terminal",
+        )
+        return C5_DELIVERY_FAILED, replacements
+
+    def _confirm_recognized_c5_order_detail(self, operation_id: int) -> tuple[str, int]:
+        op = self._get_pool_operation_by_id(int(operation_id))
+        if op is None:
+            return "missing", 0
+        note = _read_note(op["note"])
+        try:
+            detail, order_id, note = self._fetch_c5_buyer_order_detail(op, note)
+        except Exception as exc:
+            retry_note = {
+                **note,
+                "c5OrderRecognized": True,
+                "c5OrderDetailLastCheckedAt": utc_now_iso(),
+                "c5OrderDetailLastError": str(exc),
+            }
+            self.db.update_pool_operation(
+                op["id"],
+                status="delivery_pending",
+                note=_build_note(retry_note),
+            )
+            self._mark_rebuy_delivery_overdue_if_due(op, retry_note)
+            return "delivery_pending", 0
+        if detail is None:
+            # Keep every known real identifier. A temporarily unreadable detail
+            # response is a retry condition, never proof that the order is
+            # absent and never permission to buy again.
+            retry_note = {
+                **note,
+                "c5OrderRecognized": True,
+                "c5OrderDetailLastCheckedAt": utc_now_iso(),
+                "c5OrderDetailLastError": note.get("c5OrderLookupErrorMsg")
+                or "c5_order_detail_unavailable",
+            }
+            self.db.update_pool_operation(
+                op["id"],
+                status="delivery_pending",
+                note=_build_note(retry_note),
+            )
+            self._mark_rebuy_delivery_overdue_if_due(op, retry_note)
+            return "delivery_pending", 0
+        return self._apply_recognized_c5_order_detail(op, note, detail, order_id)
+
     def _check_recent_rebuy_delivery_failures(self, *, operation_id: int | None = None) -> int:
         if self.config.dry_run or (not self.config.auto_rebuy_enabled and operation_id is None):
             return 0
@@ -5246,7 +7932,7 @@ class ExecutionEngine:
         replacements = 0
         delivery_candidates = self.db.list_pool_operations_by_type_and_statuses(
             OP_REBUY_C5,
-            statuses=["delivery_pending", "completed"],
+            statuses=["delivery_pending", C5_SUBMISSION_UNCONFIRMED, "completed"],
             limit=5000,
         )
         if operation_id is not None:
@@ -5255,18 +7941,38 @@ class ExecutionEngine:
             ]
         for op in delivery_candidates:
             is_delivery_pending = str(op["status"] or "") == "delivery_pending"
+            is_submission_unconfirmed = str(op["status"] or "") == C5_SUBMISSION_UNCONFIRMED
             if not is_delivery_pending and not self._op_is_within_rebuy_audit_window(op, cutoff):
-                continue
+                if not is_submission_unconfirmed:
+                    continue
             note = _read_note(op["note"])
             if note.get(C5_DELIVERY_STATUS_KEY) in {C5_DELIVERY_SUCCESS, C5_DELIVERY_FAILED}:
                 continue
-            # C5 requires delivery within 24 hours. Once the persisted deadline
-            # has passed, the local terminal decision no longer depends on a
-            # successful detail lookup: network errors, mismatched responses,
-            # and old audit age must not leave this operation pending forever.
-            if is_delivery_pending and self._expire_rebuy_delivery_if_due(op, note):
-                failures += 1
-                replacements += 1
+            if is_delivery_pending and not _has_confirmed_c5_order_note(note):
+                note = {
+                    **note,
+                    C5_DELIVERY_STATUS_KEY: C5_SUBMISSION_UNCONFIRMED,
+                    "c5OrderStatus": C5_SUBMISSION_UNCONFIRMED,
+                    "c5SubmissionUnconfirmedAt": note.get("c5SubmissionUnconfirmedAt") or utc_now_iso(),
+                    "c5SubmissionUnconfirmedReason": "legacy_delivery_missing_required_order_evidence",
+                    "c5SubmissionReconcileAbsenceCount": int(
+                        safe_int(note.get("c5SubmissionReconcileAbsenceCount")) or 0
+                    ),
+                }
+                note.pop("c5DeliveryDeadlineAt", None)
+                self.db.update_pool_operation(
+                    op["id"],
+                    status=C5_SUBMISSION_UNCONFIRMED,
+                    note=_build_note(note),
+                )
+                is_delivery_pending = False
+                is_submission_unconfirmed = True
+            if is_submission_unconfirmed:
+                state, created, reconciled_checked = self._reconcile_c5_submission(op, note)
+                replacements += created
+                checked += reconciled_checked
+                if state == C5_DELIVERY_FAILED:
+                    failures += 1
                 continue
             if not _c5_order_lookup_ids(note):
                 continue
@@ -5275,101 +7981,37 @@ class ExecutionEngine:
             try:
                 detail, order_id, note = self._fetch_c5_buyer_order_detail(op, note)
             except Exception as exc:
+                retry_note = {
+                    **note,
+                    "c5OrderRecognized": True,
+                    "c5OrderDetailLastCheckedAt": utc_now_iso(),
+                    "c5OrderDetailLastError": str(exc),
+                }
+                self.db.update_pool_operation(op["id"], note=_build_note(retry_note))
                 print(f"[警告] 复查 C5 补仓订单失败: op={op['id']} | {exc}")
+                self._mark_rebuy_delivery_overdue_if_due(op, retry_note)
                 continue
             if detail is None:
-                if self._expire_rebuy_delivery_if_due(op, note):
-                    failures += 1
-                    replacements += 1
+                self._mark_rebuy_delivery_overdue_if_due(op, note)
                 continue
 
-            final_status = _c5_delivery_final_status(detail)
-            checked_note = {
-                **note,
-                "c5OrderStatus": safe_int(detail.get("status")),
-                "c5OrderStatusName": detail.get("statusName"),
-                "c5OrderCheckedAt": utc_now_iso(),
-            }
-            if final_status is None:
-                deadline = self._rebuy_delivery_deadline(op, checked_note)
-                checked_note["c5DeliveryDeadlineAt"] = deadline.isoformat() if deadline else None
-                self.db.update_pool_operation(op["id"], note=_build_note(checked_note))
-                if self._expire_rebuy_delivery_if_due(op, checked_note):
-                    failures += 1
-                    replacements += 1
-                continue
-
-            detail_market_hash_name = _c5_order_detail_market_hash_name(detail)
-            if detail_market_hash_name and detail_market_hash_name != op["market_hash_name"]:
-                print(
-                    f"[警告] C5 补仓订单品类不匹配，已跳过自动补仓: "
-                    f"op={op['id']} 本地={op['market_hash_name']} C5={detail_market_hash_name}"
-                )
-                continue
-
-            if final_status == C5_DELIVERY_SUCCESS:
-                self.db.update_pool_operation(
-                    op["id"],
-                    status="completed",
-                    note=_build_note(
-                        {
-                            **checked_note,
-                            C5_DELIVERY_STATUS_KEY: C5_DELIVERY_SUCCESS,
-                            "c5OrderInvalidated": False,
-                        }
-                    ),
-                )
-                self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_HOLDING)
-                completed_note = {
-                    **checked_note,
-                    C5_DELIVERY_STATUS_KEY: C5_DELIVERY_SUCCESS,
-                    "c5OrderInvalidated": False,
-                }
-                self._emit_guadao_local_event(
-                    operation="c5_rebuy_completed",
-                    message="C5 补仓已确认发货完成",
-                    market_hash_name=str(op["market_hash_name"]),
-                    operation_id=int(op["id"]),
-                    asset_id=str(op["asset_id"] or "") or None,
-                    note=completed_note,
-                    context={
-                        "state": "completed",
-                        "c5ActualPrice": safe_float(op["actual_price"]),
-                        "c5ExpectedPrice": safe_float(op["expected_price"]),
-                        "c5OrderId": order_id or checked_note.get("c5OrderId"),
-                        "c5OutTradeNo": checked_note.get("c5OutTradeNo"),
-                        "deliveryStatus": C5_DELIVERY_SUCCESS,
-                    },
-                )
+            detail_state, created = self._apply_recognized_c5_order_detail(
+                op,
+                note,
+                detail,
+                order_id,
+            )
+            replacements += created
+            if detail_state == "completed":
                 successes += 1
                 continue
-
-            failed_note = {
-                **checked_note,
-                C5_DELIVERY_STATUS_KEY: C5_DELIVERY_FAILED,
-                "c5OrderFailedCode": detail.get("failedCode"),
-                "c5OrderFailedDesc": detail.get("failedDesc"),
-                "c5OrderInvalidated": True,
-            }
-            self.db.update_pool_operation(op["id"], status=C5_DELIVERY_FAILED, note=_build_note(failed_note))
-            self._emit_guadao_local_event(
-                operation="c5_rebuy_delivery_failed",
-                message="C5 补仓订单已明确发货失败",
-                level="ERROR",
-                market_hash_name=str(op["market_hash_name"]),
-                operation_id=int(op["id"]),
-                asset_id=str(op["asset_id"] or "") or None,
-                note=failed_note,
-                context={
-                    "state": C5_DELIVERY_FAILED,
-                    "c5ActualPrice": safe_float(op["actual_price"]),
-                    "c5ExpectedPrice": safe_float(op["expected_price"]),
-                    "c5OrderId": order_id or failed_note.get("c5OrderId"),
-                    "failedCode": failed_note.get("c5OrderFailedCode"),
-                    "failedReason": failed_note.get("c5OrderFailedDesc"),
-                },
-            )
-            failures += 1
+            if detail_state == C5_DELIVERY_FAILED:
+                failures += 1
+                continue
+            if detail_state == "delivery_pending":
+                latest = self._get_pool_operation_by_id(int(op["id"]))
+                latest_note = _read_note(latest["note"]) if latest is not None else note
+                self._mark_rebuy_delivery_overdue_if_due(latest or op, latest_note)
 
         for failed_status in (C5_DELIVERY_FAILED, "failed", "canceled", "skipped"):
             for op in self.db.list_pool_operations_by_type(OP_REBUY_C5, status=failed_status, limit=5000):
@@ -5447,6 +8089,8 @@ class ExecutionEngine:
                 self.db.update_pool_operation(op["id"], note=_build_note(note))
             is_replacement = safe_int(note.get("replacementForRebuyOperationId")) is not None
             replacement_max_price = safe_float(note.get("replacementMaxPrice"))
+            manual_refrozen_price = safe_float(note.get("manualRebuyRefrozenPrice"))
+            manual_steam_net_amount = safe_float(note.get("manualRebuySteamNetAmount"))
             if is_replacement and note.get("forceRebuyReplacement") and replacement_max_price is None:
                 replacement_max_price = safe_float(expected_price)
                 note = {
@@ -5480,8 +8124,20 @@ class ExecutionEngine:
                 guadao_max_listing_ratio=rebuy_max_listing_ratio,
                 trade_url=trade_url,
                 use_live_price_as_max=False,
-                max_price_override=replacement_max_price,
+                max_price_override=manual_refrozen_price or replacement_max_price,
+                steam_net_amount_override=manual_steam_net_amount,
             )
+            submission_outcome = str(
+                getattr(result, "submission_outcome", "not_submitted") or "not_submitted"
+            )
+            if submission_outcome == "unconfirmed":
+                self._persist_c5_submission_unconfirmed(op, note, result)
+                print(
+                    f"[补仓待核对] {op['market_hash_name']} | "
+                    f"账号={_steam_account_log_label(note) or '-'} | "
+                    "C5 提交结果不确定，确认远端终态前不会重复购买"
+                )
+                continue
             if result.reason in (
                 "steam_crashed",
                 "c5_network_error",
@@ -5520,9 +8176,13 @@ class ExecutionEngine:
                 steam_sold_net = None
                 if result.listing_ratio_now:
                     steam_sold_net = (
-                        float(result.steam_reference_price) * float(rebuy_steam_net_factor)
-                        if result.steam_reference_price is not None
-                        else None
+                        manual_steam_net_amount
+                        if manual_steam_net_amount is not None and manual_steam_net_amount > 0
+                        else (
+                            float(result.steam_reference_price) * float(rebuy_steam_net_factor)
+                            if result.steam_reference_price is not None
+                            else None
+                        )
                     )
                     wait_message = (
                         f"[补仓等待] {op['market_hash_name']} | "
@@ -5580,6 +8240,13 @@ class ExecutionEngine:
                 c5_payload = getattr(result, "payload", None)
                 c5_order_id = _extract_c5_order_id(c5_payload)
                 c5_trade_order_id = _extract_c5_trade_order_id(c5_payload)
+                c5_pay_status = safe_int(c5_payload.get("payStatus")) if isinstance(c5_payload, dict) else None
+                if not _has_confirmed_c5_submission(c5_payload):
+                    # Compatibility defense: even if an older/custom buy helper
+                    # incorrectly says success=True, incomplete C5 evidence can
+                    # never advance to delivery_pending.
+                    self._persist_c5_submission_unconfirmed(op, note, result)
+                    continue
                 submitted_at = (
                     _parse_iso(str(getattr(result, "submitted_at", None) or ""))
                     or _now_utc()
@@ -5598,6 +8265,11 @@ class ExecutionEngine:
                             "c5OutTradeNo": getattr(result, "out_trade_no", None),
                             "c5OrderId": c5_order_id,
                             "c5TradeOrderId": c5_trade_order_id,
+                            "c5PayStatus": c5_pay_status,
+                            "c5OrderRecognized": True,
+                            "c5OrderRecognizedAt": utc_now_iso(),
+                            "c5OrderMatchMode": "quick_buy_response_ids",
+                            "c5SubmissionNotCreatedCount": 0,
                             "c5OrderStatus": "ordered",
                             C5_DELIVERY_STATUS_KEY: "pending",
                             "c5OrderSubmittedAt": submitted_at.isoformat(),
@@ -5607,31 +8279,41 @@ class ExecutionEngine:
                     ),
                 )
                 self.db.set_pool_status(op["market_hash_name"], POOL_STATUS_PENDING_REBUY)
+                # Both C5 identifiers prove the order exists regardless of
+                # payStatus. Query detail in the same execution round so a
+                # terminal success/failure is applied immediately; temporary
+                # detail outages retain the identifiers for scheduled retry.
+                detail_state, _detail_replacements = self._confirm_recognized_c5_order_detail(
+                    int(op["id"])
+                )
                 prefix = "[补仓替换]" if is_replacement else "[补仓]"
                 print(
                     f"{prefix} {op['market_hash_name']} | "
                     f"账号={_steam_account_log_label(note) or '-'} | "
                     f"C5买入 CNY {_format_decimal(result.actual_price)}"
                 )
-                self._emit_guadao_local_event(
-                    operation="c5_rebuy_submitted",
-                    message="C5 补仓已提交，等待发货确认",
-                    market_hash_name=str(op["market_hash_name"]),
-                    operation_id=int(op["id"]),
-                    asset_id=str(op["asset_id"] or "") or None,
-                    note=note,
-                    context={
-                        "state": "delivery_pending",
-                        "c5ActualPrice": result.actual_price,
-                        "c5MaxPrice": result.max_price,
-                        "c5OutTradeNo": getattr(result, "out_trade_no", None),
-                        "c5OrderId": c5_order_id,
-                        "c5TradeOrderId": c5_trade_order_id,
-                        "deliveryDeadlineAt": delivery_deadline.isoformat(),
-                        "isReplacement": bool(is_replacement),
-                        "replacementMaxPrice": replacement_max_price,
-                    },
-                )
+                if detail_state == "delivery_pending":
+                    current = self._get_pool_operation_by_id(int(op["id"]))
+                    current_note = _read_note(current["note"]) if current is not None else note
+                    self._emit_guadao_local_event(
+                        operation="c5_rebuy_submitted",
+                        message="C5 补仓已提交，等待发货确认",
+                        market_hash_name=str(op["market_hash_name"]),
+                        operation_id=int(op["id"]),
+                        asset_id=str(op["asset_id"] or "") or None,
+                        note=current_note,
+                        context={
+                            "state": detail_state,
+                            "c5ActualPrice": result.actual_price,
+                            "c5MaxPrice": result.max_price,
+                            "c5OutTradeNo": getattr(result, "out_trade_no", None),
+                            "c5OrderId": c5_order_id,
+                            "c5TradeOrderId": c5_trade_order_id,
+                            "deliveryDeadlineAt": delivery_deadline.isoformat(),
+                            "isReplacement": bool(is_replacement),
+                            "replacementMaxPrice": replacement_max_price,
+                        },
+                    )
                 rebuy_count += 1
             elif result.skipped:
                 self.db.update_pool_operation(op["id"], status="dry_run")
@@ -5694,6 +8376,714 @@ class ExecutionEngine:
                 )
         return rebuy_count
 
+    def _due_rebuy_operations_for_batch(self, market_hash_name: str) -> list[Any]:
+        """Return the pending operations currently owned by this category batch.
+
+        A per-operation ``rebuy:<id>`` clock remains the source of truth for
+        retry cadence.  Its ``waiting`` state intentionally cannot be claimed
+        by the generic worker; the category task below owns the one bounded
+        C5 page for every due operation of this item.
+        """
+
+        now = utc_now_iso()
+        due: list[Any] = []
+        for op in self.db.list_pool_operations_by_type(
+            OP_REBUY_C5,
+            status="pending",
+            limit=5000,
+        ):
+            if str(op["market_hash_name"] or "") != str(market_hash_name):
+                continue
+            task = self.db.get_scheduled_task(f"rebuy:{int(op['id'])}")
+            if task is None:
+                # Direct engine use in a diagnostic/test process has no
+                # runtime controller to seed the per-operation clock.  It is
+                # safe to treat the new pending operation as due once.
+                due.append(op)
+                continue
+            if (
+                str(task["task_type"] or "") == "rebuy_attempt"
+                and str(task["status"] or "") == "waiting"
+                and str(task["next_attempt_at"] or "") <= now
+            ):
+                due.append(op)
+        return due
+
+    @staticmethod
+    def _batch_rebuy_market_rows(payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        rows = payload.get("list")
+        if not isinstance(rows, list) and isinstance(payload.get("data"), dict):
+            rows = payload["data"].get("list")
+        return [dict(row) for row in rows or [] if isinstance(row, dict)]
+
+    def _resolve_batch_rebuy_trade_urls(
+        self,
+        operations: list[Any],
+    ) -> tuple[dict[int, tuple[dict[str, Any], str]], int]:
+        """Resolve each receiving account once, never falling back to another one."""
+
+        resolved: dict[int, tuple[dict[str, Any], str]] = {}
+        cached_urls: dict[tuple[str, str], str | None] = {}
+        missing = 0
+        for op in operations:
+            note = _read_note(op["note"])
+            inferred = self._infer_rebuy_account_fields(note)
+            if inferred:
+                note = {**note, **inferred}
+                self.db.update_pool_operation(int(op["id"]), note=_build_note(note))
+            cache_key = (
+                str(note.get("steamAccountId") or "").strip(),
+                str(note.get("steamId64") or "").strip(),
+            )
+            if cache_key not in cached_urls:
+                cached_urls[cache_key] = self._resolve_rebuy_trade_url(note)
+            trade_url = cached_urls[cache_key]
+            if not trade_url:
+                missing += 1
+                self.db.update_pool_operation(
+                    int(op["id"]),
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": "missing_rebuy_trade_url",
+                            "lastSkipAt": utc_now_iso(),
+                        }
+                    ),
+                )
+                continue
+            resolved[int(op["id"])] = (note, trade_url)
+        return resolved, missing
+
+    def _persist_batch_rebuy_success(
+        self,
+        *,
+        op: Any,
+        note: dict[str, Any],
+        request: dict[str, Any],
+        response: dict[str, Any],
+        submitted_at: datetime,
+        submission_mode: str = "batch",
+    ) -> bool:
+        """Advance only a C5 submission with both real order identifiers."""
+
+        payload = dict(response)
+        order_asset_id = _extract_c5_order_id(payload)
+        trade_order_id = _extract_c5_trade_order_id(payload)
+        price = safe_float(payload.get("actualPay")) or safe_float(request.get("buyPrice"))
+        if not order_asset_id or not trade_order_id or price is None or price <= 0:
+            self._persist_c5_submission_unconfirmed(
+                op,
+                note,
+                RebuyResult(
+                    False,
+                    False,
+                    f"c5_{submission_mode}_success_missing_order_evidence",
+                    actual_price=price,
+                    max_price=safe_float(op["expected_price"]),
+                    payload=payload,
+                    out_trade_no=str(request.get("outTradeNo") or "") or None,
+                    submitted_at=submitted_at.isoformat(),
+                    submission_outcome="unconfirmed",
+                ),
+            )
+            return False
+
+        deadline = submitted_at + timedelta(seconds=C5_DELIVERY_DEADLINE_SECONDS)
+        match_mode = (
+            "gap_quick_buy_response_ids"
+            if submission_mode == "gap_quick"
+            else "batch_buy_response_ids"
+        )
+        updated_note = {
+            **note,
+            "c5OutTradeNo": str(request.get("outTradeNo") or "") or None,
+            "c5ProductId": str(request.get("productId") or "") or None,
+            "c5OrderId": order_asset_id,
+            "c5TradeOrderId": trade_order_id,
+            "c5PayStatus": safe_int(payload.get("payStatus")),
+            "c5OrderRecognized": True,
+            "c5OrderRecognizedAt": utc_now_iso(),
+            "c5OrderMatchMode": match_mode,
+            "c5SubmissionNotCreatedCount": 0,
+            "c5OrderStatus": "ordered",
+            C5_DELIVERY_STATUS_KEY: "pending",
+            "c5OrderSubmittedAt": submitted_at.isoformat(),
+            "c5DeliveryDeadlineAt": deadline.isoformat(),
+            "c5OrderPayload": payload,
+        }
+        if submission_mode == "gap_quick":
+            updated_note.update(
+                {
+                    "c5GapQuickSubmissionState": "confirmed",
+                    "c5GapQuickMaxPrice": request.get("maxPrice"),
+                    "c5GapQuickPriceBatchFloor": request.get("priceBatchFloor"),
+                    "c5GapQuickConcreteFloor": request.get("concreteFloor"),
+                    "c5GapQuickSubmittedAt": submitted_at.isoformat(),
+                }
+            )
+        else:
+            updated_note.update(
+                {
+                    "c5BatchSubmissionId": request.get("batchSubmissionId"),
+                    "c5BatchSubmittedAt": submitted_at.isoformat(),
+                }
+            )
+        self.db.update_pool_operation(
+            int(op["id"]),
+            status="delivery_pending",
+            actual_price=price,
+            note=_build_note(updated_note),
+        )
+        self.db.set_pool_status(str(op["market_hash_name"]), POOL_STATUS_PENDING_REBUY)
+        self._emit_guadao_local_event(
+            operation="c5_rebuy_submitted",
+            message=(
+                "C5 差价区快速补仓已提交，等待发货确认"
+                if submission_mode == "gap_quick"
+                else "C5 批量补仓已提交，等待发货确认"
+            ),
+            market_hash_name=str(op["market_hash_name"]),
+            operation_id=int(op["id"]),
+            asset_id=str(op["asset_id"] or "") or None,
+            note=updated_note,
+            context={
+                "state": "delivery_pending",
+                "c5ActualPrice": price,
+                "c5MaxPrice": safe_float(op["expected_price"]),
+                "c5OutTradeNo": updated_note["c5OutTradeNo"],
+                "c5OrderId": order_asset_id,
+                "c5TradeOrderId": trade_order_id,
+                "deliveryDeadlineAt": deadline.isoformat(),
+                "submissionMode": submission_mode,
+                "batchSubmissionId": request.get("batchSubmissionId"),
+            },
+        )
+        return True
+
+    def run_guadao_rebuy_batch_task(self, market_hash_name: str) -> dict[str, Any]:
+        """Process one C5 price snapshot and one bounded concrete page.
+
+        ``price_batch`` remains the minimum-price authority.  The concrete
+        page is retained once and reused for normal batch buying; when its
+        visible floor is higher, a tightly capped quick-buy loop covers only
+        that hidden low-price gap before the retained page is matched.
+        """
+
+        started = time.perf_counter()
+        name = str(market_hash_name or "").strip()
+        result: dict[str, Any] = {
+            "ok": bool(name),
+            "marketHashName": name,
+            "dueOperations": 0,
+            "eligibleOperations": 0,
+            "priceBatchRequests": 0,
+            "priceBatchFloor": None,
+            "priceBatchItemId": None,
+            "concreteListingsRead": 0,
+            "concreteFloor": None,
+            "priceFloorGap": None,
+            "marketReadRequests": 0,
+            "c5RequestCount": 0,
+            "quickBuyAttempts": 0,
+            "quickBuySuccesses": 0,
+            "quickBuyNoMatch": 0,
+            "quickBuyRejected": 0,
+            "quickBuyUnconfirmed": 0,
+            "matched": 0,
+            "batchRequests": 0,
+            "submitted": 0,
+            "normalBatchMatched": 0,
+            "normalBatchRequests": 0,
+            "normalBatchSubmitted": 0,
+            "normalBatchSuccesses": 0,
+            "successes": 0,
+            "failed": 0,
+            "unconfirmed": 0,
+            "missingTradeUrl": 0,
+        }
+        if not name:
+            result["error"] = "missing_market_hash_name"
+            return result
+        if not self.config.auto_rebuy_enabled:
+            result["reason"] = "auto_rebuy_disabled"
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        due = self._due_rebuy_operations_for_batch(name)
+        result["dueOperations"] = len(due)
+        if not due:
+            result["reason"] = "no_due_operations"
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        resolved, missing_trade_url = self._resolve_batch_rebuy_trade_urls(due)
+        result["missingTradeUrl"] = missing_trade_url
+        eligible: list[tuple[Any, dict[str, Any], str, float]] = []
+        for op in due:
+            state = resolved.get(int(op["id"]))
+            frozen_price = safe_float(op["expected_price"])
+            if state is None or frozen_price is None or frozen_price <= 0:
+                continue
+            note, trade_url = state
+            eligible.append((op, note, trade_url, round(frozen_price, 2)))
+        result["eligibleOperations"] = len(eligible)
+        if not eligible:
+            result["reason"] = "no_eligible_operations"
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        try:
+            result["priceBatchRequests"] = 1
+            result["c5RequestCount"] = 1
+            price_batch_payload = self.c5_client.price_batch(
+                [name],
+                app_id=self.settings.app_id,
+            )
+            price_batch_row = price_batch_payload.get(name)
+            if not isinstance(price_batch_row, dict):
+                raise ValueError("price_batch missing item row")
+            item_id = str(price_batch_row.get("itemId") or "").strip()
+            price_batch_floor = safe_float(price_batch_row.get("price"))
+            if not item_id:
+                raise ValueError("price_batch missing itemId")
+            if price_batch_floor is None or price_batch_floor <= 0:
+                raise ValueError("price_batch missing positive price")
+            price_batch_floor = round(price_batch_floor, 2)
+            result["priceBatchItemId"] = item_id
+            result["priceBatchFloor"] = price_batch_floor
+        except Exception as exc:
+            for op, note, _trade_url, frozen_price in eligible:
+                self.db.update_pool_operation(
+                    int(op["id"]),
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": "c5_price_batch_read_failed",
+                            "lastSkipAt": utc_now_iso(),
+                            "c5ErrorPayload": {"error": str(exc)},
+                            "frozenRebuyPrice": frozen_price,
+                        }
+                    ),
+                )
+            result.update(
+                {"ok": False, "reason": "c5_price_batch_read_failed", "error": str(exc)}
+            )
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        try:
+            result["marketReadRequests"] = 1
+            result["c5RequestCount"] = int(result["c5RequestCount"]) + 1
+            payload = self.c5_client.market_products_search(
+                item_id=item_id,
+                page_size=50,
+            )
+        except Exception as exc:
+            for op, note, _trade_url, frozen_price in eligible:
+                self.db.update_pool_operation(
+                    int(op["id"]),
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": "c5_batch_listing_read_failed",
+                            "lastSkipAt": utc_now_iso(),
+                            "c5ErrorPayload": {"error": str(exc)},
+                            "frozenRebuyPrice": frozen_price,
+                        }
+                    ),
+                )
+            result.update({"ok": False, "reason": "c5_batch_listing_read_failed", "error": str(exc)})
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        concrete: list[tuple[float, str]] = []
+        seen_products: set[str] = set()
+        for row in self._batch_rebuy_market_rows(payload):
+            product_id = str(row.get("productId") or "").strip()
+            price = safe_float(row.get("price"))
+            if not product_id or product_id in seen_products or price is None or price <= 0:
+                continue
+            price = round(price, 2)
+            seen_products.add(product_id)
+            concrete.append((price, product_id))
+        concrete.sort(key=lambda row: (row[0], row[1]))
+        result["concreteListingsRead"] = len(concrete)
+        concrete_floor = concrete[0][0] if concrete else None
+        result["concreteFloor"] = concrete_floor
+        if concrete_floor is not None:
+            result["priceFloorGap"] = round(concrete_floor - price_batch_floor, 2)
+
+        eligible.sort(key=lambda row: (row[3], int(row[0]["id"])))
+        available = list(eligible)
+
+        # ``products/search`` is an internal-preview snapshot and can omit the
+        # real minimum exposed by price_batch.  Cover only the hidden band:
+        # never let quick-buy reach the first concrete listing retained below.
+        price_batch_cents = int(round(price_batch_floor * 100))
+        concrete_floor_cents = (
+            int(round(concrete_floor * 100)) if concrete_floor is not None else None
+        )
+        gap_exists = (
+            concrete_floor_cents is None or price_batch_cents < concrete_floor_cents
+        )
+        quick_limit = len(available)
+        while gap_exists and int(result["quickBuyAttempts"]) < quick_limit:
+            match_index = next(
+                (
+                    index
+                    for index, (_op, _note, _url, ceiling) in enumerate(available)
+                    if price_batch_cents <= int(round(ceiling * 100))
+                ),
+                None,
+            )
+            if match_index is None:
+                break
+            op, note, trade_url, ceiling = available[match_index]
+            max_cents = int(round(ceiling * 100))
+            if concrete_floor_cents is not None:
+                max_cents = min(max_cents, concrete_floor_cents - 1)
+            if max_cents < price_batch_cents:
+                break
+
+            previous_state = str(note.get("c5GapQuickSubmissionState") or "")
+            previous_out_trade_no = str(note.get("c5GapQuickOutTradeNo") or "").strip()
+            if previous_state == "submitting" and previous_out_trade_no:
+                self._persist_c5_submission_unconfirmed(
+                    op,
+                    note,
+                    RebuyResult(
+                        False,
+                        False,
+                        "c5_gap_quick_submission_unconfirmed",
+                        actual_price=price_batch_floor,
+                        max_price=max_cents / 100,
+                        payload={
+                            "error": "previous quick-buy response was not durably recorded"
+                        },
+                        out_trade_no=previous_out_trade_no,
+                        submitted_at=str(note.get("c5GapQuickSubmittedAt") or utc_now_iso()),
+                        submission_outcome="unconfirmed",
+                    ),
+                )
+                result["quickBuyUnconfirmed"] = int(result["quickBuyUnconfirmed"]) + 1
+                result["unconfirmed"] = int(result["unconfirmed"]) + 1
+                result["reason"] = "c5_gap_quick_unconfirmed"
+                result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+                return result
+
+            out_trade_no = uuid.uuid4().hex
+            submitted_at = _now_utc()
+            max_price = max_cents / 100
+            quick_request = {
+                "buyPrice": price_batch_floor,
+                "maxPrice": max_price,
+                "outTradeNo": out_trade_no,
+                "priceBatchFloor": price_batch_floor,
+                "concreteFloor": concrete_floor,
+            }
+            persisted_note = {
+                **note,
+                "c5OutTradeNo": out_trade_no,
+                "c5GapQuickOutTradeNo": out_trade_no,
+                "c5GapQuickSubmissionState": "submitting",
+                "c5GapQuickSubmittedAt": submitted_at.isoformat(),
+                "c5GapQuickMaxPrice": max_price,
+                "c5GapQuickPriceBatchFloor": price_batch_floor,
+                "c5GapQuickConcreteFloor": concrete_floor,
+            }
+            # The idempotency key is durable before the HTTP call.  A lost
+            # response therefore enters reconciliation instead of rebuying.
+            self.db.update_pool_operation(
+                int(op["id"]),
+                note=_build_note(persisted_note),
+            )
+            result["quickBuyAttempts"] = int(result["quickBuyAttempts"]) + 1
+            result["c5RequestCount"] = int(result["c5RequestCount"]) + 1
+            try:
+                quick_response = self.c5_client.quick_buy(
+                    app_id=self.settings.app_id,
+                    item_id=item_id,
+                    max_price=max_price,
+                    out_trade_no=out_trade_no,
+                    trade_url=trade_url,
+                )
+            except C5GameError as exc:
+                try:
+                    error_payload = json.loads(str(exc))
+                except (TypeError, ValueError):
+                    error_payload = None
+                if isinstance(error_payload, dict) and safe_int(
+                    error_payload.get("errorCode")
+                ) in {1317, 1014452}:
+                    rejected_note = {
+                        **persisted_note,
+                        "lastSkipReason": "no_matching_listing",
+                        "lastSkipAt": utc_now_iso(),
+                        "c5GapQuickSubmissionState": "rejected_no_match",
+                        "c5ErrorPayload": error_payload,
+                    }
+                    self.db.update_pool_operation(
+                        int(op["id"]),
+                        note=_build_note(rejected_note),
+                    )
+                    available[match_index] = (op, rejected_note, trade_url, ceiling)
+                    result["quickBuyNoMatch"] = int(result["quickBuyNoMatch"]) + 1
+                    break
+                if isinstance(error_payload, dict):
+                    self.db.update_pool_operation(
+                        int(op["id"]),
+                        note=_build_note(
+                            {
+                                **persisted_note,
+                                "lastSkipReason": "c5_gap_quick_rejected",
+                                "lastSkipAt": utc_now_iso(),
+                                "c5GapQuickSubmissionState": "rejected",
+                                "c5ErrorPayload": error_payload,
+                            }
+                        ),
+                    )
+                    result["quickBuyRejected"] = int(result["quickBuyRejected"]) + 1
+                    result["failed"] = int(result["failed"]) + 1
+                    result["reason"] = "c5_gap_quick_rejected"
+                    result["elapsedMs"] = round(
+                        (time.perf_counter() - started) * 1000,
+                        1,
+                    )
+                    return result
+                quick_response = None
+                quick_error: Exception | None = exc
+            except Exception as exc:
+                quick_response = None
+                quick_error = exc
+            else:
+                quick_error = None
+
+            if quick_error is not None or not _has_confirmed_c5_submission(quick_response):
+                payload_for_reconcile = (
+                    dict(quick_response)
+                    if isinstance(quick_response, dict)
+                    else {
+                        "error": str(quick_error or "missing C5 order identifiers"),
+                        "exceptionType": (
+                            type(quick_error).__name__ if quick_error is not None else None
+                        ),
+                    }
+                )
+                self._persist_c5_submission_unconfirmed(
+                    op,
+                    persisted_note,
+                    RebuyResult(
+                        False,
+                        False,
+                        "c5_gap_quick_submission_unconfirmed",
+                        actual_price=price_batch_floor,
+                        max_price=max_price,
+                        payload=payload_for_reconcile,
+                        out_trade_no=out_trade_no,
+                        submitted_at=submitted_at.isoformat(),
+                        submission_outcome="unconfirmed",
+                    ),
+                )
+                result["quickBuyUnconfirmed"] = int(result["quickBuyUnconfirmed"]) + 1
+                result["unconfirmed"] = int(result["unconfirmed"]) + 1
+                result["reason"] = "c5_gap_quick_unconfirmed"
+                result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+                return result
+
+            assert isinstance(quick_response, dict)
+            if self._persist_batch_rebuy_success(
+                op=op,
+                note=persisted_note,
+                request=quick_request,
+                response=quick_response,
+                submitted_at=submitted_at,
+                submission_mode="gap_quick",
+            ):
+                available.pop(match_index)
+                result["quickBuySuccesses"] = int(result["quickBuySuccesses"]) + 1
+                result["successes"] = int(result["successes"]) + 1
+            else:
+                result["quickBuyUnconfirmed"] = int(result["quickBuyUnconfirmed"]) + 1
+                result["unconfirmed"] = int(result["unconfirmed"]) + 1
+                result["reason"] = "c5_gap_quick_unconfirmed"
+                result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+                return result
+
+        # Lowest listing gets the tightest ceiling that still accepts it.  A
+        # looser order is kept for a later, more expensive product, maximising
+        # the number of filled pending rebuys from this one 50-row snapshot.
+        selected: list[tuple[Any, dict[str, Any], str, float, str]] = []
+        for price, product_id in concrete:
+            match_index = next(
+                (
+                    index
+                    for index, (_op, _note, _url, ceiling) in enumerate(available)
+                    if price <= ceiling + 0.005
+                ),
+                None,
+            )
+            if match_index is None:
+                continue
+            op, note, trade_url, _ceiling = available.pop(match_index)
+            selected.append((op, note, trade_url, price, product_id))
+        result["matched"] = len(selected)
+        result["normalBatchMatched"] = len(selected)
+        if not selected:
+            for op, note, _trade_url, frozen_price in available:
+                self.db.update_pool_operation(
+                    int(op["id"]),
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": "no_matching_listing",
+                            "lastSkipAt": utc_now_iso(),
+                            "c5BatchConcreteListingCount": len(concrete),
+                            "c5PriceBatchFloor": price_batch_floor,
+                            "c5ConcreteFloor": concrete_floor,
+                            "frozenRebuyPrice": frozen_price,
+                        }
+                    ),
+                )
+            result["reason"] = (
+                "quick_buy_gap_exhausted"
+                if int(result["quickBuySuccesses"]) > 0
+                else "no_matching_listing"
+            )
+            result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        batch_submission_id = uuid.uuid4().hex
+        submitted_at = _now_utc()
+        by_trade_url: dict[str, list[tuple[Any, dict[str, Any], dict[str, Any]]]] = {}
+        for op, note, trade_url, price, product_id in selected:
+            request = {
+                "productId": product_id,
+                "buyPrice": price,
+                "outTradeNo": uuid.uuid4().hex,
+                "batchSubmissionId": batch_submission_id,
+            }
+            persisted_note = {
+                **note,
+                "c5BatchSubmissionId": batch_submission_id,
+                "c5BatchSubmittedAt": submitted_at.isoformat(),
+                "c5OutTradeNo": request["outTradeNo"],
+                "c5ProductId": product_id,
+                "c5BatchRequestedPrice": price,
+                "c5BatchSubmissionState": "submitting",
+            }
+            # Persist the product/outTradeNo map before the HTTP call.  If the
+            # process loses the response, reconciliation has durable evidence
+            # and the same product will never be blindly bought again.
+            self.db.update_pool_operation(int(op["id"]), note=_build_note(persisted_note))
+            by_trade_url.setdefault(trade_url, []).append((op, persisted_note, request))
+
+        result["submitted"] = len(selected)
+        result["normalBatchSubmitted"] = len(selected)
+        for trade_url, group in by_trade_url.items():
+            result["batchRequests"] = int(result["batchRequests"]) + 1
+            result["normalBatchRequests"] = int(result["normalBatchRequests"]) + 1
+            result["c5RequestCount"] = int(result["c5RequestCount"]) + 1
+            product_list = [request for _op, _note, request in group]
+            requests_by_out = {str(request["outTradeNo"]): (op, note, request) for op, note, request in group}
+            requests_by_product = {str(request["productId"]): (op, note, request) for op, note, request in group}
+            try:
+                response = self.c5_client.batch_buy(
+                    product_list=[
+                        {
+                            "productId": request["productId"],
+                            "buyPrice": request["buyPrice"],
+                            "outTradeNo": request["outTradeNo"],
+                        }
+                        for request in product_list
+                    ],
+                    trade_url=trade_url,
+                )
+            except Exception as exc:
+                response = {"_batchException": str(exc)}
+
+            success_rows = response.get("successList") if isinstance(response, dict) else None
+            failed_rows = response.get("failedList") if isinstance(response, dict) else None
+            if not isinstance(success_rows, list) or not isinstance(failed_rows, list):
+                success_rows, failed_rows = [], []
+                response = dict(response) if isinstance(response, dict) else {"response": response}
+                response.setdefault("_batchUnconfirmedReason", "missing_success_or_failed_list")
+
+            resolved_out_trade_nos: set[str] = set()
+            for row in success_rows:
+                if not isinstance(row, dict):
+                    continue
+                match = (
+                    requests_by_out.get(str(row.get("outTradeNo") or ""))
+                    or requests_by_product.get(str(row.get("productId") or ""))
+                )
+                if match is None:
+                    continue
+                op, note, request = match
+                resolved_out_trade_nos.add(str(request["outTradeNo"]))
+                merged = {**request, **row}
+                if self._persist_batch_rebuy_success(
+                    op=op,
+                    note=note,
+                    request=request,
+                    response=merged,
+                    submitted_at=submitted_at,
+                ):
+                    result["successes"] = int(result["successes"]) + 1
+                    result["normalBatchSuccesses"] = int(result["normalBatchSuccesses"]) + 1
+                else:
+                    result["unconfirmed"] = int(result["unconfirmed"]) + 1
+
+            for row in failed_rows:
+                if not isinstance(row, dict):
+                    continue
+                match = (
+                    requests_by_out.get(str(row.get("outTradeNo") or ""))
+                    or requests_by_product.get(str(row.get("productId") or ""))
+                )
+                if match is None:
+                    continue
+                op, note, request = match
+                resolved_out_trade_nos.add(str(request["outTradeNo"]))
+                self.db.update_pool_operation(
+                    int(op["id"]),
+                    note=_build_note(
+                        {
+                            **note,
+                            "lastSkipReason": "c5_batch_rejected",
+                            "lastSkipAt": utc_now_iso(),
+                            "c5BatchSubmissionState": "rejected",
+                            "c5ErrorPayload": dict(row),
+                            "c5OutTradeNo": request["outTradeNo"],
+                        }
+                    ),
+                )
+                result["failed"] = int(result["failed"]) + 1
+
+            for out_trade_no, (op, note, request) in requests_by_out.items():
+                if out_trade_no in resolved_out_trade_nos:
+                    continue
+                self._persist_c5_submission_unconfirmed(
+                    op,
+                    note,
+                    RebuyResult(
+                        False,
+                        False,
+                        "c5_batch_submission_unconfirmed",
+                        actual_price=safe_float(request.get("buyPrice")),
+                        max_price=safe_float(op["expected_price"]),
+                        payload=response,
+                        out_trade_no=out_trade_no,
+                        submitted_at=submitted_at.isoformat(),
+                        submission_outcome="unconfirmed",
+                    ),
+                )
+                result["unconfirmed"] = int(result["unconfirmed"]) + 1
+
+        result["elapsedMs"] = round((time.perf_counter() - started) * 1000, 1)
+        return result
+
     def run_guadao_scan_task(self) -> dict[str, Any]:
         """Run only the new-candidate branch; existing-state work has its own tasks."""
 
@@ -5716,20 +9106,423 @@ class ExecutionEngine:
             pool_market_hash_names=scan_pool_names,
             inventory_payload=self._last_inventory_payload,
             weapon_case_market_hash_names=weapon_case_market_hash_names,
+            steam_request_source="guadao",
+            refresh_steam_accounts=False,
+            steam_orderbook_max_workers=1,
+            steam_orderbook_admission_timeout_seconds=(
+                GUADAO_SCAN_ORDERBOOK_ADMISSION_SECONDS
+            ),
+            steam_orderbook_price_resolver=self._guadao_scan_orderbook_price,
         )
-        self._refresh_scan_listing_prices_from_steam(report)
         status_map = self.db.get_pool_status_map()
+        blocked_by_open_cycle = self._has_open_guadao_cycle(status_map)
+        inventory_infos = {
+            info.candidate.market_hash_name: info
+            for info in self._guadao_account_inventory_infos(report)
+        }
         listed = 0
-        if not self._has_open_guadao_cycle(status_map):
+        if not blocked_by_open_cycle:
             listed = self._execute_guadao_listings(report, status_map)
         self._release_full_case_listing_capacity()
+        candidate_names = {
+            candidate.market_hash_name
+            for candidate in list(getattr(report, "guadao_candidates", []) or [])
+        }
+        evaluated_items: list[dict[str, Any]] = []
+        rejection_counts: dict[str, int] = {}
+        executable_count = 0
+        for candidate in list(getattr(report, "all_evaluated", []) or []):
+            market_hash_name = str(candidate.market_hash_name)
+            info = inventory_infos.get(market_hash_name)
+            max_ratio = float(
+                self.config.guadao_max_listing_ratio_for(market_hash_name)
+            )
+            eligible = market_hash_name in candidate_names
+            local_available = int(info.configured_available) if info is not None else 0
+            if not eligible:
+                decision = "ratio_above_limit"
+            elif local_available <= 0:
+                decision = "no_local_executable_asset"
+            elif blocked_by_open_cycle:
+                decision = "waiting_existing_cycle"
+            else:
+                decision = "executable_candidate"
+                executable_count += 1
+            rejection_counts[decision] = rejection_counts.get(decision, 0) + 1
+            evaluated_items.append(
+                {
+                    "name": candidate.name,
+                    "marketHashName": market_hash_name,
+                    "listingRatio": round(float(candidate.listing_ratio), 6),
+                    "listingRatioPct": round(float(candidate.listing_ratio_pct), 2),
+                    "maxListingRatio": round(max_ratio, 6),
+                    "maxListingRatioPct": round(max_ratio * 100.0, 2),
+                    "steamListPrice": float(candidate.steam_sell_price),
+                    "steamNetAmount": round(float(candidate.steam_after_tax_price), 2),
+                    "c5RebuyPrice": float(candidate.rebuy_price),
+                    "inventoryCount": int(candidate.inventory_count),
+                    "c5TradableCount": int(candidate.tradable_count),
+                    "localExecutableCount": local_available,
+                    "accountInventory": [
+                        {"accountName": account_name, "count": int(count)}
+                        for account_name, count in (info.account_counts if info else [])
+                    ],
+                    "eligible": eligible,
+                    "decision": decision,
+                }
+            )
+        evaluated_names = {
+            str(item.get("marketHashName") or "")
+            for item in evaluated_items
+        }
+        raw_outcomes = list(getattr(report, "item_outcomes", []) or [])
+        outcome_counts: dict[str, int] = {}
+        missing_price_items: list[dict[str, Any]] = []
+        queue_deferred_count = 0
+        for raw_outcome in raw_outcomes:
+            if not isinstance(raw_outcome, dict):
+                continue
+            status = str(raw_outcome.get("status") or "unclassified")
+            outcome_counts[status] = outcome_counts.get(status, 0) + 1
+            market_hash_name = str(raw_outcome.get("marketHashName") or "")
+            if status == "evaluated" or market_hash_name in evaluated_names:
+                continue
+            rejection_counts[status] = rejection_counts.get(status, 0) + 1
+            if status == "queue_deferred":
+                queue_deferred_count += 1
+            if status in {"steam_price_missing", "c5_price_missing"}:
+                missing_price_items.append(
+                    {
+                        "name": raw_outcome.get("name"),
+                        "marketHashName": market_hash_name,
+                        "status": status,
+                        "reason": raw_outcome.get("reason"),
+                        "stage": raw_outcome.get("stage"),
+                    }
+                )
+            evaluated_items.append(
+                {
+                    "name": raw_outcome.get("name") or market_hash_name,
+                    "marketHashName": market_hash_name,
+                    "listingRatio": raw_outcome.get("listingRatio"),
+                    "listingRatioPct": raw_outcome.get("listingRatioPct"),
+                    "maxListingRatio": None,
+                    "maxListingRatioPct": None,
+                    "steamListPrice": raw_outcome.get("steamListPrice"),
+                    "steamNetAmount": None,
+                    "c5RebuyPrice": raw_outcome.get("c5RebuyPrice"),
+                    "inventoryCount": raw_outcome.get("inventoryCount"),
+                    "c5TradableCount": raw_outcome.get("tradableCount"),
+                    "localExecutableCount": None,
+                    "accountInventory": [],
+                    "eligible": False,
+                    "decision": status,
+                    "reason": raw_outcome.get("reason"),
+                    "stage": raw_outcome.get("stage"),
+                    "requestSent": raw_outcome.get("requestSent"),
+                }
+            )
+        evaluated_items.sort(
+            key=lambda item: (
+                float(item.get("listingRatio") or 9999.0),
+                str(item.get("marketHashName") or ""),
+            )
+        )
+        scan_round = {
+            "generatedAt": getattr(report, "generated_at", utc_now_iso()),
+            "inventorySource": getattr(report, "inventory_source", None),
+            "poolTypeCount": int(getattr(report, "total_pool_types", 0) or 0),
+            "evaluatedCount": len(getattr(report, "all_evaluated", []) or []),
+            "missingPriceCount": int(getattr(report, "missing_price_count", 0) or 0),
+            "notEvaluatedCount": max(
+                0,
+                int(getattr(report, "total_pool_types", 0) or 0)
+                - len(getattr(report, "all_evaluated", []) or []),
+            ),
+            "queueDeferredCount": queue_deferred_count,
+            "outcomeCounts": outcome_counts,
+            "missingPriceItems": missing_price_items,
+            "candidateCount": len(candidate_names),
+            "executableCount": executable_count,
+            "listedCount": listed,
+            "blockedByOpenCycle": blocked_by_open_cycle,
+            "globalMaxListingRatioPct": round(
+                float(self.config.guadao_max_listing_ratio) * 100.0,
+                2,
+            ),
+            "decisionCounts": rejection_counts,
+            # Keep each persisted round bounded. Counts above still cover the
+            # complete scan; rows retain the most useful lowest-ratio items.
+            "items": evaluated_items[:80],
+            "itemsTruncated": len(evaluated_items) > 80,
+        }
         return {
             "ok": True,
             "listed": listed,
             "evaluated": len(getattr(report, "all_evaluated", []) or []),
             "candidateCount": len(getattr(report, "guadao_candidates", []) or []),
+            "executableCount": executable_count,
+            "missingPriceCount": int(getattr(report, "missing_price_count", 0) or 0),
+            "notEvaluatedCount": max(
+                0,
+                int(getattr(report, "total_pool_types", 0) or 0)
+                - len(getattr(report, "all_evaluated", []) or []),
+            ),
+            "queueDeferredCount": queue_deferred_count,
             "generatedAt": getattr(report, "generated_at", utc_now_iso()),
+            "scanRound": scan_round,
         }
+
+    def _load_account_my_listings_snapshot(
+        self,
+        client: SteamMarketClient,
+    ) -> dict[str, Any]:
+        loader = getattr(client, "my_listings_snapshot", None)
+        if callable(loader):
+            snapshot = loader()
+            return {
+                "active": list(getattr(snapshot, "active_listings", ()) or ()),
+                "pending": list(getattr(snapshot, "pending_listings", ()) or ()),
+                "officialActiveCount": safe_int(
+                    getattr(snapshot, "official_active_count", None)
+                ),
+                "actualActiveCount": max(
+                    0,
+                    int(getattr(snapshot, "actual_active_count", 0) or 0),
+                ),
+                "pagesScanned": max(
+                    0,
+                    int(getattr(snapshot, "pages_scanned", 0) or 0),
+                ),
+                "complete": bool(getattr(snapshot, "complete", False)),
+                "observedAt": str(getattr(snapshot, "observed_at", "") or "")
+                or utc_now_iso(),
+                "error": str(getattr(snapshot, "error", "") or "") or None,
+            }
+
+        # Compatibility for isolated injected clients.  Production always uses
+        # the pagination-aware snapshot above.
+        active = list(client.list_active_listings())
+        pending_loader = getattr(client, "list_confirmation_pending_listings", None)
+        pending = list(pending_loader()) if callable(pending_loader) else []
+        return {
+            "active": active,
+            "pending": pending,
+            "officialActiveCount": len(active),
+            "actualActiveCount": len(active),
+            "pagesScanned": 1,
+            "complete": True,
+            "observedAt": utc_now_iso(),
+            "error": None,
+        }
+
+    def _operation_matches_listing_rows(
+        self,
+        op: Any,
+        *,
+        listing_ids: set[str],
+        asset_ids: set[str],
+    ) -> bool:
+        note = _read_note(op["note"])
+        return self._listing_is_active(
+            active_listing_ids=listing_ids,
+            active_asset_ids=asset_ids,
+            listing_id=str(note.get("listingId") or "").strip(),
+            asset_id=str(op["asset_id"] or "").strip(),
+        )
+
+    def _apply_my_listings_active_evidence(
+        self,
+        client: SteamMarketClient,
+        operations: list[Any],
+        active_listings: list[Any],
+    ) -> tuple[set[int], int]:
+        listing_ids, asset_ids = self._active_listing_identity_sets(active_listings)
+        resolved_ids: set[int] = set()
+        newly_listed = 0
+        verified_at = utc_now_iso()
+        for op in operations:
+            if not self._operation_matches_client(op, client):
+                continue
+            if not self._operation_matches_listing_rows(
+                op,
+                listing_ids=listing_ids,
+                asset_ids=asset_ids,
+            ):
+                continue
+            operation_id = int(op["id"])
+            note = _read_note(op["note"])
+            raw_status = str(op["status"] or "")
+            listing_id = str(note.get("listingId") or "").strip()
+            asset_id = str(op["asset_id"] or "").strip()
+            if not listing_id and asset_id:
+                recovered_listing_id = self._active_listing_id_for_asset(
+                    active_listings,
+                    asset_id,
+                )
+                if recovered_listing_id:
+                    note["listingId"] = recovered_listing_id
+            previous_confirmation_status = str(
+                note.get("confirmationStatus") or ""
+            )
+            note["confirmationStatus"] = (
+                "listing_active_reverified"
+                if raw_status == "listed"
+                or previous_confirmation_status == "listing_missing_unverified"
+                else "confirmed_late"
+            )
+            note["activeVerifiedAt"] = verified_at
+            note["confirmationRecoveredAt"] = verified_at
+            self._mark_steam_listing_active(op, note)
+            resolved_ids.add(operation_id)
+            if raw_status != "listed":
+                newly_listed += 1
+        self.db.conn.commit()
+        return resolved_ids, newly_listed
+
+    def _record_my_listings_pending_evidence(
+        self,
+        client: SteamMarketClient,
+        operations: list[Any],
+        pending_listings: list[Any],
+    ) -> set[int]:
+        pending_listing_ids, pending_asset_ids = self._active_listing_identity_sets(
+            pending_listings
+        )
+        pending_ids: set[int] = set()
+        observed_at = utc_now_iso()
+        for op in operations:
+            if not self._operation_matches_client(op, client):
+                continue
+            if not self._operation_matches_listing_rows(
+                op,
+                listing_ids=pending_listing_ids,
+                asset_ids=pending_asset_ids,
+            ):
+                continue
+            operation_id = int(op["id"])
+            note = _read_note(op["note"])
+            asset_id = str(op["asset_id"] or "").strip()
+            pending_listing_id = (
+                str(note.get("listingId") or "").strip()
+                or self._active_listing_id_for_asset(pending_listings, asset_id)
+                or ""
+            )
+            if pending_listing_id:
+                note["listingId"] = pending_listing_id
+                note["marketPendingListingId"] = pending_listing_id
+            note["confirmationStatus"] = "market_pending_visible"
+            note["marketPendingVerifiedAt"] = observed_at
+            note["listingPendingAt"] = note.get("listingPendingAt") or observed_at
+            self.db.update_pool_operation(
+                operation_id,
+                status=POOL_STATUS_LISTING_PENDING,
+                note=_build_note(note),
+            )
+            self.db.set_pool_status(
+                op["market_hash_name"],
+                POOL_STATUS_LISTING_PENDING,
+            )
+            if asset_id:
+                self.db.set_asset_status(asset_id, "listing_pending")
+            pending_ids.add(operation_id)
+        self.db.conn.commit()
+        return pending_ids
+
+    def _confirm_pending_listing_operations_batch(
+        self,
+        client: SteamMarketClient,
+        operations: list[Any],
+        *,
+        pending_listings: list[Any],
+        confirmation_operation_ids: set[int] | None,
+    ) -> tuple[set[int], str | None]:
+        if confirmation_operation_ids == set():
+            return set(), None
+        pending_listing_ids, pending_asset_ids = self._active_listing_identity_sets(
+            pending_listings
+        )
+        targets: list[Any] = []
+        for op in operations:
+            operation_id = int(op["id"])
+            if (
+                confirmation_operation_ids is not None
+                and operation_id not in confirmation_operation_ids
+            ):
+                continue
+            if not self._operation_matches_client(op, client):
+                continue
+            if not self._operation_matches_listing_rows(
+                op,
+                listing_ids=pending_listing_ids,
+                asset_ids=pending_asset_ids,
+            ):
+                continue
+            targets.append(op)
+        if not targets:
+            return set(), None
+        confirmer = getattr(client, "confirm_listing_assets", None)
+        if not callable(confirmer):
+            return {
+                int(op["id"]) for op in targets
+            }, "Steam client does not support scoped listing confirmation"
+
+        asset_ids = [
+            str(op["asset_id"] or "").strip()
+            for op in targets
+            if str(op["asset_id"] or "").strip()
+        ]
+        listing_ids = [
+            str(_read_note(op["note"]).get("listingId") or "").strip()
+            for op in targets
+            if str(_read_note(op["note"]).get("listingId") or "").strip()
+        ]
+        attempted_ids = {int(op["id"]) for op in targets}
+        attempted_at = utc_now_iso()
+        error: str | None = None
+        confirmed_count: int | None = None
+        try:
+            try:
+                confirmed_count = int(
+                    confirmer(
+                        asset_ids=asset_ids,
+                        listing_ids=listing_ids or None,
+                        pending_listings=pending_listings,
+                    )
+                    or 0
+                )
+            except TypeError as exc:
+                # Test doubles and older injected clients may not yet accept
+                # the cached pending snapshot.  The fallback is still one
+                # account-batched confirmation call.
+                if "pending_listings" not in str(exc):
+                    raise
+                confirmed_count = int(
+                    confirmer(
+                        asset_ids=asset_ids,
+                        listing_ids=listing_ids or None,
+                    )
+                    or 0
+                )
+        except Exception as exc:
+            error = str(exc)
+
+        for op in targets:
+            note = _read_note(op["note"])
+            note["confirmationRetryAt"] = attempted_at
+            if error:
+                note["confirmationRetryStatus"] = "failed"
+                note["confirmationRetryMessage"] = error
+            else:
+                note["confirmationRetryStatus"] = (
+                    "confirmed_waiting_active_listing"
+                    if (confirmed_count or 0) > 0
+                    else "not_found"
+                )
+                note["confirmationRetryCount"] = confirmed_count
+            self.db.update_pool_operation(op["id"], note=_build_note(note))
+        self.db.conn.commit()
+        return attempted_ids, error
 
     def run_guadao_account_sync_task(
         self,
@@ -5747,6 +9540,11 @@ class ExecutionEngine:
                 "confirmed": 0,
                 "backfilled": 0,
                 "sold": 0,
+                "myListingsResolved": 0,
+                "historySold": 0,
+                "historyDeferred": 0,
+                "historyError": None,
+                "partial": False,
             }
         account = self._account_by_id(account_id) if account_id else self.account
         steam_id = str(account.steam_id64 or "").strip() if account else None
@@ -5754,11 +9552,7 @@ class ExecutionEngine:
         if client is None:
             return {"ok": False, "sold": 0, "error": "steam client unavailable"}
         self._steam_market_validated_accounts = set()
-        try:
-            active_listings = client.list_active_listings()
-        except Exception as exc:
-            return {"ok": False, "sold": 0, "error": str(exc)}
-        active_listing_ids, active_asset_ids = self._active_listing_identity_sets(active_listings)
+
         due_operations = self.db.list_pool_operations_by_type_and_statuses(
             OP_SELL_STEAM,
             statuses=[POOL_STATUS_LISTING_PENDING, "listed", "manual_required"],
@@ -5771,50 +9565,235 @@ class ExecutionEngine:
             due_operations = [
                 op for op in due_operations if int(op["id"]) in due_operation_ids
             ]
-        (
-            sale_receipt_results,
-            deep_attempt_ids,
-            deep_attempted_at,
-        ) = self._lookup_steam_sale_receipts_for_operations(
-            client,
-            due_operations,
-            active_listing_ids=active_listing_ids,
-            active_asset_ids=active_asset_ids,
-        )
-        confirmed = self._refresh_pending_listing_confirmations(
-            client=client,
-            active_listings=active_listings,
-            operation_ids=confirmation_operation_ids,
-            sale_receipt_results=sale_receipt_results,
-            sale_receipt_deep_attempt_ids=deep_attempt_ids,
-            sale_receipt_deep_attempted_at=deep_attempted_at,
-        )
-        backfill_operation_ids = None
-        if confirmation_operation_ids is not None or sale_operation_ids is not None:
-            backfill_operation_ids = set(confirmation_operation_ids or set()) | set(
-                sale_operation_ids or set()
+
+        # Phase 1: MyListings is the first and independent source of truth.
+        # Even when a later page is unavailable, exact active/pending matches
+        # are committed before history is considered.
+        try:
+            snapshot = self._load_account_my_listings_snapshot(client)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "accountId": account.id if account else account_id,
+                "steamId": steam_id,
+                "confirmed": 0,
+                "backfilled": 0,
+                "sold": 0,
+                "myListingsResolved": 0,
+                "historySold": 0,
+                "historyDeferred": len(due_operations),
+                "historyDeferredOperationIds": [
+                    int(op["id"]) for op in due_operations
+                ],
+                "historyError": None,
+                "partial": True,
+                "error": f"Steam MyListings snapshot failed: {exc}",
+            }
+
+        active_listings = list(snapshot["active"])
+        pending_listings = list(snapshot["pending"])
+        active_resolved_ids, initial_confirmed = (
+            self._apply_my_listings_active_evidence(
+                client,
+                due_operations,
+                active_listings,
             )
-        backfilled = self._backfill_listing_ids(
-            client=client,
-            active_listings=active_listings,
-            operation_ids=backfill_operation_ids,
         )
-        sold = self._refresh_listings(
-            client=client,
-            active_listings=active_listings,
-            operation_ids=sale_operation_ids,
-            sale_receipt_results=sale_receipt_results,
-            sale_receipt_deep_attempt_ids=deep_attempt_ids,
-            sale_receipt_deep_attempted_at=deep_attempted_at,
+        unresolved_after_active = [
+            op for op in due_operations if int(op["id"]) not in active_resolved_ids
+        ]
+        pending_operation_ids = self._record_my_listings_pending_evidence(
+            client,
+            unresolved_after_active,
+            pending_listings,
         )
-        return {
+        attempted_confirmation_ids, confirmation_error = (
+            self._confirm_pending_listing_operations_batch(
+                client,
+                unresolved_after_active,
+                pending_listings=pending_listings,
+                confirmation_operation_ids=confirmation_operation_ids,
+            )
+        )
+
+        confirmed = initial_confirmed
+        if attempted_confirmation_ids and not confirmation_error:
+            try:
+                post_confirmation_snapshot = self._load_account_my_listings_snapshot(
+                    client
+                )
+            except Exception as exc:
+                post_confirmation_snapshot = {
+                    **snapshot,
+                    "complete": False,
+                    "error": f"post-confirmation MyListings failed: {exc}",
+                }
+            snapshot = post_confirmation_snapshot
+            active_listings = list(snapshot["active"])
+            pending_listings = list(snapshot["pending"])
+            post_resolved_ids, post_confirmed = (
+                self._apply_my_listings_active_evidence(
+                    client,
+                    [
+                        op
+                        for op in due_operations
+                        if int(op["id"]) not in active_resolved_ids
+                    ],
+                    active_listings,
+                )
+            )
+            active_resolved_ids.update(post_resolved_ids)
+            confirmed += post_confirmed
+            pending_operation_ids.update(
+                self._record_my_listings_pending_evidence(
+                    client,
+                    [
+                        op
+                        for op in due_operations
+                        if int(op["id"]) not in active_resolved_ids
+                    ],
+                    pending_listings,
+                )
+            )
+        pending_operation_ids.difference_update(active_resolved_ids)
+        self.db.conn.commit()
+
+        snapshot_complete = bool(snapshot.get("complete"))
+        snapshot_error = str(snapshot.get("error") or "") or None
+        history_candidates = [
+            op
+            for op in due_operations
+            if int(op["id"]) not in active_resolved_ids
+            and int(op["id"]) not in pending_operation_ids
+        ]
+        history_candidate_ids = {int(op["id"]) for op in history_candidates}
+
+        if not snapshot_complete:
+            # An incomplete MyListings walk can prove rows that were seen, but
+            # it cannot prove absence.  MyHistory is deliberately not queried.
+            return {
+                "ok": bool(snapshot.get("pagesScanned"))
+                or bool(active_listings)
+                or bool(pending_listings),
+                "accountId": account.id if account else account_id,
+                "steamId": steam_id,
+                "confirmed": confirmed,
+                "backfilled": 0,
+                "sold": 0,
+                "myListingsResolved": len(active_resolved_ids),
+                "historySold": 0,
+                "historyDeferred": len(history_candidate_ids),
+                "historyDeferredOperationIds": sorted(history_candidate_ids),
+                "historyError": None,
+                "myListingsComplete": False,
+                "myListingsOfficialCount": snapshot.get("officialActiveCount"),
+                "myListingsReadCount": snapshot.get("actualActiveCount"),
+                "myListingsPages": snapshot.get("pagesScanned"),
+                "myListingsObservedAt": snapshot.get("observedAt"),
+                "myListingsError": snapshot_error,
+                "partial": True,
+                **(
+                    {"error": f"Steam MyListings incomplete: {snapshot_error}"}
+                    if not snapshot.get("pagesScanned") and snapshot_error
+                    else {}
+                ),
+            }
+
+        # Phase 2: only operations absent from the complete active and pending
+        # snapshot are allowed to enter MyHistory.
+        receipt_lookup = self._lookup_steam_sale_receipts_for_operations(
+            client,
+            history_candidates,
+            active_listing_ids=set(),
+            active_asset_ids=set(),
+            raise_on_error=False,
+        )
+        history_sold = 0
+        existing_rebuy_sources: set[str] | None = None
+        existing_rebuy_sell_ops: set[str] | None = None
+        receipt_positive_ids: set[int] = set()
+        operations_by_id = {int(op["id"]): op for op in history_candidates}
+        for operation_id, sale_receipt in receipt_lookup.receipts.items():
+            if sale_receipt is None:
+                continue
+            op = operations_by_id.get(int(operation_id))
+            if op is None:
+                continue
+            if existing_rebuy_sources is None or existing_rebuy_sell_ops is None:
+                (
+                    existing_rebuy_sources,
+                    existing_rebuy_sell_ops,
+                ) = self._load_existing_rebuy_source_keys()
+            self._mark_steam_listing_sold(
+                op,
+                _read_note(op["note"]),
+                sale_receipt=sale_receipt,
+                existing_rebuy_sources=existing_rebuy_sources,
+                existing_rebuy_sell_ops=existing_rebuy_sell_ops,
+            )
+            receipt_positive_ids.add(int(operation_id))
+            history_sold += 1
+        self.db.conn.commit()
+
+        if receipt_lookup.lookup_succeeded:
+            no_receipt_ids = history_candidate_ids - receipt_positive_ids
+            if no_receipt_ids:
+                self._refresh_listings(
+                    client=client,
+                    active_listings=active_listings,
+                    operation_ids=no_receipt_ids,
+                    sale_receipt_results={
+                        operation_id: None for operation_id in no_receipt_ids
+                    },
+                    sale_receipt_deep_attempt_ids=receipt_lookup.deep_attempt_ids,
+                    sale_receipt_deep_attempted_at=receipt_lookup.deep_attempted_at,
+                    sale_receipt_lookup_succeeded=True,
+                    sale_receipt_coverage_complete=receipt_lookup.coverage_complete,
+                )
+
+        deferred_ids: list[int] = []
+        for operation_id in sorted(history_candidate_ids - receipt_positive_ids):
+            row = self._get_pool_operation_by_id(operation_id)
+            if row is None:
+                continue
+            if str(row["status"] or "") in {
+                POOL_STATUS_LISTING_PENDING,
+                "listed",
+                "manual_required",
+            }:
+                deferred_ids.append(operation_id)
+        history_error = receipt_lookup.error
+        partial = bool(
+            confirmation_error
+            or history_error
+            or (deferred_ids and not receipt_lookup.coverage_complete)
+        )
+        result = {
             "ok": True,
             "accountId": account.id if account else account_id,
             "steamId": steam_id,
             "confirmed": confirmed,
-            "backfilled": backfilled,
-            "sold": sold,
+            "backfilled": 0,
+            "sold": history_sold,
+            "myListingsResolved": len(active_resolved_ids),
+            "historySold": history_sold,
+            "historyDeferred": len(deferred_ids),
+            "historyDeferredOperationIds": deferred_ids,
+            "historyError": history_error,
+            "historyRetryAt": receipt_lookup.retry_at,
+            "historyPages": receipt_lookup.pages_scanned,
+            "historyCoverageComplete": receipt_lookup.coverage_complete,
+            "myListingsComplete": True,
+            "myListingsOfficialCount": snapshot.get("officialActiveCount"),
+            "myListingsReadCount": snapshot.get("actualActiveCount"),
+            "myListingsPages": snapshot.get("pagesScanned"),
+            "myListingsObservedAt": snapshot.get("observedAt"),
+            "myListingsError": snapshot_error,
+            "partial": partial,
         }
+        if confirmation_error:
+            result["confirmationError"] = confirmation_error
+        return result
 
     def run_guadao_rebuy_task(self, operation_id: int) -> dict[str, Any]:
         count = self._execute_rebuys(operation_id=operation_id)
@@ -5824,6 +9803,37 @@ class ExecutionEngine:
             "operationId": int(operation_id),
             "rebought": count,
             "status": str(row["status"] or "") if row is not None else "missing",
+        }
+
+    def run_guadao_c5_submission_reconcile_task(self, operation_id: int) -> dict[str, Any]:
+        row = self._get_pool_operation_by_id(int(operation_id))
+        if row is None:
+            return {
+                "ok": False,
+                "operationId": int(operation_id),
+                "state": "missing",
+                "status": "missing",
+                "checked": 0,
+                "replacements": 0,
+            }
+        status = str(row["status"] or "")
+        if status != C5_SUBMISSION_UNCONFIRMED:
+            return {
+                "ok": True,
+                "operationId": int(operation_id),
+                "state": status,
+                "status": status,
+                "checked": 0,
+                "replacements": 0,
+            }
+        state, replacements, checked = self._reconcile_c5_submission(row, _read_note(row["note"]))
+        return {
+            "ok": True,
+            "operationId": int(operation_id),
+            "state": state,
+            "status": state,
+            "checked": checked,
+            "replacements": replacements,
         }
 
     def run_guadao_delivery_confirmation_task(self, operation_id: int) -> dict[str, Any]:

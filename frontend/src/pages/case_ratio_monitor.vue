@@ -1,729 +1,860 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import FolioIcon from "../components/FolioIcon.vue";
+import CaseMonitorButton from "../components/case-monitor/CaseMonitorButton.vue";
+import CaseMonitorCategoryTabs from "../components/case-monitor/CaseMonitorCategoryTabs.vue";
+import CaseMonitorDetailDrawer from "../components/case-monitor/CaseMonitorDetailDrawer.vue";
+import CaseMonitorFeedback from "../components/case-monitor/CaseMonitorFeedback.vue";
+import CaseMonitorIntervalPicker from "../components/case-monitor/CaseMonitorIntervalPicker.vue";
+import CaseMonitorPagination from "../components/case-monitor/CaseMonitorPagination.vue";
+import CaseMonitorRecommendationRow from "../components/case-monitor/CaseMonitorRecommendationRow.vue";
+import CaseMonitorSearch from "../components/case-monitor/CaseMonitorSearch.vue";
+import CaseMonitorSegmented from "../components/case-monitor/CaseMonitorSegmented.vue";
+import CaseMonitorStatusChip from "../components/case-monitor/CaseMonitorStatusChip.vue";
+import CaseMonitorToggle from "../components/case-monitor/CaseMonitorToggle.vue";
+import {
+  formatClock,
+  formatDuration,
+  recommendedRatio,
+} from "../components/case-monitor/format";
+import type {
+  CaseCategoryOption,
+  CaseMonitorJob,
+  CaseMonitorStatus,
+  CaseRatioItem,
+  CaseRatioReport,
+  SelectOption,
+} from "../components/case-monitor/types";
+import "../components/case-monitor/case-monitor.css";
 
-type RatioBucket = {
-  bucket: string;
-  lower: number;
-  upper: number;
-  durationMinutes: number;
-  durationLabel: string;
-  coveragePct: number;
+type ReportWindow = "24" | "168" | "720" | "custom";
+type Notice = {
+  tone: "success" | "error";
+  message: string;
+  showExports?: boolean;
 };
 
-type RatioThreshold = {
-  key: string;
-  label: string;
-  ratio: number;
-  durationLabel: string;
-  coveragePct: number;
+const typeOrder = ["weapon_case", "capsule", "souvenir_package"] as const;
+const typeLabels: Record<string, string> = {
+  weapon_case: "武器箱",
+  capsule: "胶囊",
+  souvenir_package: "纪念包",
 };
+const reportWindows: SelectOption<ReportWindow>[] = [
+  { value: "24", label: "24小时" },
+  { value: "168", label: "7天" },
+  { value: "720", label: "30天" },
+  { value: "custom", label: "自定义" },
+];
 
-type TimelineSegment = {
-  startedAt: string;
-  endedAt: string;
-  ratio: number;
-  bucket: string;
-  durationLabel: string;
-  leftPct: number;
-  widthPct: number;
-};
-
-type CaseRatioItem = {
-  marketHashName: string;
-  name: string;
-  crateType: string;
-  crateTypeLabel: string;
-  sampleCount: number;
-  okSampleCount: number;
-  latestRatio: number;
-  latestC5SellPrice: number | null;
-  latestSteamListPrice: number | null;
-  latestSteamAfterTaxPrice: number | null;
-  minRatio: number;
-  minRatioDurationLabel: string;
-  maxRatio: number;
-  maxRatioDurationLabel: string;
-  avgRatio: number;
-  p50Ratio: number | null;
-  p75Ratio: number | null;
-  p90Ratio: number | null;
-  conservativeMaxListingRatio: number;
-  recommendedMaxListingRatio: number;
-  aggressiveMaxListingRatio: number;
-  effectiveRecommendedMaxListingRatio: number | null;
-  selectedReferenceRatio: number | null;
-  steamReferenceSource: string | null;
-  steamReferenceSourceLabel: string | null;
-  steamReferencePrice: number | null;
-  sellerFloorPrice: number | null;
-  sellerWallListPrice: number | null;
-  buyerMaxPrice: number | null;
-  steamVolume24h: number | null;
-  steamVolume7d: number | null;
-  steamAvgDailyVolume7d: number | null;
-  liquidityLabel: string | null;
-  stddevRatio: number;
-  coveragePct: number;
-  recommendationScore: number;
-  legacySteamMinorUnitCorrectedCount: number;
-  buckets: RatioBucket[];
-  dominantBuckets: RatioBucket[];
-  ratioThresholds: RatioThreshold[];
-  timelineSegments: TimelineSegment[];
-};
-
-type CaseRatioReport = {
-  generatedAt: string;
-  startUtc: string;
-  endUtc: string;
-  rangeHours: number;
-  snapshotCount: number;
-  itemCount: number;
-  statusCounts: Record<string, number>;
-  crateTypeCounts: Record<string, number>;
-  crateTypeLabels: Record<string, string>;
-  recommendationCrateType: string;
-  legacySteamMinorUnitCorrectedCount: number;
-  steamLiquidityStatus: string;
-  steamLiquidityRefreshedAt: string | null;
-  recommendations: CaseRatioItem[];
-  items: CaseRatioItem[];
-};
-
-const typeOrder = ["weapon_case", "capsule", "souvenir_package", "container", "crate", "other"];
-
-const loading = ref(true);
-const error = ref("");
 const report = ref<CaseRatioReport | null>(null);
+const runtime = ref<CaseMonitorStatus | null>(null);
+const loading = ref(true);
+const reportError = ref("");
+const statusError = ref("");
+const action = ref<"" | "collect" | "report" | "start" | "pause">("");
+const intervalMinutes = ref(5);
+const reportWindow = ref<ReportWindow>("24");
+const refreshLiquidity = ref(true);
+const customStart = ref("");
+const customEnd = ref("");
 const keyword = ref("");
-const selected = ref("");
 const typeFilter = ref("all");
+const currentPage = ref(1);
+const pageSize = ref(10);
+const selectedName = ref("");
+const drawerItem = ref<CaseRatioItem | null>(null);
+const notice = ref<Notice | null>(null);
+const initializedStatus = ref(false);
+const lastSeenCompletedJob = ref("");
+let pollTimer: number | undefined;
 
-const typeOptions = computed(() => {
-  const counts = report.value?.crateTypeCounts ?? {};
-  const labels = report.value?.crateTypeLabels ?? {};
-  const present = Object.keys(counts).filter((key) => counts[key] > 0);
-  const keys = typeOrder.filter((key) => present.includes(key));
-  for (const key of present) {
-    if (!keys.includes(key)) keys.push(key);
+async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, {
+    cache: "no-store",
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  if (!response.ok) {
+    throw new Error(String(payload.error || `HTTP ${response.status}`));
   }
+  return payload as T;
+}
+
+async function loadReport(): Promise<void> {
+  reportError.value = "";
+  try {
+    const payload = await readJson<{ report: CaseRatioReport }>("/api/case-monitor/report/latest");
+    report.value = payload.report;
+    return;
+  } catch (apiError) {
+    try {
+      const response = await fetch("/guadao_case_ratio_report.json", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      report.value = await response.json() as CaseRatioReport;
+    } catch {
+      report.value = null;
+      reportError.value = apiError instanceof Error ? apiError.message : String(apiError);
+    }
+  }
+}
+
+function maybeHandleCompletedJob(job: CaseMonitorJob | null): void {
+  if (!job || job.status !== "completed") return;
+  if (!initializedStatus.value) {
+    lastSeenCompletedJob.value = job.jobId;
+    return;
+  }
+  if (lastSeenCompletedJob.value === job.jobId) return;
+  lastSeenCompletedJob.value = job.jobId;
+  if (job.jobType === "report") {
+    void loadReport();
+    notice.value = {
+      tone: "success",
+      message: "全量箱子报告已生成，网页数据已刷新。",
+      showExports: true,
+    };
+  } else {
+    const okCount = Number(job.result?.okCount || 0);
+    const missingCount =
+      Number(job.result?.missingC5Count || 0) +
+      Number(job.result?.missingSteamCount || 0);
+    notice.value = {
+      tone: "success",
+      message: `采集完成：成功 ${okCount}，缺价 ${missingCount}`,
+    };
+  }
+}
+
+async function loadStatus(): Promise<void> {
+  try {
+    const payload = await readJson<CaseMonitorStatus>("/api/case-monitor/status");
+    runtime.value = payload;
+    statusError.value = "";
+    if (!payload.runtime.enabled || !initializedStatus.value) {
+      intervalMinutes.value = payload.runtime.intervalMinutes || intervalMinutes.value;
+    }
+    maybeHandleCompletedJob(payload.latestJob);
+    initializedStatus.value = true;
+  } catch (error) {
+    runtime.value = null;
+    statusError.value = error instanceof Error ? error.message : String(error);
+    initializedStatus.value = true;
+  }
+}
+
+async function postAction<T>(
+  name: typeof action.value,
+  path: string,
+  body: Record<string, unknown> = {},
+): Promise<T> {
+  action.value = name;
+  try {
+    const payload = await readJson<T>(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    await loadStatus();
+    return payload;
+  } catch (error) {
+    notice.value = {
+      tone: "error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+    throw error;
+  } finally {
+    action.value = "";
+  }
+}
+
+async function collectOnce(): Promise<void> {
+  try {
+    await postAction("collect", "/api/case-monitor/collect");
+    notice.value = { tone: "success", message: "采集任务已进入后台队列。" };
+  } catch {
+    // The shared action handler already exposes the error.
+  }
+}
+
+async function generateReport(): Promise<void> {
+  const body: Record<string, unknown> = {
+    refreshLiquidity: refreshLiquidity.value,
+  };
+  if (reportWindow.value === "custom") {
+    if (!customStart.value || !customEnd.value) {
+      notice.value = { tone: "error", message: "自定义报告窗口需要同时选择开始和结束时间。" };
+      return;
+    }
+    body.dateFrom = new Date(customStart.value).toISOString();
+    body.dateTo = new Date(customEnd.value).toISOString();
+  } else {
+    body.hours = Number(reportWindow.value);
+  }
+  try {
+    await postAction("report", "/api/case-monitor/report", body);
+    notice.value = { tone: "success", message: "全量箱子报告正在后台生成。" };
+  } catch {
+    // The shared action handler already exposes the error.
+  }
+}
+
+async function toggleMonitor(): Promise<void> {
+  const enabled = runtime.value?.runtime.enabled ?? false;
+  try {
+    if (enabled) {
+      await postAction("pause", "/api/case-monitor/pause");
+      notice.value = { tone: "success", message: "监控已暂停，当前任务会安全完成。" };
+    } else {
+      await postAction("start", "/api/case-monitor/start", {
+        intervalMinutes: intervalMinutes.value,
+      });
+      notice.value = {
+        tone: "success",
+        message: `监控已启动，每 ${intervalMinutes.value} 分钟采集一次。`,
+      };
+    }
+  } catch {
+    // The shared action handler already exposes the error.
+  }
+}
+
+const runtimeStatus = computed(() => {
+  if (statusError.value) return "offline";
+  const current = runtime.value?.currentJob;
+  if (current?.status === "running" || current?.status === "queued") {
+    return current.jobType === "report" ? "reporting" : "collecting";
+  }
+  return runtime.value?.runtime.enabled ? "running" : "paused";
+});
+
+const runtimeLabel = computed(() => {
+  const job = runtime.value?.currentJob;
+  if (job?.status === "running" || job?.status === "queued") {
+    const total = Number(job.progressTotal || 0);
+    const progress = total > 0 ? ` ${job.progressCurrent}/${total}` : "";
+    return job.jobType === "report" ? `正在生成报告${progress}` : `正在采集${progress}`;
+  }
+  if (statusError.value) return "后端离线";
+  return runtime.value?.runtime.enabled ? "监控运行中" : "监控已暂停";
+});
+
+const busy = computed(() => Boolean(runtime.value?.runtime.busy || action.value));
+
+const categoryOptions = computed<CaseCategoryOption[]>(() => {
+  const counts = report.value?.crateTypeCounts || {};
+  const options = typeOrder.map((key) => ({
+    key,
+    label: typeLabels[key],
+    count: Number(counts[key] || 0),
+  }));
+  const known = options.reduce((sum, option) => sum + option.count, 0);
+  const all = Number(report.value?.itemCount || 0);
   return [
-    { key: "all", label: "全部", count: report.value?.itemCount ?? 0 },
-    ...keys.map((key) => ({ key, label: labels[key] ?? key, count: counts[key] ?? 0 })),
+    { key: "all", label: "全部", count: all },
+    ...options,
+    { key: "other", label: "其他箱类", count: Math.max(0, all - known) },
   ];
 });
 
-const visibleItems = computed(() => {
-  const source = report.value?.items ?? [];
-  const needle = keyword.value.trim().toLowerCase();
+const filteredItems = computed(() => {
+  const source = report.value?.items || [];
+  const needle = keyword.value.trim().toLocaleLowerCase("zh-CN");
   return source.filter((item) => {
-    const typeMatched = typeFilter.value === "all" || item.crateType === typeFilter.value;
-    const textMatched =
-      !needle || `${item.marketHashName} ${item.name} ${item.crateTypeLabel}`.toLowerCase().includes(needle);
-    return typeMatched && textMatched;
+    const categoryMatched =
+      typeFilter.value === "all" ||
+      (typeFilter.value === "other"
+        ? !typeOrder.includes(item.crateType as typeof typeOrder[number])
+        : item.crateType === typeFilter.value);
+    const text = `${item.marketHashName} ${item.name || ""}`.toLocaleLowerCase("zh-CN");
+    return categoryMatched && (!needle || text.includes(needle));
   });
 });
 
 const rankedItems = computed(() =>
-  [...visibleItems.value].sort(
-    (left, right) =>
-      right.recommendationScore - left.recommendationScore ||
-      (left.effectiveRecommendedMaxListingRatio ?? left.recommendedMaxListingRatio) -
-        (right.effectiveRecommendedMaxListingRatio ?? right.recommendedMaxListingRatio) ||
-      (right.steamVolume24h ?? 0) - (left.steamVolume24h ?? 0) ||
-      right.coveragePct - left.coveragePct ||
-      left.marketHashName.localeCompare(right.marketHashName),
-  ),
+  [...filteredItems.value].sort((left, right) => {
+    const leftRatio = recommendedRatio(left);
+    const rightRatio = recommendedRatio(right);
+    const leftSane = leftRatio >= 0.3 && leftRatio <= 0.95 ? 1 : 0;
+    const rightSane = rightRatio >= 0.3 && rightRatio <= 0.95 ? 1 : 0;
+    return (
+      rightSane - leftSane ||
+      Number(right.recommendationScore || 0) - Number(left.recommendationScore || 0) ||
+      Number(right.steamVolume24h || 0) - Number(left.steamVolume24h || 0) ||
+      left.marketHashName.localeCompare(right.marketHashName)
+    );
+  }),
 );
 
-const selectedItem = computed(() => {
-  if (selected.value) {
-    const found = visibleItems.value.find((item) => item.marketHashName === selected.value);
-    if (found) return found;
-  }
-  return rankedItems.value[0] ?? visibleItems.value[0];
+const totalPages = computed(() => Math.max(1, Math.ceil(rankedItems.value.length / pageSize.value)));
+const pagedItems = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return rankedItems.value.slice(start, start + pageSize.value);
 });
 
-const okSnapshotCount = computed(() => report.value?.statusCounts?.ok ?? 0);
-const missingSnapshotCount = computed(() => {
-  const counts = report.value?.statusCounts ?? {};
-  return Object.entries(counts)
-    .filter(([key]) => key !== "ok")
-    .reduce((sum, [, count]) => sum + count, 0);
+const validSnapshots = computed(() => Number(report.value?.statusCounts?.ok || 0));
+const averageCoverage = computed(() => {
+  const items = report.value?.items || [];
+  if (!items.length) return 0;
+  return items.reduce((sum, item) => sum + Number(item.coveragePct || 0), 0) / items.length;
+});
+const lastCollection = computed(() => runtime.value?.runtime.lastCollectionResult || {});
+const missingCount = computed(() =>
+  Number(lastCollection.value.missingC5Count || 0) +
+  Number(lastCollection.value.missingSteamCount || 0),
+);
+
+function openDetail(item: CaseRatioItem): void {
+  selectedName.value = item.marketHashName;
+  drawerItem.value = item;
+}
+
+function chooseCategory(value: string): void {
+  typeFilter.value = value;
+  currentPage.value = 1;
+  selectedName.value = "";
+}
+
+function exportUrl(format: "json" | "summary_csv" | "buckets_csv" | "markdown"): string {
+  const reportId = runtime.value?.latestReport.reportId;
+  const query = new URLSearchParams({ format });
+  if (reportId) query.set("reportId", reportId);
+  return `/api/case-monitor/report/export?${query.toString()}`;
+}
+
+watch(keyword, () => {
+  currentPage.value = 1;
+  selectedName.value = "";
+});
+watch(pageSize, () => {
+  currentPage.value = 1;
+});
+watch(rankedItems, () => {
+  currentPage.value = Math.min(currentPage.value, totalPages.value);
+  if (!selectedName.value && rankedItems.value.length) {
+    selectedName.value = rankedItems.value[0].marketHashName;
+  }
+}, { immediate: true });
+
+onMounted(async () => {
+  await Promise.all([loadStatus(), loadReport()]);
+  loading.value = false;
+  pollTimer = window.setInterval(() => void loadStatus(), 2500);
 });
 
-function formatRatio(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return value.toFixed(4);
-}
-
-function formatMoney(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  const decimals = Math.abs(value) < 1 ? 3 : 2;
-  return `CNY ${value.toFixed(decimals)}`;
-}
-
-function formatPct(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return `${value.toFixed(2)}%`;
-}
-
-function formatInt(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "-";
-  return Math.round(value).toLocaleString("zh-CN");
-}
-
-function formatTime(value: string): string {
-  if (!value) return "-";
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString("zh-CN", { hour12: false });
-}
-
-function ratioColor(value: number | null | undefined): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "#6f7d8c";
-  if (value <= 0.7) return "#2f7d5b";
-  if (value <= 0.75) return "#3f7f94";
-  if (value <= 0.8) return "#a77b2f";
-  return "#b5534b";
-}
-
-function chooseType(key: string): void {
-  typeFilter.value = key;
-  selected.value = "";
-}
-
-function chooseItem(item: CaseRatioItem): void {
-  selected.value = item.marketHashName;
-}
-
-function timelineStyle(segment: TimelineSegment): Record<string, string> {
-  return {
-    left: `${Math.max(0, Math.min(100, segment.leftPct))}%`,
-    width: `${Math.max(0.25, Math.min(100, segment.widthPct))}%`,
-    background: ratioColor(segment.ratio),
-  };
-}
-
-async function loadReport(): Promise<void> {
-  loading.value = true;
-  error.value = "";
-  try {
-    const response = await fetch("/guadao_case_ratio_report.json", { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    report.value = (await response.json()) as CaseRatioReport;
-  } catch (exc) {
-    report.value = null;
-    error.value = exc instanceof Error ? exc.message : String(exc);
-  } finally {
-    loading.value = false;
-  }
-}
-
-onMounted(loadReport);
+onBeforeUnmount(() => {
+  if (pollTimer !== undefined) window.clearInterval(pollTimer);
+});
 </script>
 
 <template>
-  <main class="page case-monitor-page">
-    <header class="page-header">
-      <div>
-        <p class="eyebrow">Guadao Ratio Monitor</p>
+  <main class="cm-surface case-monitor-page">
+    <header class="case-monitor-header">
+      <div class="case-monitor-title">
         <h1>箱子挂刀比监控</h1>
+        <CaseMonitorStatusChip :status="runtimeStatus" :label="runtimeLabel" />
       </div>
-      <button class="primary-button" type="button" @click="loadReport">刷新报告</button>
+      <p class="case-monitor-safety">只采集与报告，不会修改策略配置或触发真实交易</p>
+      <div class="case-monitor-actions">
+        <CaseMonitorButton
+          tone="primary"
+          icon="refresh"
+          :loading="action === 'collect'"
+          :disabled="busy"
+          @click="collectOnce"
+        >
+          采集一次
+        </CaseMonitorButton>
+        <CaseMonitorButton
+          tone="primary"
+          icon="download"
+          :loading="action === 'report'"
+          :disabled="busy"
+          @click="generateReport"
+        >
+          生成报告
+        </CaseMonitorButton>
+        <CaseMonitorButton
+          :tone="runtime?.runtime.enabled ? 'quiet' : 'success'"
+          :icon="runtime?.runtime.enabled ? 'pause' : 'play'"
+          :loading="action === 'pause' || action === 'start'"
+          :disabled="Boolean(runtime?.runtime.busy)"
+          @click="toggleMonitor"
+        >
+          {{ runtime?.runtime.enabled ? "暂停监控" : "开始监控" }}
+        </CaseMonitorButton>
+      </div>
     </header>
 
-    <section v-if="loading" class="panel empty-panel">正在读取报告...</section>
-    <section v-else-if="error" class="panel empty-panel">
-      未找到可视化数据：{{ error }}
+    <section class="case-monitor-controls" aria-label="监控与报告控制">
+      <div class="case-control-group">
+        <span class="case-control-label">采集间隔</span>
+        <CaseMonitorIntervalPicker
+          v-model="intervalMinutes"
+          :disabled="Boolean(runtime?.runtime.enabled || busy)"
+        />
+      </div>
+      <span class="case-control-divider" />
+      <div class="case-control-group">
+        <span class="case-control-label">报告窗口</span>
+        <CaseMonitorSegmented v-model="reportWindow" :options="reportWindows" :disabled="busy" />
+        <FolioIcon name="calendar" :size="14" class="case-custom-calendar" />
+        <div v-if="reportWindow === 'custom'" class="case-custom-range">
+          <input v-model="customStart" type="datetime-local" aria-label="报告开始时间" />
+          <span>至</span>
+          <input v-model="customEnd" type="datetime-local" aria-label="报告结束时间" />
+        </div>
+      </div>
+      <span class="case-control-divider" />
+      <div class="case-control-group">
+        <span class="case-control-label">刷新 Steam 成交量</span>
+        <CaseMonitorToggle v-model="refreshLiquidity" :disabled="busy" />
+      </div>
+      <span class="case-control-divider" />
+      <div class="case-cycle-summary">
+        本轮 {{ lastCollection.targetCount || 0 }} 类 ·
+        成功 {{ lastCollection.okCount || 0 }} ·
+        缺 C5 {{ lastCollection.missingC5Count || 0 }} ·
+        缺 Steam {{ lastCollection.missingSteamCount || 0 }}
+      </div>
+      <span class="case-control-divider" />
+      <div class="case-time-stat"><span>上次采集</span><strong>{{ formatClock(runtime?.runtime.lastCollectionAt) }}</strong></div>
+      <span class="case-control-divider" />
+      <div class="case-time-stat"><span>下次采集</span><strong>{{ formatClock(runtime?.runtime.nextRunAt) }}</strong></div>
+      <span class="case-control-divider" />
+      <div class="case-time-stat"><span>上次报告</span><strong>{{ formatClock(runtime?.runtime.lastReportAt || report?.generatedAt) }}</strong></div>
     </section>
 
-    <template v-else-if="report">
-      <section class="metrics-grid compact">
-        <article class="metric-card">
-          <span>报告范围</span>
-          <strong>{{ report.rangeHours }}h</strong>
-        </article>
-        <article class="metric-card">
-          <span>有效快照</span>
-          <strong>{{ okSnapshotCount }}</strong>
-        </article>
-        <article class="metric-card">
-          <span>缺价快照</span>
-          <strong>{{ missingSnapshotCount }}</strong>
-        </article>
-        <article class="metric-card">
-          <span>旧价格修正</span>
-          <strong>{{ report.legacySteamMinorUnitCorrectedCount }}</strong>
-        </article>
-      </section>
+    <section class="case-monitor-metrics" aria-label="监控概览">
+      <article class="case-metric">
+        <span class="case-metric__icon case-metric__icon--green"><FolioIcon name="shield" :size="31" /></span>
+        <div><span>有效快照</span><strong>{{ validSnapshots.toLocaleString("zh-CN") }}</strong></div>
+      </article>
+      <article class="case-metric">
+        <span class="case-metric__icon case-metric__icon--blue"><FolioIcon name="case" :size="31" /></span>
+        <div><span>监控品类</span><strong class="is-blue">{{ report?.itemCount || 0 }}</strong></div>
+      </article>
+      <article class="case-metric">
+        <span class="case-metric__icon case-metric__icon--amber"><FolioIcon name="report" :size="31" /></span>
+        <div><span>覆盖率</span><strong class="is-amber">{{ averageCoverage.toFixed(2) }}%</strong></div>
+      </article>
+      <article class="case-metric">
+        <span class="case-metric__icon case-metric__icon--green"><FolioIcon name="clock" :size="31" /></span>
+        <div><span>运行时长</span><strong>{{ runtime?.runtime.enabled ? formatDuration(runtime.runtime.runningSeconds) : "已暂停" }}</strong></div>
+      </article>
+    </section>
 
-      <section class="panel report-meta case-report-meta">
-        <div>
-          <span class="soft-label">开始</span>
-          <strong>{{ formatTime(report.startUtc) }}</strong>
-        </div>
-        <div>
-          <span class="soft-label">结束</span>
-          <strong>{{ formatTime(report.endUtc) }}</strong>
-        </div>
-        <div>
-          <span class="soft-label">生成</span>
-          <strong>{{ formatTime(report.generatedAt) }}</strong>
-        </div>
-        <div>
-          <span class="soft-label">流动性</span>
-          <strong>{{ report.steamLiquidityStatus || "-" }}</strong>
-        </div>
-        <label>
-          <span class="soft-label">筛选</span>
-          <input v-model="keyword" type="search" placeholder="market hash name" />
-        </label>
-      </section>
+    <section class="case-ranking-panel">
+      <div class="case-ranking-toolbar">
+        <CaseMonitorCategoryTabs
+          :model-value="typeFilter"
+          :options="categoryOptions"
+          @update:model-value="chooseCategory"
+        />
+        <CaseMonitorSearch v-model="keyword" />
+      </div>
+      <h2>推荐排行</h2>
 
-      <section class="panel case-filter-panel">
-        <div class="segmented-control" aria-label="箱子类别">
-          <button
-            v-for="option in typeOptions"
-            :key="option.key"
-            type="button"
-            class="segment-button"
-            :class="{ active: typeFilter === option.key }"
-            @click="chooseType(option.key)"
-          >
-            <span>{{ option.label }}</span>
-            <strong>{{ option.count }}</strong>
-          </button>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-title-row">
-          <h2>推荐排行</h2>
-          <span class="soft-label">{{ visibleItems.length }} 个条目，建议比例已考虑成交量和采用源</span>
-        </div>
-        <div class="recommendation-list">
-          <button
-            v-for="(item, index) in rankedItems.slice(0, 10)"
+      <div v-if="loading" class="cm-empty">正在读取最新全量报告…</div>
+      <div v-else-if="reportError" class="cm-empty">
+        报告暂不可用：{{ reportError }}
+      </div>
+      <template v-else>
+        <div class="case-table-scroll">
+          <div class="cm-recommendation-header" aria-hidden="true">
+            <span>排名</span>
+            <span>箱子</span>
+            <span class="cm-recommendation-header__info">建议比例 <FolioIcon name="info" :size="12" /></span>
+            <span>采用源</span>
+            <span class="cm-recommendation-header__info">24h量 <FolioIcon name="info" :size="12" /></span>
+            <span>速度</span>
+            <span class="cm-recommendation-header__info">稳定性 <FolioIcon name="info" :size="12" /></span>
+            <span>最低/持续</span>
+            <span>最高/持续</span>
+            <span>详情</span>
+          </div>
+          <CaseMonitorRecommendationRow
+            v-for="(item, index) in pagedItems"
             :key="item.marketHashName"
-            class="recommendation-row case-recommendation-row"
-            :class="{ active: selectedItem?.marketHashName === item.marketHashName }"
-            type="button"
-            @click="chooseItem(item)"
-          >
-            <span class="rank">{{ index + 1 }}</span>
-            <span class="item-name">
-              {{ item.marketHashName }}
-              <small>{{ item.crateTypeLabel }}</small>
-            </span>
-            <span>{{ formatRatio(item.effectiveRecommendedMaxListingRatio ?? item.recommendedMaxListingRatio) }}</span>
-            <span>{{ item.steamReferenceSourceLabel ?? "20墙" }}</span>
-            <span>{{ formatInt(item.steamVolume24h) }}</span>
-            <span>{{ item.liquidityLabel ?? "-" }}</span>
-          </button>
-        </div>
-      </section>
-
-      <section v-if="selectedItem" class="panel focus-panel">
-        <div class="focus-heading">
-          <div>
-            <p class="eyebrow">{{ selectedItem.crateTypeLabel }}</p>
-            <h2>{{ selectedItem.marketHashName }}</h2>
-          </div>
-          <strong>{{ formatRatio(selectedItem.effectiveRecommendedMaxListingRatio ?? selectedItem.recommendedMaxListingRatio) }}</strong>
-        </div>
-
-        <div class="focus-grid case-focus-grid">
-          <div>
-            <span class="soft-label">建议比例</span>
-            <strong>{{ formatRatio(selectedItem.effectiveRecommendedMaxListingRatio ?? selectedItem.recommendedMaxListingRatio) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">采用源</span>
-            <strong>{{ selectedItem.steamReferenceSourceLabel ?? "20墙挂价" }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">参考价格</span>
-            <strong>{{ formatMoney(selectedItem.steamReferencePrice ?? selectedItem.latestSteamListPrice) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">24h成交量</span>
-            <strong>{{ formatInt(selectedItem.steamVolume24h) }} / {{ selectedItem.liquidityLabel ?? "-" }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">C5最低在售</span>
-            <strong>{{ formatMoney(selectedItem.latestC5SellPrice) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">20墙挂价</span>
-            <strong>{{ formatMoney(selectedItem.sellerWallListPrice ?? selectedItem.latestSteamListPrice) }}</strong>
-          </div>
-        </div>
-
-        <div class="price-source-grid">
-          <div>
-            <span class="soft-label">最低在售</span>
-            <strong>{{ formatMoney(selectedItem.sellerFloorPrice) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">20墙挂价</span>
-            <strong>{{ formatMoney(selectedItem.sellerWallListPrice ?? selectedItem.latestSteamListPrice) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">最高求购</span>
-            <strong>{{ formatMoney(selectedItem.buyerMaxPrice) }}</strong>
-          </div>
-          <div>
-            <span class="soft-label">7d日均成交</span>
-            <strong>{{ formatInt(selectedItem.steamAvgDailyVolume7d) }}</strong>
-          </div>
-        </div>
-
-        <div class="threshold-grid">
-          <article
-            v-for="threshold in selectedItem.ratioThresholds"
-            :key="threshold.key"
-            class="threshold-card"
-          >
-            <span>{{ threshold.label }}</span>
-            <strong>{{ formatRatio(threshold.ratio) }}</strong>
-            <em>{{ threshold.durationLabel }} / {{ formatPct(threshold.coveragePct) }}</em>
-          </article>
-        </div>
-
-        <div class="ratio-timeline" aria-label="比例时间线">
-          <span
-            v-for="segment in selectedItem.timelineSegments"
-            :key="`${segment.startedAt}-${segment.ratio}`"
-            class="timeline-segment"
-            :style="timelineStyle(segment)"
-            :title="`${formatTime(segment.startedAt)} - ${formatTime(segment.endedAt)} | ${formatRatio(segment.ratio)} | ${segment.durationLabel}`"
+            :item="item"
+            :rank="(currentPage - 1) * pageSize + index + 1"
+            :selected="selectedName === item.marketHashName"
+            @click="openDetail(item)"
           />
-        </div>
-
-        <div class="bucket-bars detailed-buckets">
-          <div v-for="bucket in selectedItem.buckets" :key="bucket.bucket" class="bucket-row detailed-bucket-row">
-            <span>{{ bucket.bucket }}</span>
-            <div class="bar-track">
-              <div
-                class="bar-fill"
-                :style="{ width: `${Math.max(1, bucket.coveragePct)}%`, background: ratioColor(bucket.lower) }"
-              />
-            </div>
-            <strong>{{ bucket.durationLabel }}</strong>
-            <em>{{ formatPct(bucket.coveragePct) }}</em>
+          <div v-if="!pagedItems.length" class="cm-empty">
+            没有符合当前类别和关键词的箱子
           </div>
         </div>
-      </section>
+        <CaseMonitorPagination
+          v-model="currentPage"
+          :total-items="rankedItems.length"
+          :page-size="pageSize"
+          @update:page-size="pageSize = $event"
+        />
+      </template>
+    </section>
 
-      <section class="panel">
-        <div class="table-wrap">
-          <table class="data-table case-ratio-table">
-            <thead>
-              <tr>
-                <th>类别</th>
-                <th>箱子</th>
-                <th>建议</th>
-                <th>采用源</th>
-                <th>24h量</th>
-                <th>速度</th>
-                <th>稳健墙</th>
-                <th>当前</th>
-                <th>最低/持续</th>
-                <th>最高/持续</th>
-                <th>低卖/求购</th>
-                <th>C5</th>
-                <th>Steam挂价</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in visibleItems" :key="item.marketHashName" @click="chooseItem(item)">
-                <td>{{ item.crateTypeLabel }}</td>
-                <td>{{ item.marketHashName }}</td>
-                <td>{{ formatRatio(item.effectiveRecommendedMaxListingRatio ?? item.recommendedMaxListingRatio) }}</td>
-                <td>{{ item.steamReferenceSourceLabel ?? "20墙" }}</td>
-                <td>{{ formatInt(item.steamVolume24h) }}</td>
-                <td>{{ item.liquidityLabel ?? "-" }}</td>
-                <td>{{ formatRatio(item.recommendedMaxListingRatio) }}</td>
-                <td>{{ formatRatio(item.latestRatio) }}</td>
-                <td>{{ formatRatio(item.minRatio) }} / {{ item.minRatioDurationLabel }}</td>
-                <td>{{ formatRatio(item.maxRatio) }} / {{ item.maxRatioDurationLabel }}</td>
-                <td>{{ formatMoney(item.sellerFloorPrice) }} / {{ formatMoney(item.buyerMaxPrice) }}</td>
-                <td>{{ formatMoney(item.latestC5SellPrice) }}</td>
-                <td>{{ formatMoney(item.sellerWallListPrice ?? item.latestSteamListPrice) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </template>
+    <CaseMonitorFeedback
+      v-if="notice"
+      class="case-monitor-toast"
+      :tone="notice.tone"
+      @close="notice = null"
+    >
+      {{ notice.message }}
+      <template v-if="notice.showExports" #actions>
+        <a :href="exportUrl('summary_csv')">汇总 CSV</a>
+        <a :href="exportUrl('buckets_csv')">区间 CSV</a>
+        <a :href="exportUrl('markdown')">Markdown</a>
+      </template>
+    </CaseMonitorFeedback>
+
+    <CaseMonitorDetailDrawer
+      :open="Boolean(drawerItem)"
+      :item="drawerItem"
+      @close="drawerItem = null"
+    />
   </main>
 </template>
 
 <style scoped>
 .case-monitor-page {
-  max-width: 1280px;
-}
-
-.case-monitor-page > * {
-  min-width: 0;
-}
-
-.case-monitor-page .metrics-grid.compact {
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
-}
-
-.case-monitor-page .metric-card {
-  min-height: 92px;
-}
-
-.case-report-meta {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(140px, 1fr)) minmax(220px, 1.2fr);
-  gap: 12px;
-  align-items: end;
-}
-
-.case-report-meta > div,
-.case-report-meta label {
-  display: grid;
-  gap: 4px;
-}
-
-.case-report-meta input {
   width: 100%;
-  min-height: 36px;
-  border: 1px solid #c8d2dc;
-  border-radius: 6px;
-  padding: 7px 10px;
-}
-
-.case-filter-panel {
-  padding: 10px;
-}
-
-.segmented-control {
+  min-width: 0;
+  min-height: 0;
+  height: calc(100vh - 58px);
+  height: calc(100dvh - 58px);
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-direction: column;
+  overflow: hidden;
+  margin: 0;
+  padding: 16px 34px 5px;
+  background: var(--cm-canvas);
 }
 
-.segment-button {
-  min-height: 34px;
-  display: inline-flex;
+.case-monitor-header {
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(320px, auto) minmax(360px, 1fr);
   align-items: center;
-  gap: 4px;
-  border: 1px solid #c7d2dd;
-  border-radius: 6px;
-  padding: 6px 10px;
-  color: #2a3a4b;
-  background: #ffffff;
+  gap: 18px;
 }
 
-.segment-button.active {
-  border-color: #2f6b52;
-  color: #174634;
-  background: #eef8f3;
-}
-
-.recommendation-list {
-  display: grid;
-  gap: 8px;
-}
-
-.case-recommendation-row {
-  width: 100%;
-  display: grid;
-  grid-template-columns: 34px minmax(280px, 1fr) 86px 86px 72px 96px;
-  gap: 10px;
+.case-monitor-title {
+  display: flex;
   align-items: center;
-  border: 1px solid #d7dee6;
-  border-radius: 6px;
-  padding: 10px 12px;
-  text-align: left;
-  color: #172033;
-  background: #ffffff;
+  gap: 20px;
 }
 
-.case-recommendation-row.active {
-  border-color: #78a894;
-  background: #f2fbf6;
-}
-
-.case-recommendation-row .rank {
-  width: 26px;
-  height: 26px;
-  display: inline-grid;
-  place-items: center;
-  border-radius: 50%;
-  color: #ffffff;
-  background: #2f6b52;
+.case-monitor-title h1 {
+  margin: 0;
+  color: var(--cm-ink);
+  font-size: 22px;
   font-weight: 700;
+  line-height: 1.2;
 }
 
-.case-recommendation-row .item-name {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-  font-weight: 700;
+.case-monitor-title :deep(.cm-status-chip) {
+  min-height: 24px;
+  border: 0;
+  padding: 4px 0;
+  background: transparent;
 }
 
-.case-recommendation-row .item-name small {
-  color: #687487;
+.case-monitor-safety {
+  margin: 0;
+  color: #738099;
   font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.case-monitor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 14px;
+}
+
+.case-monitor-actions :deep(.cm-button) {
+  min-width: 112px;
+}
+
+.case-monitor-controls {
+  position: relative;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--cm-line);
+  border-radius: 6px;
+  padding: 8px 16px;
+  background: var(--cm-panel);
+  box-shadow: 0 1px 3px rgba(30, 48, 75, 0.03);
+  white-space: nowrap;
+}
+
+.case-control-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.case-control-label {
+  color: #505d72;
+  font-size: 11px;
   font-weight: 600;
 }
 
-.focus-heading {
+.case-control-divider {
+  width: 1px;
+  height: 23px;
+  flex: 0 0 auto;
+  background: var(--cm-line);
+}
+
+.case-custom-calendar {
+  margin-left: -31px;
+  color: #5d6b82;
+  pointer-events: none;
+}
+
+.case-custom-range {
+  position: absolute;
+  top: 39px;
+  right: 0;
+  z-index: 20;
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--cm-line);
+  border-radius: 5px;
+  padding: 9px;
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgba(28, 43, 66, 0.13);
+}
+
+.case-custom-range input {
+  min-height: 32px;
+  border: 1px solid var(--cm-line-strong);
+  border-radius: 4px;
+  padding: 5px 7px;
+  font-size: 11px;
+}
+
+.case-cycle-summary {
+  color: #5a667b;
+  font-size: 11px;
+}
+
+.case-time-stat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #5b687d;
+  font-size: 10px;
+}
+
+.case-time-stat strong {
+  color: #37445b;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.case-monitor-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
-  align-items: start;
-  margin-bottom: 14px;
+  margin-top: 9px;
 }
 
-.focus-heading h2 {
-  margin: 0;
-  overflow-wrap: anywhere;
+.case-metric {
+  min-height: 73px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid var(--cm-line);
+  border-radius: 6px;
+  padding: 10px 18px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(30, 48, 75, 0.03);
 }
 
-.focus-heading > strong {
-  color: #2f6b52;
-  font-size: 30px;
+.case-metric__icon {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+}
+
+.case-metric__icon--green {
+  color: var(--cm-green);
+  background: #eaf5ef;
+}
+
+.case-metric__icon--blue {
+  color: var(--cm-blue);
+  background: #edf3ff;
+}
+
+.case-metric__icon--amber {
+  color: #ff9700;
+  background: #fff2de;
+}
+
+.case-metric > div {
+  display: grid;
+  gap: 3px;
+}
+
+.case-metric span {
+  color: #59667b;
+  font-size: 12px;
+}
+
+.case-metric strong {
+  color: var(--cm-green);
+  font-size: 22px;
+  font-weight: 700;
   line-height: 1;
 }
 
-.case-focus-grid,
-.price-source-grid,
-.threshold-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 10px;
+.case-metric strong.is-blue {
+  color: var(--cm-blue);
 }
 
-.case-focus-grid > div,
-.price-source-grid > div,
-.threshold-card {
-  min-height: 72px;
-  border: 1px solid #e0e6ec;
+.case-metric strong.is-amber {
+  color: #ff9200;
+}
+
+.case-ranking-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: 7px;
+  overflow: hidden;
+  border: 1px solid var(--cm-line);
   border-radius: 6px;
-  padding: 10px;
-  background: #fbfcfd;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(30, 48, 75, 0.03);
+}
+
+.case-ranking-toolbar {
+  min-height: 47px;
   display: grid;
-  gap: 4px;
-}
-
-.case-focus-grid strong,
-.price-source-grid strong,
-.threshold-card strong {
-  overflow-wrap: anywhere;
-}
-
-.threshold-card em {
-  color: #687487;
-  font-size: 12px;
-  font-style: normal;
-}
-
-.ratio-timeline {
-  position: relative;
-  height: 28px;
-  margin-top: 14px;
-  overflow: hidden;
-  border: 1px solid #d7dee6;
-  border-radius: 999px;
-  background: #eef2f5;
-}
-
-.timeline-segment {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  min-width: 2px;
-}
-
-.bucket-bars {
-  display: grid;
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.bucket-row {
-  display: grid;
-  grid-template-columns: 120px minmax(180px, 1fr) 72px 72px;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) 314px;
   align-items: center;
+  gap: 18px;
+  border-bottom: 1px solid var(--cm-line);
+  padding: 8px;
 }
 
-.bar-track {
-  height: 10px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #edf1f4;
+.case-ranking-panel h2 {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0 13px;
+  color: #1f2a3d;
+  font-size: 15px;
+  font-weight: 700;
 }
 
-.bar-fill {
-  height: 100%;
-  border-radius: inherit;
+.case-table-scroll {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+  scrollbar-width: none;
 }
 
-.case-ratio-table {
-  min-width: 1320px;
+.case-table-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
-.case-ratio-table td:nth-child(2) {
-  max-width: 320px;
-  white-space: normal;
-  overflow-wrap: anywhere;
+.case-table-scroll :deep(.cm-recommendation-header) {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  min-height: 31px;
 }
 
-@media (max-width: 980px) {
-  .case-monitor-page .metrics-grid.compact,
-  .case-report-meta,
-  .case-focus-grid,
-  .price-source-grid,
-  .threshold-grid {
+.case-monitor-toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 80;
+  max-width: min(620px, calc(100vw - 36px));
+  box-shadow: 0 8px 24px rgba(22, 36, 58, 0.14);
+}
+
+@media (max-width: 1220px) {
+  .case-monitor-header {
+    grid-template-columns: 1fr auto;
+  }
+
+  .case-monitor-safety {
+    display: none;
+  }
+
+  .case-monitor-controls {
+    overflow-x: auto;
+  }
+}
+
+@media (max-width: 780px) {
+  .case-monitor-page {
+    min-height: calc(100vh - 58px);
+    min-height: calc(100dvh - 58px);
+    height: auto;
+    overflow: visible;
+    padding: 12px 10px 18px;
+  }
+
+  .case-ranking-panel,
+  .case-table-scroll {
+    flex: 0 0 auto;
+  }
+
+  .case-monitor-header {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .case-monitor-title {
+    justify-content: space-between;
+  }
+
+  .case-monitor-actions {
+    justify-content: flex-start;
+    overflow-x: auto;
+  }
+
+  .case-monitor-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
   }
 
-  .case-recommendation-row {
-    grid-template-columns: 30px minmax(0, 1fr) 76px;
+  .case-metric {
+    gap: 10px;
+    padding: 9px 10px;
   }
 
-  .case-recommendation-row > span:nth-last-child(-n + 3) {
-    display: none;
-  }
-}
-
-@media (max-width: 640px) {
-  .case-monitor-page .metrics-grid.compact,
-  .case-report-meta,
-  .case-focus-grid,
-  .price-source-grid,
-  .threshold-grid {
-    grid-template-columns: 1fr;
+  .case-metric__icon {
+    width: 42px;
+    height: 42px;
   }
 
-  .case-recommendation-row {
-    grid-template-columns: 30px minmax(0, 1fr);
-  }
-
-  .case-recommendation-row > span:nth-child(n + 4) {
-    display: none;
-  }
-
-  .bucket-row {
+  .case-ranking-toolbar {
+    align-items: stretch;
     grid-template-columns: 1fr;
   }
 }
-
-/* FOLIO compact data theme */
-.case-report-meta input{border-color:var(--folio-line);border-radius:11px;color:var(--folio-ink);background:#fff}.case-report-meta input:focus{border-color:var(--folio-green);box-shadow:0 0 0 3px rgba(35,106,76,.1)}
-.case-filter-panel{padding:12px}.segmented-control{gap:6px}.segment-button{min-height:36px;border-color:var(--folio-line);border-radius:10px;color:#59645d;background:var(--folio-surface-soft);font-size:12px;font-weight:600}.segment-button:hover{color:var(--folio-green-dark);background:#eff4f0}.segment-button.active{border-color:#b8d2c1;color:var(--folio-green-dark);background:var(--folio-green-soft);box-shadow:inset 0 0 0 1px rgba(35,106,76,.08)}
-.recommendation-list{gap:7px}.case-recommendation-row{border-color:var(--folio-line);border-radius:13px;color:var(--folio-ink);background:#fff;box-shadow:0 4px 18px rgba(34,49,41,.025);transition:.16s ease}.case-recommendation-row:hover{border-color:#cbd8cf;background:#fbfcfb;transform:translateY(-1px)}.case-recommendation-row.active{border-color:#b7d1c0;background:#f3f8f5}.case-recommendation-row .rank{color:#fff;background:var(--folio-green);box-shadow:0 5px 12px rgba(35,106,76,.16)}.case-recommendation-row .item-name small{color:var(--folio-muted)}
-.focus-heading>strong{color:var(--folio-green);letter-spacing:-.045em}.case-focus-grid>div,.price-source-grid>div,.threshold-card{border-color:#e8ece7;border-radius:12px;background:var(--folio-surface-soft)}.threshold-card em{color:var(--folio-muted)}
-.ratio-timeline{border-color:var(--folio-line);background:#eef2ee}.bar-track{background:#edf1ed}.timeline-segment,.bar-fill{filter:saturate(.72)}
 </style>

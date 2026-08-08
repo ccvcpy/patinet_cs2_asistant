@@ -1,0 +1,99 @@
+{
+  "generatedAt": "2026-07-22T09:08:13.428622+00:00",
+  "execute": true,
+  "aborted": true,
+  "trials": [
+    {
+      "trial": "control",
+      "action": "none",
+      "marketHashName": "XM1014 | Hieroglyph (Well-Worn)",
+      "assetId": "48137863919",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "xiaodigu11",
+        "buyerC": "ropzx55x",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "donkzymeng"
+      },
+      "price": {
+        "floor_cents": 35,
+        "previous_high_bid_cents": 30,
+        "a_bid_cents": 33,
+        "c_bid_cents": 34,
+        "seller_net_cents": 19,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 33,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": "8576405384",
+      "cBuyOrderId": null,
+      "listingId": "494983200568005669",
+      "terminalBuyer": "xiaodigu11",
+      "aReceipt": {
+        "listingId": "494983200568005669",
+        "purchaseId": "494983200568005670",
+        "timePurchased": 1784711290,
+        "paidAmount": 0.19,
+        "paidFee": 0.14,
+        "paidTotal": 0.33,
+        "currencyId": "2023",
+        "marketHashName": "XM1014 | Hieroglyph (Well-Worn)",
+        "assetId": "48137863919",
+        "newAssetId": "52966225015"
+      },
+      "cReceipt": null,
+      "bSaleReceipt": {
+        "listingId": "494983200568005669",
+        "purchaseId": "494983200568005670",
+        "timeSold": 1784711290,
+        "receivedAmount": 0.19,
+        "receivedCurrencyId": "2023"
+      },
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.12,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "vnuzl692": {
+          "balance": 1124.38,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "ropzx55x": {
+          "balance": 117.21,
+          "delayedBalance": 5.98,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {
+        "winner": "xiaodigu11",
+        "newAssetId": "52966225015",
+        "present": false
+      },
+      "classification": "evidence_conflict_or_request_failure",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": 0.686,
+        "aMylistingsToOrderbookBid": 0.33,
+        "bSubmitToOfficialPurchase": 1.958,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": 2.695
+      },
+      "errors": [
+        "official purchase receipt exists but the new asset is not in winner inventory"
+      ]
+    }
+  ]
+}

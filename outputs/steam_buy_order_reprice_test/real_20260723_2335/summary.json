@@ -1,0 +1,21 @@
+{
+  "status": "cleanup_not_confirmed",
+  "executed": true,
+  "account": "ropzx55x",
+  "marketHashName": "Glove Case",
+  "initialPriceCents": 21,
+  "higherPriceCents": 22,
+  "probeExplicitId": true,
+  "startedAt": "2026-07-23T15:35:30.107846+00:00",
+  "cleanup": {
+    "attempted": false,
+    "confirmedAbsent": false,
+    "cancelledOrderIds": []
+  },
+  "finishedAt": "2026-07-23T15:35:30.402234+00:00",
+  "observedExperimentOrderIds": [],
+  "errors": [
+    "no such column: steam_buy_order_id"
+  ],
+  "cleanupErrors": []
+}

@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import FolioIcon from "../components/FolioIcon.vue";
+import ProfitTradeLongBuyStrategyPanel from "../components/ProfitTradeLongBuyStrategyPanel.vue";
 import ProfitTradeRoiWatch from "../components/ProfitTradeRoiWatch.vue";
+import {
+  requiresLongBuyConfigConfirmation,
+  resolveProfitTradeLongBuyStrategyState,
+  usesProfitTradeRuntimeToggle,
+  type ProfitTradeLongBuyConfigKey,
+} from "../components/profit_trade_long_buy_strategy";
 
 type ProfitStep = {
   key: string;
@@ -57,10 +64,28 @@ type ManualItemSuggestion = {
   name: string;
 };
 
+type CatalogSearchPagination = {
+  offset: number;
+  limit: number;
+  total: number;
+  hasMore: boolean;
+  nextOffset?: number | null;
+};
+
+type ProtectedMarketHashNameItem = {
+  marketHashName: string;
+  name: string;
+};
+
+type ProtectedSteamAccountItem = {
+  accountId: string | null;
+  name: string;
+  steamId: string;
+};
+
 type ListingsCircuit = {
-  status?: "closed" | "open" | "half_open";
+  status?: "closed" | "open";
   isBlocking?: boolean;
-  nextProbeAt?: string | null;
   cooldownUntil?: string | null;
   triggerAccountName?: string | null;
   consecutive429Count?: number;
@@ -71,7 +96,8 @@ type ProfitDashboard = {
   config: {
     enabled: boolean;
     allowRealExecution: boolean;
-    allowRepriceExecution: boolean;
+    longBuyEnabled: boolean;
+    longBuyAllowRealExecution: boolean;
     balanceDiscount?: number;
     balanceDiscountPct?: number;
     minRoiPct?: number;
@@ -92,6 +118,7 @@ type ProfitDashboard = {
     stickerStatus?: "blocked" | "active";
     protectedAssetIds: string[];
     protectedMarketHashNames: string[];
+    protectedMarketHashNameItems?: ProtectedMarketHashNameItem[];
     protectedSteamIds: string[];
     aiAudit: {
       enabled: boolean;
@@ -109,6 +136,7 @@ type ProfitDashboard = {
     realizedProfit: number;
     dailySteamSpent?: number;
     dailySteamRemaining?: number;
+    longBuyActiveOrders?: number;
   };
   trades: ProfitTrade[];
   manualEntryOptions: {
@@ -118,7 +146,12 @@ type ProfitDashboard = {
   runtime?: {
     enabled?: boolean;
     status?: string;
+    runtimeStatus?: string;
     preparing?: boolean;
+    migrationHold?: boolean;
+    gateReason?: string | null;
+    taskStatus?: string | null;
+    taskRunning?: boolean;
     nextAttemptAt?: string | null;
     lastRunAt?: string | null;
     lastRunSummary?: string | null;
@@ -135,12 +168,23 @@ type ProfitDashboard = {
   } | null;
 };
 
+type CompletedProfitPayload = {
+  generatedAt: string;
+  summary: {
+    count: number;
+    realizedProfit: number;
+    steamBuyTotal: number;
+  };
+  items: ProfitTrade[];
+};
+
 const fallbackDashboard: ProfitDashboard = {
   generatedAt: "",
   config: {
     enabled: false,
     allowRealExecution: false,
-    allowRepriceExecution: false,
+    longBuyEnabled: false,
+    longBuyAllowRealExecution: false,
     balanceDiscount: undefined,
     balanceDiscountPct: undefined,
     minRoiPct: undefined,
@@ -161,6 +205,7 @@ const fallbackDashboard: ProfitDashboard = {
     stickerStatus: "blocked",
     protectedAssetIds: [],
     protectedMarketHashNames: [],
+    protectedMarketHashNameItems: [],
     protectedSteamIds: [],
     aiAudit: {
       enabled: false,
@@ -194,22 +239,47 @@ const fallbackDashboard: ProfitDashboard = {
 };
 
 const dashboard = ref<ProfitDashboard>(fallbackDashboard);
+const listingsCooling = computed(() => dashboard.value.listingsCircuit.status === "open");
 const loading = ref(false);
 const apiOnline = ref<boolean | null>(null);
 const message = ref("");
 const manualProtectedAssetId = ref("");
 const manualProtectedMarketHashName = ref("");
 const manualProtectedSteamId = ref("");
+const protectionListOpen = ref(false);
+const protectionItemQuery = ref("");
+const protectionItemSuggestions = ref<ManualItemSuggestion[]>([]);
+const protectionItemSearchOpen = ref(false);
+const protectionItemSearchBusy = ref(false);
+const protectionItemHasMore = ref(false);
+const protectionItemNextOffset = ref(0);
+const protectionError = ref("");
 const dailySteamBudgetDraft = ref("1000");
 const reservedBalanceDrafts = ref<Record<string, string>>({});
 const manualSettleInputs = ref<Record<number, string>>({});
 const lastRunStorageKey = "profitTrade.lastRun.v1";
 const runtimeBusy = ref(false);
+const runOnceBusy = ref(false);
 const runtimeConfirmEnabled = ref<boolean | null>(null);
+const runtimeConfirmError = ref("");
+const configToggleBusy = ref<ProfitTradeLongBuyConfigKey | null>(null);
+const longBuyWriteConfirm = ref<boolean | null>(null);
+const longBuyWriteConfirmError = ref("");
+const countdownNow = ref(Date.now());
 const lastRunAt = ref<number | null>(null);
 const lastRunResult = ref("");
 const completedDateFrom = ref("");
 const completedDateTo = ref("");
+const completedDataset = ref<CompletedProfitPayload>({
+  generatedAt: "",
+  summary: { count: 0, realizedProfit: 0, steamBuyTotal: 0 },
+  items: [],
+});
+const completedAllSummary = ref({
+  count: 0,
+  realizedProfit: 0,
+  steamBuyTotal: 0,
+});
 const completedPage = ref(1);
 const completedPageSize = 10;
 
@@ -235,7 +305,12 @@ const manualItemQuery = ref("");
 const manualItemSuggestions = ref<ManualItemSuggestion[]>([]);
 const manualItemSearchOpen = ref(false);
 const manualItemSearchBusy = ref(false);
+const manualItemHasMore = ref(false);
+const manualItemNextOffset = ref(0);
 let manualItemSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let protectionItemSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
+let runtimeScheduleTimer: ReturnType<typeof setInterval> | null = null;
 const manualRecordForm = ref<ManualRecordForm>({
   marketHashName: "",
   name: "",
@@ -252,8 +327,7 @@ const manualRecordForm = ref<ManualRecordForm>({
 
 const sortedTrades = computed(() => [...dashboard.value.trades].sort((a, b) => b.id - a.id));
 const activeTrades = computed(() => sortedTrades.value.filter((trade) => trade.status !== "completed"));
-const completedTrades = computed(() => sortedTrades.value
-  .filter((trade) => trade.status === "completed")
+const completedTrades = computed(() => [...completedDataset.value.items]
   .sort((a, b) => {
     const aTime = completedTradePurchaseTimeMs(a) ?? Number.NEGATIVE_INFINITY;
     const bTime = completedTradePurchaseTimeMs(b) ?? Number.NEGATIVE_INFINITY;
@@ -287,18 +361,12 @@ const completedFilteredTrades = computed(() => {
     return true;
   });
 });
-const completedTotalProfit = computed(() => completedTrades.value.reduce(
-  (total, trade) => total + (Number(trade.realizedProfit) || 0),
-  0,
-));
+const completedTotalProfit = computed(() => completedAllSummary.value.realizedProfit);
 const completedFilteredProfit = computed(() => completedFilteredTrades.value.reduce(
   (total, trade) => total + (Number(trade.realizedProfit) || 0),
   0,
 ));
-const completedTotalSteamBuy = computed(() => completedTrades.value.reduce(
-  (total, trade) => total + (Number(trade.steamBuyPrice) || 0),
-  0,
-));
+const completedTotalSteamBuy = computed(() => completedAllSummary.value.steamBuyTotal);
 const completedFilteredSteamBuy = computed(() => completedFilteredTrades.value.reduce(
   (total, trade) => total + (Number(trade.steamBuyPrice) || 0),
   0,
@@ -326,9 +394,26 @@ const protectedAssetCount = computed(() => dashboard.value.config.protectedAsset
 const protectedNameCount = computed(() => dashboard.value.config.protectedMarketHashNames?.length ?? 0);
 const protectedSteamCount = computed(() => dashboard.value.config.protectedSteamIds?.length ?? 0);
 const protectedAssetPreview = computed(() => dashboard.value.config.protectedAssetIds ?? []);
-const protectedNamePreview = computed(() => dashboard.value.config.protectedMarketHashNames ?? []);
-const protectedSteamPreview = computed(() => dashboard.value.config.protectedSteamIds ?? []);
+const protectedNamePreview = computed<ProtectedMarketHashNameItem[]>(() => {
+  const detailed = dashboard.value.config.protectedMarketHashNameItems ?? [];
+  if (detailed.length) return detailed;
+  return (dashboard.value.config.protectedMarketHashNames ?? []).map((marketHashName) => ({
+    marketHashName,
+    name: marketHashName,
+  }));
+});
+const protectedSteamPreview = computed<ProtectedSteamAccountItem[]>(() => (
+  (dashboard.value.config.protectedSteamIds ?? []).map((steamId) => {
+    const account = manualEntryAccounts.value.find((item) => item.steamId === steamId);
+    return {
+      accountId: account?.accountId ?? null,
+      name: account?.name ?? "未导入账号",
+      steamId,
+    };
+  })
+));
 const autoRunEnabled = computed(() => Boolean(dashboard.value.runtime?.enabled ?? dashboard.value.config.enabled));
+const profitCycleRunning = computed(() => Boolean(runOnceBusy.value || dashboard.value.runtime?.taskRunning));
 const stickerSlabActive = computed(() => dashboard.value.config.stickerSlabStatus === "active");
 const stickerActive = computed(() => dashboard.value.config.stickerStatus === "active");
 const apiStatusLabel = computed(() => {
@@ -339,21 +424,53 @@ const apiStatusLabel = computed(() => {
 const realExecutionLabel = computed(() => (
   dashboard.value.config.allowRealExecution ? "真实执行已开放" : "真实执行未开放"
 ));
+const longBuyStrategyState = computed(() => (
+  resolveProfitTradeLongBuyStrategyState(dashboard.value.config)
+));
+const longBuyRemoteWritesEnabled = computed(() => longBuyStrategyState.value.canWriteSteam);
+const longBuyObservationMode = computed(() => longBuyStrategyState.value.mode === "observe");
+const longBuyExecutionLabel = computed(() => {
+  if (longBuyStrategyState.value.mode === "observe") return "观察模式（不写 Steam 求购）";
+  return longBuyStrategyState.value.label;
+});
+const longBuyExecutionDetail = computed(() => longBuyStrategyState.value.detail);
 const autoRunStatusLabel = computed(() => {
+  if (profitCycleRunning.value) return "Profit Trade 本轮执行中";
   if (dashboard.value.runtime?.preparing) return "后端 Worker 启动准备中";
-  return autoRunEnabled.value ? `后端 Worker ${dashboard.value.runtime?.status || "运行中"}` : "后端 Worker 已关闭";
+  return autoRunEnabled.value ? "后端 10 分钟循环运行中" : "后端 Worker 已关闭";
+});
+const autoRunCountdown = computed(() => {
+  if (!autoRunEnabled.value) return "";
+  const nextAt = dashboard.value.runtime?.nextAttemptAt;
+  if (!nextAt) return "";
+  const target = new Date(nextAt).getTime();
+  if (!Number.isFinite(target)) return "";
+  return formatCountdown(target - countdownNow.value);
 });
 const nextAutoRunLabel = computed(() => {
   if (!autoRunEnabled.value) return "新机会任务已暂停";
+  if (profitCycleRunning.value) return "本轮执行中，完成后重新安排10分钟倒计时";
   const nextAt = dashboard.value.runtime?.nextAttemptAt;
-  return nextAt ? formatDateTime(nextAt) : "等待后端安排到期任务";
+  if (!nextAt) return "等待后端安排到期任务";
+  const target = new Date(nextAt).getTime();
+  if (!Number.isFinite(target)) return "等待后端安排到期任务";
+  return `${formatDateTime(nextAt)}（${autoRunCountdown.value}）`;
 });
 const lastRunLabel = computed(() => {
   const backendLastRun = dashboard.value.lastRun;
+  const runtimeLastRunAt = dashboard.value.runtime?.lastRunAt;
+  const backendTime = backendLastRun?.generatedAt
+    ? new Date(backendLastRun.generatedAt).getTime()
+    : Number.NEGATIVE_INFINITY;
+  const runtimeTime = runtimeLastRunAt
+    ? new Date(runtimeLastRunAt).getTime()
+    : Number.NEGATIVE_INFINITY;
+  if (runtimeLastRunAt && runtimeTime >= backendTime) {
+    return `${formatDateTime(runtimeLastRunAt)}｜${dashboard.value.runtime?.lastRunSummary || "后端任务已运行"}`;
+  }
   if (backendLastRun?.generatedAt && backendLastRun?.summary) {
     return `${formatDateTime(backendLastRun.generatedAt)}｜${backendLastRun.summary}`;
   }
-  if (dashboard.value.runtime?.lastRunAt) return `${formatDateTime(dashboard.value.runtime.lastRunAt)}｜${dashboard.value.runtime.lastRunSummary || "后端任务已运行"}`;
   if (!lastRunAt.value || !lastRunResult.value) return "暂无";
   return `${formatDateTime(lastRunAt.value)}｜${lastRunResult.value}`;
 });
@@ -380,6 +497,41 @@ function formatDateTime(value: number | string | null | undefined): string {
     second: "2-digit",
     hour12: false,
   });
+}
+
+function formatCountdown(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+async function refreshRuntimeSchedule(): Promise<void> {
+  try {
+    const payload = await fetchJson("/api/runtime/state?executor=profit_trade") as {
+      state?: ProfitDashboard["runtime"];
+    };
+    if (payload.state) {
+      const previousLastRunAt = dashboard.value.runtime?.lastRunAt;
+      dashboard.value = {
+        ...dashboard.value,
+        runtime: {
+          ...dashboard.value.runtime,
+          ...payload.state,
+        },
+      };
+      if (
+        payload.state.lastRunAt
+        && payload.state.lastRunAt !== previousLastRunAt
+      ) {
+        void loadDashboard();
+        window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
+      }
+    }
+    apiOnline.value = true;
+  } catch {
+    apiOnline.value = false;
+  }
 }
 
 function parseDateStart(value: string): number | null {
@@ -443,6 +595,8 @@ function openCreateManualRecord(): void {
   manualRecordError.value = "";
   manualItemQuery.value = "";
   manualItemSuggestions.value = [];
+  manualItemHasMore.value = false;
+  manualItemNextOffset.value = 0;
   manualItemSearchOpen.value = false;
   manualRecordForm.value = {
     marketHashName: "",
@@ -468,6 +622,8 @@ function openEditManualRecord(trade: ProfitTrade): void {
     ? `${trade.name} / ${trade.marketHashName}`
     : trade.marketHashName;
   manualItemSuggestions.value = [];
+  manualItemHasMore.value = false;
+  manualItemNextOffset.value = 0;
   manualItemSearchOpen.value = false;
   manualRecordForm.value = {
     marketHashName: trade.marketHashName,
@@ -491,13 +647,29 @@ function closeManualRecord(): void {
   manualRecordError.value = "";
 }
 
-async function searchManualItems(): Promise<void> {
+function mergeItemSuggestions(
+  current: ManualItemSuggestion[],
+  incoming: ManualItemSuggestion[],
+): ManualItemSuggestion[] {
+  const merged = new Map(current.map((item) => [item.marketHashName, item]));
+  for (const item of incoming) merged.set(item.marketHashName, item);
+  return [...merged.values()];
+}
+
+async function searchManualItems(append = false): Promise<void> {
   manualItemSearchBusy.value = true;
+  const query = manualItemQuery.value;
   try {
-    const payload = await fetchJson(
-      `/api/profit-trade/items/search?query=${encodeURIComponent(manualItemQuery.value.trim())}&limit=20`,
-    ) as { items?: ManualItemSuggestion[] };
-    manualItemSuggestions.value = payload.items ?? [];
+    const page = await fetchProfitTradeItemSuggestions(
+      query,
+      append ? manualItemNextOffset.value : 0,
+    );
+    if (query !== manualItemQuery.value) return;
+    manualItemSuggestions.value = append
+      ? mergeItemSuggestions(manualItemSuggestions.value, page.items)
+      : page.items;
+    manualItemHasMore.value = Boolean(page.pagination?.hasMore);
+    manualItemNextOffset.value = Number(page.pagination?.nextOffset ?? 0);
     manualItemSearchOpen.value = true;
     apiOnline.value = true;
   } catch (error) {
@@ -508,9 +680,82 @@ async function searchManualItems(): Promise<void> {
   }
 }
 
+async function fetchProfitTradeItemSuggestions(
+  query: string,
+  offset = 0,
+): Promise<{ items: ManualItemSuggestion[]; pagination?: CatalogSearchPagination }> {
+  const payload = await fetchJson(
+    `/api/profit-trade/items/search?query=${encodeURIComponent(query.trim())}&limit=50&offset=${offset}`,
+  ) as { items?: ManualItemSuggestion[]; pagination?: CatalogSearchPagination };
+  return { items: payload.items ?? [], pagination: payload.pagination };
+}
+
+async function searchProtectionItems(append = false): Promise<void> {
+  protectionItemSearchBusy.value = true;
+  protectionError.value = "";
+  const query = protectionItemQuery.value;
+  try {
+    const page = await fetchProfitTradeItemSuggestions(
+      query,
+      append ? protectionItemNextOffset.value : 0,
+    );
+    if (query !== protectionItemQuery.value) return;
+    protectionItemSuggestions.value = append
+      ? mergeItemSuggestions(protectionItemSuggestions.value, page.items)
+      : page.items;
+    protectionItemHasMore.value = Boolean(page.pagination?.hasMore);
+    protectionItemNextOffset.value = Number(page.pagination?.nextOffset ?? 0);
+    protectionItemSearchOpen.value = true;
+    apiOnline.value = true;
+  } catch (error) {
+    if (error instanceof TypeError) apiOnline.value = false;
+    protectionError.value = `物品搜索失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    protectionItemSearchBusy.value = false;
+  }
+}
+
+function onProtectionItemInput(): void {
+  manualProtectedMarketHashName.value = "";
+  protectionItemHasMore.value = false;
+  protectionItemNextOffset.value = 0;
+  protectionItemSearchOpen.value = true;
+  if (protectionItemSearchTimer) clearTimeout(protectionItemSearchTimer);
+  protectionItemSearchTimer = setTimeout(() => void searchProtectionItems(), 220);
+}
+
+function chooseProtectionItem(item: ManualItemSuggestion): void {
+  manualProtectedMarketHashName.value = item.marketHashName;
+  protectionItemQuery.value = item.name !== item.marketHashName
+    ? `${item.name} / ${item.marketHashName}`
+    : item.marketHashName;
+  protectionItemSearchOpen.value = false;
+  protectionError.value = "";
+}
+
+function openProtectionList(): void {
+  protectionError.value = "";
+  protectionItemQuery.value = "";
+  manualProtectedMarketHashName.value = "";
+  protectionItemSuggestions.value = [];
+  protectionItemHasMore.value = false;
+  protectionItemNextOffset.value = 0;
+  protectionItemSearchOpen.value = false;
+  manualProtectedSteamId.value = "";
+  protectionListOpen.value = true;
+}
+
+function closeProtectionList(): void {
+  protectionListOpen.value = false;
+  protectionItemSearchOpen.value = false;
+  protectionError.value = "";
+}
+
 function onManualItemInput(): void {
   manualRecordForm.value.marketHashName = "";
   manualRecordForm.value.name = "";
+  manualItemHasMore.value = false;
+  manualItemNextOffset.value = 0;
   manualItemSearchOpen.value = true;
   if (manualItemSearchTimer) clearTimeout(manualItemSearchTimer);
   manualItemSearchTimer = setTimeout(() => void searchManualItems(), 220);
@@ -595,19 +840,43 @@ function resetCompletedPage(): void {
   completedPage.value = 1;
 }
 
-function setCompletedDatePreset(days: number | "all"): void {
+async function loadCompletedTrades(): Promise<void> {
+  const params = new URLSearchParams();
+  const from = parseDateStart(completedDateFrom.value);
+  const to = parseDateEnd(completedDateTo.value);
+  if (from !== null) params.set("boughtFrom", new Date(from).toISOString());
+  if (to !== null) params.set("boughtTo", new Date(to).toISOString());
+  const suffix = params.size ? `?${params.toString()}` : "";
+  const payload = await fetchJson(
+    `/api/profit-trade/completed${suffix}`,
+  ) as CompletedProfitPayload;
+  completedDataset.value = payload;
+  if (from === null && to === null) {
+    completedAllSummary.value = { ...payload.summary };
+  }
+  resetCompletedPage();
+}
+
+function localDateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+async function setCompletedDatePreset(days: number | "all"): Promise<void> {
   if (days === "all") {
     completedDateFrom.value = "";
     completedDateTo.value = "";
-    resetCompletedPage();
+    await loadCompletedTrades();
     return;
   }
   const end = new Date();
   const start = new Date();
   start.setDate(end.getDate() - Math.max(0, days - 1));
-  completedDateFrom.value = start.toISOString().slice(0, 10);
-  completedDateTo.value = end.toISOString().slice(0, 10);
-  resetCompletedPage();
+  completedDateFrom.value = localDateInputValue(start);
+  completedDateTo.value = localDateInputValue(end);
+  await loadCompletedTrades();
 }
 
 function goCompletedPage(direction: -1 | 1): void {
@@ -709,17 +978,27 @@ function stepClass(step: ProfitStep, trade: ProfitTrade): string {
   return "pending";
 }
 
+class ApiRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, statusText: string, detail: string) {
+    super(`${status} ${statusText}${detail ? ` ${detail}` : ""}`);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
+
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
   const response = await fetch(url, init);
   if (!response.ok) {
     let detail = "";
     try {
       const payload = await response.json() as { error?: string };
-      detail = payload.error ? ` ${payload.error}` : "";
+      detail = payload.error ?? "";
     } catch {
       detail = "";
     }
-    throw new Error(`${response.status} ${response.statusText}${detail}`);
+    throw new ApiRequestError(response.status, response.statusText, detail);
   }
   return response.json();
 }
@@ -761,6 +1040,7 @@ async function loadDashboard(): Promise<void> {
       runtime: runtimeState,
       listingsCircuit: payload.listingsCircuit || { status: "closed", isBlocking: false },
     };
+    await loadCompletedTrades();
     dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
     syncReservedBalanceDrafts();
     apiOnline.value = true;
@@ -779,6 +1059,7 @@ async function loadDashboard(): Promise<void> {
 async function toggleEnabled(): Promise<void> {
   const nextEnabled = runtimeConfirmEnabled.value ?? !autoRunEnabled.value;
   message.value = "";
+  runtimeConfirmError.value = "";
   runtimeBusy.value = true;
   try {
     await fetchJson("/api/runtime/toggle", {
@@ -788,47 +1069,173 @@ async function toggleEnabled(): Promise<void> {
     });
     apiOnline.value = true;
     runtimeConfirmEnabled.value = null;
-    message.value = nextEnabled ? "Profit Trade 后端 Worker 已提交开启，正在执行 Cookie 门禁。" : "Profit Trade 新机会已停止；已有流水继续安全闭环。";
+    runtimeConfirmError.value = "";
     await loadDashboard();
+    if (apiOnline.value) {
+      message.value = nextEnabled ? "Profit Trade 后端 10 分钟循环已开启，正在执行 Cookie 门禁；门禁通过后立即运行第一轮。" : "Profit Trade 新机会与 10 分钟循环已停止；已有流水继续安全闭环。";
+    }
   } catch (error) {
-    apiOnline.value = false;
-    message.value = `API未连接，无法${nextEnabled ? "开启" : "关闭"}后端开关`;
+    apiOnline.value = error instanceof ApiRequestError;
+    const detail = error instanceof Error ? error.message : String(error);
+    runtimeConfirmError.value = `${nextEnabled ? "开启" : "关闭"}失败：${detail}`;
+    message.value = runtimeConfirmError.value;
   } finally {
     runtimeBusy.value = false;
   }
 }
 
-async function toggleRealExecution(): Promise<void> {
-  const nextAllowed = !dashboard.value.config.allowRealExecution;
+async function runOnce(): Promise<void> {
+  if (profitCycleRunning.value) {
+    message.value = "Profit Trade 本轮已经在执行，请等待完成后再启动下一轮。";
+    return;
+  }
+  runOnceBusy.value = true;
   message.value = "";
   try {
-    await fetchJson("/api/profit-trade/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allowRealExecution: nextAllowed }),
-    });
+    const previousLastRunAt = dashboard.value.runtime?.lastRunAt || null;
+    const queued = await fetchJson("/api/profit-trade/run-once", { method: "POST" }) as {
+      ok?: boolean;
+      queued?: boolean;
+      alreadyRunning?: boolean;
+    };
+    if (!queued.alreadyRunning && (!queued.ok || !queued.queued)) {
+      throw new Error("后端未能排入本轮任务");
+    }
     apiOnline.value = true;
+    const deadline = Date.now() + 30 * 60 * 1000;
+    let consecutiveReadFailures = 0;
+    while (Date.now() < deadline) {
+      let runtimePayload: { state?: ProfitDashboard["runtime"] };
+      try {
+        runtimePayload = await fetchJson("/api/runtime/state?executor=profit_trade") as {
+          state?: ProfitDashboard["runtime"];
+        };
+        consecutiveReadFailures = 0;
+      } catch (error) {
+        consecutiveReadFailures += 1;
+        if (consecutiveReadFailures >= 5) throw error;
+        await new Promise(resolve => window.setTimeout(resolve, 1000));
+        continue;
+      }
+      const state = runtimePayload.state;
+      if (state) {
+        dashboard.value = {
+          ...dashboard.value,
+          runtime: { ...dashboard.value.runtime, ...state },
+        };
+        const completedNewRun = Boolean(
+          state.lastRunAt
+          && state.lastRunAt !== previousLastRunAt
+          && !state.taskRunning,
+        );
+        if (completedNewRun) break;
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 1000));
+    }
+    if (
+      dashboard.value.runtime?.lastRunAt === previousLastRunAt
+      || dashboard.value.runtime?.taskRunning
+    ) {
+      throw new Error("后端执行超过30分钟，请到实时日志查看当前任务状态");
+    }
     await loadDashboard();
+    window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
+    if (apiOnline.value) {
+      const errorCount = Number(dashboard.value.lastRun?.errorCount || 0);
+      message.value = errorCount > 0
+        ? `Profit Trade 本轮已结束，但有 ${errorCount} 个错误：${dashboard.value.lastRun?.errors?.join("；") || "请查看实时日志"}`
+        : "Profit Trade 本轮已完成，观察池和执行状态已经刷新；下一轮仍按10分钟计划执行。";
+    }
   } catch (error) {
-    apiOnline.value = false;
-    message.value = `真实执行开关失败：${error instanceof Error ? error.message : String(error)}`;
+    apiOnline.value = error instanceof ApiRequestError;
+    const detail = error instanceof Error ? error.message : String(error);
+    message.value = `执行一轮失败：${detail}`;
+  } finally {
+    runOnceBusy.value = false;
   }
 }
 
-async function toggleRepriceExecution(): Promise<void> {
-  const nextAllowed = !dashboard.value.config.allowRepriceExecution;
+function openRuntimeConfirm(): void {
+  runtimeConfirmError.value = "";
+  runtimeConfirmEnabled.value = !autoRunEnabled.value;
+}
+
+function closeRuntimeConfirm(): void {
+  if (runtimeBusy.value) return;
+  runtimeConfirmEnabled.value = null;
+  runtimeConfirmError.value = "";
+}
+
+const profitTradeConfigToggleLabels: Record<ProfitTradeLongBuyConfigKey, string> = {
+  enabled: "Profit Trade 总功能",
+  allowRealExecution: "普通真实执行",
+  longBuyEnabled: "长期求购功能",
+  longBuyAllowRealExecution: "长期求购 Steam 写入",
+};
+
+async function updateProfitTradeConfigToggle(
+  key: ProfitTradeLongBuyConfigKey,
+  nextEnabled: boolean,
+): Promise<void> {
+  if (configToggleBusy.value || runtimeBusy.value) return;
+  const label = profitTradeConfigToggleLabels[key];
   message.value = "";
+  configToggleBusy.value = key;
+  const togglesRuntime = usesProfitTradeRuntimeToggle(key);
+  if (togglesRuntime) runtimeBusy.value = true;
   try {
-    await fetchJson("/api/profit-trade/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allowRepriceExecution: nextAllowed }),
-    });
+    if (togglesRuntime) {
+      await fetchJson("/api/runtime/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ executor: "profit_trade", enabled: nextEnabled }),
+      });
+    } else {
+      await fetchJson("/api/profit-trade/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: nextEnabled }),
+      });
+    }
     apiOnline.value = true;
     await loadDashboard();
+    if (apiOnline.value) message.value = `${label}已${nextEnabled ? "开启" : "关闭"}`;
   } catch (error) {
-    apiOnline.value = false;
-    message.value = `C5改价开关失败：${error instanceof Error ? error.message : String(error)}`;
+    if (!(error instanceof ApiRequestError)) apiOnline.value = false;
+    const detail = error instanceof Error ? error.message : String(error);
+    message.value = `${label}更新失败：${detail}`;
+    if (key === "longBuyAllowRealExecution") longBuyWriteConfirmError.value = message.value;
+  } finally {
+    configToggleBusy.value = null;
+    if (togglesRuntime) runtimeBusy.value = false;
+  }
+}
+
+function requestLongBuyConfigToggle(
+  key: ProfitTradeLongBuyConfigKey,
+  nextEnabled: boolean,
+): void {
+  if (configToggleBusy.value || runtimeBusy.value) return;
+  if (requiresLongBuyConfigConfirmation(key)) {
+    longBuyWriteConfirmError.value = "";
+    longBuyWriteConfirm.value = nextEnabled;
+    return;
+  }
+  void updateProfitTradeConfigToggle(key, nextEnabled);
+}
+
+function closeLongBuyWriteConfirm(): void {
+  if (configToggleBusy.value) return;
+  longBuyWriteConfirm.value = null;
+  longBuyWriteConfirmError.value = "";
+}
+
+async function confirmLongBuyWriteToggle(): Promise<void> {
+  if (longBuyWriteConfirm.value === null) return;
+  const nextEnabled = longBuyWriteConfirm.value;
+  await updateProfitTradeConfigToggle("longBuyAllowRealExecution", nextEnabled);
+  if (!configToggleBusy.value && !longBuyWriteConfirmError.value) {
+    longBuyWriteConfirm.value = null;
   }
 }
 
@@ -1069,11 +1476,11 @@ async function updateProtection(
   action: "add" | "remove",
   kind: "asset" | "marketHashName" | "steamId",
   value: string | null | undefined,
-): Promise<void> {
+): Promise<boolean> {
   const normalizedValue = String(value || "").trim();
   if (!normalizedValue) {
     message.value = "没有可保护的值";
-    return;
+    return false;
   }
   message.value = "";
   try {
@@ -1086,9 +1493,11 @@ async function updateProtection(
     const actionLabel = action === "add" ? "加入保护" : "移出保护";
     message.value = `${normalizedValue} 已${actionLabel}`;
     await loadDashboard();
+    return true;
   } catch (error) {
     apiOnline.value = false;
     message.value = `保护名单更新失败：${error instanceof Error ? error.message : String(error)}`;
+    return false;
   }
 }
 
@@ -1098,12 +1507,25 @@ async function addManualProtectedAsset(): Promise<void> {
 }
 
 async function addManualProtectedMarketHashName(): Promise<void> {
-  await updateProtection("add", "marketHashName", manualProtectedMarketHashName.value);
+  if (!manualProtectedMarketHashName.value) {
+    protectionError.value = "请先输入中文名或英文名，并从搜索结果中选择准确饰品。";
+    return;
+  }
+  const added = await updateProtection("add", "marketHashName", manualProtectedMarketHashName.value);
+  if (!added) return;
   manualProtectedMarketHashName.value = "";
+  protectionItemQuery.value = "";
+  protectionItemSuggestions.value = [];
+  protectionItemSearchOpen.value = false;
 }
 
 async function addManualProtectedSteamId(): Promise<void> {
-  await updateProtection("add", "steamId", manualProtectedSteamId.value);
+  if (!manualProtectedSteamId.value) {
+    protectionError.value = "请先选择一个当前已导入的 Steam 账号。";
+    return;
+  }
+  const added = await updateProtection("add", "steamId", manualProtectedSteamId.value);
+  if (!added) return;
   manualProtectedSteamId.value = "";
 }
 
@@ -1145,11 +1567,20 @@ function restoreLastRun(): void {
 onMounted(() => {
   restoreLastRun();
   void loadDashboard();
+  countdownTimer = setInterval(() => {
+    countdownNow.value = Date.now();
+  }, 1000);
+  runtimeScheduleTimer = setInterval(() => {
+    void refreshRuntimeSchedule();
+  }, 5000);
   window.addEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 
 onUnmounted(() => {
   if (manualItemSearchTimer) clearTimeout(manualItemSearchTimer);
+  if (protectionItemSearchTimer) clearTimeout(protectionItemSearchTimer);
+  if (countdownTimer) clearInterval(countdownTimer);
+  if (runtimeScheduleTimer) clearInterval(runtimeScheduleTimer);
   window.removeEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 </script>
@@ -1168,6 +1599,9 @@ onUnmounted(() => {
         <button class="secondary-button" type="button" @click="loadDashboard">
           刷新
         </button>
+        <button class="secondary-button" type="button" :disabled="profitCycleRunning" @click="runOnce">
+          {{ profitCycleRunning ? "本轮执行中…" : "执行一轮" }}
+        </button>
         <button class="secondary-button" type="button" @click="scanOpportunities">
           扫描机会
         </button>
@@ -1177,19 +1611,8 @@ onUnmounted(() => {
         <button class="secondary-button" type="button" @click="sendDailyReport">
           发送日报
         </button>
-        <button class="primary-button" type="button" :disabled="runtimeBusy" @click="runtimeConfirmEnabled = !autoRunEnabled">
-          {{ autoRunEnabled ? "关闭执行器" : "开启执行器" }}
-        </button>
-        <button
-          class="secondary-button"
-          :class="{ active: dashboard.config.allowRepriceExecution }"
-          type="button"
-          @click="toggleRepriceExecution"
-        >
-          {{ dashboard.config.allowRepriceExecution ? "禁止仅C5改价" : "仅允许C5改价" }}
-        </button>
-        <button class="secondary-button danger-button" type="button" @click="toggleRealExecution">
-          {{ dashboard.config.allowRealExecution ? "禁止真实执行" : "允许真实执行" }}
+        <button class="primary-button" type="button" :disabled="runtimeBusy" @click="openRuntimeConfirm">
+          {{ autoRunEnabled ? `关闭10分钟循环 ${autoRunCountdown}` : "开启10分钟循环" }}
         </button>
       </div>
     </header>
@@ -1234,12 +1657,24 @@ onUnmounted(() => {
         <span>真实执行</span>
         <strong>{{ realExecutionLabel }}</strong>
       </article>
+      <article
+        class="execution-status-item"
+        :class="{
+          online: longBuyRemoteWritesEnabled,
+          observe: longBuyObservationMode,
+          offline: !dashboard.config.longBuyEnabled,
+        }"
+      >
+        <span>长期求购</span>
+        <strong>{{ longBuyExecutionLabel }}</strong>
+        <small>{{ longBuyExecutionDetail }}</small>
+      </article>
       <article class="execution-status-item" :class="{ online: autoRunEnabled }">
         <span>后端 Worker</span>
         <strong>{{ autoRunStatusLabel }}</strong>
       </article>
       <article class="execution-status-item">
-        <span>下一次执行</span>
+        <span>下一次10分钟轮次</span>
         <strong>{{ nextAutoRunLabel }}</strong>
       </article>
       <article class="execution-status-item wide">
@@ -1248,19 +1683,175 @@ onUnmounted(() => {
       </article>
     </section>
 
-    <div v-if="runtimeConfirmEnabled !== null" class="runtime-confirm-backdrop" @click.self="runtimeConfirmEnabled = null">
+    <ProfitTradeLongBuyStrategyPanel
+      :config="dashboard.config"
+      :active-order-count="dashboard.summary.longBuyActiveOrders ?? 0"
+      :updating-key="configToggleBusy ?? (runtimeBusy ? 'enabled' : null)"
+      @toggle="requestLongBuyConfigToggle"
+    />
+
+    <div v-if="profitCycleRunning" class="profit-cycle-running" role="status" aria-live="polite">
+      <span class="cycle-spinner" aria-hidden="true"></span>
+      <div><strong>Profit Trade 本轮正在执行</strong><p>正在推进 C5 售出同步、全量候选扫描、Steam orderbook 评估和 ROI 观察池更新；完成后页面会自动刷新。</p></div>
+    </div>
+
+    <div v-if="runtimeConfirmEnabled !== null" class="runtime-confirm-backdrop" @click.self="closeRuntimeConfirm">
       <section class="runtime-confirm-dialog" role="dialog" aria-modal="true">
         <span><FolioIcon :name="runtimeConfirmEnabled ? 'shield' : 'warning'" :size="22" /></span>
-        <h2>{{ runtimeConfirmEnabled ? "开启 Profit Trade 执行器" : "关闭 Profit Trade 执行器" }}</h2>
-        <p v-if="runtimeConfirmEnabled">后端会先通过共享 Cookie 门禁。全部账号 Cookie 有效后，才开放新机会、新锁 A 和新买 B。</p>
-        <p v-else>关闭后停止新机会、新锁 A 和新买 B；已有 Steam 终态确认、已买 B 后续 C5 上架、售出同步、安全改价和收益结算仍会继续，并可能产生真实写操作。</p>
-        <div><button class="secondary-button" type="button" @click="runtimeConfirmEnabled = null">取消</button><button class="primary-button" type="button" :disabled="runtimeBusy" @click="toggleEnabled">{{ runtimeBusy ? "提交中…" : "确认" }}</button></div>
+        <h2>{{ runtimeConfirmEnabled ? "开启 Profit Trade 10分钟循环" : "关闭 Profit Trade 10分钟循环" }}</h2>
+        <p v-if="runtimeConfirmEnabled && dashboard.runtime?.migrationHold">当前仍处于迁移保护，后端会拒绝开启。请先完成执行器迁移确认。</p>
+        <p v-else-if="runtimeConfirmEnabled">后端会先通过共享 Cookie 门禁；门禁通过后立即运行第一轮，之后每 10 分钟运行一次。全部账号 Cookie 有效后，才开放新机会、新锁 A 和新买 B。</p>
+        <p v-else>关闭后停止后续 10 分钟轮次、新机会、新锁 A 和新买 B；已有 Steam 终态确认、已买 B 后续 C5 上架、售出同步、安全改价和收益结算仍会继续，并可能产生真实写操作。</p>
+        <p v-if="runtimeConfirmError" class="runtime-confirm-error" role="alert">{{ runtimeConfirmError }}</p>
+        <div><button class="secondary-button" type="button" :disabled="runtimeBusy" @click="closeRuntimeConfirm">取消</button><button class="primary-button" type="button" :disabled="runtimeBusy" @click="toggleEnabled">{{ runtimeBusy ? "提交中…" : "确认" }}</button></div>
+      </section>
+    </div>
+
+    <div v-if="longBuyWriteConfirm !== null" class="runtime-confirm-backdrop" @click.self="closeLongBuyWriteConfirm">
+      <section class="runtime-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="long-buy-write-confirm-title">
+        <span><FolioIcon :name="longBuyWriteConfirm ? 'shield' : 'warning'" :size="22" /></span>
+        <h2 id="long-buy-write-confirm-title">{{ longBuyWriteConfirm ? "开启长期 Steam 写入" : "关闭长期 Steam 写入" }}</h2>
+        <p v-if="longBuyWriteConfirm">开启后，只有四项许可与全部风控同时满足时，程序才可以新建、撤销或安全重建 Steam 长期求购；交叉盘口的保守冻结规则仍然有效。</p>
+        <p v-else>关闭后不再新建、撤销或改价 Steam 长期求购；已有订单不会被撤掉，系统仍会安全核对其真实成交。</p>
+        <p v-if="longBuyWriteConfirmError" class="runtime-confirm-error" role="alert">{{ longBuyWriteConfirmError }}</p>
+        <div>
+          <button class="secondary-button" type="button" :disabled="Boolean(configToggleBusy)" @click="closeLongBuyWriteConfirm">取消</button>
+          <button class="primary-button" type="button" :disabled="Boolean(configToggleBusy)" @click="confirmLongBuyWriteToggle">{{ configToggleBusy ? "提交中…" : "确认" }}</button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="protectionListOpen" class="protection-modal-backdrop" @click.self="closeProtectionList">
+      <section class="protection-modal" role="dialog" aria-modal="true" aria-labelledby="protection-list-title">
+        <header class="protection-modal-header">
+          <div>
+            <span>PROFIT TRADE PROTECTION</span>
+            <h2 id="protection-list-title">保护列表</h2>
+            <p>受保护资产、品类和账号不会进入 Profit Trade 自动执行。</p>
+          </div>
+          <button class="modal-close-button" type="button" aria-label="关闭保护列表" @click="closeProtectionList">×</button>
+        </header>
+
+        <div class="protection-editor-grid">
+          <form class="protection-form" @submit.prevent="addManualProtectedAsset">
+            <label for="protected-asset-id">固定保护资产</label>
+            <div class="protection-input-row">
+              <input id="protected-asset-id" v-model.trim="manualProtectedAssetId" type="text" autocomplete="off" placeholder="assetId">
+              <button class="mini-action protect-action" type="submit">加入</button>
+            </div>
+          </form>
+          <form class="protection-form" @submit.prevent="addManualProtectedMarketHashName">
+            <label for="protected-market-hash-name">固定保护品类</label>
+            <div class="protection-input-row protection-search-row">
+              <div class="manual-item-search">
+                <FolioIcon name="scan" :size="17" />
+                <input
+                  id="protected-market-hash-name"
+                  v-model="protectionItemQuery"
+                  type="text"
+                  autocomplete="off"
+                  placeholder="输入中文名或英文名搜索"
+                  @input="onProtectionItemInput"
+                  @focus="searchProtectionItems(false)"
+                >
+                <em v-if="protectionItemSearchBusy">搜索中…</em>
+                <div v-if="protectionItemSearchOpen" class="manual-item-suggestions">
+                  <button
+                    v-for="item in protectionItemSuggestions"
+                    :key="item.marketHashName"
+                    type="button"
+                    @click="chooseProtectionItem(item)"
+                  >
+                    <strong>{{ item.name }}</strong>
+                    <small>{{ item.marketHashName }}</small>
+                  </button>
+                  <button
+                    v-if="protectionItemHasMore"
+                    class="catalog-load-more"
+                    type="button"
+                    :disabled="protectionItemSearchBusy"
+                    @click="searchProtectionItems(true)"
+                  >
+                    {{ protectionItemSearchBusy ? "加载中…" : "加载更多结果" }}
+                  </button>
+                  <p v-if="!protectionItemSearchBusy && protectionItemSuggestions.length === 0">没有匹配结果，请换一部分名称再试</p>
+                </div>
+              </div>
+              <button class="mini-action protect-action" type="submit" :disabled="!manualProtectedMarketHashName">加入</button>
+            </div>
+            <small v-if="manualProtectedMarketHashName" class="protection-selected-value">已选择：{{ manualProtectedMarketHashName }}</small>
+          </form>
+          <form class="protection-form" @submit.prevent="addManualProtectedSteamId">
+            <label for="protected-steam-id">固定保护账号</label>
+            <div class="protection-input-row">
+              <select id="protected-steam-id" v-model="manualProtectedSteamId">
+                <option value="">选择当前已导入账号</option>
+                <option
+                  v-for="account in manualEntryAccounts"
+                  :key="account.accountId"
+                  :value="account.steamId || ''"
+                  :disabled="!account.steamId"
+                >
+                  {{ account.name }} · {{ account.steamId || "未配置SteamID" }}
+                </option>
+              </select>
+              <button class="mini-action protect-action" type="submit" :disabled="!manualProtectedSteamId">加入</button>
+            </div>
+          </form>
+        </div>
+
+        <p v-if="protectionError" class="protection-error" role="alert">{{ protectionError }}</p>
+
+        <div class="protection-modal-groups">
+          <section class="protection-modal-group protected-kinds">
+            <header><strong>保护品类</strong><span>{{ protectedNameCount }}</span></header>
+            <div class="protected-kind-list">
+              <button
+                v-for="item in protectedNamePreview"
+                :key="item.marketHashName"
+                class="protected-kind-row"
+                type="button"
+                title="点击移出保护"
+                @click="updateProtection('remove', 'marketHashName', item.marketHashName)"
+              >
+                <span><strong>{{ item.name }}</strong><small>{{ item.marketHashName }}</small></span>
+                <em>移出</em>
+              </button>
+              <small v-if="protectedNameCount === 0" class="protection-empty">暂无保护品类</small>
+            </div>
+          </section>
+          <section class="protection-modal-group">
+            <header><strong>保护资产</strong><span>{{ protectedAssetCount }}</span></header>
+            <button v-for="assetId in protectedAssetPreview" :key="assetId" class="protection-chip" type="button" @click="updateProtection('remove', 'asset', assetId)">{{ assetId }}</button>
+            <small v-if="protectedAssetCount === 0" class="protection-empty">暂无保护资产</small>
+          </section>
+          <section class="protection-modal-group">
+            <header><strong>保护账号</strong><span>{{ protectedSteamCount }}</span></header>
+            <button
+              v-for="account in protectedSteamPreview"
+              :key="account.steamId"
+              class="protected-kind-row"
+              type="button"
+              title="点击移出保护"
+              @click="updateProtection('remove', 'steamId', account.steamId)"
+            >
+              <span><strong>{{ account.name }}</strong><small>{{ account.steamId }}</small></span>
+              <em>移出</em>
+            </button>
+            <small v-if="protectedSteamCount === 0" class="protection-empty">暂无保护账号</small>
+          </section>
+        </div>
+        <p class="protection-modal-hint">点击名单中的项目可以移出保护；品类以英文 marketHashName 作为真实执行键，中文名只用于辨认。</p>
       </section>
     </div>
 
     <p v-if="message" class="inline-status">{{ message }}</p>
 
-    <ProfitTradeRoiWatch />
+    <ProfitTradeRoiWatch
+      :running="profitCycleRunning"
+      :executor-enabled="autoRunEnabled"
+      :allow-real-execution="dashboard.config.allowRealExecution"
+    />
 
     <section class="profit-layout">
       <article class="panel profit-settings">
@@ -1407,87 +1998,13 @@ onUnmounted(() => {
             暂未读取到本地 Steam 账号，不能保存账号保留余额。
           </p>
         </form>
-        <div class="protection-panel">
-          <h3>保护名单</h3>
-          <form class="protection-form" @submit.prevent="addManualProtectedAsset">
-            <label for="protected-asset-id">固定保护资产</label>
-            <div class="protection-input-row">
-              <input
-                id="protected-asset-id"
-                v-model.trim="manualProtectedAssetId"
-                type="text"
-                autocomplete="off"
-                placeholder="assetId"
-              >
-              <button class="mini-action protect-action" type="submit">加入</button>
-            </div>
-          </form>
-          <form class="protection-form" @submit.prevent="addManualProtectedMarketHashName">
-            <label for="protected-market-hash-name">固定保护品类</label>
-            <div class="protection-input-row">
-              <input
-                id="protected-market-hash-name"
-                v-model.trim="manualProtectedMarketHashName"
-                type="text"
-                autocomplete="off"
-                placeholder="market_hash_name"
-              >
-              <button class="mini-action protect-action" type="submit">加入</button>
-            </div>
-          </form>
-          <form class="protection-form" @submit.prevent="addManualProtectedSteamId">
-            <label for="protected-steam-id">固定保护账号</label>
-            <div class="protection-input-row">
-              <input
-                id="protected-steam-id"
-                v-model.trim="manualProtectedSteamId"
-                type="text"
-                autocomplete="off"
-                placeholder="SteamId64"
-              >
-              <button class="mini-action protect-action" type="submit">加入</button>
-            </div>
-          </form>
-          <div class="protection-group">
-            <span>资产 assetId</span>
-            <button
-              v-for="assetId in protectedAssetPreview"
-              :key="assetId"
-              class="protection-chip"
-              type="button"
-              @click="updateProtection('remove', 'asset', assetId)"
-            >
-              {{ assetId }}
-            </button>
-            <small v-if="protectedAssetCount === 0">暂无</small>
+        <div class="protection-panel protection-summary-panel">
+          <div>
+            <span>固定保护</span>
+            <h3>保护列表</h3>
+            <p>{{ protectedNameCount }} 个品类 · {{ protectedAssetCount }} 个资产 · {{ protectedSteamCount }} 个账号</p>
           </div>
-          <div class="protection-group">
-            <span>整类饰品</span>
-            <button
-              v-for="marketHashName in protectedNamePreview"
-              :key="marketHashName"
-              class="protection-chip"
-              type="button"
-              @click="updateProtection('remove', 'marketHashName', marketHashName)"
-            >
-              {{ marketHashName }}
-            </button>
-            <small v-if="protectedNameCount === 0">暂无</small>
-          </div>
-          <div class="protection-group">
-            <span>Steam账号</span>
-            <button
-              v-for="steamId in protectedSteamPreview"
-              :key="steamId"
-              class="protection-chip"
-              type="button"
-              @click="updateProtection('remove', 'steamId', steamId)"
-            >
-              {{ steamId }}
-            </button>
-            <small v-if="protectedSteamCount === 0">暂无</small>
-          </div>
-          <small class="protection-hint">点击名单里的标签可以移出保护。</small>
+          <button class="secondary-button" type="button" @click="openProtectionList">查看与管理</button>
         </div>
       </article>
 
@@ -1495,7 +2012,7 @@ onUnmounted(() => {
         <article v-if="loading" class="panel empty-state">加载中...</article>
         <article v-else-if="activeTrades.length === 0" class="panel empty-state">
           <strong>暂无进行中做T流水</strong>
-          <span v-if="dashboard.listingsCircuit.isBlocking">Steam listings 冷却期间不会创建新的买 B 流水或锁定 A；观察区仍会继续更新行情。</span>
+          <span v-if="listingsCooling">Steam listings 冷却期间不查询指定卖单；新机会仍会重新校验行情，并可改走安全求购。</span>
           <span v-else>候选、买入、上架和人工处理中的流水会显示在这里。</span>
           <small v-if="dashboard.config.allowRealExecution">真实执行当前已允许，点“执行一轮”可能触发真实买入或上架。</small>
           <small v-else>真实执行当前禁止，可以先安全扫描和查看候选。</small>
@@ -1598,9 +2115,9 @@ onUnmounted(() => {
             </div>
           </div>
 
-            <p v-if="dashboard.listingsCircuit.isBlocking && trade.stepIndex <= 2" class="trade-circuit-note">
-              Steam listings 冷却中；这笔买入前流水会安全停止并释放 A，不会发送新的购买请求。下次探测
-              {{ formatDateTime(dashboard.listingsCircuit.nextProbeAt || dashboard.listingsCircuit.cooldownUntil) }}。
+            <p v-if="listingsCooling && trade.stepIndex <= 2" class="trade-circuit-note">
+              Steam listings 冷却中；这笔流水会重新读取 Steam orderbook 与 C5 行情，仍符合条件时改走安全求购。冷却结束
+              {{ formatDateTime(dashboard.listingsCircuit.cooldownUntil) }}，到期后自动恢复正常 listings 查询。
             </p>
 
             <div class="progress-track" aria-hidden="true">
@@ -1678,7 +2195,7 @@ onUnmounted(() => {
           <div class="panel-title-row">
             <h2>已完结收益（按 Steam 购买时间）</h2>
             <span class="soft-label">
-              {{ completedFilteredTrades.length }} / {{ completedTrades.length }} 笔
+              {{ completedFilteredTrades.length }} / {{ completedAllSummary.count }} 笔
             </span>
             <button class="primary-button" type="button" @click="openCreateManualRecord">
               新增手工流水
@@ -1693,7 +2210,7 @@ onUnmounted(() => {
               <input
                 v-model="completedDateFrom"
                 type="date"
-                @change="resetCompletedPage"
+                @change="loadCompletedTrades"
               >
             </label>
             <label>
@@ -1701,7 +2218,7 @@ onUnmounted(() => {
               <input
                 v-model="completedDateTo"
                 type="date"
-                @change="resetCompletedPage"
+                @change="loadCompletedTrades"
               >
             </label>
             <div class="completed-filter-actions">
@@ -1832,7 +2349,7 @@ onUnmounted(() => {
                 autocomplete="off"
                 placeholder="输入中文名或英文名，例如：次时代、M4A4"
                 @input="onManualItemInput"
-                @focus="searchManualItems"
+                @focus="searchManualItems(false)"
               >
               <em v-if="manualItemSearchBusy">搜索中…</em>
               <div v-if="manualItemSearchOpen" class="manual-item-suggestions">
@@ -1844,6 +2361,15 @@ onUnmounted(() => {
                 >
                   <strong>{{ item.name }}</strong>
                   <small>{{ item.marketHashName }}</small>
+                </button>
+                <button
+                  v-if="manualItemHasMore"
+                  class="catalog-load-more"
+                  type="button"
+                  :disabled="manualItemSearchBusy"
+                  @click="searchManualItems(true)"
+                >
+                  {{ manualItemSearchBusy ? "加载中…" : "加载更多结果" }}
                 </button>
                 <p v-if="!manualItemSearchBusy && manualItemSuggestions.length === 0">没有匹配结果，请换一部分名称再试</p>
               </div>
@@ -2058,6 +2584,12 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 
+.execution-status-item small {
+  color: #687487;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .execution-status-item.online {
   border-color: #91c7ad;
   background: #f1fbf6;
@@ -2066,6 +2598,11 @@ onUnmounted(() => {
 .execution-status-item.offline {
   border-color: #e0a39a;
   background: #fff6f4;
+}
+
+.execution-status-item.observe {
+  border-color: #dfc77e;
+  background: #fff9e9;
 }
 
 .execution-status-item.running {
@@ -2359,7 +2896,8 @@ onUnmounted(() => {
   gap: 6px;
 }
 
-.protection-input-row input {
+.protection-input-row input,
+.protection-input-row select {
   min-width: 0;
   min-height: 32px;
   border: 1px solid #c9d5df;
@@ -2368,12 +2906,34 @@ onUnmounted(() => {
   color: #172033;
   background: #ffffff;
   font-size: 13px;
+  font-family: inherit;
 }
 
-.protection-input-row input:focus {
+.protection-input-row input:focus,
+.protection-input-row select:focus {
   border-color: #2f6b52;
   outline: none;
   box-shadow: 0 0 0 2px rgba(47, 107, 82, 0.12);
+}
+
+.protection-search-row .manual-item-search {
+  min-width: 0;
+}
+
+.protection-selected-value {
+  color: var(--folio-green);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.protection-error {
+  margin: 12px 0 0;
+  border: 1px solid #ebceca;
+  border-radius: 11px;
+  padding: 9px 11px;
+  color: var(--folio-red);
+  background: var(--folio-red-soft);
+  font-size: 12px;
 }
 
 .protection-group {
@@ -2407,6 +2967,211 @@ onUnmounted(() => {
   background: #f8fafc;
   text-align: left;
   overflow-wrap: anywhere;
+}
+
+.protection-summary-panel {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border: 1px solid var(--folio-line);
+  border-radius: 14px;
+  padding: 13px;
+  background: var(--folio-surface-soft);
+}
+
+.protection-summary-panel > div {
+  display: grid;
+  gap: 3px;
+}
+
+.protection-summary-panel > div > span {
+  color: var(--folio-green);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+
+.protection-summary-panel p {
+  margin: 0;
+  color: var(--folio-muted);
+  font-size: 11px;
+}
+
+.protection-modal-backdrop {
+  position: fixed;
+  z-index: 1150;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(20, 34, 27, .46);
+  backdrop-filter: blur(4px);
+}
+
+.protection-modal {
+  width: min(980px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid var(--folio-line);
+  border-radius: 20px;
+  padding: 22px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(19, 49, 36, .22);
+}
+
+.protection-modal-header,
+.protection-modal-group > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.protection-modal-header span {
+  color: var(--folio-green);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .09em;
+}
+
+.protection-modal-header h2 {
+  margin: 4px 0 0;
+  color: var(--folio-ink);
+  font-size: 23px;
+}
+
+.protection-modal-header p,
+.protection-modal-hint {
+  margin: 5px 0 0;
+  color: var(--folio-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.modal-close-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--folio-line);
+  border-radius: 10px;
+  color: var(--folio-muted);
+  background: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.protection-editor-grid {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.protection-modal-groups {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(210px, 1fr);
+  gap: 12px;
+}
+
+.protection-modal-group {
+  min-height: 110px;
+  max-height: 390px;
+  overflow: auto;
+  border: 1px solid var(--folio-line);
+  border-radius: 14px;
+  padding: 12px;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  background: var(--folio-surface-soft);
+}
+
+.protection-modal-group.protected-kinds {
+  grid-row: span 2;
+}
+
+.protection-modal-group > header {
+  position: sticky;
+  z-index: 2;
+  top: -12px;
+  margin: -12px -12px 2px;
+  padding: 12px;
+  background: var(--folio-surface-soft);
+}
+
+.protection-modal-group > header strong {
+  color: var(--folio-ink);
+  font-size: 13px;
+}
+
+.protection-modal-group > header span {
+  min-width: 25px;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: var(--folio-green-dark);
+  background: var(--folio-green-soft);
+  font-size: 10px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.protected-kind-list {
+  display: grid;
+  gap: 6px;
+}
+
+.protected-kind-row {
+  width: 100%;
+  border: 1px solid var(--folio-line);
+  border-radius: 11px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  background: #fff;
+  cursor: pointer;
+}
+
+.protected-kind-row:hover {
+  border-color: #c7d8cc;
+  background: var(--folio-green-soft);
+}
+
+.protected-kind-row > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.protected-kind-row strong {
+  color: var(--folio-ink);
+  font-size: 12px;
+}
+
+.protected-kind-row small {
+  color: var(--folio-muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.protected-kind-row em {
+  flex: none;
+  color: var(--folio-red);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.protection-empty {
+  padding: 12px;
+  color: var(--folio-muted);
+  text-align: center;
+}
+
+.protection-modal-hint {
+  margin-top: 12px;
 }
 
 .trade-stack {
@@ -2869,7 +3634,7 @@ onUnmounted(() => {
 
 /* FOLIO compact data theme */
 .api-pill,.status-badge,.roi-badge,.roi-basis-badge,.type-badge{min-height:28px;border-color:var(--folio-line);color:var(--folio-muted);background:var(--folio-surface-soft);font-size:11px;font-weight:700}.api-pill.online,.roi-badge{border-color:#c8dfd0;color:var(--folio-green);background:var(--folio-green-soft)}.api-pill.offline,.status-badge.attention{border-color:#ebceca;color:var(--folio-red);background:var(--folio-red-soft)}.type-badge.warning{border-color:#e7d9bb;color:var(--folio-amber);background:var(--folio-amber-soft)}.secondary-button.active{border-color:#bfd7c7;color:var(--folio-green-dark);background:var(--folio-green-soft)}
-.profit-summary-grid,.execution-status-grid{gap:8px}.profit-metric,.execution-status-item{border-color:var(--folio-line);border-radius:14px;background:#fff;box-shadow:var(--folio-shadow)}.profit-metric{min-height:88px;padding:14px}.profit-metric span,.execution-status-item span{color:var(--folio-muted);font-size:11px}.profit-metric strong,.execution-status-item strong{color:var(--folio-ink)}.profit-metric.danger,.execution-status-item.offline{border-color:#ebceca;background:var(--folio-red-soft)}.execution-status-item.online{border-color:#c8dfd0;background:#f3f8f5}.execution-status-item.running{border-color:#cad9df;background:var(--folio-blue-soft)}
+.profit-summary-grid,.execution-status-grid{gap:8px}.profit-metric,.execution-status-item{border-color:var(--folio-line);border-radius:14px;background:#fff;box-shadow:var(--folio-shadow)}.profit-metric{min-height:88px;padding:14px}.profit-metric span,.execution-status-item span,.execution-status-item small{color:var(--folio-muted);font-size:11px}.profit-metric strong,.execution-status-item strong{color:var(--folio-ink)}.profit-metric.danger,.execution-status-item.offline{border-color:#ebceca;background:var(--folio-red-soft)}.execution-status-item.online{border-color:#c8dfd0;background:#f3f8f5}.execution-status-item.observe{border-color:#e7d9bb;background:var(--folio-amber-soft)}.execution-status-item.running{border-color:#cad9df;background:var(--folio-blue-soft)}
 .inline-status,.trade-warning{border-color:#e7d9bb;border-radius:11px;color:#805b1c;background:var(--folio-amber-soft)}.profit-layout{gap:14px}.settings-list div,.protection-panel{border-color:#edf0ed}.settings-list dt,.budget-form label,.protection-form label,.protection-group>span,.trade-no,.trade-hash,.trade-detail-grid dt,.completed-filter-note,.completed-toolbar label,.completed-profit-summary dt,.completed-profit-summary small,.completed-trade-row span,.completed-trade-row dt{color:var(--folio-muted)}.settings-list dd,.formula-panel strong,.protection-panel h3,.trade-head h2,.trade-detail-grid dd,.completed-profit-summary dd,.completed-trade-row strong,.completed-trade-row dd{color:var(--folio-ink)}
 .formula-panel,.trade-detail-grid dl,.completed-profit-summary div{border-color:#e8ece7;border-radius:12px;background:var(--folio-surface-soft)}.formula-panel small{color:var(--folio-red)}.status-toggle{border-color:var(--folio-line);border-radius:12px;color:var(--folio-muted);background:var(--folio-surface-soft)}.status-toggle strong{color:var(--folio-red)}.status-toggle.active{border-color:#bfd7c7;color:var(--folio-green);background:var(--folio-green-soft)}.status-toggle.active strong{color:var(--folio-green)}
 .protection-input-row input,.manual-settle-row input,.completed-toolbar input{border-color:#dfe4df;border-radius:11px;color:var(--folio-ink);background:#fff}.protection-input-row input:focus,.manual-settle-row input:focus,.completed-toolbar input:focus{border-color:var(--folio-green);box-shadow:0 0 0 3px rgba(35,106,76,.1)}.protection-group{border-color:var(--folio-line);border-radius:12px}.protection-chip{border-color:var(--folio-line);border-radius:10px;color:var(--folio-ink);background:var(--folio-surface-soft)}.protection-chip:hover{border-color:#c7d8cc;background:var(--folio-green-soft)}
@@ -2880,5 +3645,7 @@ onUnmounted(() => {
 .trade-stack,.completed-zone{min-width:0}.completed-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.completed-profit-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.completed-filter-actions,.completed-pagination{justify-content:flex-start}
 .panel-title-row{gap:12px}.panel-title-row>.primary-button{margin-left:auto}.completed-card-head{display:flex;align-items:center;gap:8px;min-width:0}.completed-card-head strong{min-width:0}.manual-record-badge{display:inline-flex;align-items:center;min-height:24px;padding:3px 8px;border:1px solid #bfd7c7;border-radius:999px;color:var(--folio-green);background:var(--folio-green-soft);font-size:11px;font-weight:700;white-space:nowrap}.manual-record-badge.corrected{border-color:#d9d2b9;color:#725f20;background:#fbf7e8}.completed-edit-button{position:absolute;top:12px;right:12px;width:32px;height:32px;padding:0;border:1px solid var(--folio-line);border-radius:9px;display:grid;place-items:center;color:var(--folio-muted);background:#fff;box-shadow:0 2px 8px rgba(28,48,37,.06);cursor:pointer;transition:border-color .15s ease,color .15s ease,background .15s ease}.completed-edit-button:hover{border-color:#bfd7c7;color:var(--folio-green-dark);background:var(--folio-green-soft)}
 .manual-record-backdrop{position:fixed;z-index:1000;inset:0;display:grid;place-items:center;padding:24px;background:rgba(20,34,27,.46);backdrop-filter:blur(4px)}.manual-record-modal{width:min(920px,calc(100vw - 48px));max-height:calc(100vh - 48px);overflow:auto;border:1px solid var(--folio-line);border-radius:20px;padding:22px;background:#fff;box-shadow:0 24px 70px rgba(19,49,36,.22)}.manual-record-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.manual-record-header span{color:var(--folio-green);font-size:11px;font-weight:800;letter-spacing:.08em}.manual-record-header h2{margin:4px 0 0;color:var(--folio-ink);font-size:22px}.manual-record-notice{margin:16px 0;padding:11px 13px;border:1px solid #cfe0d4;border-radius:12px;color:#315d48;background:var(--folio-green-soft);font-size:13px;line-height:1.6}.manual-record-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.manual-record-form label{display:grid;gap:7px;color:var(--folio-muted);font-size:12px;font-weight:700}.manual-record-form .wide-field{grid-column:1/-1}.manual-record-form input,.manual-record-form select,.manual-record-form textarea{width:100%;box-sizing:border-box;border:1px solid #dfe4df;border-radius:11px;padding:10px 11px;color:var(--folio-ink);background:#fff;font:inherit;outline:none}.manual-record-form textarea{resize:vertical;line-height:1.5}.manual-record-form input:focus,.manual-record-form select:focus,.manual-record-form textarea:focus{border-color:var(--folio-green);box-shadow:0 0 0 3px rgba(35,106,76,.1)}.manual-item-search{position:relative}.manual-item-search>svg{position:absolute;z-index:2;left:12px;top:12px;color:var(--folio-green)}.manual-item-search>input{padding-left:39px;padding-right:82px}.manual-item-search>em{position:absolute;right:12px;top:11px;color:var(--folio-muted);font-size:11px;font-style:normal;font-weight:600}.manual-item-suggestions{position:absolute;z-index:30;top:46px;left:0;right:0;max-height:290px;overflow:auto;border:1px solid var(--folio-line);border-radius:12px;padding:6px;background:#fff;box-shadow:0 18px 50px rgba(25,48,36,.14)}.manual-item-suggestions button{width:100%;padding:9px 10px;border:0;border-radius:8px;display:grid;gap:3px;text-align:left;background:#fff;cursor:pointer}.manual-item-suggestions button:hover{background:var(--folio-green-soft)}.manual-item-suggestions strong{color:var(--folio-ink);font-size:13px}.manual-item-suggestions small{color:var(--folio-muted);font-size:11px}.manual-item-suggestions p{margin:5px;padding:10px;color:var(--folio-muted);font-size:12px;font-weight:500}.manual-item-selected{color:var(--folio-green)!important;font-size:11px;font-weight:600}.manual-account-picker{margin:0;border:1px solid var(--folio-line);border-radius:14px;padding:13px;background:var(--folio-surface-soft)}.manual-account-picker legend{padding:0 5px;color:var(--folio-muted);font-size:12px;font-weight:700}.manual-account-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.manual-account-heading>div{display:grid;gap:2px}.manual-account-heading span{color:var(--folio-green);font-size:10px;font-weight:800;letter-spacing:.06em}.manual-account-heading strong{color:var(--folio-ink);font-size:14px}.manual-account-unrecorded{border:1px solid var(--folio-line);border-radius:9px;padding:6px 10px;color:var(--folio-muted);background:#fff;font-size:11px;font-weight:700}.manual-account-unrecorded.selected{border-color:#9fc5ad;color:var(--folio-green-dark);background:var(--folio-green-soft)}.manual-account-cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.manual-account-cards>button{position:relative;min-width:0;min-height:92px;padding:10px;border:1px solid #dce5de;border-radius:11px;display:grid;grid-template-columns:32px minmax(0,1fr);grid-template-rows:auto auto;gap:6px 8px;text-align:left;background:#fff;cursor:pointer}.manual-account-cards>button:hover{border-color:#9fc5ad;background:#fbfdfb}.manual-account-cards>button.selected{border-color:var(--folio-green);background:#f1f7f3;box-shadow:inset 0 0 0 1px var(--folio-green)}.manual-account-cards i{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;color:#fff;background:#718d7d;font-size:10px;font-style:normal;font-weight:800}.manual-account-cards>button.selected i{background:var(--folio-green)}.manual-account-cards span{min-width:0;display:grid;gap:2px}.manual-account-cards strong,.manual-account-cards small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.manual-account-cards strong{color:var(--folio-ink);font-size:11px}.manual-account-cards small{color:var(--folio-muted);font-size:9px}.manual-account-cards b{grid-column:1/3;justify-self:end;color:var(--folio-green);font-size:9px}.manual-account-cards>p{grid-column:1/-1;margin:4px;padding:10px;color:var(--folio-red);font-size:12px;text-align:center}.manual-record-preview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:2px 0 0}.manual-record-preview div{border:1px solid var(--folio-line);border-radius:12px;padding:11px;background:var(--folio-surface-soft)}.manual-record-preview dt{color:var(--folio-muted);font-size:11px}.manual-record-preview dd{margin:4px 0 0;color:var(--folio-ink);font-size:16px;font-weight:800}.manual-record-preview dd.positive{color:var(--folio-green)}.manual-record-preview dd.negative{color:var(--folio-red)}.manual-record-error{margin:0;padding:10px 12px;border:1px solid #ebceca;border-radius:11px;color:var(--folio-red);background:var(--folio-red-soft);font-size:13px}.manual-record-actions{display:flex;justify-content:flex-end;gap:10px;padding-top:4px}
-.runtime-confirm-backdrop{position:fixed;z-index:1100;inset:0;display:grid;place-items:center;padding:24px;background:rgba(20,34,27,.46);backdrop-filter:blur(4px)}.runtime-confirm-dialog{width:min(470px,calc(100vw - 48px));border:1px solid var(--folio-line);border-radius:19px;padding:24px;background:#fff;box-shadow:0 24px 70px rgba(19,49,36,.22)}.runtime-confirm-dialog>span{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;color:var(--folio-green);background:var(--folio-green-soft)}.runtime-confirm-dialog h2{margin:15px 0 8px;color:var(--folio-ink);font-size:21px}.runtime-confirm-dialog p{margin:0;color:var(--folio-muted);font-size:13px;line-height:1.7}.runtime-confirm-dialog>div{display:flex;justify-content:flex-end;gap:9px;margin-top:19px}
+.runtime-confirm-backdrop{position:fixed;z-index:1100;inset:0;display:grid;place-items:center;padding:24px;background:rgba(20,34,27,.46);backdrop-filter:blur(4px)}.runtime-confirm-dialog{width:min(470px,calc(100vw - 48px));border:1px solid var(--folio-line);border-radius:19px;padding:24px;background:#fff;box-shadow:0 24px 70px rgba(19,49,36,.22)}.runtime-confirm-dialog>span{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;color:var(--folio-green);background:var(--folio-green-soft)}.runtime-confirm-dialog h2{margin:15px 0 8px;color:var(--folio-ink);font-size:21px}.runtime-confirm-dialog p{margin:0;color:var(--folio-muted);font-size:13px;line-height:1.7}.runtime-confirm-dialog .runtime-confirm-error{margin-top:13px;padding:10px 12px;border:1px solid #ebceca;border-radius:10px;color:var(--folio-red);background:var(--folio-red-soft);font-weight:700}.runtime-confirm-dialog>div{display:flex;justify-content:flex-end;gap:9px;margin-top:19px}
+.profit-cycle-running{display:flex;align-items:center;gap:13px;border:1px solid #acd0b9;border-radius:14px;padding:13px 16px;color:var(--folio-green-dark);background:linear-gradient(135deg,#eef7f1,#f8fbf8);box-shadow:0 8px 24px rgba(35,106,76,.07)}.profit-cycle-running>div{display:grid;gap:3px}.profit-cycle-running strong{font-size:13px}.profit-cycle-running p{margin:0;color:var(--folio-muted);font-size:11px;line-height:1.55}.cycle-spinner{width:20px;height:20px;border:2px solid #bad7c5;border-top-color:var(--folio-green);border-radius:50%;animation:profit-cycle-spin .8s linear infinite}@keyframes profit-cycle-spin{to{transform:rotate(360deg)}}
+.manual-item-suggestions .catalog-load-more{display:block;margin-top:4px;border-top:1px solid var(--folio-line);color:var(--folio-green);text-align:center;font-weight:750}.manual-item-suggestions .catalog-load-more:disabled{opacity:.55}
 </style>

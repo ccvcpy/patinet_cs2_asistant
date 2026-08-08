@@ -1,0 +1,21 @@
+{
+  "generatedAt": "2026-07-22T10:48:43.712608+00:00",
+  "execute": false,
+  "candidate": null,
+  "seller": null,
+  "observers": [],
+  "price": null,
+  "listingId": null,
+  "sampleCount": 0,
+  "timingSeconds": {
+    "submitToRemoteActive": null,
+    "submitToOrderbookVisible": null,
+    "cancelToRemoteRemoved": null,
+    "cancelToOrderbookAbsent": null
+  },
+  "targetEverVisible": false,
+  "errors": [
+    "400 Client Error: Bad Request for url: https://steamcommunity.com/inventory/76561199119018953/730/2?l=english&count=5000"
+  ],
+  "aborted": true
+}

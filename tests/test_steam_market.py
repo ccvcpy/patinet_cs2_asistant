@@ -8,6 +8,7 @@ import requests
 
 from cs2_assistant.accounts import Account
 from cs2_assistant.clients.steam_market import SteamListing, SteamMarketClient, SteamMarketError
+from cs2_assistant.services.steam_request_scheduler import SteamRequestGuardRejected
 
 
 class _FakeResponse:
@@ -76,8 +77,75 @@ class SteamMarketClientTests(unittest.TestCase):
             client.wallet_balance(safety_terminal=True)
             client.my_listings(safety_terminal=True)
             client.market_history(safety_terminal=True)
+            client.order_book(
+                app_id=730,
+                market_hash_name="Revolution Case",
+                safety_terminal=True,
+            )
 
-        self.assertEqual([0, 0, 0], [int(row["priority"]) for row in scheduled])
+        self.assertEqual([0, 0, 0, 0], [int(row["priority"]) for row in scheduled])
+
+    def test_active_listing_safety_read_is_scheduled_as_p0(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="guadao",
+        )
+
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {
+                "success": True,
+                "total_count": 0,
+                "num_active_listings": 0,
+                "listings": {},
+                "listings_to_confirm": [],
+            }
+        )
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            self.assertEqual([], client.list_active_listings(safety_terminal=True))
+
+        self.assertEqual([0], [int(row["priority"]) for row in scheduled])
+
+    def test_execution_wallet_read_is_p1_but_safety_read_stays_p0(self) -> None:
+        """The hot buy path may bypass observation, never terminal safety."""
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {},
+            text=(
+                'g_rgWalletInfo = {"wallet_balance":0,'
+                '"wallet_delayed_balance":0,"wallet_currency":23};'
+            ),
+        )
+
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.wallet_balance(execution_priority=True)
+            client.wallet_balance(safety_terminal=True, execution_priority=True)
+
+        self.assertEqual([1, 0], [int(row["priority"]) for row in scheduled])
 
     def test_real_action_methods_forward_last_moment_execution_guard(self) -> None:
         scheduled: list[dict[str, object]] = []
@@ -157,6 +225,35 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertEqual(1, len(scheduled))
         self.assertIs(scheduled[0]["bounded_retry"], True)
         self.assertIs(scheduled[0]["quiet_before"], True)
+
+    def test_search_listings_can_surface_first_400_without_internal_relogin(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+        relogin_calls = 0
+
+        def fake_relogin() -> bool:
+            nonlocal relogin_calls
+            relogin_calls += 1
+            return True
+
+        client._try_account_relogin = fake_relogin  # type: ignore[method-assign]
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": False},
+            status_code=400,
+        )
+
+        with self.assertRaises(SteamMarketError) as caught:
+            client.search_listings(
+                app_id=730,
+                market_hash_name="USP-S | Tropical Breeze (Factory New)",
+                auth_retry=False,
+            )
+
+        self.assertEqual(400, caught.exception.status_code)
+        self.assertEqual(0, relogin_calls)
 
     def test_request_telemetry_captures_429_without_changing_relogin_or_retry(self) -> None:
         events: list[dict[str, object]] = []
@@ -242,12 +339,17 @@ class SteamMarketClientTests(unittest.TestCase):
             "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
             return_value=CaptureScheduler(),
         ):
-            client.order_book(app_id=730, market_hash_name="Kilowatt Case")
+            client.order_book(
+                app_id=730,
+                market_hash_name="Kilowatt Case",
+                admission_timeout_seconds=90.0,
+            )
 
         self.assertEqual(1, len(scheduled))
         metadata = scheduled[0]["metadata"]
         self.assertIsInstance(metadata, dict)
         self.assertEqual("Kilowatt Case", metadata["marketHashName"])  # type: ignore[index]
+        self.assertEqual(90.0, scheduled[0]["timeout_seconds"])
 
     def test_get_transport_retry_count_remains_three_with_telemetry(self) -> None:
         events: list[dict[str, object]] = []
@@ -337,6 +439,131 @@ class SteamMarketClientTests(unittest.TestCase):
             [("cid[]", (None, "conf-good")), ("ck[]", (None, "nonce-good"))],
             captured["files"],
         )
+
+    def test_list_active_listings_without_count_reads_every_remote_page(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        starts: list[tuple[int, int]] = []
+
+        def fake_my_listings(
+            *,
+            start: int = 0,
+            count: int = 100,
+            safety_terminal: bool = False,
+        ) -> dict[str, object]:
+            del safety_terminal
+            starts.append((start, count))
+            end = min(105, start + count)
+            return {
+                "success": True,
+                "total_count": 105,
+                "num_active_listings": 105,
+                "listings": {
+                    f"listing-{index}": {
+                        "asset": {
+                            "id": f"asset-{index}",
+                            "market_hash_name": f"Test Item {index}",
+                        },
+                        "price": 100 + index,
+                    }
+                    for index in range(start, end)
+                },
+                "listings_to_confirm": [],
+            }
+
+        client.my_listings = fake_my_listings  # type: ignore[method-assign]
+
+        listings = client.list_active_listings()
+
+        self.assertEqual([(0, 100), (100, 100)], starts)
+        self.assertEqual(105, len(listings))
+        self.assertEqual("listing-104", listings[-1].listing_id)
+        self.assertEqual("asset-104", listings[-1].asset_id)
+
+    def test_list_active_listings_explicit_count_remains_a_total_result_limit(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        calls: list[tuple[int, int]] = []
+
+        def fake_my_listings(
+            *,
+            start: int = 0,
+            count: int = 100,
+            safety_terminal: bool = False,
+        ) -> dict[str, object]:
+            del safety_terminal
+            calls.append((start, count))
+            end = min(105, start + count)
+            return {
+                "success": True,
+                "total_count": 105,
+                "num_active_listings": 105,
+                "listings": {
+                    f"listing-{index}": {
+                        "asset": {"id": f"asset-{index}"},
+                        "price": 100,
+                    }
+                    for index in range(start, end)
+                },
+                "listings_to_confirm": [],
+            }
+
+        client.my_listings = fake_my_listings  # type: ignore[method-assign]
+
+        self.assertEqual(20, len(client.list_active_listings(count=20)))
+        self.assertEqual([(0, 20)], calls)
+        calls.clear()
+        self.assertEqual(100, len(client.list_active_listings(count=100)))
+        self.assertEqual([(0, 100)], calls)
+        calls.clear()
+        self.assertEqual(105, len(client.list_active_listings(count=200)))
+        self.assertEqual([(0, 100), (100, 100)], calls)
+
+    def test_my_listings_snapshot_keeps_positive_rows_when_second_page_stays_unreadable(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        starts: list[int] = []
+
+        def fake_my_listings(
+            *,
+            start: int = 0,
+            count: int = 100,
+            safety_terminal: bool = False,
+        ) -> dict[str, object]:
+            del count, safety_terminal
+            starts.append(start)
+            if start >= 100:
+                raise SteamMarketError("second page unavailable")
+            return {
+                "success": True,
+                "total_count": 105,
+                "num_active_listings": 105,
+                "listings": {
+                    f"listing-{index}": {
+                        "asset": {"id": f"asset-{index}"},
+                        "price": 100,
+                    }
+                    for index in range(100)
+                },
+                "listings_to_confirm": [],
+            }
+
+        client.my_listings = fake_my_listings  # type: ignore[method-assign]
+
+        snapshot = client.my_listings_snapshot()
+
+        self.assertEqual([0, 100, 0, 100], starts)
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(100, snapshot.actual_active_count)
+        self.assertEqual(105, snapshot.official_active_count)
+        self.assertEqual("listing-99", snapshot.active_listings[-1].listing_id)
+        self.assertIn("second page unavailable", str(snapshot.error))
 
     def test_create_buy_order_confirms_exact_purchase_confirmation_and_reposts(self) -> None:
         client = SteamMarketClient(
@@ -475,6 +702,51 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertEqual("session-1", captured["data"]["sessionid"])  # type: ignore[index]
         self.assertEqual("buy-order-1", captured["data"]["buy_orderid"])  # type: ignore[index]
         self.assertFalse(captured["allow_redirects"])
+
+    def test_cancel_buy_order_execution_guard_blocks_http(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        post_called = False
+
+        def fake_post(*_: object, **__: object) -> _FakeResponse:
+            nonlocal post_called
+            post_called = True
+            return _FakeResponse({"success": 1})
+
+        client._session.post = fake_post  # type: ignore[method-assign]
+
+        with self.assertRaises(SteamRequestGuardRejected):
+            client.cancel_buy_order(
+                buy_order_id="buy-order-1",
+                execution_guard=lambda: False,
+            )
+
+        self.assertFalse(post_called)
+
+    def test_remove_listing_execution_guard_blocks_http(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        post_called = False
+
+        def fake_post(*_: object, **__: object) -> _FakeResponse:
+            nonlocal post_called
+            post_called = True
+            return _FakeResponse({"success": 1})
+
+        client._session.post = fake_post  # type: ignore[method-assign]
+
+        with self.assertRaises(SteamRequestGuardRejected):
+            client.remove_listing(
+                "listing-1",
+                execution_guard=lambda: False,
+            )
+
+        self.assertFalse(post_called)
+
     def test_search_listings_uses_new_market_route_action_and_normalizes_listing_ids(self) -> None:
         client = SteamMarketClient(
             cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
@@ -848,6 +1120,43 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertEqual("session-new", client.sessionid)
         self.assertEqual(2, len(request_headers))
 
+    def test_observation_client_does_not_relogin_after_auth_failure(self) -> None:
+        """A P3 observation must surface a 401 instead of refreshing account cookies."""
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-old; steamLoginSecure=76561198000000000%7C%7Ctoken-old",
+            steam_id64="76561198000000000",
+            allow_account_relogin=False,
+        )
+        client.account_id = "main"
+        client._account_store = object()
+        request_count = 0
+
+        def fake_request(
+            method: str,
+            url: str,
+            *,
+            params: dict[str, object] | None = None,
+            data: dict[str, object] | None = None,
+            files: object | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: int | None = None,
+        ) -> _FakeResponse:
+            nonlocal request_count
+            request_count += 1
+            return _FakeResponse({"success": False}, status_code=401)
+
+        client._session.request = fake_request  # type: ignore[method-assign]
+        with patch(
+            "cs2_assistant.clients.steam_market.try_steam_auto_relogin"
+        ) as relogin_mock:
+            with self.assertRaises(SteamMarketError) as raised:
+                client._request("GET", "/market/mylistings", params={"start": 0, "count": 1})
+
+        self.assertEqual(401, raised.exception.status_code)
+        self.assertEqual(0, relogin_mock.call_count)
+        self.assertEqual(1, request_count)
+
     def test_find_sale_receipt_reads_received_amount_from_market_history(self) -> None:
         client = SteamMarketClient(
             cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
@@ -962,12 +1271,12 @@ class SteamMarketClientTests(unittest.TestCase):
         )
         starts: list[int] = []
 
-        def fake_history(*, start: int = 0, count: int = 100) -> dict[str, object]:
+        def fake_history(*, start: int = 0, count: int = 500) -> dict[str, object]:
             starts.append(start)
-            if start < 200:
+            if start < 1000:
                 return {
                     "success": True,
-                    "total_count": 300,
+                    "total_count": 1500,
                     "events": [
                         {
                             "listingid": f"unrelated-{start}",
@@ -979,7 +1288,7 @@ class SteamMarketClientTests(unittest.TestCase):
                 }
             return {
                 "success": True,
-                "total_count": 300,
+                "total_count": 1500,
                 "events": [
                     {
                         "listingid": "listing-page-3",
@@ -1016,10 +1325,119 @@ class SteamMarketClientTests(unittest.TestCase):
             max_pages=3,
         )
 
-        self.assertEqual([0, 100, 200], starts)
+        self.assertEqual([0, 500, 1000], starts)
         self.assertEqual({"operation-1"}, set(receipts))
         self.assertEqual("purchase-page-3", receipts["operation-1"]["purchaseId"])
         self.assertEqual(1.56, receipts["operation-1"]["receivedAmount"])
+
+    def test_sale_receipt_lookup_uses_500_rows_and_preserves_receipts_before_later_error(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        calls: list[tuple[int, int]] = []
+
+        def fake_history(*, start: int = 0, count: int = 100) -> dict[str, object]:
+            calls.append((start, count))
+            if start >= 500:
+                raise SteamMarketError(
+                    "Steam history HTTP 429",
+                    status_code=429,
+                    retry_after="60",
+                )
+            return {
+                "success": True,
+                "total_count": 1000,
+                "events": [
+                    {
+                        "listingid": "listing-found",
+                        "purchaseid": "purchase-found",
+                        "event_type": 3,
+                        "time_event": 1783512933,
+                    }
+                ],
+                "purchases": {
+                    "listing-found_purchase-found": {
+                        "asset": {"id": "asset-found"},
+                        "time_sold": 1783512000,
+                        "received_amount": 156,
+                        "received_currencyid": "2023",
+                    }
+                },
+            }
+
+        client.market_history = fake_history  # type: ignore[method-assign]
+
+        result = client.find_sale_receipts_for_targets_with_coverage(
+            [
+                {
+                    "key": "found",
+                    "listingId": "listing-found",
+                    "assetId": "asset-found",
+                },
+                {
+                    "key": "missing",
+                    "listingId": "listing-missing",
+                    "assetId": "asset-missing",
+                },
+            ],
+            max_pages=2,
+        )
+
+        self.assertEqual([(0, 500), (500, 500)], calls)
+        self.assertEqual({"found"}, set(result.receipts))
+        self.assertEqual("purchase-found", result.receipts["found"]["purchaseId"])
+        self.assertFalse(result.coverage_complete)
+        self.assertFalse(result.lookup_succeeded)
+        self.assertIn("HTTP 429", str(result.error))
+
+    def test_find_inventory_asset_ids_uses_official_pagination_and_exact_asset_id(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        calls: list[dict[str, object]] = []
+
+        def fake_request(
+            method: str,
+            path: str,
+            *,
+            params: dict[str, object] | None = None,
+            **_kwargs: object,
+        ) -> _FakeResponse:
+            calls.append({"method": method, "path": path, "params": dict(params or {})})
+            if params and params.get("start_assetid"):
+                return _FakeResponse(
+                    {
+                        "success": 1,
+                        "assets": [{"assetid": "asset-target"}],
+                        "more_items": True,
+                        "last_assetid": "asset-target",
+                    }
+                )
+            return _FakeResponse(
+                {
+                    "success": 1,
+                    "assets": [{"assetid": "unrelated-asset"}],
+                    "more_items": True,
+                    "last_assetid": "unrelated-asset",
+                }
+            )
+
+        client._request = fake_request  # type: ignore[method-assign]
+
+        result = client.find_inventory_asset_ids(["asset-target"])
+
+        self.assertEqual(
+            "/inventory/76561198000000000/730/2",
+            calls[0]["path"],
+        )
+        self.assertEqual("schinese", calls[0]["params"]["l"])
+        self.assertNotIn("start_assetid", calls[0]["params"])
+        self.assertEqual("unrelated-asset", calls[1]["params"]["start_assetid"])
+        self.assertEqual(frozenset({"asset-target"}), result.found_asset_ids)
+        self.assertFalse(result.coverage_complete)
+        self.assertEqual(2, result.pages_scanned)
 
     def test_find_purchase_receipt_matches_item_time_and_paid_total(self) -> None:
         client = SteamMarketClient(
@@ -1094,6 +1512,280 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertEqual("old-asset-1", receipt["assetId"])
         self.assertEqual("new-asset-1", receipt["newAssetId"])
         self.assertEqual("Desert Eagle | Mulberry (Factory New)", receipt["marketHashName"])
+
+    def test_find_purchase_receipt_accepts_paid_total_below_buy_order_maximum(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+
+        def fake_request(
+            method: str,
+            path: str,
+            *,
+            params: dict[str, object] | None = None,
+            data: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            _allow_retry: bool = True,
+        ) -> _FakeResponse:
+            return _FakeResponse(
+                {
+                    "success": True,
+                    "total_count": 1,
+                    "events": [
+                        {
+                            "listingid": "listing-cheaper-fill",
+                            "purchaseid": "purchase-cheaper-fill",
+                            "event_type": 4,
+                            "time_event": 1784810085,
+                        }
+                    ],
+                    "purchases": {
+                        "listing-cheaper-fill_purchase-cheaper-fill": {
+                            "paid_amount": 821,
+                            "paid_fee": 123,
+                            "currencyid": "2023",
+                            "asset": {
+                                "appid": 730,
+                                "contextid": "16",
+                                "id": "old-sticker",
+                                "new_id": "new-sticker",
+                                "new_contextid": "2",
+                            },
+                        }
+                    },
+                    "assets": {
+                        "730": {
+                            "2": {
+                                "old-sticker": {
+                                    "id": "old-sticker",
+                                    "market_hash_name": "Sticker | Hot Pepper (Holo)",
+                                }
+                            }
+                        }
+                    },
+                }
+            )
+
+        client._request = fake_request  # type: ignore[method-assign]
+
+        receipt = client.find_purchase_receipt(
+            market_hash_name="Sticker | Hot Pepper (Holo)",
+            maximum_total=9.77,
+            earliest_time=1784810000,
+        )
+
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(9.44, receipt["paidTotal"])
+        self.assertEqual("new-sticker", receipt["newAssetId"])
+
+    def test_find_purchase_receipts_normalizes_cny_history_and_returns_multiple_fills(
+        self,
+    ) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        market_name = "AK-47 | Redline (Field-Tested)"
+        payload = {
+            "success": True,
+            "total_count": 2,
+            "events": [
+                {
+                    "listingid": "listing-1",
+                    "purchaseid": "purchase-1",
+                    "event_type": 4,
+                    "time_event": 1785200500,
+                },
+                {
+                    "listingid": "listing-2",
+                    "purchaseid": "purchase-2",
+                    "event_type": 4,
+                    "time_event": 1785200600,
+                },
+            ],
+            "purchases": {
+                "listing-1_purchase-1": {
+                    "paid_amount": 10000,
+                    "paid_fee": 1500,
+                    "currencyid": "2023",
+                    "asset": {
+                        "appid": 730,
+                        "id": "old-1",
+                        "new_id": "new-1",
+                    },
+                },
+                "listing-2_purchase-2": {
+                    "paid_amount": 10100,
+                    "paid_fee": 1515,
+                    "currencyid": "2023",
+                    "asset": {
+                        "appid": 730,
+                        "id": "old-2",
+                        "new_id": "new-2",
+                    },
+                },
+            },
+            "assets": {
+                "730": {
+                    "2": {
+                        "old-1": {
+                            "id": "old-1",
+                            "market_hash_name": market_name,
+                        },
+                        "old-2": {
+                            "id": "old-2",
+                            "market_hash_name": market_name,
+                        },
+                    }
+                }
+            },
+        }
+        client.market_history = (  # type: ignore[method-assign]
+            lambda **_: payload
+        )
+
+        result = client.find_purchase_receipts_for_targets_with_coverage(
+            [
+                {
+                    "key": "order-1",
+                    "marketHashName": market_name,
+                    "maximumTotal": 120.0,
+                    "earliestTime": 1785200000,
+                    "maxReceipts": 2,
+                }
+            ]
+        )
+
+        self.assertTrue(result.coverage_complete)
+        self.assertEqual(2, len(result.receipts["order-1"]))
+        self.assertEqual(
+            [23, 23],
+            [row["currencyId"] for row in result.receipts["order-1"]],
+        )
+        self.assertEqual(
+            ["purchase-1", "purchase-2"],
+            [row["purchaseId"] for row in result.receipts["order-1"]],
+        )
+
+    def test_find_purchase_receipts_rejects_non_cny_and_over_maximum(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        market_name = "AK-47 | Redline (Field-Tested)"
+        payload = {
+            "success": True,
+            "total_count": 2,
+            "events": [
+                {
+                    "listingid": "listing-usd",
+                    "purchaseid": "purchase-usd",
+                    "event_type": 4,
+                    "time_event": 1785200500,
+                },
+                {
+                    "listingid": "listing-over",
+                    "purchaseid": "purchase-over",
+                    "event_type": 4,
+                    "time_event": 1785200600,
+                },
+            ],
+            "purchases": {
+                "listing-usd_purchase-usd": {
+                    "paid_amount": 9000,
+                    "paid_fee": 1000,
+                    "currencyid": "2001",
+                    "market_hash_name": market_name,
+                },
+                "listing-over_purchase-over": {
+                    "paid_amount": 12001,
+                    "paid_fee": 0,
+                    "currencyid": "2023",
+                    "market_hash_name": market_name,
+                },
+            },
+            "assets": {},
+        }
+        client.market_history = (  # type: ignore[method-assign]
+            lambda **_: payload
+        )
+
+        result = client.find_purchase_receipts_for_targets_with_coverage(
+            [
+                {
+                    "key": "order-1",
+                    "marketHashName": market_name,
+                    "maximumTotal": 120.0,
+                    "earliestTime": 1785200000,
+                    "maxReceipts": 2,
+                }
+            ]
+        )
+
+        self.assertTrue(result.coverage_complete)
+        self.assertEqual((), result.receipts["order-1"])
+
+    def test_find_purchase_receipts_reports_incomplete_bounded_history(self) -> None:
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+        )
+        market_name = "AK-47 | Redline (Field-Tested)"
+
+        def market_history(*, start: int, **_: object) -> dict:
+            index = int(start)
+            return {
+                "success": True,
+                "total_count": 2,
+                "events": [
+                    {
+                        "listingid": f"listing-{index}",
+                        "purchaseid": f"purchase-{index}",
+                        "event_type": 4,
+                        "time_event": 1785200500 + index,
+                    }
+                ],
+                "purchases": {
+                    f"listing-{index}_purchase-{index}": {
+                        "paid_amount": 10000,
+                        "paid_fee": 1500,
+                        "currencyid": "2023",
+                        "market_hash_name": market_name,
+                    }
+                },
+                "assets": {},
+            }
+
+        client.market_history = market_history  # type: ignore[method-assign]
+        targets = [
+            {
+                "key": "order-1",
+                "marketHashName": market_name,
+                "maximumTotal": 120.0,
+                "earliestTime": 1785200000,
+                "maxReceipts": 2,
+            }
+        ]
+
+        bounded = client.find_purchase_receipts_for_targets_with_coverage(
+            targets,
+            count=1,
+            max_pages=1,
+        )
+        complete = client.find_purchase_receipts_for_targets_with_coverage(
+            targets,
+            count=1,
+            max_pages=2,
+        )
+
+        self.assertFalse(bounded.coverage_complete)
+        self.assertEqual(1, bounded.pages_scanned)
+        self.assertEqual(1, len(bounded.receipts["order-1"]))
+        self.assertTrue(complete.coverage_complete)
+        self.assertEqual(2, complete.pages_scanned)
+        self.assertEqual(2, len(complete.receipts["order-1"]))
 
 
 if __name__ == "__main__":

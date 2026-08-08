@@ -11,6 +11,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cs2_assistant.services.market import MarketService, calculate_t_yield_rate
+from cs2_assistant.services.pricing import choose_orderbook_price
 
 
 class FakeSteamDTClient:
@@ -127,6 +128,25 @@ class FakeSteamMarketClient:
         return payload
 
 
+class RecordingBatchSteamMarketClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float | None]] = []
+
+    def order_book(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        admission_timeout_seconds: float | None = None,
+    ) -> dict:
+        self.calls.append((market_hash_name, admission_timeout_seconds))
+        return {
+            "success": 1,
+            "eCurrency": 23,
+            "rgCompactSellOrders": [[100, 1], [200, 4]],
+        }
+
+
 class FakeC5PriceBatchFailureClient:
     def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict:
         raise RuntimeError("c5 ssl eof")
@@ -136,6 +156,37 @@ class FakeC5PriceBatchFailureClient:
 
 
 class MarketServiceTestCase(unittest.TestCase):
+    def test_guadao_batch_uses_one_orderbook_snapshot_with_custom_wall_pricing(self) -> None:
+        steam = RecordingBatchSteamMarketClient()
+        service = MarketService(
+            steam_market_client=steam,
+            include_c5_purchase_prices=False,
+            fallback_max_workers=1,
+            steam_orderbook_admission_timeout_seconds=90.0,
+            steam_orderbook_price_resolver=lambda _name, payload: choose_orderbook_price(
+                payload,
+                wall_min_count=5,
+                price_offset=-0.01,
+                min_price=0.01,
+            ),
+        )
+
+        states = service.refresh_items(
+            [
+                {"market_hash_name": "Case A", "name_cn": "箱子 A"},
+                {"market_hash_name": "Case B", "name_cn": "箱子 B"},
+            ]
+        )
+
+        self.assertEqual(
+            [("Case A", 90.0), ("Case B", 90.0)],
+            steam.calls,
+        )
+        self.assertEqual([2.01, 2.01], [round(state.steam_sell_price or 0, 2) for state in states])
+        self.assertTrue(
+            all(state.raw_json.get("steam_orderbook_snapshot") for state in states)
+        )
+
     def test_c5_bid_price_comes_from_c5_official_api(self) -> None:
         service = MarketService(
             steamdt_client=FakeSteamDTClient(),

@@ -80,6 +80,7 @@ from cs2_assistant.services.guadao_case_monitor import (
     save_case_ratio_snapshots,
     write_case_ratio_report_files,
 )
+from cs2_assistant.services.case_monitor_runtime import CaseMonitorCliJob
 from cs2_assistant.services.profit_trade import (
     build_profit_trade_dashboard_payload,
     execute_profit_trade_buy,
@@ -1849,7 +1850,7 @@ def _build_pool_inventory_report(
 
 
 def _print_pool_inventory_report(report: dict[str, Any]) -> None:
-    scope_label = "广义武器箱" if report["scope"] == "case_only" else "非广义武器箱"
+    scope_label = "广义箱子（CSGO-API crates）" if report["scope"] == "crates_only" else "非广义箱子"
     print("C5 库存冷却查询")
     print(
         f"库存源: {report['source']} | C5账号 {report['accountCount']} 个 | "
@@ -3202,43 +3203,63 @@ def _print_case_monitor_collect_summary(snapshots: list[Any], *, saved_count: in
 
 def cmd_pool_case_monitor_collect(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
-    config = load_strategy_config(settings)
-    if not settings.c5_api_key:
-        raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY")
+    with CaseMonitorCliJob(
+        settings,
+        job_type="collect",
+        parameters={
+            "marketHashNames": _case_monitor_items_arg(args),
+            "limit": args.limit,
+            "maxWorkers": args.max_workers,
+        },
+    ) as job:
+        config = load_strategy_config(settings)
+        if not settings.c5_api_key:
+            raise RuntimeError("缺少 C5GAME_API_KEY / C5_API_KEY")
 
-    db = _open_db(settings)
-    try:
-        targets = list_case_monitor_targets(
-            db,
-            market_hash_names=_case_monitor_items_arg(args),
-            limit=args.limit,
+        db = _open_db(settings)
+        try:
+            targets = list_case_monitor_targets(
+                db,
+                market_hash_names=_case_monitor_items_arg(args),
+                limit=args.limit,
+            )
+        finally:
+            db.close()
+        if not targets:
+            print("没有找到可监控的箱子。请先运行 catalog sync-csgo-api --category crates 或传 --item。")
+            job.set_result({"savedCount": 0, "targetCount": 0, "statusCounts": {}})
+            return 0
+
+        steam_clients = build_steam_clients_for_monitor(settings)
+        c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
+        print(
+            f"开始采集箱子挂刀比 | 箱子 {len(targets)} 个 | "
+            f"Steam cookie {len(steam_clients)} 个 | C5=c5api | Steam=official orderbook"
         )
-    finally:
-        db.close()
-    if not targets:
-        print("没有找到可监控的箱子。请先运行 catalog sync-csgo-api --category crates 或传 --item。")
-        return 0
-
-    steam_clients = build_steam_clients_for_monitor(settings)
-    c5_client = C5GameClient(settings.c5_api_key, settings.c5_base_url)
-    print(
-        f"开始采集箱子挂刀比 | 箱子 {len(targets)} 个 | "
-        f"Steam cookie {len(steam_clients)} 个 | C5=c5api | Steam=official orderbook"
-    )
-    snapshots = collect_case_ratio_snapshots(
-        settings=settings,
-        config=config,
-        targets=targets,
-        c5_client=c5_client,
-        steam_clients=steam_clients,
-        max_workers=args.max_workers,
-    )
-    db = _open_db(settings)
-    try:
-        saved_count = save_case_ratio_snapshots(db, snapshots)
-    finally:
-        db.close()
-    _print_case_monitor_collect_summary(snapshots, saved_count=saved_count)
+        snapshots = collect_case_ratio_snapshots(
+            settings=settings,
+            config=config,
+            targets=targets,
+            c5_client=c5_client,
+            steam_clients=steam_clients,
+            max_workers=args.max_workers,
+        )
+        db = _open_db(settings)
+        try:
+            saved_count = save_case_ratio_snapshots(db, snapshots)
+        finally:
+            db.close()
+        status_counts: dict[str, int] = {}
+        for snapshot in snapshots:
+            status_counts[snapshot.status] = status_counts.get(snapshot.status, 0) + 1
+        job.set_result(
+            {
+                "savedCount": saved_count,
+                "targetCount": len(targets),
+                "statusCounts": status_counts,
+            }
+        )
+        _print_case_monitor_collect_summary(snapshots, saved_count=saved_count)
     return 0
 
 
@@ -3350,50 +3371,70 @@ def _print_case_ratio_report(report: dict[str, Any], *, start_local: datetime, e
 
 def cmd_pool_case_monitor_report(args: argparse.Namespace) -> int:
     settings = _settings_from_args(args)
-    config = load_strategy_config(settings)
-    start_local, end_local = _case_report_boundaries_from_args(args)
-    db = _open_db(settings)
-    try:
-        report = build_case_ratio_report(
-            db,
-            start_utc=_to_utc_iso(start_local),
-            end_utc=_to_utc_iso(end_local),
-            market_hash_name=args.market_hash_name,
-            recommendation_crate_type=args.recommendation_type,
-            bucket_size=args.bucket_size,
-            expected_interval_minutes=args.expected_interval_minutes,
-            max_gap_minutes=args.max_gap_minutes,
-            top_n=args.top,
-        )
-    finally:
-        db.close()
-    if not args.no_refresh_liquidity:
-        steam_clients = build_steam_clients_for_monitor(settings)
-        if steam_clients:
-            report = enrich_case_ratio_report_with_steam_liquidity(
-                report,
-                settings=settings,
-                config=config,
-                steam_clients=steam_clients,
+    with CaseMonitorCliJob(
+        settings,
+        job_type="report",
+        parameters={
+            "hours": args.hours,
+            "dateFrom": args.date_from,
+            "dateTo": args.date_to,
+            "refreshLiquidity": not args.no_refresh_liquidity,
+            "allCrateTypes": args.recommendation_type == "all",
+        },
+    ) as job:
+        config = load_strategy_config(settings)
+        start_local, end_local = _case_report_boundaries_from_args(args)
+        db = _open_db(settings)
+        try:
+            report = build_case_ratio_report(
+                db,
+                start_utc=_to_utc_iso(start_local),
+                end_utc=_to_utc_iso(end_local),
+                market_hash_name=args.market_hash_name,
                 recommendation_crate_type=args.recommendation_type,
+                bucket_size=args.bucket_size,
+                expected_interval_minutes=args.expected_interval_minutes,
+                max_gap_minutes=args.max_gap_minutes,
                 top_n=args.top,
-                max_workers=args.liquidity_workers,
             )
+        finally:
+            db.close()
+        if not args.no_refresh_liquidity:
+            steam_clients = build_steam_clients_for_monitor(settings)
+            if steam_clients:
+                report = enrich_case_ratio_report_with_steam_liquidity(
+                    report,
+                    settings=settings,
+                    config=config,
+                    steam_clients=steam_clients,
+                    recommendation_crate_type=args.recommendation_type,
+                    top_n=args.top,
+                    max_workers=args.liquidity_workers,
+                )
+            else:
+                report["steamLiquidityStatus"] = "skipped_no_steam_client"
+
+        frontend_path = ensure_case_report_frontend_payload(report, _case_ratio_report_frontend_path())
+        output_dir = Path(args.output_dir) if args.output_dir else _case_ratio_report_output_dir(settings)
+        paths = write_case_ratio_report_files(report, output_dir)
+        job.set_result(
+            {
+                "generatedAt": report.get("generatedAt"),
+                "snapshotCount": report.get("snapshotCount"),
+                "itemCount": report.get("itemCount"),
+                "exportPaths": paths,
+                "webDataPath": str(frontend_path),
+            }
+        )
+
+        if args.dump_json:
+            _print_json(report)
         else:
-            report["steamLiquidityStatus"] = "skipped_no_steam_client"
-
-    frontend_path = ensure_case_report_frontend_payload(report, _case_ratio_report_frontend_path())
-    output_dir = Path(args.output_dir) if args.output_dir else _case_ratio_report_output_dir(settings)
-    paths = write_case_ratio_report_files(report, output_dir)
-
-    if args.dump_json:
-        _print_json(report)
-    else:
-        _print_case_ratio_report(report, start_local=start_local, end_local=end_local)
-        print("\n已生成报告文件:")
-        for label, path in paths.items():
-            print(f"- {label}: {path}")
-        print(f"- webData: {frontend_path}")
+            _print_case_ratio_report(report, start_local=start_local, end_local=end_local)
+            print("\n已生成报告文件:")
+            for label, path in paths.items():
+                print(f"- {label}: {path}")
+            print(f"- webData: {frontend_path}")
     return 0
 
 
@@ -3429,7 +3470,7 @@ def cmd_pool_config(args: argparse.Namespace) -> int:
         config.c5_settlement_factor = _prompt_float("C5 结算系数 (c5_settlement_factor)", config.c5_settlement_factor)
         config.balance_discount = _prompt_float("余额折扣率 (balance_discount)", config.balance_discount)
         config.guadao_max_listing_ratio = _prompt_float("挂刀阈值 listing_ratio ≤ (guadao_max_listing_ratio)", config.guadao_max_listing_ratio)
-        config.guadao_item_scope = _prompt_str("挂刀品类范围 case_only/non_case_only (guadao_item_scope)", config.guadao_item_scope)
+        config.guadao_item_scope = _prompt_str("挂刀品类范围 crates_only/non_case_only (guadao_item_scope)", config.guadao_item_scope)
         config.case_max_open_guadao_count = _prompt_int(
             "箱子 Steam 活跃挂单槽上限 (case_max_open_guadao_count)",
             config.case_max_open_guadao_count,
@@ -4061,8 +4102,6 @@ def cmd_profit_trade_config(args: argparse.Namespace) -> int:
         raise RuntimeError("--enable 和 --disable 不能同时使用")
     if args.allow_real_execution and args.disallow_real_execution:
         raise RuntimeError("--allow-real-execution 和 --disallow-real-execution 不能同时使用")
-    if args.allow_reprice_execution and args.disallow_reprice_execution:
-        raise RuntimeError("--allow-reprice-execution 和 --disallow-reprice-execution 不能同时使用")
     enabled_value = args.enable if (args.enable or args.disable) else None
     real_execution_value = (
         True
@@ -4071,19 +4110,11 @@ def cmd_profit_trade_config(args: argparse.Namespace) -> int:
         if args.disallow_real_execution
         else None
     )
-    reprice_execution_value = (
-        True
-        if args.allow_reprice_execution
-        else False
-        if args.disallow_reprice_execution
-        else None
-    )
-    if enabled_value is not None or real_execution_value is not None or reprice_execution_value is not None:
+    if enabled_value is not None or real_execution_value is not None:
         config = set_profit_trade_config(
             settings,
             enabled=enabled_value,
             allow_real_execution=real_execution_value,
-            allow_reprice_execution=reprice_execution_value,
         )
         write_profit_trade_dashboard_payload(settings)
     else:
@@ -4097,7 +4128,6 @@ def cmd_profit_trade_config(args: argparse.Namespace) -> int:
     print("搬砖做T配置:")
     print(f"  enabled:                  {payload['enabled']}")
     print(f"  allowRealExecution:       {payload['allowRealExecution']}")
-    print(f"  allowRepriceExecution:    {payload['allowRepriceExecution']}")
     print(f"  minRoi:                   {payload['minRoiPct']:.2f}%")
     print(f"  minItemValue:             CNY {payload['minItemValue']:.2f}")
     print(f"  maxBuyPerCycle:           {payload['maxBuyPerCycle']}")
@@ -4560,8 +4590,6 @@ def build_parser() -> argparse.ArgumentParser:
     profit_trade_config.add_argument("--disable", action="store_true", help="关闭 profitTrade 扫描/执行开关")
     profit_trade_config.add_argument("--allow-real-execution", action="store_true", help="允许真实 Steam 买入 / C5 上架")
     profit_trade_config.add_argument("--disallow-real-execution", action="store_true", help="禁止真实 Steam 买入 / C5 上架")
-    profit_trade_config.add_argument("--allow-reprice-execution", action="store_true", help="只允许已上架 C5 做T流水自动改价，不允许买B或新上架")
-    profit_trade_config.add_argument("--disallow-reprice-execution", action="store_true", help="禁止已上架 C5 做T流水自动改价")
     profit_trade_config.add_argument("--dump-json", action="store_true", help="输出 JSON")
     profit_trade_config.set_defaults(handler=cmd_profit_trade_config)
 
@@ -4671,7 +4699,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="查询 C5 API 全库存中符合 guadaoItemScope 的广义箱子可交易/冷却状态",
         description=(
             "直接读取 C5 API 的全部绑定 Steam 库存，按当前 guadaoItemScope 过滤。\n"
-            "case_only 会识别 CSGO-API crates，以及 Case/Capsule/Package/Container 等广义箱子。"
+            "crates_only 会识别 CSGO-API crates，包括 Case/Capsule/Package/Container 等广义箱子；旧 case_only 仅作兼容输入。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )

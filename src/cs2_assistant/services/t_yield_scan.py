@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cs2_assistant.accounts import AccountStore
 from cs2_assistant.accounts.steam_auth import try_steam_auto_relogin
@@ -15,6 +15,7 @@ from cs2_assistant.services.market import (
     DEFAULT_STEAM_BALANCE_DISCOUNT,
     MarketService,
 )
+from cs2_assistant.services.pricing import PricingDecision
 from cs2_assistant.utils import ensure_parent_dir, safe_float, utc_now_iso
 
 INVENTORY_FILTER_ALL = "all"
@@ -637,11 +638,18 @@ def build_market_service(
     *,
     include_c5_purchase_prices: bool,
     include_c5: bool = True,
+    steam_request_source: str = "notify",
+    refresh_steam_accounts: bool = True,
+    steam_orderbook_max_workers: int = 4,
+    steam_orderbook_admission_timeout_seconds: float | None = None,
+    steam_orderbook_price_resolver: (
+        Callable[[str, dict[str, Any]], PricingDecision | None] | None
+    ) = None,
 ) -> MarketService:
     store = AccountStore(PROJECT_ROOT / "config")
     usable_accounts = []
     for account in store.list_accounts():
-        if account.username and account.password:
+        if refresh_steam_accounts and account.username and account.password:
             ok, _, refreshed_account = try_steam_auto_relogin(store, account_id=account.id)
             if ok and refreshed_account is not None:
                 account = refreshed_account
@@ -658,7 +666,7 @@ def build_market_service(
                 device_id=account.device_id,
                 account_id=account.id,
                 base_url=settings.steam_market_base_url,
-                request_source="notify",
+                request_source=steam_request_source,
             )
             steam_market_client = candidate_client
             break
@@ -671,7 +679,7 @@ def build_market_service(
                 identity_secret=settings.steam_identity_secret,
                 device_id=settings.steam_device_id,
                 base_url=settings.steam_market_base_url,
-                request_source="notify",
+                request_source=steam_request_source,
             )
         except Exception:
             pass
@@ -688,6 +696,11 @@ def build_market_service(
         steam_market_client=steam_market_client,
         app_id=settings.app_id,
         include_c5_purchase_prices=include_c5_purchase_prices,
+        fallback_max_workers=max(1, int(steam_orderbook_max_workers)),
+        steam_orderbook_admission_timeout_seconds=(
+            steam_orderbook_admission_timeout_seconds
+        ),
+        steam_orderbook_price_resolver=steam_orderbook_price_resolver,
     )
 
 

@@ -18,6 +18,7 @@ from cs2_assistant.models import CatalogItem, StrategyConfig
 from cs2_assistant.services.guadao_case_monitor import (
     CaseMonitorTarget,
     _parse_price_history_liquidity,
+    _parse_price_history_time,
     build_case_ratio_report,
     collect_case_ratio_snapshots,
     list_case_monitor_targets,
@@ -88,6 +89,35 @@ class GuadaoCaseMonitorCollectTestCase(unittest.TestCase):
 
         self.assertEqual(17030, liquidity["steamVolume24h"])
         self.assertEqual(17030, liquidity["steamVolume7d"])
+        self.assertEqual("2026-06-18T15:00:00+00:00", liquidity["steamPriceHistoryLatestAt"])
+
+    def test_legacy_price_history_label_matches_market_beta_epoch_in_summer(self) -> None:
+        parsed = _parse_price_history_time("Jul 21 2026 20: +0")
+
+        self.assertEqual(datetime(2026, 7, 21, 19, 0, tzinfo=timezone.utc), parsed)
+
+    def test_legacy_price_history_label_matches_market_beta_epoch_in_winter(self) -> None:
+        parsed = _parse_price_history_time("Jan 15 2026 01: +0")
+
+        self.assertEqual(datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc), parsed)
+
+    def test_legacy_price_history_correction_is_stable_at_us_dst_boundaries(self) -> None:
+        cases = (
+            ("Mar 08 2026 01: +0", datetime(2026, 3, 8, 0, 0, tzinfo=timezone.utc)),
+            ("Mar 08 2026 03: +0", datetime(2026, 3, 8, 2, 0, tzinfo=timezone.utc)),
+            ("Nov 01 2026 01: +0", datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)),
+            ("Nov 01 2026 03: +0", datetime(2026, 11, 1, 2, 0, tzinfo=timezone.utc)),
+        )
+
+        for label, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(expected, _parse_price_history_time(label))
+
+    def test_price_history_unix_seconds_and_milliseconds_are_canonical_utc(self) -> None:
+        expected = datetime(2026, 7, 21, 19, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(expected, _parse_price_history_time(1784660400))
+        self.assertEqual(expected, _parse_price_history_time(1784660400000))
 
     def test_collect_uses_case_wall_offset_and_listing_ratio_formula(self) -> None:
         settings = Settings(c5_api_key="c5-token")

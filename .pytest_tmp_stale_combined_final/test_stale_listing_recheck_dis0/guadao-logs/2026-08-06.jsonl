@@ -1,0 +1,1 @@
+{"event_id":"gdlog_69570c9f63e24c81bd4b868cb56d89c2","timestamp_utc":"2026-08-06T18:49:18.454Z","sequence":1,"level":"ERROR","source":"guadao","provider":"local","component":"guadao_runtime","operation":"stale_listing_recheck","message":"挂刀到期任务执行失败","safe_context":{"taskKey":"stale_listing_recheck","error":"stale walk exploded"}}

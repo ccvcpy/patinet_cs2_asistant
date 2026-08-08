@@ -1,0 +1,20 @@
+{
+  "status": "dry_run",
+  "executed": false,
+  "account": "ropzx55x",
+  "marketHashName": "Glove Case",
+  "initialPriceCents": 21,
+  "higherPriceCents": 22,
+  "probeExplicitId": true,
+  "startedAt": "2026-07-23T15:34:07.439769+00:00",
+  "conclusion": "no Steam request sent",
+  "safety": {
+    "currencyId": 23,
+    "maxPriceCents": 100,
+    "sellAsset": false,
+    "touchC5": false
+  },
+  "observedExperimentOrderIds": [],
+  "errors": [],
+  "cleanupErrors": []
+}

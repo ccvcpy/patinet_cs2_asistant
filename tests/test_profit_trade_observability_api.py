@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,10 +22,13 @@ if str(SRC_DIR) not in sys.path:
 
 from cs2_assistant.config import Settings
 from cs2_assistant.db import Database
+from cs2_assistant.models import CatalogItem
+from cs2_assistant.services.strategy import load_strategy_config
 import cs2_assistant.services.web_api as web_api
 
 
 MARKET_HASH_NAME = "USP-S | Tropical Breeze (Factory New)"
+LOOPBACK_OPENER = build_opener(ProxyHandler({}))
 
 
 class OneRequestServer(HTTPServer):
@@ -45,6 +48,57 @@ class FakeLogger:
     pass
 
 
+class FakeRuntimeController:
+    """No-worker runtime used when a route test must not start background I/O."""
+
+    def __init__(self) -> None:
+        self.wake_calls = 0
+        self.manual_status_requests: list[str] = []
+        self.selection_refresh_calls = 0
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def wake(self) -> None:
+        self.wake_calls += 1
+
+    def profit_trade_manual_execution_status(self, request_id: str) -> dict:
+        self.manual_status_requests.append(request_id)
+        return {
+            "ok": True,
+            "requestId": request_id,
+            "taskKey": f"profit-manual:{request_id}",
+            "marketHashName": MARKET_HASH_NAME,
+            "name": "USP消音版 | 椰风花语（崭新出厂）",
+            "requestedQuantity": 1,
+            "status": "failed",
+            "terminal": True,
+            "summary": "一键执行失败：测试错误",
+            "error": "测试错误",
+            "counts": {"created": 1, "bought": 0, "listed": 0, "failed": 1},
+            "trades": [],
+        }
+
+    def profit_selection_watch_now(self) -> dict:
+        self.selection_refresh_calls += 1
+        return {
+            "ok": True,
+            "taskKey": "profit_selection_watch",
+            "queued": True,
+            "alreadyRunning": False,
+            "researchOnly": True,
+            "canExecute": False,
+        }
+
+
+class FakeCaseMonitorController:
+    def start(self) -> None:
+        return None
+
+
 class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -58,6 +112,24 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_profit_trade_sse_market_name_filter_matches_only_selected_item(self) -> None:
+        filters = {"marketHashName": MARKET_HASH_NAME}
+        self.assertTrue(
+            web_api._profit_trade_log_event_matches(
+                {"market_hash_name": MARKET_HASH_NAME, "message": "selected"},
+                filters,
+            )
+        )
+        self.assertFalse(
+            web_api._profit_trade_log_event_matches(
+                {
+                    "market_hash_name": "AK-47 | Redline (Field-Tested)",
+                    "message": MARKET_HASH_NAME,
+                },
+                filters,
+            )
+        )
+
     @staticmethod
     def _free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -70,7 +142,13 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         path: str,
         *,
         body: dict | None = None,
+        runtime_controller: FakeRuntimeController | None = None,
     ) -> tuple[int, dict]:
+        # Route tests must not start a real scheduler.  A real controller can
+        # still be shutting down a worker after the response is sent, while
+        # this one-request HTTP fixture only waits three seconds for its
+        # server thread to exit.
+        runtime_controller = runtime_controller or FakeRuntimeController()
         port = self._free_port()
         server_errors: list[BaseException] = []
 
@@ -80,6 +158,8 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
                     self.settings,
                     host="127.0.0.1",
                     port=port,
+                    runtime_controller=runtime_controller,
+                    case_monitor_controller=FakeCaseMonitorController(),
                 )
             except BaseException as exc:  # pragma: no cover - surfaced below
                 server_errors.append(exc)
@@ -96,14 +176,17 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
                 f"http://127.0.0.1:{port}{path}",
                 data=raw_body,
                 method=method,
-                headers={"Content-Type": "application/json"} if raw_body is not None else {},
+                headers={
+                    **({"Content-Type": "application/json"} if raw_body is not None else {}),
+                    "Connection": "close",
+                },
             )
             response_body = b""
             status = 0
             deadline = time.monotonic() + 3.0
             while True:
                 try:
-                    with urlopen(request, timeout=2.0) as response:
+                    with LOOPBACK_OPENER.open(request, timeout=2.0) as response:
                         status = int(response.status)
                         response_body = response.read()
                     break
@@ -122,6 +205,67 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
             raise server_errors[0]
         return status, json.loads(response_body.decode("utf-8"))
 
+    def test_profit_trade_config_rejects_removed_reprice_only_field(self) -> None:
+        removed_field = "allow" + "RepriceExecution"
+
+        status, payload = self._request(
+            "POST",
+            "/api/profit-trade/config",
+            body={removed_field: True},
+        )
+
+        self.assertEqual(400, status)
+        self.assertIn("unsupported config field", payload["error"])
+
+        status, payload = self._request(
+            "POST",
+            "/api/profit-trade/config",
+            body={"allowRealExecution": False},
+        )
+
+        self.assertEqual(200, status)
+        self.assertNotIn(removed_field, payload)
+        self.assertNotIn(removed_field, payload["config"])
+
+    def test_profit_trade_long_buy_config_round_trip_and_validation(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/profit-trade/config",
+            body={
+                "longBuyEnabled": True,
+                "longBuyAllowRealExecution": False,
+                "longBuyMaxActiveOrders": 25,
+                "longBuyCreateFractionPerCycle": 0.2,
+                "longBuyAggressiveRoiDelta": 0.005,
+                "longBuyMinPriceAdvantage": 0.1,
+                "longBuyMaxPriceAdvantage": 1.0,
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["longBuyEnabled"])
+        self.assertFalse(payload["longBuyAllowRealExecution"])
+        self.assertTrue(payload["config"]["longBuyEnabled"])
+        self.assertFalse(payload["config"]["longBuyAllowRealExecution"])
+        config = load_strategy_config(self.settings)
+        self.assertEqual(25, config.profit_trade_long_buy_max_active_orders)
+        self.assertEqual(
+            0.2,
+            config.profit_trade_long_buy_create_fraction_per_cycle,
+        )
+        self.assertEqual(0.005, config.profit_trade_long_buy_aggressive_roi_delta)
+        self.assertEqual(0.1, config.profit_trade_long_buy_min_price_advantage)
+        self.assertEqual(1.0, config.profit_trade_long_buy_max_price_advantage)
+
+        invalid_status, invalid = self._request(
+            "POST",
+            "/api/profit-trade/config",
+            body={"longBuyCreateFractionPerCycle": 0},
+        )
+
+        self.assertEqual(400, invalid_status)
+        self.assertIn("longBuyCreateFractionPerCycle", invalid["error"])
+
     def test_roi_watch_and_history_endpoints_match_frontend_contract(self) -> None:
         db = Database(self.settings.db_path)
         try:
@@ -137,6 +281,9 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
                         "balance_discount": 0.69,
                         "expected_profit": 5.25,
                         "expected_roi": 0.0525,
+                        "buy_order_reference_roi": (74.25 / 101.0) - 0.69,
+                        "buy_order_reference_profit": 74.25 - (101.0 * 0.69),
+                        "buy_order_reference_status": "crossed_possible_stale",
                         "min_roi": 0.08,
                         "manual_review_roi": 0.20,
                         "inventory_count": 1,
@@ -144,10 +291,66 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
                         "risk_status": "passed",
                         "execution_status": "below_min_roi",
                         "execution_reason": "ROI below automatic threshold",
+                        "raw": {
+                            "c5PurchaseSellRatio": 0.6491,
+                            "c5MinPurchaseSellRatio": 0.70,
+                            "c5CurrentSellPrice": 6.47,
+                            "c5PurchaseMaxPrice": 4.20,
+                            "competitorBuyPrice": 99.0,
+                            "competitorBuyRoi": 0.06,
+                            "competitorBuyProfit": 6.0,
+                            "competitorBuyStatus": "self_price_excluded",
+                            "excludedOwnBuyPrices": [100.0],
+                            "longBuyProposal": {
+                                "eligible": False,
+                                "targetPrice": 100.0,
+                                "quantity": 1,
+                                "decision": "standard_safe_price",
+                            },
+                            "steamOrderbook": {
+                                "observedAt": "2026-07-13T01:02:02+00:00",
+                                "currencyId": 23,
+                                "sellerFloorPrice": 100.0,
+                                "sellerFloorCount": 1,
+                                "buyerMaxPrice": 101.0,
+                                "buyerMaxCount": 2,
+                                "spreadAmount": -1.0,
+                                "spreadPct": -0.01,
+                                "crossed": True,
+                                "sellLevels": [{"price": 100.0, "count": 1}],
+                                "buyLevels": [{"price": 101.0, "count": 2}],
+                            }
+                        },
                     }
                 ],
                 scan_id="PTSCAN-api-contract",
                 observed_at="2026-07-13T01:02:03+00:00",
+            )
+            long_buy_id = db.create_profit_trade_long_buy_order(
+                market_hash_name=MARKET_HASH_NAME,
+                steam_account_id="account-a",
+                steam_id="steam-a",
+                create_request_id="PTLB-api-contract",
+                bid_price_cents=10000,
+                quantity=1,
+                c5_price_batch=75.0,
+                c5_expected_net_price=74.25,
+                balance_discount=0.69,
+                standard_roi=0.08,
+                aggressive_roi=0.075,
+                standard_safe_price_cents=9642,
+                aggressive_safe_price_cents=9705,
+                competitor_buy_price_cents=9900,
+                competitor_buy_status="self_price_excluded",
+                worst_case_roi=0.0525,
+                source_scan_id="PTSCAN-api-contract",
+                wallet_before=1000.0,
+            )
+            db.update_profit_trade_long_buy_order(
+                long_buy_id,
+                event_type="remote_created",
+                state="active",
+                buy_order_id="buy-api-contract",
             )
             trade_id = db.add_profit_trade(
                 trade_no="PT-api-linked",
@@ -179,6 +382,35 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         self.assertEqual("below_min_roi", payload["items"][0]["executionStatusCode"])
         self.assertEqual(trade_id, payload["items"][0]["latestTrade"]["tradeId"])
         self.assertEqual("steam_bought", payload["items"][0]["latestTrade"]["status"])
+        self.assertEqual(101.0, payload["items"][0]["steamOrderbook"]["buyerMaxPrice"])
+        self.assertTrue(payload["items"][0]["steamOrderbook"]["crossed"])
+        self.assertEqual(0.69, payload["items"][0]["roiBasis"])
+        self.assertEqual("crossed_possible_stale", payload["items"][0]["buyOrderReferenceStatus"])
+        self.assertEqual(0.6491, payload["items"][0]["c5PurchaseSellRatio"])
+        self.assertEqual(0.70, payload["items"][0]["c5MinPurchaseSellRatio"])
+        self.assertEqual(6.47, payload["items"][0]["c5CurrentSellPrice"])
+        self.assertEqual(4.20, payload["items"][0]["c5PurchaseMaxPrice"])
+        self.assertEqual(99.0, payload["items"][0]["competitorBuyPrice"])
+        self.assertEqual([100.0], payload["items"][0]["excludedOwnBuyPrices"])
+        self.assertEqual(
+            "buy-api-contract",
+            payload["items"][0]["longBuyOrder"]["buyOrderId"],
+        )
+        self.assertEqual(
+            "standard_safe_price",
+            payload["items"][0]["longBuyProposal"]["decision"],
+        )
+        self.assertAlmostEqual((74.25 / 101.0) - 0.69, payload["items"][0]["buyOrderReferenceRoi"])
+        self.assertAlmostEqual(5.25, payload["summary"]["currentExpectedProfitTotal"])
+        self.assertEqual(0.0, payload["summary"]["buyOrderReferenceProfitTotal"])
+        self.assertEqual(1, payload["summary"]["longBuyActiveOrders"])
+
+        dashboard_status, dashboard = self._request(
+            "GET",
+            "/api/profit-trade/dashboard",
+        )
+        self.assertEqual(200, dashboard_status)
+        self.assertEqual(1, dashboard["summary"]["longBuyActiveOrders"])
 
         query = urlencode(
             {
@@ -198,6 +430,184 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         self.assertEqual("PTSCAN-api-contract", history["items"][0]["scanId"])
         self.assertEqual(trade_id, history["items"][0]["relatedTrade"]["tradeId"])
         self.assertEqual("steam_bought", history["items"][0]["relatedTrade"]["status"])
+        self.assertEqual(
+            [{"price": 101.0, "count": 2}],
+            history["items"][0]["steamOrderbook"]["buyLevels"],
+        )
+        self.assertAlmostEqual(0.0525, history["stats"]["highestRoi"])
+        self.assertEqual(0.69, history["stats"]["roiBasis"])
+        self.assertEqual(1, history["trend"]["totalValidPoints"])
+        self.assertEqual("2026-07-13T01:02:03+00:00", history["trend"]["points"][0]["observedAt"])
+
+    def test_manual_execution_status_endpoint_returns_batch_terminal_result(self) -> None:
+        runtime = FakeRuntimeController()
+        request_id = "PTMAN-api-status"
+
+        status, payload = self._request(
+            "GET",
+            "/api/profit-trade/manual-execution/status?"
+            + urlencode({"requestId": request_id}),
+            runtime_controller=runtime,
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual([request_id], runtime.manual_status_requests)
+        self.assertEqual(request_id, payload["requestId"])
+        self.assertEqual("failed", payload["status"])
+        self.assertTrue(payload["terminal"])
+        self.assertEqual(1, payload["counts"]["failed"])
+
+    def test_selection_watch_api_is_research_only_and_matches_shared_history_contract(self) -> None:
+        selection_name = "Glock-18 | Selection Research (Field-Tested)"
+        fake_runtime = FakeRuntimeController()
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.upsert_items(
+                [
+                    CatalogItem(
+                        market_hash_name=selection_name,
+                        name_cn="Glock-18 | 选品研究（久经沙场）",
+                        raw_json={
+                            "category": {"name": "手枪"},
+                            "weapon": {"name": "Glock-18"},
+                            "rarity": {"name": "保密级", "color": "#d32ce6"},
+                            "wear": {"name": "久经沙场"},
+                            "min_float": 0.10,
+                            "max_float": 0.70,
+                            "image": "https://example.invalid/selection.png",
+                        },
+                    )
+                ]
+            )
+        finally:
+            db.close()
+
+        rejected_status, rejected = self._request(
+            "POST",
+            "/api/profit-trade/selection-watch",
+            body={"action": "add", "marketHashName": "arbitrary-not-in-local-catalog"},
+            runtime_controller=fake_runtime,
+        )
+        self.assertEqual(400, rejected_status)
+        self.assertIn("local catalog", rejected["error"])
+        self.assertEqual(0, fake_runtime.wake_calls)
+
+        add_status, added = self._request(
+            "POST",
+            "/api/profit-trade/selection-watch",
+            body={"action": "add", "marketHashName": selection_name},
+            runtime_controller=fake_runtime,
+        )
+        self.assertEqual(200, add_status)
+        self.assertTrue(added["researchOnly"])
+        self.assertFalse(added["canExecute"])
+        self.assertEqual("selection_only", added["item"]["executionStatus"])
+        self.assertEqual(1, fake_runtime.wake_calls)
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.record_profit_trade_selection_watch_scan(
+                [
+                    {
+                        "market_hash_name": selection_name,
+                        "name_cn": "Glock-18 | 选品研究（久经沙场）",
+                        "status": "observed",
+                        "event_type": "observed",
+                        "steam_buy_price": 10.0,
+                        "steam_price_source": "steam_orderbook",
+                        "c5_listing_price": 9.0,
+                        "c5_price_source": "c5_batch",
+                        "c5_expected_net_price": 8.91,
+                        "balance_discount": 0.69,
+                        "expected_profit": 2.01,
+                        "expected_roi": 0.201,
+                        "buy_order_reference_roi": 0.246,
+                        "buy_order_reference_profit": 2.46,
+                        "buy_order_reference_status": "valid",
+                        "raw": {
+                            "steamOrderbook": {
+                                "observedAt": "2026-07-23T01:02:03+00:00",
+                                "currencyId": 23,
+                                "sellerFloorPrice": 10.0,
+                                "sellerFloorCount": 1,
+                                "buyerMaxPrice": 9.5,
+                                "buyerMaxCount": 2,
+                                "crossed": False,
+                                "sellLevels": [{"price": 10.0, "count": 1}],
+                                "buyLevels": [{"price": 9.5, "count": 2}],
+                            }
+                        },
+                    }
+                ],
+                scan_id="PTSEL-api-contract",
+                observed_at="2026-07-23T01:02:04+00:00",
+            )
+        finally:
+            db.close()
+
+        watch_status, watch = self._request(
+            "GET",
+            "/api/profit-trade/selection-watch?active=true&page=1&pageSize=12&sort=roi_desc",
+            runtime_controller=fake_runtime,
+        )
+        self.assertEqual(200, watch_status)
+        self.assertTrue(watch["researchOnly"])
+        self.assertFalse(watch["canExecute"])
+        self.assertEqual(selection_name, watch["items"][0]["marketHashName"])
+        self.assertEqual("selection_only", watch["items"][0]["executionStatus"])
+        self.assertEqual(0, watch["items"][0]["inventoryCount"])
+        self.assertEqual(0, watch["items"][0]["tradableCount"])
+        self.assertEqual(9.5, watch["items"][0]["steamOrderbook"]["buyerMaxPrice"])
+        self.assertEqual("手枪", watch["items"][0]["itemType"])
+        self.assertEqual("保密级", watch["items"][0]["rarityName"])
+        self.assertEqual("久经沙场", watch["items"][0]["wearName"])
+        self.assertEqual(0.10, watch["items"][0]["minFloat"])
+        self.assertEqual("观望", watch["items"][0]["inventoryAdviceLabel"])
+        self.assertEqual(1, watch["summary"]["positiveOpportunityCount"])
+
+        refresh_status, refresh = self._request(
+            "POST",
+            "/api/profit-trade/selection-watch/refresh",
+            body={},
+            runtime_controller=fake_runtime,
+        )
+        self.assertEqual(202, refresh_status)
+        self.assertTrue(refresh["researchOnly"])
+        self.assertFalse(refresh["canExecute"])
+        self.assertEqual(1, fake_runtime.selection_refresh_calls)
+
+        history_status, history = self._request(
+            "GET",
+            "/api/profit-trade/selection-watch/history?"
+            + urlencode({"marketHashName": selection_name, "page": 1, "pageSize": 20}),
+            runtime_controller=fake_runtime,
+        )
+        self.assertEqual(200, history_status)
+        contract_row = next(
+            item
+            for item in history["items"]
+            if item["scanId"] == "PTSEL-api-contract"
+        )
+        self.assertEqual(9.5, contract_row["steamOrderbook"]["buyerMaxPrice"])
+        self.assertAlmostEqual(0.201, history["stats"]["highestRoi"])
+        self.assertAlmostEqual(0.201, history["stats"]["averageRoi"])
+        self.assertEqual(0.69, history["stats"]["roiBasis"])
+        # The add audit event is retained too, but it has no price/ROI; only
+        # the actual market observation belongs to the ROI aggregate.
+        self.assertEqual(1, history["stats"]["validObservationCount"])
+        self.assertEqual(1, history["trend"]["totalValidPoints"])
+        self.assertAlmostEqual(0.201, history["trend"]["points"][0]["expectedRoi"])
+        self.assertAlmostEqual(0.246, history["trend"]["points"][0]["buyOrderReferenceRoi"])
+
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            self.assertEqual(0, db.conn.execute("SELECT COUNT(*) FROM profit_trades").fetchone()[0])
+            self.assertEqual(0, db.conn.execute("SELECT COUNT(*) FROM asset_reservations").fetchone()[0])
+        finally:
+            db.close()
 
     def test_dashboard_roi_watch_and_interruptions_expose_persistent_listings_circuit(self) -> None:
         db = Database(self.settings.db_path)
@@ -238,6 +648,65 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         )
         self.assertEqual(200, interruptions_status)
         self.assertEqual("open", interruptions["listingsCircuit"]["status"])
+
+    def test_completed_endpoint_is_not_truncated_and_filters_by_steam_purchase_time(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            for index, (bought_at, profit) in enumerate(
+                (
+                    ("2026-07-11T01:00:00+00:00", 3.25),
+                    ("2026-07-27T01:00:00+00:00", 4.75),
+                ),
+                start=1,
+            ):
+                db.add_profit_trade(
+                    trade_no=f"PT-completed-range-{index}",
+                    market_hash_name=MARKET_HASH_NAME,
+                    status="completed",
+                    step_key="settled",
+                    step_index=6,
+                    steam_buy_price=100.0,
+                    steam_balance_discount=0.69,
+                    steam_real_cost=69.0,
+                    c5_sold_net_price=69.0 + profit,
+                    realized_profit=profit,
+                    note=json.dumps({"steamBuySucceededAt": bought_at}),
+                )
+            # These attempts would push both completed rows outside the bounded
+            # operational dashboard list. They must not affect accounting.
+            for index in range(101):
+                db.add_profit_trade(
+                    trade_no=f"PT-cancelled-noise-{index}",
+                    market_hash_name=MARKET_HASH_NAME,
+                    status="cancelled",
+                    step_key="asset_locked",
+                    step_index=2,
+                )
+        finally:
+            db.close()
+
+        status, payload = self._request("GET", "/api/profit-trade/completed")
+        self.assertEqual(200, status)
+        self.assertEqual(2, payload["summary"]["count"])
+        self.assertEqual(8.0, payload["summary"]["realizedProfit"])
+        self.assertEqual(200.0, payload["summary"]["steamBuyTotal"])
+        self.assertEqual(
+            ["PT-completed-range-2", "PT-completed-range-1"],
+            [item["tradeNo"] for item in payload["items"]],
+        )
+
+        query = urlencode(
+            {
+                "boughtFrom": "2026-07-26T16:00:00+00:00",
+                "boughtTo": "2026-07-27T15:59:59.999+00:00",
+            }
+        )
+        status, payload = self._request("GET", f"/api/profit-trade/completed?{query}")
+        self.assertEqual(200, status)
+        self.assertEqual(1, payload["summary"]["count"])
+        self.assertEqual(4.75, payload["summary"]["realizedProfit"])
+        self.assertEqual("PT-completed-range-2", payload["items"][0]["tradeNo"])
 
     def test_interruption_endpoint_searches_chinese_name_and_rejects_completed(self) -> None:
         db = Database(self.settings.db_path)
@@ -521,6 +990,9 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         )
         self.assertEqual(200, search_status)
         self.assertEqual("M4A4 | Temukau (Field-Tested)", search["items"][0]["marketHashName"])
+        self.assertEqual(1, search["pagination"]["total"])
+        self.assertFalse(search["pagination"]["hasMore"])
+        self.assertIsNone(search["pagination"]["nextOffset"])
 
         create_status, created = self._request(
             "POST",

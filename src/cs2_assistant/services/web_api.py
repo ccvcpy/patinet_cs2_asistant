@@ -4,15 +4,36 @@ import json
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from cs2_assistant.config import Settings
+from cs2_assistant.accounts import AccountStore
+from cs2_assistant.config import PROJECT_ROOT, Settings
 from cs2_assistant.services.c5_case_sweeper import C5CaseSweeper
+from cs2_assistant.services.c5_catalog_taxonomy import (
+    build_c5_catalog_taxonomy,
+    estimate_c5_catalog_filter,
+)
+from cs2_assistant.services.c5_research_scan import (
+    list_c5_research_results,
+)
+from cs2_assistant.services.case_monitor_runtime import (
+    CaseMonitorBusyError,
+    CaseMonitorRuntimeController,
+)
 from cs2_assistant.services.guadao_logging import get_guadao_event_logger
+from cs2_assistant.services.guadao_audit import (
+    export_guadao_audit,
+    list_guadao_audit_rows,
+)
 from cs2_assistant.services.profit_trade_logging import get_profit_trade_event_logger
 from cs2_assistant.services.public_payload import sanitize_public_payload
 from cs2_assistant.services.runtime_controller import UnifiedRuntimeController
+from cs2_assistant.services.steam_balances import (
+    load_steam_account_balances,
+    refresh_steam_account_balances,
+)
 from cs2_assistant.services.steam_request_scheduler import (
     DEFAULT_ACCOUNT_ROUTE_COOLDOWN_SECONDS,
     DEFAULT_GLOBAL_COOLDOWN_SECONDS,
@@ -20,11 +41,14 @@ from cs2_assistant.services.steam_request_scheduler import (
     GLOBAL_DEGRADED_AFTER_SECONDS,
 )
 from cs2_assistant.services.profit_trade import (
+    build_profit_trade_completed_payload,
     build_profit_trade_dashboard_payload,
     build_profit_trade_interruption_timeline_payload,
     build_profit_trade_interruptions_payload,
     build_profit_trade_roi_history_payload,
     build_profit_trade_roi_watch_payload,
+    build_profit_trade_selection_history_payload,
+    build_profit_trade_selection_watch_payload,
     create_manual_profit_trade_record,
     dismiss_profit_trade,
     execute_profit_trade_buy,
@@ -40,6 +64,7 @@ from cs2_assistant.services.profit_trade import (
     set_profit_trade_interruption_acknowledged,
     update_profit_trade_protection,
     update_manual_profit_trade_record,
+    update_profit_trade_selection_watch,
 )
 
 
@@ -64,6 +89,23 @@ def _query_int(
     return max(minimum, min(value, maximum))
 
 
+def _query_int_strict(
+    query: dict[str, list[str]],
+    key: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int = 500,
+) -> int:
+    """Parse a bounded integer without silently changing invalid client input."""
+
+    raw = _query_value(query, key)
+    value = int(raw) if raw else int(default)
+    if value < minimum or value > maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
 def _profit_trade_log_filters(query: dict[str, list[str]]) -> dict[str, Any]:
     filters: dict[str, Any] = {}
     mappings = {
@@ -77,6 +119,7 @@ def _profit_trade_log_filters(query: dict[str, list[str]]) -> dict[str, Any]:
         "accountId": "accountId",
         "tradeNo": "tradeNo",
         "requestId": "requestId",
+        "marketHashName": "marketHashName",
         "keyword": "keyword",
         "cursor": "cursor",
     }
@@ -156,6 +199,7 @@ def _profit_trade_log_event_matches(event: dict[str, Any], filters: dict[str, An
         "accountId": "account_id",
         "tradeNo": "trade_no",
         "requestId": "request_id",
+        "marketHashName": "market_hash_name",
     }
     for filter_key, event_key in exact_fields.items():
         expected = str(filters.get(filter_key) or "").strip()
@@ -268,6 +312,7 @@ def run_profit_trade_api_server(
         dict[str, Any],
     ] | None = None,
     runtime_controller: UnifiedRuntimeController | None = None,
+    case_monitor_controller: CaseMonitorRuntimeController | None = None,
 ) -> None:
     c5_sweeper = C5CaseSweeper(settings)
     profit_trade_logger = get_profit_trade_event_logger()
@@ -275,6 +320,9 @@ def run_profit_trade_api_server(
     owns_runtime_controller = runtime_controller is None
     runtime = runtime_controller or UnifiedRuntimeController(settings)
     runtime.start()
+    owns_case_monitor_controller = case_monitor_controller is None
+    case_monitor = case_monitor_controller or CaseMonitorRuntimeController(settings)
+    case_monitor.start()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "CS2AssistantAPI/0.2"
@@ -291,6 +339,19 @@ def run_profit_trade_api_server(
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file(self, path: Path, content_type: str) -> None:
+            body = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{path.name}"',
+            )
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
         def _read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or "0")
             if length <= 0:
@@ -301,6 +362,39 @@ def run_profit_trade_api_server(
             except ValueError:
                 return {}
             return payload if isinstance(payload, dict) else {}
+
+        def _read_json_body_strict(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError("request body must be valid UTF-8 JSON") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        def _send_download(
+            self,
+            *,
+            filename: str,
+            content_type: str,
+            content: str,
+        ) -> None:
+            body = str(content).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", str(content_type))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{str(filename).replace(chr(34), "")}"',
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send_profit_trade_log_export(
             self,
@@ -466,12 +560,218 @@ def run_profit_trade_api_server(
             parsed = urlparse(self.path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            if path == "/api/guadao-audit/presets":
+                account_error: str | None = None
+                try:
+                    accounts = [
+                        {
+                            "id": account.id,
+                            "name": account.name,
+                            "label": account.name,
+                            "steamId": account.steam_id64,
+                        }
+                        for account in AccountStore(PROJECT_ROOT / "config").list_accounts()
+                    ]
+                except Exception as exc:
+                    accounts = []
+                    account_error = str(exc)
+                preset = {
+                    "id": "guadao-audit-2026-07-19",
+                    "name": "2026-07-19 对账基准",
+                    "startAt": "2026-07-19T15:20:00+08:00",
+                    "endAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "initialBalance": "2502.92",
+                    "initialRealValue": "1755.474",
+                    "initialComprehensiveRatio": "0.70137040",
+                    "accounts": accounts,
+                }
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "defaultPreset": preset,
+                        "presets": [preset],
+                        "accountError": account_error,
+                        "readOnly": True,
+                        "canExecute": False,
+                    },
+                )
+                return
+            if path.startswith("/api/guadao-audit/runs/"):
+                parts = [part for part in path.split("/") if part]
+                request_id = parts[3] if len(parts) >= 4 else ""
+                try:
+                    if len(parts) == 4:
+                        payload = runtime.guadao_audit_run_status(request_id)
+                        self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                        return
+                    if len(parts) == 5 and parts[4] == "rows":
+                        section = _query_value(query, "section") or None
+                        page = _query_int_strict(
+                            query,
+                            "page",
+                            1,
+                            maximum=1_000_000_000,
+                        )
+                        page_size = _query_int_strict(
+                            query,
+                            "pageSize",
+                            50,
+                            maximum=200,
+                        )
+                        rows = list_guadao_audit_rows(settings, request_id, table=section)
+                        if not isinstance(rows, list):
+                            raise ValueError("section is required for paginated audit rows")
+                        total = len(rows)
+                        start = (page - 1) * page_size
+                        items = rows[start : start + page_size]
+                        self._send_json(
+                            HTTPStatus.OK,
+                            {
+                                "ok": True,
+                                "requestId": request_id,
+                                "section": section,
+                                "page": page,
+                                "pageSize": page_size,
+                                "total": total,
+                                "hasMore": start + len(items) < total,
+                                "rows": items,
+                                "readOnly": True,
+                                "canExecute": False,
+                            },
+                        )
+                        return
+                    if len(parts) == 5 and parts[4] == "export":
+                        exported = export_guadao_audit(
+                            settings,
+                            request_id,
+                            _query_value(query, "format", "json"),
+                        )
+                        self._send_download(
+                            filename=exported["filename"],
+                            content_type=exported["contentType"],
+                            content=exported["content"],
+                        )
+                        return
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "guadao_audit_route_not_found"},
+                    )
+                except (KeyError, LookupError) as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                return
+            if path == "/api/c5-research/taxonomy":
+                try:
+                    payload = build_c5_catalog_taxonomy(settings)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path.startswith("/api/c5-research/scans/"):
+                parts = [part for part in path.split("/") if part]
+                request_id = parts[3] if len(parts) >= 4 else ""
+                try:
+                    if len(parts) == 4:
+                        payload = runtime.c5_research_scan_status(request_id)
+                    elif len(parts) == 5 and parts[4] == "results":
+                        payload = list_c5_research_results(
+                            settings,
+                            request_id,
+                            page=_query_int(
+                                query,
+                                "page",
+                                1,
+                                maximum=1_000_000_000,
+                            ),
+                            page_size=_query_int(query, "pageSize", 50, maximum=200),
+                            sort=_query_value(query, "sort", "roi_desc"),
+                        )
+                    else:
+                        self._send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {"ok": False, "error": "c5_research_route_not_found"},
+                        )
+                        return
+                except (KeyError, LookupError) as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                    return
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/case-monitor/status":
+                self._send_json(HTTPStatus.OK, case_monitor.status())
+                return
+            if path == "/api/case-monitor/report/latest":
+                try:
+                    payload = case_monitor.latest_report()
+                except FileNotFoundError as exc:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, payload)
+                return
+            if path == "/api/case-monitor/report/export":
+                try:
+                    export_path, content_type = case_monitor.export_file(
+                        _query_value(query, "format", "json"),
+                        report_id=_query_value(query, "reportId") or None,
+                    )
+                    self._send_file(export_path, content_type)
+                except FileNotFoundError as exc:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": str(exc)},
+                    )
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                return
             if path == "/api/runtime/cookies":
                 self._send_json(HTTPStatus.OK, {"ok": True, **runtime.cookie_snapshot()})
                 return
             if path == "/api/runtime/state":
                 try:
                     payload = runtime.runtime_states(_query_value(query, "executor") or None)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/steam-balances":
+                try:
+                    payload = load_steam_account_balances(settings)
                 except Exception as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                     return
@@ -494,6 +794,7 @@ def run_profit_trade_api_server(
                         page_size=_query_int(query, "pageSize", 10, maximum=100),
                         keyword=_query_value(query, "q") or None,
                         account_name=_query_value(query, "account") or None,
+                        market_hash_name=_query_value(query, "marketHashName") or None,
                         status=_query_value(query, "status") or None,
                         start_at=_query_value(query, "startAt") or None,
                         end_at=_query_value(query, "endAt") or None,
@@ -520,6 +821,7 @@ def run_profit_trade_api_server(
                     payload = runtime.search_items(
                         _query_value(query, "q") or _query_value(query, "query"),
                         limit=_query_int(query, "limit", 30, maximum=100),
+                        offset=_query_int(query, "offset", 0, minimum=0),
                     )
                 except Exception as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
@@ -659,9 +961,65 @@ def run_profit_trade_api_server(
                     return
                 self._send_json(HTTPStatus.OK, {"ok": True, **payload})
                 return
+            if path == "/api/profit-trade/manual-execution/status":
+                try:
+                    payload = runtime.profit_trade_manual_execution_status(
+                        _query_value(query, "requestId")
+                    )
+                except LookupError as exc:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, payload)
+                return
             if path == "/api/profit-trade/roi-watch/history":
                 try:
                     payload = build_profit_trade_roi_history_payload(
+                        settings,
+                        _query_value(query, "marketHashName"),
+                        from_time=_query_value(query, "from") or None,
+                        to_time=_query_value(query, "to") or None,
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "pageSize", 100, maximum=500),
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/profit-trade/selection-watch":
+                try:
+                    active_text = _query_value(query, "active", "true").lower()
+                    if active_text not in {
+                        "1", "true", "yes", "0", "false", "no", "all", "include"
+                    }:
+                        raise ValueError("active must be true, false, or all")
+                    active = None if active_text in {"all", "include"} else active_text not in {"0", "false", "no"}
+                    payload = build_profit_trade_selection_watch_payload(
+                        settings,
+                        active=active,
+                        keyword=_query_value(query, "keyword") or None,
+                        status=_query_value(query, "status") or None,
+                        sort=_query_value(query, "sort", "roi_desc"),
+                        page=_query_int(query, "page", 1),
+                        page_size=_query_int(query, "pageSize", 50, maximum=200),
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
+            if path == "/api/profit-trade/selection-watch/history":
+                try:
+                    payload = build_profit_trade_selection_history_payload(
                         settings,
                         _query_value(query, "marketHashName"),
                         from_time=_query_value(query, "from") or None,
@@ -760,11 +1118,12 @@ def run_profit_trade_api_server(
                 keyword = str((query.get("query") or [""])[0])
                 try:
                     limit = int((query.get("limit") or ["20"])[0])
-                    items = c5_sweeper.search_items(keyword, limit=limit)
+                    offset = max(0, int((query.get("offset") or ["0"])[0]))
+                    payload = c5_sweeper.search_items_page(keyword, limit=limit, offset=offset)
                 except Exception as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                     return
-                self._send_json(HTTPStatus.OK, {"ok": True, "items": items})
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
                 return
             if path == "/api/c5-sweeper/accounts":
                 refresh = str((query.get("refresh") or [""])[0]).lower() in {"1", "true", "yes"}
@@ -778,11 +1137,29 @@ def run_profit_trade_api_server(
             if path == "/api/profit-trade/dashboard":
                 self._send_json(HTTPStatus.OK, build_profit_trade_dashboard_payload(settings))
                 return
+            if path == "/api/profit-trade/completed":
+                try:
+                    payload = build_profit_trade_completed_payload(
+                        settings,
+                        bought_from=_query_value(query, "boughtFrom") or None,
+                        bought_to=_query_value(query, "boughtTo") or None,
+                    )
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, payload)
+                return
             if path == "/api/profit-trade/items/search":
                 keyword = _query_value(query, "query")
                 try:
                     limit = _query_int(query, "limit", 20, minimum=1, maximum=50)
-                    result = search_profit_trade_catalog_items(settings, keyword, limit=limit)
+                    offset = _query_int(query, "offset", 0, minimum=0)
+                    result = search_profit_trade_catalog_items(
+                        settings,
+                        keyword,
+                        limit=limit,
+                        offset=offset,
+                    )
                 except Exception as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                     return
@@ -798,6 +1175,191 @@ def run_profit_trade_api_server(
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if path == "/api/guadao-audit/runs":
+                try:
+                    body = self._read_json_body_strict()
+                    payload = runtime.queue_guadao_audit_run(body)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                request_id = str(payload.get("requestId") or "").strip()
+                if not request_id:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": "audit queue returned no requestId"},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, **payload})
+                return
+            if path.startswith("/api/guadao-audit/runs/"):
+                parts = [part for part in path.split("/") if part]
+                request_id = parts[3] if len(parts) >= 4 else ""
+                action = parts[4] if len(parts) == 5 else ""
+                if action not in {"cancel", "retry"}:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "guadao_audit_action_not_found"},
+                    )
+                    return
+                try:
+                    self._read_json_body_strict()
+                    payload = (
+                        runtime.cancel_guadao_audit_run(request_id)
+                        if action == "cancel"
+                        else runtime.retry_guadao_audit_run(request_id)
+                    )
+                except (KeyError, LookupError) as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                    return
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, **payload})
+                return
+            if path == "/api/c5-research/estimate":
+                try:
+                    body = self._read_json_body_strict()
+                    payload = estimate_c5_catalog_filter(settings, body)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "researchOnly": True,
+                        "canExecute": False,
+                        **payload,
+                    },
+                )
+                return
+            if path == "/api/c5-research/scans":
+                try:
+                    body = self._read_json_body_strict()
+                    payload = runtime.queue_c5_research_scan(body)
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                request_id = str(payload.get("requestId") or "").strip()
+                if not request_id:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": "research queue returned no requestId"},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, **payload})
+                return
+            if path.startswith("/api/c5-research/scans/"):
+                parts = [part for part in path.split("/") if part]
+                request_id = parts[3] if len(parts) >= 4 else ""
+                action = parts[4] if len(parts) == 5 else ""
+                if action not in {"pause", "resume", "cancel"}:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "c5_research_action_not_found"},
+                    )
+                    return
+                try:
+                    self._read_json_body_strict()
+                    payload = runtime.control_c5_research_scan(request_id, action)
+                except (KeyError, LookupError) as exc:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+                    return
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, **payload})
+                return
+            if path == "/api/case-monitor/start":
+                body = self._read_json_body()
+                try:
+                    payload = case_monitor.start_monitor(body.get("intervalMinutes", 5))
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.OK, payload)
+                return
+            if path == "/api/case-monitor/pause":
+                self._send_json(HTTPStatus.OK, case_monitor.pause_monitor())
+                return
+            if path == "/api/case-monitor/collect":
+                try:
+                    job = case_monitor.request_collect()
+                except CaseMonitorBusyError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "currentJob": exc.job,
+                        },
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+                return
+            if path == "/api/case-monitor/report":
+                body = self._read_json_body()
+                try:
+                    job = case_monitor.request_report(body)
+                except CaseMonitorBusyError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "currentJob": exc.job,
+                        },
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "job": job})
+                return
+            if path == "/api/steam-balances/refresh":
+                try:
+                    payload = refresh_steam_account_balances(settings)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, **payload})
+                return
             if path in {"/api/runtime/toggle", "/api/guadao/runtime/toggle"}:
                 body = self._read_json_body()
                 executor_key = str(body.get("executor") or "guadao")
@@ -825,6 +1387,25 @@ def run_profit_trade_api_server(
                         "message": "已唤醒统一到期任务调度；各执行器仍服从自己的持久化开关",
                     },
                 )
+                return
+            if path == "/api/guadao/runtime/stale-recheck-now":
+                body = self._read_json_body()
+                confirmed = body.get("confirm") == "stale_listing_recheck_only"
+                try:
+                    result = runtime.stale_listing_recheck_now(confirmed=confirmed)
+                except RuntimeError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
                 return
             if path == "/api/guadao/runtime/full-scan":
                 try:
@@ -896,6 +1477,47 @@ def run_profit_trade_api_server(
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
                     return
                 self._send_json(HTTPStatus.OK, {"ok": True, "acknowledgement": result})
+                return
+            if path == "/api/guadao/operations/batch-refreeze-rebuy":
+                body = self._read_json_body()
+                try:
+                    result = runtime.batch_refreeze_guadao_rebuys(
+                        body.get("operationIds"),
+                        rebuy_price=float(body.get("rebuyPrice")),
+                        execute_now=bool(body.get("executeNow", True)),
+                        confirmed=body.get("confirmed") is True,
+                        request_id=str(body.get("requestId") or "") or None,
+                        reason=str(body.get("reason") or "") or None,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/guadao/operations/batch-manual-complete":
+                body = self._read_json_body()
+                try:
+                    result = runtime.batch_complete_guadao_rebuys_manually(
+                        body.get("operationIds"),
+                        actual_rebuy_price=float(body.get("actualRebuyPrice")),
+                        source=str(body.get("source") or ""),
+                        completed_at=str(body.get("completedAt") or ""),
+                        memo=str(body.get("memo") or "") or None,
+                        external_order_ref=str(body.get("externalOrderRef") or "") or None,
+                        confirmed=body.get("confirmed") is True,
+                        request_id=str(body.get("requestId") or "") or None,
+                        reason=str(body.get("reason") or "") or None,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/guadao/settings":
                 body = self._read_json_body()
@@ -1006,48 +1628,100 @@ def run_profit_trade_api_server(
                 return
             if path == "/api/profit-trade/config":
                 body = self._read_json_body()
-                if (
-                    "enabled" not in body
-                    and "allowRealExecution" not in body
-                    and "allowRepriceExecution" not in body
-                    and "stickerSlabStatus" not in body
-                    and "stickerStatus" not in body
-                    and "dailySteamBudget" not in body
-                    and "accountReservedBalances" not in body
-                ):
+                allowed_fields = {
+                    "enabled",
+                    "allowRealExecution",
+                    "longBuyEnabled",
+                    "longBuyAllowRealExecution",
+                    "longBuyMaxActiveOrders",
+                    "longBuyCreateFractionPerCycle",
+                    "longBuyAggressiveRoiDelta",
+                    "longBuyMinPriceAdvantage",
+                    "longBuyMaxPriceAdvantage",
+                    "stickerSlabStatus",
+                    "stickerStatus",
+                    "dailySteamBudget",
+                    "accountReservedBalances",
+                }
+                unsupported_fields = sorted(set(body) - allowed_fields)
+                if unsupported_fields:
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
-                        {"error": "enabled, allowRealExecution, allowRepriceExecution, stickerSlabStatus, stickerStatus, dailySteamBudget or accountReservedBalances is required"},
+                        {"error": f"unsupported config field(s): {', '.join(unsupported_fields)}"},
                     )
                     return
-                config = set_profit_trade_config(
-                    settings,
-                    enabled=bool(body["enabled"]) if "enabled" in body else None,
-                    allow_real_execution=bool(body["allowRealExecution"])
-                    if "allowRealExecution" in body
-                    else None,
-                    allow_reprice_execution=bool(body["allowRepriceExecution"])
-                    if "allowRepriceExecution" in body
-                    else None,
-                    sticker_slab_status=str(body["stickerSlabStatus"])
-                    if "stickerSlabStatus" in body
-                    else None,
-                    sticker_status=str(body["stickerStatus"])
-                    if "stickerStatus" in body
-                    else None,
-                    daily_steam_budget=float(body["dailySteamBudget"])
-                    if "dailySteamBudget" in body
-                    else None,
-                    account_reserved_balances=body["accountReservedBalances"]
-                    if "accountReservedBalances" in body
-                    else None,
-                )
+                if not any(field in body for field in allowed_fields):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "at least one supported Profit Trade config field is required"},
+                    )
+                    return
+                try:
+                    config = set_profit_trade_config(
+                        settings,
+                        enabled=bool(body["enabled"]) if "enabled" in body else None,
+                        allow_real_execution=bool(body["allowRealExecution"])
+                        if "allowRealExecution" in body
+                        else None,
+                        long_buy_enabled=bool(body["longBuyEnabled"])
+                        if "longBuyEnabled" in body
+                        else None,
+                        long_buy_allow_real_execution=bool(
+                            body["longBuyAllowRealExecution"]
+                        )
+                        if "longBuyAllowRealExecution" in body
+                        else None,
+                        long_buy_max_active_orders=int(body["longBuyMaxActiveOrders"])
+                        if "longBuyMaxActiveOrders" in body
+                        else None,
+                        long_buy_create_fraction_per_cycle=float(
+                            body["longBuyCreateFractionPerCycle"]
+                        )
+                        if "longBuyCreateFractionPerCycle" in body
+                        else None,
+                        long_buy_aggressive_roi_delta=float(
+                            body["longBuyAggressiveRoiDelta"]
+                        )
+                        if "longBuyAggressiveRoiDelta" in body
+                        else None,
+                        long_buy_min_price_advantage=float(
+                            body["longBuyMinPriceAdvantage"]
+                        )
+                        if "longBuyMinPriceAdvantage" in body
+                        else None,
+                        long_buy_max_price_advantage=float(
+                            body["longBuyMaxPriceAdvantage"]
+                        )
+                        if "longBuyMaxPriceAdvantage" in body
+                        else None,
+                        sticker_slab_status=str(body["stickerSlabStatus"])
+                        if "stickerSlabStatus" in body
+                        else None,
+                        sticker_status=str(body["stickerStatus"])
+                        if "stickerStatus" in body
+                        else None,
+                        daily_steam_budget=float(body["dailySteamBudget"])
+                        if "dailySteamBudget" in body
+                        else None,
+                        account_reserved_balances=body["accountReservedBalances"]
+                        if "accountReservedBalances" in body
+                        else None,
+                    )
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "enabled": config.profit_trade_enabled,
                         "allowRealExecution": config.profit_trade_allow_real_execution,
-                        "allowRepriceExecution": config.profit_trade_allow_reprice_execution,
+                        "longBuyEnabled": config.profit_trade_long_buy_enabled,
+                        "longBuyAllowRealExecution": (
+                            config.profit_trade_long_buy_allow_real_execution
+                        ),
                         "config": build_profit_trade_dashboard_payload(settings, limit=0)["config"],
                     },
                 )
@@ -1083,6 +1757,59 @@ def run_profit_trade_api_server(
                         )["config"],
                     },
                 )
+                return
+            if path == "/api/profit-trade/selection-watch":
+                body = self._read_json_body()
+                try:
+                    result = update_profit_trade_selection_watch(
+                        settings,
+                        action=str(body.get("action") or ""),
+                        market_hash_name=str(body.get("marketHashName") or ""),
+                    )
+                    # The selection pool is research-only, but an add/re-enter
+                    # should make its independent P3 task eligible immediately.
+                    runtime.wake()
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/api/profit-trade/selection-watch/refresh":
+                self._read_json_body()
+                try:
+                    result = runtime.profit_selection_watch_now()
+                except RuntimeError as exc:
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                except Exception as exc:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": str(exc)},
+                    )
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
+                return
+            if path == "/api/profit-trade/roi-watch/execute":
+                body = self._read_json_body()
+                try:
+                    result = runtime.queue_profit_trade_manual_execution(
+                        market_hash_name=str(body.get("marketHashName") or ""),
+                        quantity=int(body.get("quantity") or 0),
+                        confirmed=body.get("confirmed") is True,
+                        expected_roi=body.get("expectedRoi"),
+                        scan_id=str(body.get("scanId") or "") or None,
+                        observed_at=str(body.get("observedAt") or "") or None,
+                    )
+                except RuntimeError as exc:
+                    self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+                    return
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, result)
                 return
             if path == "/api/profit-trade/scan":
                 body = self._read_json_body()
@@ -1300,6 +2027,8 @@ def run_profit_trade_api_server(
     try:
         server.serve_forever()
     finally:
+        if owns_case_monitor_controller:
+            case_monitor.stop()
         if owns_runtime_controller:
             runtime.stop()
         c5_sweeper.close()

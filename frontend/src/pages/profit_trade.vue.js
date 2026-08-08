@@ -1,12 +1,15 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import FolioIcon from "../components/FolioIcon.vue";
+import ProfitTradeLongBuyStrategyPanel from "../components/ProfitTradeLongBuyStrategyPanel.vue";
 import ProfitTradeRoiWatch from "../components/ProfitTradeRoiWatch.vue";
+import { requiresLongBuyConfigConfirmation, resolveProfitTradeLongBuyStrategyState, usesProfitTradeRuntimeToggle, } from "../components/profit_trade_long_buy_strategy";
 const fallbackDashboard = {
     generatedAt: "",
     config: {
         enabled: false,
         allowRealExecution: false,
-        allowRepriceExecution: false,
+        longBuyEnabled: false,
+        longBuyAllowRealExecution: false,
         balanceDiscount: undefined,
         balanceDiscountPct: undefined,
         minRoiPct: undefined,
@@ -27,6 +30,7 @@ const fallbackDashboard = {
         stickerStatus: "blocked",
         protectedAssetIds: [],
         protectedMarketHashNames: [],
+        protectedMarketHashNameItems: [],
         protectedSteamIds: [],
         aiAudit: {
             enabled: false,
@@ -59,22 +63,47 @@ const fallbackDashboard = {
     lastRun: null,
 };
 const dashboard = ref(fallbackDashboard);
+const listingsCooling = computed(() => dashboard.value.listingsCircuit.status === "open");
 const loading = ref(false);
 const apiOnline = ref(null);
 const message = ref("");
 const manualProtectedAssetId = ref("");
 const manualProtectedMarketHashName = ref("");
 const manualProtectedSteamId = ref("");
+const protectionListOpen = ref(false);
+const protectionItemQuery = ref("");
+const protectionItemSuggestions = ref([]);
+const protectionItemSearchOpen = ref(false);
+const protectionItemSearchBusy = ref(false);
+const protectionItemHasMore = ref(false);
+const protectionItemNextOffset = ref(0);
+const protectionError = ref("");
 const dailySteamBudgetDraft = ref("1000");
 const reservedBalanceDrafts = ref({});
 const manualSettleInputs = ref({});
 const lastRunStorageKey = "profitTrade.lastRun.v1";
 const runtimeBusy = ref(false);
+const runOnceBusy = ref(false);
 const runtimeConfirmEnabled = ref(null);
+const runtimeConfirmError = ref("");
+const configToggleBusy = ref(null);
+const longBuyWriteConfirm = ref(null);
+const longBuyWriteConfirmError = ref("");
+const countdownNow = ref(Date.now());
 const lastRunAt = ref(null);
 const lastRunResult = ref("");
 const completedDateFrom = ref("");
 const completedDateTo = ref("");
+const completedDataset = ref({
+    generatedAt: "",
+    summary: { count: 0, realizedProfit: 0, steamBuyTotal: 0 },
+    items: [],
+});
+const completedAllSummary = ref({
+    count: 0,
+    realizedProfit: 0,
+    steamBuyTotal: 0,
+});
 const completedPage = ref(1);
 const completedPageSize = 10;
 const manualRecordOpen = ref(false);
@@ -85,7 +114,12 @@ const manualItemQuery = ref("");
 const manualItemSuggestions = ref([]);
 const manualItemSearchOpen = ref(false);
 const manualItemSearchBusy = ref(false);
+const manualItemHasMore = ref(false);
+const manualItemNextOffset = ref(0);
 let manualItemSearchTimer = null;
+let protectionItemSearchTimer = null;
+let countdownTimer = null;
+let runtimeScheduleTimer = null;
 const manualRecordForm = ref({
     marketHashName: "",
     name: "",
@@ -101,8 +135,7 @@ const manualRecordForm = ref({
 });
 const sortedTrades = computed(() => [...dashboard.value.trades].sort((a, b) => b.id - a.id));
 const activeTrades = computed(() => sortedTrades.value.filter((trade) => trade.status !== "completed"));
-const completedTrades = computed(() => sortedTrades.value
-    .filter((trade) => trade.status === "completed")
+const completedTrades = computed(() => [...completedDataset.value.items]
     .sort((a, b) => {
     const aTime = completedTradePurchaseTimeMs(a) ?? Number.NEGATIVE_INFINITY;
     const bTime = completedTradePurchaseTimeMs(b) ?? Number.NEGATIVE_INFINITY;
@@ -139,9 +172,9 @@ const completedFilteredTrades = computed(() => {
         return true;
     });
 });
-const completedTotalProfit = computed(() => completedTrades.value.reduce((total, trade) => total + (Number(trade.realizedProfit) || 0), 0));
+const completedTotalProfit = computed(() => completedAllSummary.value.realizedProfit);
 const completedFilteredProfit = computed(() => completedFilteredTrades.value.reduce((total, trade) => total + (Number(trade.realizedProfit) || 0), 0));
-const completedTotalSteamBuy = computed(() => completedTrades.value.reduce((total, trade) => total + (Number(trade.steamBuyPrice) || 0), 0));
+const completedTotalSteamBuy = computed(() => completedAllSummary.value.steamBuyTotal);
 const completedFilteredSteamBuy = computed(() => completedFilteredTrades.value.reduce((total, trade) => total + (Number(trade.steamBuyPrice) || 0), 0));
 const completedProfitSummaryLabel = computed(() => (completedHasDateFilter.value ? "当前筛选总收益" : "总收益"));
 const completedSteamBuySummaryLabel = computed(() => (completedHasDateFilter.value ? "筛选已结算 Steam买入" : "已结算 Steam买入总额"));
@@ -163,9 +196,25 @@ const protectedAssetCount = computed(() => dashboard.value.config.protectedAsset
 const protectedNameCount = computed(() => dashboard.value.config.protectedMarketHashNames?.length ?? 0);
 const protectedSteamCount = computed(() => dashboard.value.config.protectedSteamIds?.length ?? 0);
 const protectedAssetPreview = computed(() => dashboard.value.config.protectedAssetIds ?? []);
-const protectedNamePreview = computed(() => dashboard.value.config.protectedMarketHashNames ?? []);
-const protectedSteamPreview = computed(() => dashboard.value.config.protectedSteamIds ?? []);
+const protectedNamePreview = computed(() => {
+    const detailed = dashboard.value.config.protectedMarketHashNameItems ?? [];
+    if (detailed.length)
+        return detailed;
+    return (dashboard.value.config.protectedMarketHashNames ?? []).map((marketHashName) => ({
+        marketHashName,
+        name: marketHashName,
+    }));
+});
+const protectedSteamPreview = computed(() => ((dashboard.value.config.protectedSteamIds ?? []).map((steamId) => {
+    const account = manualEntryAccounts.value.find((item) => item.steamId === steamId);
+    return {
+        accountId: account?.accountId ?? null,
+        name: account?.name ?? "未导入账号",
+        steamId,
+    };
+})));
 const autoRunEnabled = computed(() => Boolean(dashboard.value.runtime?.enabled ?? dashboard.value.config.enabled));
+const profitCycleRunning = computed(() => Boolean(runOnceBusy.value || dashboard.value.runtime?.taskRunning));
 const stickerSlabActive = computed(() => dashboard.value.config.stickerSlabStatus === "active");
 const stickerActive = computed(() => dashboard.value.config.stickerStatus === "active");
 const apiStatusLabel = computed(() => {
@@ -176,24 +225,61 @@ const apiStatusLabel = computed(() => {
     return "后端 API 检查中";
 });
 const realExecutionLabel = computed(() => (dashboard.value.config.allowRealExecution ? "真实执行已开放" : "真实执行未开放"));
+const longBuyStrategyState = computed(() => (resolveProfitTradeLongBuyStrategyState(dashboard.value.config)));
+const longBuyRemoteWritesEnabled = computed(() => longBuyStrategyState.value.canWriteSteam);
+const longBuyObservationMode = computed(() => longBuyStrategyState.value.mode === "observe");
+const longBuyExecutionLabel = computed(() => {
+    if (longBuyStrategyState.value.mode === "observe")
+        return "观察模式（不写 Steam 求购）";
+    return longBuyStrategyState.value.label;
+});
+const longBuyExecutionDetail = computed(() => longBuyStrategyState.value.detail);
 const autoRunStatusLabel = computed(() => {
+    if (profitCycleRunning.value)
+        return "Profit Trade 本轮执行中";
     if (dashboard.value.runtime?.preparing)
         return "后端 Worker 启动准备中";
-    return autoRunEnabled.value ? `后端 Worker ${dashboard.value.runtime?.status || "运行中"}` : "后端 Worker 已关闭";
+    return autoRunEnabled.value ? "后端 10 分钟循环运行中" : "后端 Worker 已关闭";
+});
+const autoRunCountdown = computed(() => {
+    if (!autoRunEnabled.value)
+        return "";
+    const nextAt = dashboard.value.runtime?.nextAttemptAt;
+    if (!nextAt)
+        return "";
+    const target = new Date(nextAt).getTime();
+    if (!Number.isFinite(target))
+        return "";
+    return formatCountdown(target - countdownNow.value);
 });
 const nextAutoRunLabel = computed(() => {
     if (!autoRunEnabled.value)
         return "新机会任务已暂停";
+    if (profitCycleRunning.value)
+        return "本轮执行中，完成后重新安排10分钟倒计时";
     const nextAt = dashboard.value.runtime?.nextAttemptAt;
-    return nextAt ? formatDateTime(nextAt) : "等待后端安排到期任务";
+    if (!nextAt)
+        return "等待后端安排到期任务";
+    const target = new Date(nextAt).getTime();
+    if (!Number.isFinite(target))
+        return "等待后端安排到期任务";
+    return `${formatDateTime(nextAt)}（${autoRunCountdown.value}）`;
 });
 const lastRunLabel = computed(() => {
     const backendLastRun = dashboard.value.lastRun;
+    const runtimeLastRunAt = dashboard.value.runtime?.lastRunAt;
+    const backendTime = backendLastRun?.generatedAt
+        ? new Date(backendLastRun.generatedAt).getTime()
+        : Number.NEGATIVE_INFINITY;
+    const runtimeTime = runtimeLastRunAt
+        ? new Date(runtimeLastRunAt).getTime()
+        : Number.NEGATIVE_INFINITY;
+    if (runtimeLastRunAt && runtimeTime >= backendTime) {
+        return `${formatDateTime(runtimeLastRunAt)}｜${dashboard.value.runtime?.lastRunSummary || "后端任务已运行"}`;
+    }
     if (backendLastRun?.generatedAt && backendLastRun?.summary) {
         return `${formatDateTime(backendLastRun.generatedAt)}｜${backendLastRun.summary}`;
     }
-    if (dashboard.value.runtime?.lastRunAt)
-        return `${formatDateTime(dashboard.value.runtime.lastRunAt)}｜${dashboard.value.runtime.lastRunSummary || "后端任务已运行"}`;
     if (!lastRunAt.value || !lastRunResult.value)
         return "暂无";
     return `${formatDateTime(lastRunAt.value)}｜${lastRunResult.value}`;
@@ -222,6 +308,36 @@ function formatDateTime(value) {
         second: "2-digit",
         hour12: false,
     });
+}
+function formatCountdown(milliseconds) {
+    const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+async function refreshRuntimeSchedule() {
+    try {
+        const payload = await fetchJson("/api/runtime/state?executor=profit_trade");
+        if (payload.state) {
+            const previousLastRunAt = dashboard.value.runtime?.lastRunAt;
+            dashboard.value = {
+                ...dashboard.value,
+                runtime: {
+                    ...dashboard.value.runtime,
+                    ...payload.state,
+                },
+            };
+            if (payload.state.lastRunAt
+                && payload.state.lastRunAt !== previousLastRunAt) {
+                void loadDashboard();
+                window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
+            }
+        }
+        apiOnline.value = true;
+    }
+    catch {
+        apiOnline.value = false;
+    }
 }
 function parseDateStart(value) {
     if (!value)
@@ -281,6 +397,8 @@ function openCreateManualRecord() {
     manualRecordError.value = "";
     manualItemQuery.value = "";
     manualItemSuggestions.value = [];
+    manualItemHasMore.value = false;
+    manualItemNextOffset.value = 0;
     manualItemSearchOpen.value = false;
     manualRecordForm.value = {
         marketHashName: "",
@@ -306,6 +424,8 @@ function openEditManualRecord(trade) {
         ? `${trade.name} / ${trade.marketHashName}`
         : trade.marketHashName;
     manualItemSuggestions.value = [];
+    manualItemHasMore.value = false;
+    manualItemNextOffset.value = 0;
     manualItemSearchOpen.value = false;
     manualRecordForm.value = {
         marketHashName: trade.marketHashName,
@@ -328,11 +448,24 @@ function closeManualRecord() {
     manualRecordOpen.value = false;
     manualRecordError.value = "";
 }
-async function searchManualItems() {
+function mergeItemSuggestions(current, incoming) {
+    const merged = new Map(current.map((item) => [item.marketHashName, item]));
+    for (const item of incoming)
+        merged.set(item.marketHashName, item);
+    return [...merged.values()];
+}
+async function searchManualItems(append = false) {
     manualItemSearchBusy.value = true;
+    const query = manualItemQuery.value;
     try {
-        const payload = await fetchJson(`/api/profit-trade/items/search?query=${encodeURIComponent(manualItemQuery.value.trim())}&limit=20`);
-        manualItemSuggestions.value = payload.items ?? [];
+        const page = await fetchProfitTradeItemSuggestions(query, append ? manualItemNextOffset.value : 0);
+        if (query !== manualItemQuery.value)
+            return;
+        manualItemSuggestions.value = append
+            ? mergeItemSuggestions(manualItemSuggestions.value, page.items)
+            : page.items;
+        manualItemHasMore.value = Boolean(page.pagination?.hasMore);
+        manualItemNextOffset.value = Number(page.pagination?.nextOffset ?? 0);
         manualItemSearchOpen.value = true;
         apiOnline.value = true;
     }
@@ -345,9 +478,73 @@ async function searchManualItems() {
         manualItemSearchBusy.value = false;
     }
 }
+async function fetchProfitTradeItemSuggestions(query, offset = 0) {
+    const payload = await fetchJson(`/api/profit-trade/items/search?query=${encodeURIComponent(query.trim())}&limit=50&offset=${offset}`);
+    return { items: payload.items ?? [], pagination: payload.pagination };
+}
+async function searchProtectionItems(append = false) {
+    protectionItemSearchBusy.value = true;
+    protectionError.value = "";
+    const query = protectionItemQuery.value;
+    try {
+        const page = await fetchProfitTradeItemSuggestions(query, append ? protectionItemNextOffset.value : 0);
+        if (query !== protectionItemQuery.value)
+            return;
+        protectionItemSuggestions.value = append
+            ? mergeItemSuggestions(protectionItemSuggestions.value, page.items)
+            : page.items;
+        protectionItemHasMore.value = Boolean(page.pagination?.hasMore);
+        protectionItemNextOffset.value = Number(page.pagination?.nextOffset ?? 0);
+        protectionItemSearchOpen.value = true;
+        apiOnline.value = true;
+    }
+    catch (error) {
+        if (error instanceof TypeError)
+            apiOnline.value = false;
+        protectionError.value = `物品搜索失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    finally {
+        protectionItemSearchBusy.value = false;
+    }
+}
+function onProtectionItemInput() {
+    manualProtectedMarketHashName.value = "";
+    protectionItemHasMore.value = false;
+    protectionItemNextOffset.value = 0;
+    protectionItemSearchOpen.value = true;
+    if (protectionItemSearchTimer)
+        clearTimeout(protectionItemSearchTimer);
+    protectionItemSearchTimer = setTimeout(() => void searchProtectionItems(), 220);
+}
+function chooseProtectionItem(item) {
+    manualProtectedMarketHashName.value = item.marketHashName;
+    protectionItemQuery.value = item.name !== item.marketHashName
+        ? `${item.name} / ${item.marketHashName}`
+        : item.marketHashName;
+    protectionItemSearchOpen.value = false;
+    protectionError.value = "";
+}
+function openProtectionList() {
+    protectionError.value = "";
+    protectionItemQuery.value = "";
+    manualProtectedMarketHashName.value = "";
+    protectionItemSuggestions.value = [];
+    protectionItemHasMore.value = false;
+    protectionItemNextOffset.value = 0;
+    protectionItemSearchOpen.value = false;
+    manualProtectedSteamId.value = "";
+    protectionListOpen.value = true;
+}
+function closeProtectionList() {
+    protectionListOpen.value = false;
+    protectionItemSearchOpen.value = false;
+    protectionError.value = "";
+}
 function onManualItemInput() {
     manualRecordForm.value.marketHashName = "";
     manualRecordForm.value.name = "";
+    manualItemHasMore.value = false;
+    manualItemNextOffset.value = 0;
     manualItemSearchOpen.value = true;
     if (manualItemSearchTimer)
         clearTimeout(manualItemSearchTimer);
@@ -429,19 +626,41 @@ async function saveManualRecord() {
 function resetCompletedPage() {
     completedPage.value = 1;
 }
-function setCompletedDatePreset(days) {
+async function loadCompletedTrades() {
+    const params = new URLSearchParams();
+    const from = parseDateStart(completedDateFrom.value);
+    const to = parseDateEnd(completedDateTo.value);
+    if (from !== null)
+        params.set("boughtFrom", new Date(from).toISOString());
+    if (to !== null)
+        params.set("boughtTo", new Date(to).toISOString());
+    const suffix = params.size ? `?${params.toString()}` : "";
+    const payload = await fetchJson(`/api/profit-trade/completed${suffix}`);
+    completedDataset.value = payload;
+    if (from === null && to === null) {
+        completedAllSummary.value = { ...payload.summary };
+    }
+    resetCompletedPage();
+}
+function localDateInputValue(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+}
+async function setCompletedDatePreset(days) {
     if (days === "all") {
         completedDateFrom.value = "";
         completedDateTo.value = "";
-        resetCompletedPage();
+        await loadCompletedTrades();
         return;
     }
     const end = new Date();
     const start = new Date();
     start.setDate(end.getDate() - Math.max(0, days - 1));
-    completedDateFrom.value = start.toISOString().slice(0, 10);
-    completedDateTo.value = end.toISOString().slice(0, 10);
-    resetCompletedPage();
+    completedDateFrom.value = localDateInputValue(start);
+    completedDateTo.value = localDateInputValue(end);
+    await loadCompletedTrades();
 }
 function goCompletedPage(direction) {
     completedPage.value = Math.min(completedTotalPages.value, Math.max(1, completedCurrentPage.value + direction));
@@ -533,18 +752,25 @@ function stepClass(step, trade) {
         return "current";
     return "pending";
 }
+class ApiRequestError extends Error {
+    constructor(status, statusText, detail) {
+        super(`${status} ${statusText}${detail ? ` ${detail}` : ""}`);
+        this.name = "ApiRequestError";
+        this.status = status;
+    }
+}
 async function fetchJson(url, init) {
     const response = await fetch(url, init);
     if (!response.ok) {
         let detail = "";
         try {
             const payload = await response.json();
-            detail = payload.error ? ` ${payload.error}` : "";
+            detail = payload.error ?? "";
         }
         catch {
             detail = "";
         }
-        throw new Error(`${response.status} ${response.statusText}${detail}`);
+        throw new ApiRequestError(response.status, response.statusText, detail);
     }
     return response.json();
 }
@@ -580,6 +806,7 @@ async function loadDashboard() {
             runtime: runtimeState,
             listingsCircuit: payload.listingsCircuit || { status: "closed", isBlocking: false },
         };
+        await loadCompletedTrades();
         dailySteamBudgetDraft.value = String(dashboard.value.config.dailySteamBudget ?? 1000);
         syncReservedBalanceDrafts();
         apiOnline.value = true;
@@ -599,6 +826,7 @@ async function loadDashboard() {
 async function toggleEnabled() {
     const nextEnabled = runtimeConfirmEnabled.value ?? !autoRunEnabled.value;
     message.value = "";
+    runtimeConfirmError.value = "";
     runtimeBusy.value = true;
     try {
         await fetchJson("/api/runtime/toggle", {
@@ -608,49 +836,169 @@ async function toggleEnabled() {
         });
         apiOnline.value = true;
         runtimeConfirmEnabled.value = null;
-        message.value = nextEnabled ? "Profit Trade 后端 Worker 已提交开启，正在执行 Cookie 门禁。" : "Profit Trade 新机会已停止；已有流水继续安全闭环。";
+        runtimeConfirmError.value = "";
         await loadDashboard();
+        if (apiOnline.value) {
+            message.value = nextEnabled ? "Profit Trade 后端 10 分钟循环已开启，正在执行 Cookie 门禁；门禁通过后立即运行第一轮。" : "Profit Trade 新机会与 10 分钟循环已停止；已有流水继续安全闭环。";
+        }
     }
     catch (error) {
-        apiOnline.value = false;
-        message.value = `API未连接，无法${nextEnabled ? "开启" : "关闭"}后端开关`;
+        apiOnline.value = error instanceof ApiRequestError;
+        const detail = error instanceof Error ? error.message : String(error);
+        runtimeConfirmError.value = `${nextEnabled ? "开启" : "关闭"}失败：${detail}`;
+        message.value = runtimeConfirmError.value;
     }
     finally {
         runtimeBusy.value = false;
     }
 }
-async function toggleRealExecution() {
-    const nextAllowed = !dashboard.value.config.allowRealExecution;
+async function runOnce() {
+    if (profitCycleRunning.value) {
+        message.value = "Profit Trade 本轮已经在执行，请等待完成后再启动下一轮。";
+        return;
+    }
+    runOnceBusy.value = true;
     message.value = "";
     try {
-        await fetchJson("/api/profit-trade/config", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ allowRealExecution: nextAllowed }),
-        });
+        const previousLastRunAt = dashboard.value.runtime?.lastRunAt || null;
+        const queued = await fetchJson("/api/profit-trade/run-once", { method: "POST" });
+        if (!queued.alreadyRunning && (!queued.ok || !queued.queued)) {
+            throw new Error("后端未能排入本轮任务");
+        }
         apiOnline.value = true;
+        const deadline = Date.now() + 30 * 60 * 1000;
+        let consecutiveReadFailures = 0;
+        while (Date.now() < deadline) {
+            let runtimePayload;
+            try {
+                runtimePayload = await fetchJson("/api/runtime/state?executor=profit_trade");
+                consecutiveReadFailures = 0;
+            }
+            catch (error) {
+                consecutiveReadFailures += 1;
+                if (consecutiveReadFailures >= 5)
+                    throw error;
+                await new Promise(resolve => window.setTimeout(resolve, 1000));
+                continue;
+            }
+            const state = runtimePayload.state;
+            if (state) {
+                dashboard.value = {
+                    ...dashboard.value,
+                    runtime: { ...dashboard.value.runtime, ...state },
+                };
+                const completedNewRun = Boolean(state.lastRunAt
+                    && state.lastRunAt !== previousLastRunAt
+                    && !state.taskRunning);
+                if (completedNewRun)
+                    break;
+            }
+            await new Promise(resolve => window.setTimeout(resolve, 1000));
+        }
+        if (dashboard.value.runtime?.lastRunAt === previousLastRunAt
+            || dashboard.value.runtime?.taskRunning) {
+            throw new Error("后端执行超过30分钟，请到实时日志查看当前任务状态");
+        }
         await loadDashboard();
+        window.dispatchEvent(new CustomEvent("profit-trade:refresh-observability"));
+        if (apiOnline.value) {
+            const errorCount = Number(dashboard.value.lastRun?.errorCount || 0);
+            message.value = errorCount > 0
+                ? `Profit Trade 本轮已结束，但有 ${errorCount} 个错误：${dashboard.value.lastRun?.errors?.join("；") || "请查看实时日志"}`
+                : "Profit Trade 本轮已完成，观察池和执行状态已经刷新；下一轮仍按10分钟计划执行。";
+        }
     }
     catch (error) {
-        apiOnline.value = false;
-        message.value = `真实执行开关失败：${error instanceof Error ? error.message : String(error)}`;
+        apiOnline.value = error instanceof ApiRequestError;
+        const detail = error instanceof Error ? error.message : String(error);
+        message.value = `执行一轮失败：${detail}`;
+    }
+    finally {
+        runOnceBusy.value = false;
     }
 }
-async function toggleRepriceExecution() {
-    const nextAllowed = !dashboard.value.config.allowRepriceExecution;
+function openRuntimeConfirm() {
+    runtimeConfirmError.value = "";
+    runtimeConfirmEnabled.value = !autoRunEnabled.value;
+}
+function closeRuntimeConfirm() {
+    if (runtimeBusy.value)
+        return;
+    runtimeConfirmEnabled.value = null;
+    runtimeConfirmError.value = "";
+}
+const profitTradeConfigToggleLabels = {
+    enabled: "Profit Trade 总功能",
+    allowRealExecution: "普通真实执行",
+    longBuyEnabled: "长期求购功能",
+    longBuyAllowRealExecution: "长期求购 Steam 写入",
+};
+async function updateProfitTradeConfigToggle(key, nextEnabled) {
+    if (configToggleBusy.value || runtimeBusy.value)
+        return;
+    const label = profitTradeConfigToggleLabels[key];
     message.value = "";
+    configToggleBusy.value = key;
+    const togglesRuntime = usesProfitTradeRuntimeToggle(key);
+    if (togglesRuntime)
+        runtimeBusy.value = true;
     try {
-        await fetchJson("/api/profit-trade/config", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ allowRepriceExecution: nextAllowed }),
-        });
+        if (togglesRuntime) {
+            await fetchJson("/api/runtime/toggle", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ executor: "profit_trade", enabled: nextEnabled }),
+            });
+        }
+        else {
+            await fetchJson("/api/profit-trade/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ [key]: nextEnabled }),
+            });
+        }
         apiOnline.value = true;
         await loadDashboard();
+        if (apiOnline.value)
+            message.value = `${label}已${nextEnabled ? "开启" : "关闭"}`;
     }
     catch (error) {
-        apiOnline.value = false;
-        message.value = `C5改价开关失败：${error instanceof Error ? error.message : String(error)}`;
+        if (!(error instanceof ApiRequestError))
+            apiOnline.value = false;
+        const detail = error instanceof Error ? error.message : String(error);
+        message.value = `${label}更新失败：${detail}`;
+        if (key === "longBuyAllowRealExecution")
+            longBuyWriteConfirmError.value = message.value;
+    }
+    finally {
+        configToggleBusy.value = null;
+        if (togglesRuntime)
+            runtimeBusy.value = false;
+    }
+}
+function requestLongBuyConfigToggle(key, nextEnabled) {
+    if (configToggleBusy.value || runtimeBusy.value)
+        return;
+    if (requiresLongBuyConfigConfirmation(key)) {
+        longBuyWriteConfirmError.value = "";
+        longBuyWriteConfirm.value = nextEnabled;
+        return;
+    }
+    void updateProfitTradeConfigToggle(key, nextEnabled);
+}
+function closeLongBuyWriteConfirm() {
+    if (configToggleBusy.value)
+        return;
+    longBuyWriteConfirm.value = null;
+    longBuyWriteConfirmError.value = "";
+}
+async function confirmLongBuyWriteToggle() {
+    if (longBuyWriteConfirm.value === null)
+        return;
+    const nextEnabled = longBuyWriteConfirm.value;
+    await updateProfitTradeConfigToggle("longBuyAllowRealExecution", nextEnabled);
+    if (!configToggleBusy.value && !longBuyWriteConfirmError.value) {
+        longBuyWriteConfirm.value = null;
     }
 }
 async function setItemTypeStatus(key, status) {
@@ -888,7 +1236,7 @@ async function updateProtection(action, kind, value) {
     const normalizedValue = String(value || "").trim();
     if (!normalizedValue) {
         message.value = "没有可保护的值";
-        return;
+        return false;
     }
     message.value = "";
     try {
@@ -901,10 +1249,12 @@ async function updateProtection(action, kind, value) {
         const actionLabel = action === "add" ? "加入保护" : "移出保护";
         message.value = `${normalizedValue} 已${actionLabel}`;
         await loadDashboard();
+        return true;
     }
     catch (error) {
         apiOnline.value = false;
         message.value = `保护名单更新失败：${error instanceof Error ? error.message : String(error)}`;
+        return false;
     }
 }
 async function addManualProtectedAsset() {
@@ -912,11 +1262,26 @@ async function addManualProtectedAsset() {
     manualProtectedAssetId.value = "";
 }
 async function addManualProtectedMarketHashName() {
-    await updateProtection("add", "marketHashName", manualProtectedMarketHashName.value);
+    if (!manualProtectedMarketHashName.value) {
+        protectionError.value = "请先输入中文名或英文名，并从搜索结果中选择准确饰品。";
+        return;
+    }
+    const added = await updateProtection("add", "marketHashName", manualProtectedMarketHashName.value);
+    if (!added)
+        return;
     manualProtectedMarketHashName.value = "";
+    protectionItemQuery.value = "";
+    protectionItemSuggestions.value = [];
+    protectionItemSearchOpen.value = false;
 }
 async function addManualProtectedSteamId() {
-    await updateProtection("add", "steamId", manualProtectedSteamId.value);
+    if (!manualProtectedSteamId.value) {
+        protectionError.value = "请先选择一个当前已导入的 Steam 账号。";
+        return;
+    }
+    const added = await updateProtection("add", "steamId", manualProtectedSteamId.value);
+    if (!added)
+        return;
     manualProtectedSteamId.value = "";
 }
 function handleSharedConfigChange() {
@@ -955,11 +1320,23 @@ function restoreLastRun() {
 onMounted(() => {
     restoreLastRun();
     void loadDashboard();
+    countdownTimer = setInterval(() => {
+        countdownNow.value = Date.now();
+    }, 1000);
+    runtimeScheduleTimer = setInterval(() => {
+        void refreshRuntimeSchedule();
+    }, 5000);
     window.addEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 onUnmounted(() => {
     if (manualItemSearchTimer)
         clearTimeout(manualItemSearchTimer);
+    if (protectionItemSearchTimer)
+        clearTimeout(protectionItemSearchTimer);
+    if (countdownTimer)
+        clearInterval(countdownTimer);
+    if (runtimeScheduleTimer)
+        clearInterval(runtimeScheduleTimer);
     window.removeEventListener("profit-trade:config-changed", handleSharedConfigChange);
 });
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
@@ -976,9 +1353,11 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['online']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['offline']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['settings-list']} */ ;
@@ -1012,8 +1391,27 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-summary-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-summary-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-summary-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-hint']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-trade-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['attention']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-head']} */ ;
@@ -1103,6 +1501,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
@@ -1111,6 +1510,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['offline']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['online']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['observe']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['running']} */ ;
 /** @type {__VLS_StyleScopedClasses['inline-status']} */ ;
@@ -1218,6 +1619,7 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
@@ -1253,6 +1655,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cycle-running']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cycle-running']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cycle-running']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
@@ -1280,6 +1689,13 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     type: "button",
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (__VLS_ctx.runOnce) },
+    ...{ class: "secondary-button" },
+    type: "button",
+    disabled: (__VLS_ctx.profitCycleRunning),
+});
+(__VLS_ctx.profitCycleRunning ? "本轮执行中…" : "执行一轮");
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.scanOpportunities) },
     ...{ class: "secondary-button" },
     type: "button",
@@ -1295,27 +1711,12 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     type: "button",
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (...[$event]) => {
-            __VLS_ctx.runtimeConfirmEnabled = !__VLS_ctx.autoRunEnabled;
-        } },
+    ...{ onClick: (__VLS_ctx.openRuntimeConfirm) },
     ...{ class: "primary-button" },
     type: "button",
     disabled: (__VLS_ctx.runtimeBusy),
 });
-(__VLS_ctx.autoRunEnabled ? "关闭执行器" : "开启执行器");
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.toggleRepriceExecution) },
-    ...{ class: "secondary-button" },
-    ...{ class: ({ active: __VLS_ctx.dashboard.config.allowRepriceExecution }) },
-    type: "button",
-});
-(__VLS_ctx.dashboard.config.allowRepriceExecution ? "禁止仅C5改价" : "仅允许C5改价");
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.toggleRealExecution) },
-    ...{ class: "secondary-button danger-button" },
-    type: "button",
-});
-(__VLS_ctx.dashboard.config.allowRealExecution ? "禁止真实执行" : "允许真实执行");
+(__VLS_ctx.autoRunEnabled ? `关闭10分钟循环 ${__VLS_ctx.autoRunCountdown}` : "开启10分钟循环");
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "profit-summary-grid" },
 });
@@ -1384,6 +1785,19 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElement
 (__VLS_ctx.realExecutionLabel);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
     ...{ class: "execution-status-item" },
+    ...{ class: ({
+            online: __VLS_ctx.longBuyRemoteWritesEnabled,
+            observe: __VLS_ctx.longBuyObservationMode,
+            offline: !__VLS_ctx.dashboard.config.longBuyEnabled,
+        }) },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+(__VLS_ctx.longBuyExecutionLabel);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+(__VLS_ctx.longBuyExecutionDetail);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+    ...{ class: "execution-status-item" },
     ...{ class: ({ online: __VLS_ctx.autoRunEnabled }) },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
@@ -1401,13 +1815,44 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
 (__VLS_ctx.lastRunLabel);
+/** @type {[typeof ProfitTradeLongBuyStrategyPanel, ]} */ ;
+// @ts-ignore
+const __VLS_0 = __VLS_asFunctionalComponent(ProfitTradeLongBuyStrategyPanel, new ProfitTradeLongBuyStrategyPanel({
+    ...{ 'onToggle': {} },
+    config: (__VLS_ctx.dashboard.config),
+    activeOrderCount: (__VLS_ctx.dashboard.summary.longBuyActiveOrders ?? 0),
+    updatingKey: (__VLS_ctx.configToggleBusy ?? (__VLS_ctx.runtimeBusy ? 'enabled' : null)),
+}));
+const __VLS_1 = __VLS_0({
+    ...{ 'onToggle': {} },
+    config: (__VLS_ctx.dashboard.config),
+    activeOrderCount: (__VLS_ctx.dashboard.summary.longBuyActiveOrders ?? 0),
+    updatingKey: (__VLS_ctx.configToggleBusy ?? (__VLS_ctx.runtimeBusy ? 'enabled' : null)),
+}, ...__VLS_functionalComponentArgsRest(__VLS_0));
+let __VLS_3;
+let __VLS_4;
+let __VLS_5;
+const __VLS_6 = {
+    onToggle: (__VLS_ctx.requestLongBuyConfigToggle)
+};
+var __VLS_2;
+if (__VLS_ctx.profitCycleRunning) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "profit-cycle-running" },
+        role: "status",
+        'aria-live': "polite",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+        ...{ class: "cycle-spinner" },
+        'aria-hidden': "true",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+}
 if (__VLS_ctx.runtimeConfirmEnabled !== null) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-        ...{ onClick: (...[$event]) => {
-                if (!(__VLS_ctx.runtimeConfirmEnabled !== null))
-                    return;
-                __VLS_ctx.runtimeConfirmEnabled = null;
-            } },
+        ...{ onClick: (__VLS_ctx.closeRuntimeConfirm) },
         ...{ class: "runtime-confirm-backdrop" },
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
@@ -1418,31 +1863,38 @@ if (__VLS_ctx.runtimeConfirmEnabled !== null) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     /** @type {[typeof FolioIcon, ]} */ ;
     // @ts-ignore
-    const __VLS_0 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+    const __VLS_7 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
         name: (__VLS_ctx.runtimeConfirmEnabled ? 'shield' : 'warning'),
         size: (22),
     }));
-    const __VLS_1 = __VLS_0({
+    const __VLS_8 = __VLS_7({
         name: (__VLS_ctx.runtimeConfirmEnabled ? 'shield' : 'warning'),
         size: (22),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_0));
+    }, ...__VLS_functionalComponentArgsRest(__VLS_7));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-    (__VLS_ctx.runtimeConfirmEnabled ? "开启 Profit Trade 执行器" : "关闭 Profit Trade 执行器");
-    if (__VLS_ctx.runtimeConfirmEnabled) {
+    (__VLS_ctx.runtimeConfirmEnabled ? "开启 Profit Trade 10分钟循环" : "关闭 Profit Trade 10分钟循环");
+    if (__VLS_ctx.runtimeConfirmEnabled && __VLS_ctx.dashboard.runtime?.migrationHold) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    else if (__VLS_ctx.runtimeConfirmEnabled) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
     }
     else {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
     }
+    if (__VLS_ctx.runtimeConfirmError) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+            ...{ class: "runtime-confirm-error" },
+            role: "alert",
+        });
+        (__VLS_ctx.runtimeConfirmError);
+    }
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-        ...{ onClick: (...[$event]) => {
-                if (!(__VLS_ctx.runtimeConfirmEnabled !== null))
-                    return;
-                __VLS_ctx.runtimeConfirmEnabled = null;
-            } },
+        ...{ onClick: (__VLS_ctx.closeRuntimeConfirm) },
         ...{ class: "secondary-button" },
         type: "button",
+        disabled: (__VLS_ctx.runtimeBusy),
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
         ...{ onClick: (__VLS_ctx.toggleEnabled) },
@@ -1452,6 +1904,337 @@ if (__VLS_ctx.runtimeConfirmEnabled !== null) {
     });
     (__VLS_ctx.runtimeBusy ? "提交中…" : "确认");
 }
+if (__VLS_ctx.longBuyWriteConfirm !== null) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ onClick: (__VLS_ctx.closeLongBuyWriteConfirm) },
+        ...{ class: "runtime-confirm-backdrop" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "runtime-confirm-dialog" },
+        role: "dialog",
+        'aria-modal': "true",
+        'aria-labelledby': "long-buy-write-confirm-title",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    /** @type {[typeof FolioIcon, ]} */ ;
+    // @ts-ignore
+    const __VLS_10 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: (__VLS_ctx.longBuyWriteConfirm ? 'shield' : 'warning'),
+        size: (22),
+    }));
+    const __VLS_11 = __VLS_10({
+        name: (__VLS_ctx.longBuyWriteConfirm ? 'shield' : 'warning'),
+        size: (22),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_10));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({
+        id: "long-buy-write-confirm-title",
+    });
+    (__VLS_ctx.longBuyWriteConfirm ? "开启长期 Steam 写入" : "关闭长期 Steam 写入");
+    if (__VLS_ctx.longBuyWriteConfirm) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    else {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    }
+    if (__VLS_ctx.longBuyWriteConfirmError) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+            ...{ class: "runtime-confirm-error" },
+            role: "alert",
+        });
+        (__VLS_ctx.longBuyWriteConfirmError);
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.closeLongBuyWriteConfirm) },
+        ...{ class: "secondary-button" },
+        type: "button",
+        disabled: (Boolean(__VLS_ctx.configToggleBusy)),
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.confirmLongBuyWriteToggle) },
+        ...{ class: "primary-button" },
+        type: "button",
+        disabled: (Boolean(__VLS_ctx.configToggleBusy)),
+    });
+    (__VLS_ctx.configToggleBusy ? "提交中…" : "确认");
+}
+if (__VLS_ctx.protectionListOpen) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ onClick: (__VLS_ctx.closeProtectionList) },
+        ...{ class: "protection-modal-backdrop" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "protection-modal" },
+        role: "dialog",
+        'aria-modal': "true",
+        'aria-labelledby': "protection-list-title",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({
+        ...{ class: "protection-modal-header" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({
+        id: "protection-list-title",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.closeProtectionList) },
+        ...{ class: "modal-close-button" },
+        type: "button",
+        'aria-label': "关闭保护列表",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protection-editor-grid" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
+        ...{ onSubmit: (__VLS_ctx.addManualProtectedAsset) },
+        ...{ class: "protection-form" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        for: "protected-asset-id",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protection-input-row" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        id: "protected-asset-id",
+        value: (__VLS_ctx.manualProtectedAssetId),
+        type: "text",
+        autocomplete: "off",
+        placeholder: "assetId",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ class: "mini-action protect-action" },
+        type: "submit",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
+        ...{ onSubmit: (__VLS_ctx.addManualProtectedMarketHashName) },
+        ...{ class: "protection-form" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        for: "protected-market-hash-name",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protection-input-row protection-search-row" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "manual-item-search" },
+    });
+    /** @type {[typeof FolioIcon, ]} */ ;
+    // @ts-ignore
+    const __VLS_13 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: "scan",
+        size: (17),
+    }));
+    const __VLS_14 = __VLS_13({
+        name: "scan",
+        size: (17),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_13));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+        ...{ onInput: (__VLS_ctx.onProtectionItemInput) },
+        ...{ onFocus: (...[$event]) => {
+                if (!(__VLS_ctx.protectionListOpen))
+                    return;
+                __VLS_ctx.searchProtectionItems(false);
+            } },
+        id: "protected-market-hash-name",
+        value: (__VLS_ctx.protectionItemQuery),
+        type: "text",
+        autocomplete: "off",
+        placeholder: "输入中文名或英文名搜索",
+    });
+    if (__VLS_ctx.protectionItemSearchBusy) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    }
+    if (__VLS_ctx.protectionItemSearchOpen) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+            ...{ class: "manual-item-suggestions" },
+        });
+        for (const [item] of __VLS_getVForSourceType((__VLS_ctx.protectionItemSuggestions))) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.protectionListOpen))
+                            return;
+                        if (!(__VLS_ctx.protectionItemSearchOpen))
+                            return;
+                        __VLS_ctx.chooseProtectionItem(item);
+                    } },
+                key: (item.marketHashName),
+                type: "button",
+            });
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+            (item.name);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+            (item.marketHashName);
+        }
+        if (__VLS_ctx.protectionItemHasMore) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.protectionListOpen))
+                            return;
+                        if (!(__VLS_ctx.protectionItemSearchOpen))
+                            return;
+                        if (!(__VLS_ctx.protectionItemHasMore))
+                            return;
+                        __VLS_ctx.searchProtectionItems(true);
+                    } },
+                ...{ class: "catalog-load-more" },
+                type: "button",
+                disabled: (__VLS_ctx.protectionItemSearchBusy),
+            });
+            (__VLS_ctx.protectionItemSearchBusy ? "加载中…" : "加载更多结果");
+        }
+        if (!__VLS_ctx.protectionItemSearchBusy && __VLS_ctx.protectionItemSuggestions.length === 0) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+        }
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ class: "mini-action protect-action" },
+        type: "submit",
+        disabled: (!__VLS_ctx.manualProtectedMarketHashName),
+    });
+    if (__VLS_ctx.manualProtectedMarketHashName) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+            ...{ class: "protection-selected-value" },
+        });
+        (__VLS_ctx.manualProtectedMarketHashName);
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
+        ...{ onSubmit: (__VLS_ctx.addManualProtectedSteamId) },
+        ...{ class: "protection-form" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+        for: "protected-steam-id",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protection-input-row" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.select, __VLS_intrinsicElements.select)({
+        id: "protected-steam-id",
+        value: (__VLS_ctx.manualProtectedSteamId),
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.option, __VLS_intrinsicElements.option)({
+        value: "",
+    });
+    for (const [account] of __VLS_getVForSourceType((__VLS_ctx.manualEntryAccounts))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.option, __VLS_intrinsicElements.option)({
+            key: (account.accountId),
+            value: (account.steamId || ''),
+            disabled: (!account.steamId),
+        });
+        (account.name);
+        (account.steamId || "未配置SteamID");
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ class: "mini-action protect-action" },
+        type: "submit",
+        disabled: (!__VLS_ctx.manualProtectedSteamId),
+    });
+    if (__VLS_ctx.protectionError) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+            ...{ class: "protection-error" },
+            role: "alert",
+        });
+        (__VLS_ctx.protectionError);
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protection-modal-groups" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "protection-modal-group protected-kinds" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    (__VLS_ctx.protectedNameCount);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "protected-kind-list" },
+    });
+    for (const [item] of __VLS_getVForSourceType((__VLS_ctx.protectedNamePreview))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.protectionListOpen))
+                        return;
+                    __VLS_ctx.updateProtection('remove', 'marketHashName', item.marketHashName);
+                } },
+            key: (item.marketHashName),
+            ...{ class: "protected-kind-row" },
+            type: "button",
+            title: "点击移出保护",
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (item.name);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        (item.marketHashName);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    }
+    if (__VLS_ctx.protectedNameCount === 0) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+            ...{ class: "protection-empty" },
+        });
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "protection-modal-group" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    (__VLS_ctx.protectedAssetCount);
+    for (const [assetId] of __VLS_getVForSourceType((__VLS_ctx.protectedAssetPreview))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.protectionListOpen))
+                        return;
+                    __VLS_ctx.updateProtection('remove', 'asset', assetId);
+                } },
+            key: (assetId),
+            ...{ class: "protection-chip" },
+            type: "button",
+        });
+        (assetId);
+    }
+    if (__VLS_ctx.protectedAssetCount === 0) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+            ...{ class: "protection-empty" },
+        });
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
+        ...{ class: "protection-modal-group" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    (__VLS_ctx.protectedSteamCount);
+    for (const [account] of __VLS_getVForSourceType((__VLS_ctx.protectedSteamPreview))) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.protectionListOpen))
+                        return;
+                    __VLS_ctx.updateProtection('remove', 'steamId', account.steamId);
+                } },
+            key: (account.steamId),
+            ...{ class: "protected-kind-row" },
+            type: "button",
+            title: "点击移出保护",
+        });
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+        (account.name);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+        (account.steamId);
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+    }
+    if (__VLS_ctx.protectedSteamCount === 0) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+            ...{ class: "protection-empty" },
+        });
+    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "protection-modal-hint" },
+    });
+}
 if (__VLS_ctx.message) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
         ...{ class: "inline-status" },
@@ -1460,8 +2243,16 @@ if (__VLS_ctx.message) {
 }
 /** @type {[typeof ProfitTradeRoiWatch, ]} */ ;
 // @ts-ignore
-const __VLS_3 = __VLS_asFunctionalComponent(ProfitTradeRoiWatch, new ProfitTradeRoiWatch({}));
-const __VLS_4 = __VLS_3({}, ...__VLS_functionalComponentArgsRest(__VLS_3));
+const __VLS_16 = __VLS_asFunctionalComponent(ProfitTradeRoiWatch, new ProfitTradeRoiWatch({
+    running: (__VLS_ctx.profitCycleRunning),
+    executorEnabled: (__VLS_ctx.autoRunEnabled),
+    allowRealExecution: (__VLS_ctx.dashboard.config.allowRealExecution),
+}));
+const __VLS_17 = __VLS_16({
+    running: (__VLS_ctx.profitCycleRunning),
+    executorEnabled: (__VLS_ctx.autoRunEnabled),
+    allowRealExecution: (__VLS_ctx.dashboard.config.allowRealExecution),
+}, ...__VLS_functionalComponentArgsRest(__VLS_16));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "profit-layout" },
 });
@@ -1638,128 +2429,19 @@ if (!__VLS_ctx.dashboard.manualEntryOptions.accounts.length) {
     });
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-panel" },
+    ...{ class: "protection-panel protection-summary-panel" },
 });
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h3, __VLS_intrinsicElements.h3)({});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
-    ...{ onSubmit: (__VLS_ctx.addManualProtectedAsset) },
-    ...{ class: "protection-form" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
-    for: "protected-asset-id",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-input-row" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
-    id: "protected-asset-id",
-    value: (__VLS_ctx.manualProtectedAssetId),
-    type: "text",
-    autocomplete: "off",
-    placeholder: "assetId",
-});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
+(__VLS_ctx.protectedNameCount);
+(__VLS_ctx.protectedAssetCount);
+(__VLS_ctx.protectedSteamCount);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ class: "mini-action protect-action" },
-    type: "submit",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
-    ...{ onSubmit: (__VLS_ctx.addManualProtectedMarketHashName) },
-    ...{ class: "protection-form" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
-    for: "protected-market-hash-name",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-input-row" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
-    id: "protected-market-hash-name",
-    value: (__VLS_ctx.manualProtectedMarketHashName),
-    type: "text",
-    autocomplete: "off",
-    placeholder: "market_hash_name",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ class: "mini-action protect-action" },
-    type: "submit",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.form, __VLS_intrinsicElements.form)({
-    ...{ onSubmit: (__VLS_ctx.addManualProtectedSteamId) },
-    ...{ class: "protection-form" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
-    for: "protected-steam-id",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-input-row" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
-    id: "protected-steam-id",
-    value: (__VLS_ctx.manualProtectedSteamId),
-    type: "text",
-    autocomplete: "off",
-    placeholder: "SteamId64",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ class: "mini-action protect-action" },
-    type: "submit",
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-group" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-for (const [assetId] of __VLS_getVForSourceType((__VLS_ctx.protectedAssetPreview))) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-        ...{ onClick: (...[$event]) => {
-                __VLS_ctx.updateProtection('remove', 'asset', assetId);
-            } },
-        key: (assetId),
-        ...{ class: "protection-chip" },
-        type: "button",
-    });
-    (assetId);
-}
-if (__VLS_ctx.protectedAssetCount === 0) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
-}
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-group" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-for (const [marketHashName] of __VLS_getVForSourceType((__VLS_ctx.protectedNamePreview))) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-        ...{ onClick: (...[$event]) => {
-                __VLS_ctx.updateProtection('remove', 'marketHashName', marketHashName);
-            } },
-        key: (marketHashName),
-        ...{ class: "protection-chip" },
-        type: "button",
-    });
-    (marketHashName);
-}
-if (__VLS_ctx.protectedNameCount === 0) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
-}
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "protection-group" },
-});
-__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-for (const [steamId] of __VLS_getVForSourceType((__VLS_ctx.protectedSteamPreview))) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-        ...{ onClick: (...[$event]) => {
-                __VLS_ctx.updateProtection('remove', 'steamId', steamId);
-            } },
-        key: (steamId),
-        ...{ class: "protection-chip" },
-        type: "button",
-    });
-    (steamId);
-}
-if (__VLS_ctx.protectedSteamCount === 0) {
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
-}
-__VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
-    ...{ class: "protection-hint" },
+    ...{ onClick: (__VLS_ctx.openProtectionList) },
+    ...{ class: "secondary-button" },
+    type: "button",
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "trade-stack" },
@@ -1774,7 +2456,7 @@ else if (__VLS_ctx.activeTrades.length === 0) {
         ...{ class: "panel empty-state" },
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-    if (__VLS_ctx.dashboard.listingsCircuit.isBlocking) {
+    if (__VLS_ctx.listingsCooling) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     }
     else {
@@ -1949,11 +2631,11 @@ else {
                 type: "button",
             });
         }
-        if (__VLS_ctx.dashboard.listingsCircuit.isBlocking && trade.stepIndex <= 2) {
+        if (__VLS_ctx.listingsCooling && trade.stepIndex <= 2) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
                 ...{ class: "trade-circuit-note" },
             });
-            (__VLS_ctx.formatDateTime(__VLS_ctx.dashboard.listingsCircuit.nextProbeAt || __VLS_ctx.dashboard.listingsCircuit.cooldownUntil));
+            (__VLS_ctx.formatDateTime(__VLS_ctx.dashboard.listingsCircuit.cooldownUntil));
         }
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "progress-track" },
@@ -2061,7 +2743,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
     ...{ class: "soft-label" },
 });
 (__VLS_ctx.completedFilteredTrades.length);
-(__VLS_ctx.completedTrades.length);
+(__VLS_ctx.completedAllSummary.count);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.openCreateManualRecord) },
     ...{ class: "primary-button" },
@@ -2076,14 +2758,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
-    ...{ onChange: (__VLS_ctx.resetCompletedPage) },
+    ...{ onChange: (__VLS_ctx.loadCompletedTrades) },
     type: "date",
 });
 (__VLS_ctx.completedDateFrom);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
-    ...{ onChange: (__VLS_ctx.resetCompletedPage) },
+    ...{ onChange: (__VLS_ctx.loadCompletedTrades) },
     type: "date",
 });
 (__VLS_ctx.completedDateTo);
@@ -2192,14 +2874,14 @@ else {
         });
         /** @type {[typeof FolioIcon, ]} */ ;
         // @ts-ignore
-        const __VLS_6 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        const __VLS_19 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
             name: "edit",
             size: (16),
         }));
-        const __VLS_7 = __VLS_6({
+        const __VLS_20 = __VLS_19({
             name: "edit",
             size: (16),
-        }, ...__VLS_functionalComponentArgsRest(__VLS_6));
+        }, ...__VLS_functionalComponentArgsRest(__VLS_19));
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "completed-main" },
         });
@@ -2304,17 +2986,21 @@ if (__VLS_ctx.manualRecordOpen) {
     });
     /** @type {[typeof FolioIcon, ]} */ ;
     // @ts-ignore
-    const __VLS_9 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+    const __VLS_22 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
         name: "scan",
         size: (17),
     }));
-    const __VLS_10 = __VLS_9({
+    const __VLS_23 = __VLS_22({
         name: "scan",
         size: (17),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_9));
+    }, ...__VLS_functionalComponentArgsRest(__VLS_22));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
         ...{ onInput: (__VLS_ctx.onManualItemInput) },
-        ...{ onFocus: (__VLS_ctx.searchManualItems) },
+        ...{ onFocus: (...[$event]) => {
+                if (!(__VLS_ctx.manualRecordOpen))
+                    return;
+                __VLS_ctx.searchManualItems(false);
+            } },
         autocomplete: "off",
         placeholder: "输入中文名或英文名，例如：次时代、M4A4",
     });
@@ -2342,6 +3028,23 @@ if (__VLS_ctx.manualRecordOpen) {
             (item.name);
             __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
             (item.marketHashName);
+        }
+        if (__VLS_ctx.manualItemHasMore) {
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+                ...{ onClick: (...[$event]) => {
+                        if (!(__VLS_ctx.manualRecordOpen))
+                            return;
+                        if (!(__VLS_ctx.manualItemSearchOpen))
+                            return;
+                        if (!(__VLS_ctx.manualItemHasMore))
+                            return;
+                        __VLS_ctx.searchManualItems(true);
+                    } },
+                ...{ class: "catalog-load-more" },
+                type: "button",
+                disabled: (__VLS_ctx.manualItemSearchBusy),
+            });
+            (__VLS_ctx.manualItemSearchBusy ? "加载中…" : "加载更多结果");
         }
         if (!__VLS_ctx.manualItemSearchBusy && __VLS_ctx.manualItemSuggestions.length === 0) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
@@ -2516,10 +3219,8 @@ if (__VLS_ctx.manualRecordOpen) {
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
-/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
-/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
-/** @type {__VLS_StyleScopedClasses['danger-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-summary-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-metric']} */ ;
@@ -2534,11 +3235,56 @@ if (__VLS_ctx.manualRecordOpen) {
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution-status-item']} */ ;
 /** @type {__VLS_StyleScopedClasses['wide']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cycle-running']} */ ;
+/** @type {__VLS_StyleScopedClasses['cycle-spinner']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-confirm-backdrop']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-error']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-dialog']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-confirm-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-header']} */ ;
+/** @type {__VLS_StyleScopedClasses['modal-close-button']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-editor-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-search-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-selected-value']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-groups']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kinds']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-empty']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-empty']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-group']} */ ;
+/** @type {__VLS_StyleScopedClasses['protected-kind-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-empty']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-modal-hint']} */ ;
 /** @type {__VLS_StyleScopedClasses['inline-status']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-layout']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
@@ -2563,25 +3309,8 @@ if (__VLS_ctx.manualRecordOpen) {
 /** @type {__VLS_StyleScopedClasses['wallet-reserve-input']} */ ;
 /** @type {__VLS_StyleScopedClasses['wallet-reserve-empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['protection-panel']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
-/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
-/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-form']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-input-row']} */ ;
-/** @type {__VLS_StyleScopedClasses['mini-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protect-action']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-group']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-chip']} */ ;
-/** @type {__VLS_StyleScopedClasses['protection-hint']} */ ;
+/** @type {__VLS_StyleScopedClasses['protection-summary-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary-button']} */ ;
 /** @type {__VLS_StyleScopedClasses['trade-stack']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['empty-state']} */ ;
@@ -2651,6 +3380,7 @@ if (__VLS_ctx.manualRecordOpen) {
 /** @type {__VLS_StyleScopedClasses['manual-item-field']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-search']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-item-selected']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-account-picker']} */ ;
 /** @type {__VLS_StyleScopedClasses['wide-field']} */ ;
@@ -2671,21 +3401,35 @@ const __VLS_self = (await import('vue')).defineComponent({
     setup() {
         return {
             FolioIcon: FolioIcon,
+            ProfitTradeLongBuyStrategyPanel: ProfitTradeLongBuyStrategyPanel,
             ProfitTradeRoiWatch: ProfitTradeRoiWatch,
             dashboard: dashboard,
+            listingsCooling: listingsCooling,
             loading: loading,
             apiOnline: apiOnline,
             message: message,
             manualProtectedAssetId: manualProtectedAssetId,
             manualProtectedMarketHashName: manualProtectedMarketHashName,
             manualProtectedSteamId: manualProtectedSteamId,
+            protectionListOpen: protectionListOpen,
+            protectionItemQuery: protectionItemQuery,
+            protectionItemSuggestions: protectionItemSuggestions,
+            protectionItemSearchOpen: protectionItemSearchOpen,
+            protectionItemSearchBusy: protectionItemSearchBusy,
+            protectionItemHasMore: protectionItemHasMore,
+            protectionError: protectionError,
             dailySteamBudgetDraft: dailySteamBudgetDraft,
             reservedBalanceDrafts: reservedBalanceDrafts,
             manualSettleInputs: manualSettleInputs,
             runtimeBusy: runtimeBusy,
             runtimeConfirmEnabled: runtimeConfirmEnabled,
+            runtimeConfirmError: runtimeConfirmError,
+            configToggleBusy: configToggleBusy,
+            longBuyWriteConfirm: longBuyWriteConfirm,
+            longBuyWriteConfirmError: longBuyWriteConfirmError,
             completedDateFrom: completedDateFrom,
             completedDateTo: completedDateTo,
+            completedAllSummary: completedAllSummary,
             manualRecordOpen: manualRecordOpen,
             manualRecordSaving: manualRecordSaving,
             manualRecordEditingTradeId: manualRecordEditingTradeId,
@@ -2694,6 +3438,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             manualItemSuggestions: manualItemSuggestions,
             manualItemSearchOpen: manualItemSearchOpen,
             manualItemSearchBusy: manualItemSearchBusy,
+            manualItemHasMore: manualItemHasMore,
             manualRecordForm: manualRecordForm,
             activeTrades: activeTrades,
             completedTrades: completedTrades,
@@ -2718,11 +3463,17 @@ const __VLS_self = (await import('vue')).defineComponent({
             protectedNamePreview: protectedNamePreview,
             protectedSteamPreview: protectedSteamPreview,
             autoRunEnabled: autoRunEnabled,
+            profitCycleRunning: profitCycleRunning,
             stickerSlabActive: stickerSlabActive,
             stickerActive: stickerActive,
             apiStatusLabel: apiStatusLabel,
             realExecutionLabel: realExecutionLabel,
+            longBuyRemoteWritesEnabled: longBuyRemoteWritesEnabled,
+            longBuyObservationMode: longBuyObservationMode,
+            longBuyExecutionLabel: longBuyExecutionLabel,
+            longBuyExecutionDetail: longBuyExecutionDetail,
             autoRunStatusLabel: autoRunStatusLabel,
+            autoRunCountdown: autoRunCountdown,
             nextAutoRunLabel: nextAutoRunLabel,
             lastRunLabel: lastRunLabel,
             formatMoney: formatMoney,
@@ -2733,10 +3484,15 @@ const __VLS_self = (await import('vue')).defineComponent({
             openEditManualRecord: openEditManualRecord,
             closeManualRecord: closeManualRecord,
             searchManualItems: searchManualItems,
+            searchProtectionItems: searchProtectionItems,
+            onProtectionItemInput: onProtectionItemInput,
+            chooseProtectionItem: chooseProtectionItem,
+            openProtectionList: openProtectionList,
+            closeProtectionList: closeProtectionList,
             onManualItemInput: onManualItemInput,
             chooseManualItem: chooseManualItem,
             saveManualRecord: saveManualRecord,
-            resetCompletedPage: resetCompletedPage,
+            loadCompletedTrades: loadCompletedTrades,
             setCompletedDatePreset: setCompletedDatePreset,
             goCompletedPage: goCompletedPage,
             noteText: noteText,
@@ -2752,8 +3508,12 @@ const __VLS_self = (await import('vue')).defineComponent({
             stepClass: stepClass,
             loadDashboard: loadDashboard,
             toggleEnabled: toggleEnabled,
-            toggleRealExecution: toggleRealExecution,
-            toggleRepriceExecution: toggleRepriceExecution,
+            runOnce: runOnce,
+            openRuntimeConfirm: openRuntimeConfirm,
+            closeRuntimeConfirm: closeRuntimeConfirm,
+            requestLongBuyConfigToggle: requestLongBuyConfigToggle,
+            closeLongBuyWriteConfirm: closeLongBuyWriteConfirm,
+            confirmLongBuyWriteToggle: confirmLongBuyWriteToggle,
             saveDailySteamBudget: saveDailySteamBudget,
             saveAccountReservedBalances: saveAccountReservedBalances,
             manualSettleTrade: manualSettleTrade,

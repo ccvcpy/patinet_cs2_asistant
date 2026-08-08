@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Callable
 
 from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient, SteamMarketClient
 from cs2_assistant.models import MarketState
-from cs2_assistant.services.pricing import choose_orderbook_price
-from cs2_assistant.utils import chunked, safe_float, safe_int
+from cs2_assistant.services.pricing import (
+    PricingDecision,
+    build_orderbook_snapshot,
+    choose_orderbook_price,
+)
+from cs2_assistant.services.steam_request_scheduler import SteamRequestTimeout
+from cs2_assistant.utils import chunked, safe_float, safe_int, utc_now_iso
 
 DEFAULT_C5_SETTLEMENT_FACTOR = 0.869
 DEFAULT_STEAM_BALANCE_DISCOUNT = 0.73
@@ -120,6 +125,10 @@ class MarketService:
         steam_currency: int = 23,
         include_c5_purchase_prices: bool = True,
         fallback_max_workers: int = 4,
+        steam_orderbook_admission_timeout_seconds: float | None = None,
+        steam_orderbook_price_resolver: (
+            Callable[[str, dict[str, Any]], PricingDecision | None] | None
+        ) = None,
     ):
         self.steamdt_client = steamdt_client
         self.csqaq_client = csqaq_client
@@ -131,16 +140,15 @@ class MarketService:
         self.steam_currency = steam_currency
         self.include_c5_purchase_prices = include_c5_purchase_prices
         self.fallback_max_workers = max(1, int(fallback_max_workers))
+        self.steam_orderbook_admission_timeout_seconds = (
+            None
+            if steam_orderbook_admission_timeout_seconds is None
+            else max(0.0, float(steam_orderbook_admission_timeout_seconds))
+        )
+        self.steam_orderbook_price_resolver = steam_orderbook_price_resolver
 
     def refresh_items(self, items: list[dict[str, Any]]) -> list[MarketState]:
-        states = {
-            row["market_hash_name"]: MarketState(
-                market_hash_name=row["market_hash_name"],
-                name_cn=row.get("name_cn"),
-                c5_item_id=row.get("c5_item_id"),
-            )
-            for row in items
-        }
+        states = self._create_states(items)
 
         market_hash_names = list(states.keys())
         if self.csqaq_client:
@@ -152,19 +160,7 @@ class MarketService:
         if self.steam_market_clients:
             self._load_steam_market_prices(states, market_hash_names)
 
-        if self.c5_client:
-            for batch in chunked(market_hash_names, 100):
-                try:
-                    data = self.c5_client.price_batch(batch, app_id=self.app_id)
-                except Exception as exc:
-                    for market_hash_name in batch:
-                        state = states.get(market_hash_name)
-                        if state is not None:
-                            state.raw_json["c5_batch_error"] = str(exc)
-                    continue
-                self._apply_c5_batch(states, data)
-            if self.include_c5_purchase_prices:
-                self._apply_c5_purchase_prices(states)
+        self._load_c5_prices(states, market_hash_names)
 
         for state in states.values():
             state.ratio = calculate_ratio(
@@ -173,22 +169,109 @@ class MarketService:
             )
         return list(states.values())
 
-    def _load_steam_market_prices(
+    def refresh_items_stream(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        on_state_ready: Callable[[MarketState], None],
+    ) -> list[MarketState]:
+        """Refresh a batch while publishing each completed Steam orderbook state.
+
+        C5 data remains batched.  It is loaded before the per-item Steam work so
+        a completed orderbook can be evaluated immediately without waiting for
+        the other Steam futures.  This path is intentionally opt-in; existing
+        callers retain the original whole-batch return contract.
+        """
+
+        states = self._create_states(items)
+        market_hash_names = list(states.keys())
+        if self.csqaq_client:
+            self._load_csqaq_prices(states, market_hash_names)
+        if self.steamdt_client:
+            self._load_steamdt_prices(states, market_hash_names)
+
+        self._load_c5_prices(states, market_hash_names)
+
+        def publish(state: MarketState) -> None:
+            state.ratio = calculate_ratio(state.c5_sell_price, state.steam_sell_price)
+            on_state_ready(state)
+
+        if self.steam_market_clients:
+            self._load_steam_market_prices(
+                states,
+                market_hash_names,
+                on_state_ready=publish,
+            )
+        else:
+            for state in states.values():
+                publish(state)
+        return list(states.values())
+
+    @staticmethod
+    def _create_states(items: list[dict[str, Any]]) -> dict[str, MarketState]:
+        return {
+            row["market_hash_name"]: MarketState(
+                market_hash_name=row["market_hash_name"],
+                name_cn=row.get("name_cn"),
+                c5_item_id=row.get("c5_item_id"),
+            )
+            for row in items
+        }
+
+    def _load_c5_prices(
         self,
         states: dict[str, MarketState],
         market_hash_names: list[str],
     ) -> None:
-        def load_one(market_hash_name: str) -> tuple[str, dict[str, Any] | None, list[str]]:
+        if not self.c5_client:
+            return
+        for batch in chunked(market_hash_names, 100):
+            try:
+                data = self.c5_client.price_batch(batch, app_id=self.app_id)
+            except Exception as exc:
+                for market_hash_name in batch:
+                    state = states.get(market_hash_name)
+                    if state is not None:
+                        state.raw_json["c5_batch_error"] = str(exc)
+                continue
+            self._apply_c5_batch(states, data)
+        if self.include_c5_purchase_prices:
+            self._apply_c5_purchase_prices(states)
+
+    def _load_steam_market_prices(
+        self,
+        states: dict[str, MarketState],
+        market_hash_names: list[str],
+        *,
+        on_state_ready: Callable[[MarketState], None] | None = None,
+    ) -> None:
+        def load_one(
+            market_hash_name: str,
+        ) -> tuple[str, dict[str, Any] | None, list[str], int | None, str | None]:
             errors: list[str] = []
-            for client in self.steam_market_clients:
+            error_type: str | None = None
+            for client_index, client in enumerate(self.steam_market_clients):
                 account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
                 try:
-                    payload = client.order_book(
-                        app_id=self.app_id,
-                        market_hash_name=market_hash_name,
-                    )
+                    orderbook_kwargs: dict[str, Any] = {
+                        "app_id": self.app_id,
+                        "market_hash_name": market_hash_name,
+                    }
+                    if self.steam_orderbook_admission_timeout_seconds is not None:
+                        orderbook_kwargs["admission_timeout_seconds"] = (
+                            self.steam_orderbook_admission_timeout_seconds
+                        )
+                    payload = client.order_book(**orderbook_kwargs)
                 except Exception as exc:
                     errors.append(f"{account_label}: {exc}")
+                    if isinstance(exc, SteamRequestTimeout):
+                        error_type = "queue_timeout"
+                        # No HTTP callback ran. Trying another account only adds
+                        # another observation ticket behind the same global
+                        # scheduler and turns local congestion into fake
+                        # remote-price failures.
+                        break
+                    error_type = "request_failed"
                     continue
                 data = _payload_data(payload or {})
                 currency = safe_int(data.get("eCurrency"))
@@ -197,33 +280,71 @@ class MarketService:
                         f"{account_label}: orderbook currency mismatch "
                         f"expected={self.steam_currency} actual={currency}"
                     )
+                    error_type = "currency_mismatch"
                     continue
-                return market_hash_name, payload, errors
-            return market_hash_name, None, errors
+                return market_hash_name, payload, errors, client_index, None
+            return market_hash_name, None, errors, None, error_type
+
+        def apply_result(
+            result: tuple[
+                str,
+                dict[str, Any] | None,
+                list[str],
+                int | None,
+                str | None,
+            ]
+        ) -> None:
+            market_hash_name, payload, errors, client_index, error_type = result
+            state = states.get(market_hash_name)
+            if state is None:
+                return
+            if payload is None:
+                state.raw_json["steam_orderbook_error"] = " | ".join(errors) if errors else "empty_orderbook_response"
+                state.raw_json["steam_orderbook_error_type"] = (
+                    error_type or "empty_response"
+                )
+            else:
+                if errors:
+                    state.raw_json["steam_orderbook_retry_errors"] = errors
+                if client_index is not None:
+                    state.raw_json["steam_orderbook_client_index"] = client_index
+                state.raw_json["steam_orderbook"] = payload
+                state.raw_json["steam_orderbook_snapshot"] = build_orderbook_snapshot(
+                    payload or {},
+                    observed_at=utc_now_iso(),
+                    depth=5,
+                    expected_currency=self.steam_currency,
+                )
+                resolver = self.steam_orderbook_price_resolver
+                decision = (
+                    resolver(market_hash_name, payload or {})
+                    if resolver is not None
+                    else choose_orderbook_price(
+                        payload or {},
+                        wall_min_count=1,
+                        price_offset=0.0,
+                    )
+                )
+                if decision is None:
+                    state.raw_json["steam_orderbook_error"] = "empty_sell_orderbook"
+                    state.raw_json["steam_orderbook_error_type"] = (
+                        "empty_sell_orderbook"
+                    )
+                else:
+                    state.steam_sell_price = decision.list_price
+                    state.steam_price_source = "steam_orderbook"
+            if on_state_ready is not None:
+                on_state_ready(state)
 
         max_workers = min(self.fallback_max_workers, len(market_hash_names))
         if max_workers <= 1:
-            results = [load_one(market_hash_name) for market_hash_name in market_hash_names]
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                results = list(executor.map(load_one, market_hash_names))
-
-        for market_hash_name, payload, errors in results:
-            state = states.get(market_hash_name)
-            if state is None:
-                continue
-            if payload is None:
-                state.raw_json["steam_orderbook_error"] = " | ".join(errors) if errors else "empty_orderbook_response"
-                continue
-            if errors:
-                state.raw_json["steam_orderbook_retry_errors"] = errors
-            state.raw_json["steam_orderbook"] = payload
-            decision = choose_orderbook_price(payload or {}, wall_min_count=1, price_offset=0.0)
-            if decision is None:
-                state.raw_json["steam_orderbook_error"] = "empty_sell_orderbook"
-                continue
-            state.steam_sell_price = decision.list_price
-            state.steam_price_source = "steam_orderbook"
+            for market_hash_name in market_hash_names:
+                apply_result(load_one(market_hash_name))
+            return
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(load_one, market_hash_name) for market_hash_name in market_hash_names]
+            for future in as_completed(futures):
+                apply_result(future.result())
 
     def _load_steamdt_prices(
         self,

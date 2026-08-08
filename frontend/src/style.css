@@ -387,14 +387,17 @@ button:disabled {
 
 /* FOLIO compact data system ------------------------------------------------ */
 :root {
-  font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --folio-font: "Segoe UI Variable Text", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  font-family: var(--folio-font);
   color: #17201c;
   background: #f4f6f2;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --folio-bg: #f4f6f2;
   --folio-ink: #17201c;
-  --folio-muted: #6f7872;
+  /* Normal-size helper text must remain readable on the warm FOLIO surfaces. */
+  --folio-muted: #59655f;
+  --folio-muted-strong: #46564c;
   --folio-line: #e4e8e2;
   --folio-surface: #fff;
   --folio-surface-soft: #f7f9f6;
@@ -411,6 +414,65 @@ button:disabled {
   --folio-violet: #695b8d;
   --folio-violet-soft: #f0edf6;
   --folio-shadow: 0 6px 26px rgba(34, 49, 41, .035);
+  --folio-surface-raised: #ffffff;
+  --folio-surface-tint: #f2f7f3;
+  --folio-line-strong: #d8e2da;
+  --folio-shadow-raised: 0 16px 42px rgba(26, 48, 36, .08);
+  --folio-shadow-float: 0 26px 64px rgba(26, 48, 36, .14);
+  --folio-focus-ring: 0 0 0 3px rgba(35, 106, 76, .14);
+  /* Green operations design system.  These tokens intentionally mirror the
+     approved atomic component board and are scoped to the non-executor pages
+     through .app-shell--minimal-v2 below. */
+  --ops-font: "Source Han Sans SC", "Noto Sans CJK SC", "思源黑体 CN", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --ops-primary: #0f8b45;
+  --ops-primary-hover: #0c753a;
+  --ops-primary-pressed: #095e30;
+  --ops-primary-soft: #edf8f1;
+  --ops-primary-mint: #e0f2e8;
+  --ops-neutral-950: #111827;
+  --ops-neutral-900: #1f2937;
+  --ops-neutral-700: #4b5563;
+  --ops-neutral-600: #59645d;
+  --ops-neutral-500: #7b847e;
+  --ops-neutral-300: #d1d8d2;
+  --ops-neutral-200: #e3e8e4;
+  --ops-neutral-100: #f3f5f3;
+  --ops-neutral-50: #f8faf8;
+  --ops-surface: #ffffff;
+  --ops-canvas: #f7f9f6;
+  --ops-success: #0f8b45;
+  --ops-success-soft: #eaf6ee;
+  --ops-warning: #a66b12;
+  --ops-warning-soft: #fff5df;
+  --ops-error: #b5423c;
+  --ops-error-soft: #fcecea;
+  --ops-neutral-state: #59645d;
+  --ops-neutral-state-soft: #f0f2f0;
+  --ops-radius-xs: 4px;
+  --ops-radius-sm: 6px;
+  --ops-radius-md: 8px;
+  --ops-radius-lg: 12px;
+  --ops-shadow-shallow: 0 1px 3px rgba(20, 58, 38, .07);
+  --ops-shadow-medium: 0 8px 24px rgba(20, 58, 38, .075);
+  --ops-shadow-deep: 0 24px 64px rgba(15, 52, 32, .18);
+  --ops-focus-ring: 0 0 0 3px rgba(19, 134, 71, .15);
+  --minimal-bg: var(--ops-canvas);
+  --minimal-surface: var(--ops-surface);
+  --minimal-surface-soft: var(--ops-neutral-50);
+  --minimal-ink: var(--ops-neutral-900);
+  --minimal-muted: var(--ops-neutral-600);
+  --minimal-line: var(--ops-neutral-200);
+  --minimal-line-strong: var(--ops-neutral-300);
+  --minimal-blue: var(--ops-primary);
+  --minimal-blue-soft: var(--ops-primary-soft);
+  --minimal-amber: var(--ops-warning);
+  --minimal-amber-soft: var(--ops-warning-soft);
+  --minimal-success: var(--ops-success);
+  --minimal-success-soft: var(--ops-success-soft);
+  --minimal-danger: var(--ops-error);
+  --minimal-danger-soft: var(--ops-error-soft);
+  --minimal-shadow: var(--ops-shadow-shallow);
+  --minimal-shadow-float: var(--ops-shadow-deep);
 }
 
 html, body { min-width: 320px; min-height: 100%; background: var(--folio-bg); }
@@ -524,4 +586,155 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .page-header h1 { font-size: 25px; }
   .metric-card { min-height: 92px; border-radius: 14px; }
   .panel { border-radius: 14px; padding: 14px; }
+}
+
+/* Green operations theme applies only outside the two production execution modules. */
+.app-shell--minimal-v2 {
+  color: var(--minimal-ink);
+  font-family: var(--ops-font);
+  background:
+    radial-gradient(circle at 88% 3%, rgba(66, 154, 94, .055), transparent 23%),
+    var(--minimal-bg);
+}
+.app-shell--minimal-v2 .page {
+  width: min(1440px, calc(100vw - 48px));
+}
+.app-shell--minimal-v2 .top-nav {
+  align-items: center;
+  gap: 4px;
+  min-height: 58px;
+  padding-block: 8px;
+  border-bottom-color: var(--minimal-line);
+  background: rgba(255, 255, 255, .96);
+  box-shadow: var(--ops-shadow-shallow);
+}
+.app-shell--minimal-v2 .nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin-right: clamp(8px, 2vw, 24px);
+  color: var(--minimal-ink);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.app-shell--minimal-v2 .nav-brand-mark {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--ops-primary);
+  border-radius: var(--ops-radius-md);
+  color: #fff;
+  background: linear-gradient(145deg, var(--ops-primary), var(--ops-primary-pressed));
+  box-shadow: var(--ops-shadow-shallow);
+}
+.app-shell--minimal-v2 .nav-tab {
+  position: relative;
+  min-height: 40px;
+  border: 1px solid transparent;
+  border-radius: var(--ops-radius-sm);
+  color: var(--minimal-muted);
+  background: transparent;
+}
+.app-shell--minimal-v2 .nav-tab:hover {
+  color: var(--ops-primary-hover);
+  border-color: var(--ops-neutral-200);
+  background: var(--ops-neutral-50);
+}
+.app-shell--minimal-v2 .nav-tab.active {
+  color: var(--ops-primary-hover);
+  border-color: #cce3d3;
+  background: var(--ops-primary-soft);
+  box-shadow: inset 0 -2px 0 var(--ops-primary);
+}
+.app-shell--minimal-v2 .nav-tab.active svg {
+  color: var(--ops-primary);
+}
+
+/* Shared real controls for the green operations pages.  Page-level scoped
+   styles may arrange these controls, while these rules own their language. */
+.app-shell--minimal-v2 :is(.primary-button, .primary) {
+  min-height: 40px;
+  border: 1px solid var(--ops-primary);
+  border-radius: var(--ops-radius-sm);
+  color: #fff;
+  background: var(--ops-primary);
+  box-shadow: var(--ops-shadow-shallow);
+}
+.app-shell--minimal-v2 :is(.primary-button, .primary):hover:not(:disabled) {
+  color: #fff;
+  border-color: var(--ops-primary-hover);
+  background: var(--ops-primary-hover);
+  box-shadow: var(--ops-shadow-medium);
+  transform: translateY(-1px);
+}
+.app-shell--minimal-v2 :is(.secondary-button, .secondary, .new-round, .open-round) {
+  min-height: 40px;
+  border: 1px solid #a9cbb4;
+  border-radius: var(--ops-radius-sm);
+  color: var(--ops-primary-hover);
+  background: var(--ops-surface);
+  box-shadow: none;
+}
+.app-shell--minimal-v2 :is(.secondary-button, .secondary, .new-round, .open-round):hover:not(:disabled) {
+  border-color: var(--ops-primary);
+  color: var(--ops-primary-hover);
+  background: var(--ops-primary-soft);
+}
+.app-shell--minimal-v2 :is(.icon-button, .page-button) {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--ops-neutral-300);
+  border-radius: var(--ops-radius-sm);
+  color: var(--ops-neutral-700);
+  background: var(--ops-surface);
+  box-shadow: none;
+}
+.app-shell--minimal-v2 :is(.icon-button, .page-button):hover:not(:disabled) {
+  border-color: #a9cbb4;
+  color: var(--ops-primary-hover);
+  background: var(--ops-primary-soft);
+}
+.app-shell--minimal-v2 :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  border-color: var(--ops-neutral-300);
+  border-radius: var(--ops-radius-sm);
+  color: var(--ops-neutral-900);
+  background: var(--ops-surface);
+}
+.app-shell--minimal-v2 :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea):hover:not(:disabled) {
+  border-color: #a9b5ac;
+}
+.app-shell--minimal-v2 :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus {
+  border-color: var(--ops-primary);
+  box-shadow: var(--ops-focus-ring);
+}
+.app-shell--minimal-v2 :is(.metric-card, .metrics article) {
+  border-radius: var(--ops-radius-md);
+  box-shadow: var(--ops-shadow-shallow);
+}
+.app-shell--minimal-v2 .panel {
+  border-radius: var(--ops-radius-lg);
+  box-shadow: var(--ops-shadow-medium);
+}
+.app-shell--minimal-v2 :is(.status-success, .read-status.ok, .status-pill.completed, .order-pill.delivered) {
+  color: var(--ops-success);
+  background: var(--ops-success-soft);
+}
+.app-shell--minimal-v2 :is(.status-warning, .read-status.skipped, .status-pill.draft, .status-pill.paused, .order-pill.pending) {
+  color: var(--ops-warning);
+  background: var(--ops-warning-soft);
+}
+.app-shell--minimal-v2 :is(.status-error, .read-status.error, .status-pill.stopped, .order-pill.failed) {
+  color: var(--ops-error);
+  background: var(--ops-error-soft);
+}
+.app-shell--minimal-v2 :is(.status-neutral, .status-pill.running) {
+  color: var(--ops-neutral-state);
+  background: var(--ops-neutral-state-soft);
+}
+@media (max-width: 760px) {
+  .app-shell--minimal-v2 .nav-brand strong { display: none; }
+  .app-shell--minimal-v2 .nav-brand { margin-right: 2px; }
+  .app-shell--minimal-v2 .page { width: min(100vw - 20px, 1440px); }
 }

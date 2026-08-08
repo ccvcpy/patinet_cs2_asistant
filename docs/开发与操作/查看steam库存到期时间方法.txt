@@ -1,0 +1,13 @@
+根因找到了，你完全正确：Steam 现在把受保护物品拆到了独立的 context 16 = Trade-protected Items。steampy 的 GameOptions.CS 写死只读 context 2，所以我刚才只看到了普通库存 642 件，漏掉了 701+625+459+68+24=1,877 件受保护库存；五账号 Steam 官方页面实际总数是 642+1,877=2,519 件。这个 1,877 还恰好与 C5 显示的全部冷却数量一致，说明不是 C5 库存不在 Steam，而是我读错了 Steam context。现在我会读取 context 16，把真实解锁时间和各品类数量算出来。
+
+看别人库存？？
+
+
+调查结论：
+现状是：五个 Steam 账号的官方库存上下文合计不是 642 件，而是至少 2,519 件；642 件只是普通库存，另外 1,877 件在 Steam 的受保护库存 context 16。
+关键约束是：steampy 的 get_my_inventory(GameOptions.CS) 默认写死 context_id=2，不会自动把 context 16 合并进来。
+我之前不知道但现在知道的是：context 16 不只包含“等待解锁”的物品，还包含已经挂在 Steam 市场上的物品，必须进一步读取 owner_descriptions 区分“市场在售”和“保护期未结束”。
+基于以上，我的判断是：你对“五个 Steam 库存约两千件”的判断完全正确；我之前说“1,803 件不在 Steam 背包里”是错误结论，应当撤回。
+
+
+Steam context 16 的 owner_descriptions 确实给出了每一批资产的真实保护截止时间。

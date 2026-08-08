@@ -13,6 +13,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cs2_assistant.accounts import Account
 from cs2_assistant.config import Settings
 from cs2_assistant.services.t_yield_scan import (
     INVENTORY_FILTER_COOLDOWN_ONLY,
@@ -21,6 +22,7 @@ from cs2_assistant.services.t_yield_scan import (
     TYieldAccountRef,
     TYieldCandidate,
     TYieldScanReport,
+    build_market_service,
     filter_candidates_by_inventory_filter,
     scan_t_yield,
     summarize_inventory_types,
@@ -67,6 +69,41 @@ class FakeC5PreflightMarketService:
 
 
 class TYieldScanTestCase(unittest.TestCase):
+    def test_guadao_market_service_reuses_saved_cookie_without_bulk_relogin(self) -> None:
+        account = Account(
+            id="steam-a",
+            name="steam-a",
+            steam_id64="76561198000000000",
+            cookies=(
+                "sessionid=session-1; "
+                "steamLoginSecure=76561198000000000%7C%7Ctoken"
+            ),
+        )
+        account_store = SimpleNamespace(list_accounts=lambda: [account])
+        settings = Settings()
+
+        with patch(
+            "cs2_assistant.services.t_yield_scan.AccountStore",
+            return_value=account_store,
+        ), patch(
+            "cs2_assistant.services.t_yield_scan.try_steam_auto_relogin",
+            side_effect=AssertionError("guadao scan must not validate every account"),
+        ):
+            service = build_market_service(
+                settings,
+                include_c5_purchase_prices=False,
+                include_c5=False,
+                steam_request_source="guadao",
+                refresh_steam_accounts=False,
+                steam_orderbook_max_workers=1,
+                steam_orderbook_admission_timeout_seconds=90.0,
+            )
+
+        self.assertEqual(1, len(service.steam_market_clients))
+        self.assertEqual("guadao", service.steam_market_clients[0]._request_source)
+        self.assertEqual(1, service.fallback_max_workers)
+        self.assertEqual(90.0, service.steam_orderbook_admission_timeout_seconds)
+
     def test_bottom_rows_returns_lowest_yield_first(self) -> None:
         report = TYieldScanReport(
             generated_at="2026-04-01T00:00:00+00:00",

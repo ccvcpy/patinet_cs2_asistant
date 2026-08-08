@@ -6,6 +6,7 @@ const legacyRoutes: Record<string, string> = {
   guadao: "/guadao/overview",
   "case-ratio": "/case-ratio",
   "profit-trade": "/profit-trade/overview",
+  "c5-t-monitor": "/c5-t-monitor",
   "c5-sweeper": "/c5-sweeper",
 };
 
@@ -48,6 +49,21 @@ const routes: RouteRecordRaw[] = [
     ],
   },
   { path: "/case-ratio", component: () => import("./pages/case_ratio_monitor.vue") },
+  {
+    path: "/case-ratio/components",
+    name: "case-ratio-components",
+    component: () => import("./pages/case_ratio_monitor_atoms.vue"),
+  },
+  {
+    path: "/c5-t-monitor",
+    name: "c5-t-monitor",
+    component: () => import("./pages/c5_t_monitor.vue"),
+  },
+  {
+    path: "/c5-t-monitor/components",
+    name: "c5-t-monitor-components",
+    component: () => import("./pages/c5_t_monitor_atoms.vue"),
+  },
   { path: "/c5-sweeper", component: () => import("./pages/c5_sweeper.vue") },
   {
     path: "/profit-trade",

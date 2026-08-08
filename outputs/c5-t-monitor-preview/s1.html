@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>C5 做T监控 - S1 完整页面预览</title>
+  <link rel="stylesheet" href="./c5-t-preview.css" />
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="shield-check"></i></span>
+      <span>CS2 交易运营中心</span>
+    </div>
+    <nav class="topnav">
+      <span class="nav-item"><i data-lucide="layout-dashboard"></i>概览</span>
+      <span class="nav-item"><i data-lucide="archive"></i>仓库</span>
+      <span class="nav-item"><i data-lucide="gem"></i>饰品管理</span>
+      <span class="nav-item active"><i data-lucide="scan-line"></i>C5 扫描 &amp; 库存运营</span>
+      <span class="nav-item"><i data-lucide="clipboard-list"></i>订单管理</span>
+      <span class="nav-item"><i data-lucide="chart-no-axes-column-increasing"></i>数据分析</span>
+      <span class="nav-item"><i data-lucide="briefcase-business"></i>工具箱</span>
+      <span class="nav-item"><i data-lucide="settings"></i>系统设置</span>
+    </nav>
+    <span class="top-spacer"></span>
+    <span class="top-action"><i data-lucide="bell"></i>消息</span>
+    <span class="top-action"><i data-lucide="circle-user-round"></i>运营账号<i data-lucide="chevron-down"></i></span>
+  </header>
+
+  <main class="page">
+    <section class="page-heading">
+      <div>
+        <h1>C5 做T监控</h1>
+        <p>实时扫描 C5 市场，结合 Steam 官方盘口识别稳定做T机会，为后续选品与库存运营提供依据。</p>
+      </div>
+      <div class="heading-actions">
+        <button class="button primary heading-primary"><i data-lucide="scan-line"></i>开始扫描 C5 市场</button>
+      </div>
+    </section>
+
+    <section class="kpis">
+      <article class="kpi">
+        <span class="kpi-icon"><i data-lucide="layers-3"></i></span>
+        <div class="kpi-copy">
+          <span>今日扫描饰品</span>
+          <strong>8,752</strong>
+          <small>较昨日 <b>+13.6% ↑</b></small>
+        </div>
+      </article>
+      <article class="kpi">
+        <span class="kpi-icon"><i data-lucide="activity"></i></span>
+        <div class="kpi-copy">
+          <span>可做T机会</span>
+          <strong>186</strong>
+          <small>较昨日 <b>+8.3% ↑</b></small>
+        </div>
+      </article>
+      <article class="kpi">
+        <span class="kpi-icon"><i data-lucide="tag"></i></span>
+        <div class="kpi-copy">
+          <span>预计利润总额</span>
+          <strong>¥ 24,560.75</strong>
+          <small>较昨日 <b>+11.2% ↑</b></small>
+        </div>
+      </article>
+      <article class="kpi">
+        <span class="kpi-icon"><i data-lucide="chart-pie"></i></span>
+        <div class="kpi-copy">
+          <span>库存周转率</span>
+          <strong>2.38</strong>
+          <small>较昨日 <b>+0.27 ↑</b></small>
+        </div>
+      </article>
+    </section>
+
+    <section class="filter-bar">
+      <label class="field">
+        <span>市场</span>
+        <span class="select-shell">C5<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+      </label>
+      <label class="field">
+        <span>饰品类型</span>
+        <span class="select-shell">全部<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+      </label>
+      <label class="field">
+        <span>品质</span>
+        <span class="select-shell">全部<span class="top-spacer"></span><i data-lucide="chevron-down"></i></span>
+      </label>
+      <label class="field">
+        <span>磨损区间</span>
+        <span class="range-shell"><span>0.00</span><i>~</i><span>1.00</span></span>
+      </label>
+      <label class="field">
+        <span>价格区间</span>
+        <span class="range-shell price-range"><span>¥&nbsp; 最低价</span><i>~</i><span>¥&nbsp; 最高价</span></span>
+      </label>
+      <label class="field">
+        <span>搜索</span>
+        <span class="input-shell"><i data-lucide="search"></i><span>饰品名称 / 关键词</span></span>
+      </label>
+      <div class="filter-actions">
+        <button class="button">重置</button>
+        <button class="button primary"><i data-lucide="list-filter"></i>筛选</button>
+      </div>
+    </section>
+
+    <section class="opportunity">
+      <div class="opportunity-summary">
+        <div class="opportunity-title">
+          <span class="opportunity-badge"><i data-lucide="shopping-cart"></i></span>
+          <strong>今日扫描概览（C5）</strong>
+        </div>
+        <div class="op-stat"><span>扫描饰品</span><strong>8,752</strong></div>
+        <div class="op-stat"><span>可做T机会</span><strong class="green">186 <small>(2.12%)</small></strong></div>
+        <div class="op-stat"><span>预计成本</span><strong>¥ 182,540.60</strong></div>
+        <div class="op-stat"><span>预计利润</span><strong>¥ 24,560.75</strong></div>
+        <div class="op-stat"><span>平均利润率</span><strong>13.45%</strong></div>
+      </div>
+      <div class="roi-distribution">
+        <header><span>机会分布（按利润率）</span><span>查看更多 <i data-lucide="chevron-right"></i></span></header>
+        <div class="distribution-bar"><span></span><span></span><span></span><span></span></div>
+        <div class="distribution-legend">
+          <span class="legend-item"><i class="legend-dot"></i>≥ 20%（38）</span>
+          <span class="legend-item"><i class="legend-dot light"></i>10%~20%（67）</span>
+          <span class="legend-item"><i class="legend-dot amber"></i>5%~10%（54）</span>
+          <span class="legend-item"><i class="legend-dot gray"></i>&lt; 5%（27）</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="ranking">
+      <header class="ranking-head">
+        <h2>做T产品推荐排行</h2>
+        <span>按稳定推荐分排序，当前 ROI 不是唯一依据</span>
+      </header>
+      <div class="rank-grid rank-header">
+        <span>排名</span><span>产品</span><span>品质</span><span>Steam 买入</span><span>C5 售价</span>
+        <span>C5 预计到手</span><span>单件收益</span><span>当前 ROI</span>
+        <span>7日平均 ROI</span><span>正 ROI 占比</span><span>库存状态</span><span>推荐</span><span>详情</span>
+      </div>
+
+      <div class="rank-grid rank-row selected">
+        <span class="rank-number">1</span>
+        <div class="product">
+          <span class="product-thumb green"><i data-lucide="crosshair"></i></span>
+          <span class="product-copy"><strong>USP消音版 | 脑洞大开（崭新出厂）</strong><small>USP-S | Cortex (Factory New)</small></span>
+        </div>
+        <span><i class="quality-tag covert">隐秘</i></span>
+        <span class="money">¥376.78</span><span class="money">¥267.80</span><span class="money">¥265.12</span>
+        <span class="roi">+¥5.14</span><span class="roi">1.37%</span><span class="roi">0.84%</span>
+        <span class="stability"><strong>100%</strong><i class="mini-track"><span style="width:100%"></span></i></span>
+        <span><i class="inventory-status ready">可入库</i></span>
+        <span><i class="recommendation">稳定推荐</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <div class="rank-grid rank-row">
+        <span class="rank-number">2</span>
+        <div class="product">
+          <span class="product-thumb red"><i data-lucide="target"></i></span>
+          <span class="product-copy"><strong>AK-47 | 红线（久经沙场）</strong><small>AK-47 | Redline (Field-Tested)</small></span>
+        </div>
+        <span><i class="quality-tag covert">隐秘</i></span>
+        <span class="money">¥119.40</span><span class="money">¥84.70</span><span class="money">¥83.85</span>
+        <span class="roi">+¥1.47</span><span class="roi">1.23%</span><span class="roi">1.41%</span>
+        <span class="stability"><strong>91.7%</strong><i class="mini-track"><span style="width:91.7%"></span></i></span>
+        <span><i class="inventory-status ready">可入库</i></span>
+        <span><i class="recommendation">稳定推荐</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <div class="rank-grid rank-row">
+        <span class="rank-number">3</span>
+        <div class="product">
+          <span class="product-thumb amber"><i data-lucide="badge"></i></span>
+          <span class="product-copy"><strong>沙漠之鹰 | 古铜密码（崭新出厂）</strong><small>Desert Eagle | The Bronze (Factory New)</small></span>
+        </div>
+        <span><i class="quality-tag covert">隐秘</i></span>
+        <span class="money">¥529.64</span><span class="money">¥369.97</span><span class="money">¥366.27</span>
+        <span class="roi">+¥0.82</span><span class="roi neutral">0.15%</span><span class="roi">1.90%</span>
+        <span class="stability"><strong>84.8%</strong><i class="mini-track"><span style="width:84.8%"></span></i></span>
+        <span><i class="inventory-status watch">观望</i></span>
+        <span><i class="recommendation observe">等待回落</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <div class="rank-grid rank-row">
+        <span class="rank-number">4</span>
+        <div class="product">
+          <span class="product-thumb blue"><i data-lucide="shield"></i></span>
+          <span class="product-copy"><strong>M4A4 | 皇帝（略有磨损）</strong><small>M4A4 | The Emperor (Minimal Wear)</small></span>
+        </div>
+        <span><i class="quality-tag classified">保密</i></span>
+        <span class="money">¥302.60</span><span class="money">¥212.90</span><span class="money">¥210.77</span>
+        <span class="roi">+¥1.98</span><span class="roi">0.65%</span><span class="roi">0.93%</span>
+        <span class="stability"><strong>82.1%</strong><i class="mini-track"><span style="width:82.1%"></span></i></span>
+        <span><i class="inventory-status watch">观望</i></span>
+        <span><i class="recommendation">稳定推荐</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <div class="rank-grid rank-row">
+        <span class="rank-number">5</span>
+        <div class="product">
+          <span class="product-thumb green"><i data-lucide="circle-dot"></i></span>
+          <span class="product-copy"><strong>M4A1消音版 | 幽独（崭新出厂）</strong><small>M4A1-S | Solitude (Factory New)</small></span>
+        </div>
+        <span><i class="quality-tag restricted">受限</i></span>
+        <span class="money">¥179.71</span><span class="money">¥126.19</span><span class="money">¥124.93</span>
+        <span class="roi">+¥0.93</span><span class="roi neutral">0.52%</span><span class="roi negative">-0.63%</span>
+        <span class="stability"><strong>25.0%</strong><i class="mini-track"><span class="amber" style="width:25%"></span></i></span>
+        <span><i class="inventory-status avoid">不建议</i></span>
+        <span><i class="recommendation observe">继续观察</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <div class="rank-grid rank-row">
+        <span class="rank-number">6</span>
+        <div class="product">
+          <span class="product-thumb amber"><i data-lucide="focus"></i></span>
+          <span class="product-copy"><strong>AWP | 二西莫夫（久经沙场）</strong><small>AWP | Asiimov (Field-Tested)</small></span>
+        </div>
+        <span><i class="quality-tag classified">保密</i></span>
+        <span class="money">¥418.20</span><span class="money">¥290.80</span><span class="money">¥287.89</span>
+        <span class="roi negative">-¥0.67</span><span class="roi negative">-0.16%</span><span class="roi neutral">0.72%</span>
+        <span class="stability"><strong>58.3%</strong><i class="mini-track"><span class="amber" style="width:58.3%"></span></i></span>
+        <span><i class="inventory-status avoid">不建议</i></span>
+        <span><i class="recommendation avoid">暂不建议</i></span>
+        <span><i class="detail-link"><i data-lucide="chevron-right"></i></i></span>
+      </div>
+
+      <footer class="pagination">
+        <span>共 126 项，第 1 / 13 页</span>
+        <div class="pages">
+          <span class="page-button disabled"><i data-lucide="chevron-left"></i></span>
+          <span class="page-button active">1</span><span class="page-button">2</span><span class="page-button">3</span>
+          <span class="page-button">4</span><span>…</span><span class="page-button">13</span>
+          <span class="page-button"><i data-lucide="chevron-right"></i></span>
+          <span class="select-shell">每页 10 项<i data-lucide="chevron-down"></i></span>
+        </div>
+      </footer>
+    </section>
+
+    <section class="bottom-panels">
+      <article class="bottom-panel">
+        <header class="panel-title">
+          <div><strong>首选产品 ROI 走势</strong><small>USP-S | Cortex · 最近 24 小时</small></div>
+          <span>当前 1.37%</span>
+        </header>
+        <div class="trend-wrap">
+          <div class="trend-stats">
+            <span>最低<strong>0.31%</strong></span>
+            <span>平均<strong>0.84%</strong></span>
+            <span>最高<strong>4.05%</strong></span>
+          </div>
+          <svg class="trend-chart" viewBox="0 0 320 90" preserveAspectRatio="none">
+            <line class="trend-grid" x1="0" y1="18" x2="320" y2="18"></line>
+            <line class="trend-grid" x1="0" y1="42" x2="320" y2="42"></line>
+            <line class="trend-grid" x1="0" y1="66" x2="320" y2="66"></line>
+            <path class="trend-fill" d="M0,58 L18,55 L34,57 L52,49 L70,45 L88,48 L105,39 L122,44 L140,42 L158,31 L176,35 L194,37 L212,47 L230,45 L248,38 L266,41 L284,34 L302,36 L320,32 L320,76 L0,76 Z"></path>
+            <polyline class="trend-line" points="0,58 18,55 34,57 52,49 70,45 88,48 105,39 122,44 140,42 158,31 176,35 194,37 212,47 230,45 248,38 266,41 284,34 302,36 320,32"></polyline>
+            <text class="trend-axis" x="0" y="88">09:30</text><text class="trend-axis" x="80" y="88">15:30</text>
+            <text class="trend-axis" x="160" y="88">21:30</text><text class="trend-axis" x="240" y="88">03:30</text>
+            <text class="trend-axis" x="300" y="88">09:30</text>
+          </svg>
+        </div>
+      </article>
+
+      <article class="bottom-panel">
+        <header class="panel-title">
+          <div><strong>正 ROI 持续时间</strong><small>不是只看最高点</small></div>
+          <span>100% 为正</span>
+        </header>
+        <div class="duration-list">
+          <div class="duration-row"><span>≥ 2.00%</span><i class="duration-track"><span style="width:13%"></span></i><b>3h07m · 13%</b></div>
+          <div class="duration-row"><span>1%~2%</span><i class="duration-track"><span style="width:39%"></span></i><b>9h22m · 39%</b></div>
+          <div class="duration-row"><span>0%~1%</span><i class="duration-track"><span style="width:48%"></span></i><b>11h31m · 48%</b></div>
+          <div class="duration-row"><span>&lt; 0%</span><i class="duration-track"><span style="width:2%"></span></i><b>0m · 0%</b></div>
+        </div>
+      </article>
+
+      <article class="bottom-panel">
+        <header class="panel-title">
+          <div><strong>监控状态</strong><small>共享 Profit Trade 选品观察链路</small></div>
+          <span>研究模式</span>
+        </header>
+        <div class="monitor-status">
+          <div class="status-line"><span>调度状态</span><strong class="online">运行中</strong></div>
+          <div class="status-line"><span>采样间隔</span><strong>10 分钟</strong></div>
+          <div class="status-line"><span>价格异常</span><strong>7 项</strong></div>
+          <div class="status-line"><span>远端写操作</span><strong>永久禁用</strong></div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <script>lucide.createIcons({ attrs: { "stroke-width": 1.8 } });</script>
+</body>
+</html>

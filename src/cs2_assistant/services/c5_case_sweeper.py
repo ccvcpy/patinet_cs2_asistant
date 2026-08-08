@@ -467,13 +467,21 @@ class C5CaseSweeper:
         return account
 
     def search_items(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return self.search_items_page(query, limit=limit, offset=0)["items"]
+
+    def search_items_page(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         query = query.strip()
         limit = max(1, min(50, int(limit)))
+        offset = max(0, int(offset))
         db = Database(self.settings.db_path)
         try:
-            # The catalog search is local and cheap. Fetch a wider window before
-            # filtering so skins/capsules cannot crowd weapon cases out of the UI.
-            rows = db.search_items(query, limit=max(200, limit * 20))
+            rows = db.search_items(query, limit=None)
         finally:
             db.close()
         result = [
@@ -504,8 +512,20 @@ class C5CaseSweeper:
                 "c5ItemId": None,
                 "custom": True,
             }
-            result = [*result[: max(0, limit - 1)], custom]
-        return result[:limit]
+            result = [custom, *result]
+        total = len(result)
+        page = result[offset : offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "items": page,
+            "pagination": {
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "hasMore": next_offset < total,
+                "nextOffset": next_offset if next_offset < total else None,
+            },
+        }
 
     def create_round(
         self,

@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import FolioIcon from "../components/FolioIcon.vue";
+import OperationVisualAtom from "../components/OperationVisualAtom.vue";
 const dashboard = ref(null);
 const apiError = ref("");
 const actionError = ref("");
@@ -17,6 +18,8 @@ const selectedItem = ref(null);
 const itemSuggestions = ref([]);
 const itemSearchOpen = ref(false);
 const itemSearchBusy = ref(false);
+const itemSearchHasMore = ref(false);
+const itemSearchNextOffset = ref(0);
 const maxPrice = ref(1.1);
 const budget = ref(300);
 const targetCount = ref(200);
@@ -113,11 +116,26 @@ async function postAction(path, body, success) {
         busy.value = false;
     }
 }
-async function searchItems(query = itemQuery.value) {
+async function searchItems(query = itemQuery.value, append = false) {
     itemSearchBusy.value = true;
     try {
-        const payload = await fetchJson(`/api/c5-sweeper/items?query=${encodeURIComponent(query.trim())}&limit=20`);
-        itemSuggestions.value = payload.items || [];
+        const normalizedQuery = query.trim();
+        const offset = append ? itemSearchNextOffset.value : 0;
+        const payload = await fetchJson(`/api/c5-sweeper/items?query=${encodeURIComponent(normalizedQuery)}&limit=20&offset=${offset}`);
+        if (normalizedQuery !== itemQuery.value.trim())
+            return;
+        const incoming = payload.items || [];
+        if (append) {
+            const merged = new Map(itemSuggestions.value.map((item) => [item.marketHashName, item]));
+            for (const item of incoming)
+                merged.set(item.marketHashName, item);
+            itemSuggestions.value = [...merged.values()];
+        }
+        else {
+            itemSuggestions.value = incoming;
+        }
+        itemSearchHasMore.value = Boolean(payload.pagination?.hasMore);
+        itemSearchNextOffset.value = Number(payload.pagination?.nextOffset ?? 0);
         itemSearchOpen.value = true;
     }
     catch (error) {
@@ -131,6 +149,8 @@ function onItemInput() {
     selectedItem.value = null;
     formDirty.value = true;
     itemSearchOpen.value = true;
+    itemSearchHasMore.value = false;
+    itemSearchNextOffset.value = 0;
     if (searchTimer)
         window.clearTimeout(searchTimer);
     searchTimer = window.setTimeout(() => searchItems(), 250);
@@ -666,10 +686,701 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-logo']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['item-name']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['round-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['attempt-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['field']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['field']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-body']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['new-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['open-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-ring']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['rounds-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['events-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['details-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['timeline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['modal-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['workspace']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['field']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-ring']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-content']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['timeline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-logo']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['api']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['api']} */ ;
+/** @type {__VLS_StyleScopedClasses['offline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-caption']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['green-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['green']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['navy']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['amber']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['blue']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['round-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['attempt-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['budget-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['archive-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-ring']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-message']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['blue-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['new-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['open-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['running']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['delivered']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['draft']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['paused']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['pending']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['failed']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['timeline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['modal-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['operation-visual-atom']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['api']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['api']} */ ;
+/** @type {__VLS_StyleScopedClasses['offline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['execution']} */ ;
+/** @type {__VLS_StyleScopedClasses['active']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['alert']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['alert']} */ ;
+/** @type {__VLS_StyleScopedClasses['error']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['alert']} */ ;
+/** @type {__VLS_StyleScopedClasses['notice']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-caption']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metrics']} */ ;
+/** @type {__VLS_StyleScopedClasses['green-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['blue']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['wide-track']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['round-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['attempt-chip']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['unavailable']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['unavailable']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-cards']} */ ;
+/** @type {__VLS_StyleScopedClasses['unavailable']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['form-fields']} */ ;
+/** @type {__VLS_StyleScopedClasses['budget-field']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['calculation']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['new-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['open-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['primary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['new-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['open-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['new-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['open-round']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['archive-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['progress-ring']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-message']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['blue-text']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['detail-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['selected']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['table-scroll']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['running']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['completed']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['delivered']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['draft']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['paused']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['pending']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['status-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['stopped']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['order-pill']} */ ;
+/** @type {__VLS_StyleScopedClasses['failed']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['empty']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['empty']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['timeline']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['modal-backdrop']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['operation-visual-atom']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-heading']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['hero']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['account-picker']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
-    ...{ class: "sweeper-page" },
+    ...{ class: "sweeper-page sweeper-page--folio-refresh sweeper-page--minimal-v2" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "hero" },
@@ -677,19 +1388,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "hero-title" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
-    ...{ class: "hero-logo" },
-    'aria-hidden': "true",
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_0 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "case",
-    size: (38),
+const __VLS_0 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "case-scanner",
+    size: (70),
 }));
 const __VLS_1 = __VLS_0({
-    name: "case",
-    size: (38),
+    name: "case-scanner",
+    size: (70),
 }, ...__VLS_functionalComponentArgsRest(__VLS_0));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
@@ -760,18 +1467,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "green" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_9 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "case",
-    size: (21),
+const __VLS_9 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "case-single",
+    size: (38),
 }));
 const __VLS_10 = __VLS_9({
-    name: "case",
-    size: (21),
+    name: "case-single",
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_9));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({
@@ -788,18 +1492,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "green" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_12 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "price",
-    size: (21),
+const __VLS_12 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "price-tag",
+    size: (38),
 }));
 const __VLS_13 = __VLS_12({
-    name: "price",
-    size: (21),
+    name: "price-tag",
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_12));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -812,18 +1513,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "green" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_15 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "wallet",
-    size: (21),
+const __VLS_15 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "budget-wallet",
+    size: (38),
 }));
 const __VLS_16 = __VLS_15({
-    name: "wallet",
-    size: (21),
+    name: "budget-wallet",
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_15));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -833,18 +1531,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "amber" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_18 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+const __VLS_18 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
     name: "clock",
-    size: (21),
+    size: (38),
 }));
 const __VLS_19 = __VLS_18({
     name: "clock",
-    size: (21),
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_18));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -861,18 +1556,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "green" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_21 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "success",
-    size: (21),
+const __VLS_21 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "delivery-success",
+    size: (38),
 }));
 const __VLS_22 = __VLS_21({
-    name: "success",
-    size: (21),
+    name: "delivery-success",
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_21));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -888,18 +1580,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElemen
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "metric-label" },
 });
-__VLS_asFunctionalElement(__VLS_intrinsicElements.i, __VLS_intrinsicElements.i)({
-    ...{ class: "navy" },
-});
-/** @type {[typeof FolioIcon, ]} */ ;
+/** @type {[typeof OperationVisualAtom, ]} */ ;
 // @ts-ignore
-const __VLS_24 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "clock",
-    size: (21),
+const __VLS_24 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+    name: "refresh",
+    size: (38),
 }));
 const __VLS_25 = __VLS_24({
-    name: "clock",
-    size: (21),
+    name: "refresh",
+    size: (38),
 }, ...__VLS_functionalComponentArgsRest(__VLS_24));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -958,6 +1647,21 @@ if (__VLS_ctx.itemSearchOpen && __VLS_ctx.canEdit) {
         if (item.custom) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
         }
+    }
+    if (__VLS_ctx.itemSearchHasMore) {
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+            ...{ onClick: (...[$event]) => {
+                    if (!(__VLS_ctx.itemSearchOpen && __VLS_ctx.canEdit))
+                        return;
+                    if (!(__VLS_ctx.itemSearchHasMore))
+                        return;
+                    __VLS_ctx.searchItems(__VLS_ctx.itemQuery, true);
+                } },
+            ...{ class: "catalog-load-more" },
+            type: "button",
+            disabled: (__VLS_ctx.itemSearchBusy),
+        });
+        (__VLS_ctx.itemSearchBusy ? "加载中…" : "加载更多结果");
     }
     if (!__VLS_ctx.itemSuggestions.length) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({});
@@ -1402,6 +2106,20 @@ if (__VLS_ctx.confirmationOpen) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
         ...{ class: "confirm-modal" },
     });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "confirm-heading" },
+    });
+    /** @type {[typeof OperationVisualAtom, ]} */ ;
+    // @ts-ignore
+    const __VLS_27 = __VLS_asFunctionalComponent(OperationVisualAtom, new OperationVisualAtom({
+        name: "warning",
+        size: (52),
+    }));
+    const __VLS_28 = __VLS_27({
+        name: "warning",
+        size: (52),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_27));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
     (__VLS_ctx.dashboard?.round?.roundNumber);
@@ -1444,9 +2162,10 @@ if (__VLS_ctx.confirmationOpen) {
     });
 }
 /** @type {__VLS_StyleScopedClasses['sweeper-page']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--folio-refresh']} */ ;
+/** @type {__VLS_StyleScopedClasses['sweeper-page--minimal-v2']} */ ;
 /** @type {__VLS_StyleScopedClasses['hero']} */ ;
 /** @type {__VLS_StyleScopedClasses['hero-title']} */ ;
-/** @type {__VLS_StyleScopedClasses['hero-logo']} */ ;
 /** @type {__VLS_StyleScopedClasses['hero-status']} */ ;
 /** @type {__VLS_StyleScopedClasses['status-icon']} */ ;
 /** @type {__VLS_StyleScopedClasses['api']} */ ;
@@ -1460,22 +2179,16 @@ if (__VLS_ctx.confirmationOpen) {
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
 /** @type {__VLS_StyleScopedClasses['metrics']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['green']} */ ;
 /** @type {__VLS_StyleScopedClasses['item-name']} */ ;
 /** @type {__VLS_StyleScopedClasses['account-caption']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['green']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['green']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['amber']} */ ;
 /** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['green']} */ ;
 /** @type {__VLS_StyleScopedClasses['mini-track']} */ ;
 /** @type {__VLS_StyleScopedClasses['blue']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
-/** @type {__VLS_StyleScopedClasses['navy']} */ ;
 /** @type {__VLS_StyleScopedClasses['workspace']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['form-panel']} */ ;
@@ -1484,6 +2197,7 @@ if (__VLS_ctx.confirmationOpen) {
 /** @type {__VLS_StyleScopedClasses['item-field']} */ ;
 /** @type {__VLS_StyleScopedClasses['search-wrap']} */ ;
 /** @type {__VLS_StyleScopedClasses['suggestions']} */ ;
+/** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
 /** @type {__VLS_StyleScopedClasses['recent-items']} */ ;
 /** @type {__VLS_StyleScopedClasses['account-picker']} */ ;
 /** @type {__VLS_StyleScopedClasses['account-heading']} */ ;
@@ -1530,6 +2244,7 @@ if (__VLS_ctx.confirmationOpen) {
 /** @type {__VLS_StyleScopedClasses['empty']} */ ;
 /** @type {__VLS_StyleScopedClasses['modal-backdrop']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-modal']} */ ;
+/** @type {__VLS_StyleScopedClasses['confirm-heading']} */ ;
 /** @type {__VLS_StyleScopedClasses['confirm-account']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['primary']} */ ;
@@ -1538,6 +2253,7 @@ const __VLS_self = (await import('vue')).defineComponent({
     setup() {
         return {
             FolioIcon: FolioIcon,
+            OperationVisualAtom: OperationVisualAtom,
             dashboard: dashboard,
             apiError: apiError,
             actionError: actionError,
@@ -1552,6 +2268,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             itemSuggestions: itemSuggestions,
             itemSearchOpen: itemSearchOpen,
             itemSearchBusy: itemSearchBusy,
+            itemSearchHasMore: itemSearchHasMore,
             maxPrice: maxPrice,
             budget: budget,
             targetCount: targetCount,

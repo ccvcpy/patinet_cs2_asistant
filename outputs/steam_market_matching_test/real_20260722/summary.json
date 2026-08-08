@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-07-22T08:49:27.445598+00:00",
+  "execute": true,
+  "aborted": true,
+  "trials": [
+    {
+      "trial": "control",
+      "action": "none",
+      "marketHashName": "M249 | Sage Camo (Field-Tested)",
+      "assetId": "50550557310",
+      "roles": {
+        "seller": "xiaodigu11",
+        "buyerA": "vnuzl692",
+        "buyerC": "ropzx55x",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "donkzymeng"
+      },
+      "price": {
+        "floor_cents": 21,
+        "previous_high_bid_cents": null,
+        "a_bid_cents": 19,
+        "c_bid_cents": 20,
+        "seller_net_cents": 17,
+        "seller_fee_cents": 2,
+        "buyer_total_cents": 19
+      },
+      "aBuyOrderId": null,
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.12,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23
+        },
+        "vnuzl692": {
+          "balance": 1124.38,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23
+        },
+        "ropzx55x": {
+          "balance": 117.21,
+          "delayedBalance": 5.98,
+          "currency": "CNY",
+          "currencyId": 23
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "evidence_conflict_or_request_failure",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": null,
+        "aMylistingsToOrderbookBid": null,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": [
+        "vnuzl692:createbuyorder_a:\"抱歉！我们无法从 Steam 服务器获得关于您订单的信息。请再次检查您的订单是否确已创建或填写。如没有，请稍后再试。\"",
+        "\"抱歉！我们无法从 Steam 服务器获得关于您订单的信息。请再次检查您的订单是否确已创建或填写。如没有，请稍后再试。\""
+      ]
+    }
+  ]
+}

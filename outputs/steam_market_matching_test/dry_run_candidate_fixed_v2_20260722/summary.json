@@ -1,0 +1,60 @@
+{
+  "generatedAt": "2026-07-22T09:04:04.787519+00:00",
+  "execute": false,
+  "aborted": false,
+  "trials": [
+    {
+      "trial": "control",
+      "action": "none",
+      "marketHashName": "XM1014 | Hieroglyph (Well-Worn)",
+      "assetId": "48137863919",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "xiaodigu11",
+        "buyerC": "ropzx55x",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "donkzymeng"
+      },
+      "price": {
+        "floor_cents": 35,
+        "previous_high_bid_cents": 30,
+        "a_bid_cents": 33,
+        "c_bid_cents": 34,
+        "seller_net_cents": 19,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 33,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": null,
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.12,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "insufficient_evidence",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": null,
+        "aMylistingsToOrderbookBid": null,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": []
+    }
+  ]
+}

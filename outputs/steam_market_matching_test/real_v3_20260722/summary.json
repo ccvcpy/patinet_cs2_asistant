@@ -1,0 +1,128 @@
+{
+  "generatedAt": "2026-07-22T09:27:44.107650+00:00",
+  "execute": true,
+  "aborted": true,
+  "globalErrors": [
+    "Remaining trials stopped: donkzymeng returned a USD-denominated orderbook while the other accounts returned CNY; the follow-up market-page check then received HTTP 429."
+  ],
+  "trials": [
+    {
+      "trial": "control",
+      "action": "none",
+      "marketHashName": "Five-SeveN | Desert Seal (Field-Tested)",
+      "assetId": "52745245990",
+      "roles": {
+        "seller": "xiaodigu11",
+        "buyerA": "vnuzl692",
+        "buyerC": "ropzx55x",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "donkzymeng"
+      },
+      "price": {
+        "floor_cents": 42,
+        "previous_high_bid_cents": 37,
+        "a_bid_cents": 40,
+        "c_bid_cents": 41,
+        "seller_net_cents": 26,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 40,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": "8576414496",
+      "cBuyOrderId": null,
+      "listingId": "508493999443938217",
+      "terminalBuyer": "vnuzl692",
+      "aReceipt": {
+        "listingId": "508493999443938217",
+        "purchaseId": "508493999443938218",
+        "timePurchased": 1784711849,
+        "paidAmount": 0.26,
+        "paidFee": 0.14,
+        "paidTotal": 0.4,
+        "currencyId": "2023",
+        "marketHashName": "Five-SeveN | Desert Seal (Field-Tested)",
+        "assetId": "52745245990",
+        "newAssetId": "52966388954"
+      },
+      "cReceipt": null,
+      "bSaleReceipt": {
+        "listingId": "508493999443938217",
+        "purchaseId": "508493999443938218",
+        "timeSold": 1784711849,
+        "receivedAmount": 0.26,
+        "receivedCurrencyId": "2023"
+      },
+      "walletsBefore": {
+        "vnuzl692": {
+          "balance": 1124.57,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "xiaodigu11": {
+          "balance": 1237.79,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "ropzx55x": {
+          "balance": 117.21,
+          "delayedBalance": 5.98,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {
+        "xiaodigu11": {
+          "balance": 1238.05,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "vnuzl692": {
+          "balance": 1124.17,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "ropzx55x": {
+          "balance": 117.21,
+          "delayedBalance": 5.98,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "assetVerification": {
+        "winner": "vnuzl692",
+        "newAssetId": "52966388954",
+        "present": true,
+        "sellerOldAssetId": "52745245990",
+        "sellerOldAssetPresent": false,
+        "source": "authenticated_inventory_json"
+      },
+      "classification": "existing_high_bid_matched_before_public_listing",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": 9.378,
+        "aMylistingsToOrderbookBid": 8.921,
+        "bSubmitToOfficialPurchase": 1.609,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": 6.632
+      },
+      "errors": []
+    }
+  ]
+}

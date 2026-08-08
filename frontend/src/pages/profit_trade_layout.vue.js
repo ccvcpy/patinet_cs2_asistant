@@ -3,7 +3,6 @@ import { RouterLink, RouterView } from "vue-router";
 import FolioIcon from "../components/FolioIcon.vue";
 const apiOnline = ref(null);
 const realExecutionAllowed = ref(false);
-const busy = ref(false);
 const error = ref("");
 const listingsCircuit = ref({ status: "closed", isBlocking: false });
 const runtimeCookies = ref({});
@@ -12,17 +11,19 @@ const cookieExpanded = ref(false);
 const nowMs = ref(Date.now());
 let statusTimer = null;
 let countdownTimer = null;
-const circuitRecoveredRecently = computed(() => {
-    if (listingsCircuit.value.status !== "closed" || !listingsCircuit.value.lastRecoveredAt)
+const circuitVisible = computed(() => {
+    if (listingsCircuit.value.status !== "open")
         return false;
-    const recoveredAt = new Date(listingsCircuit.value.lastRecoveredAt).getTime();
-    return Number.isFinite(recoveredAt) && nowMs.value - recoveredAt < 5 * 60 * 1000;
-});
-const circuitVisible = computed(() => Boolean(listingsCircuit.value.isBlocking) || circuitRecoveredRecently.value);
-const circuitRemainingLabel = computed(() => {
-    const target = listingsCircuit.value.nextProbeAt || listingsCircuit.value.cooldownUntil;
+    const target = listingsCircuit.value.cooldownUntil;
     if (!target)
-        return listingsCircuit.value.status === "half_open" ? "等待单次恢复探测" : "-";
+        return true;
+    const targetMs = new Date(target).getTime();
+    return !Number.isFinite(targetMs) || targetMs > nowMs.value;
+});
+const circuitRemainingLabel = computed(() => {
+    const target = listingsCircuit.value.cooldownUntil;
+    if (!target)
+        return "-";
     const seconds = Math.max(0, Math.ceil((new Date(target).getTime() - nowMs.value) / 1000));
     const minutes = Math.floor(seconds / 60);
     return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
@@ -79,30 +80,6 @@ async function refreshSharedStatus() {
         error.value = reason instanceof Error ? reason.message : String(reason);
     }
 }
-async function emergencyDisable() {
-    if (!realExecutionAllowed.value || busy.value)
-        return;
-    busy.value = true;
-    error.value = "";
-    try {
-        const response = await fetch("/api/profit-trade/config", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ allowRealExecution: false }),
-        });
-        if (!response.ok)
-            throw new Error(await readError(response));
-        realExecutionAllowed.value = false;
-        apiOnline.value = true;
-        window.dispatchEvent(new CustomEvent("profit-trade:config-changed"));
-    }
-    catch (reason) {
-        error.value = `紧急关闭失败：${reason instanceof Error ? reason.message : String(reason)}`;
-    }
-    finally {
-        busy.value = false;
-    }
-}
 onMounted(() => {
     void refreshSharedStatus();
     statusTimer = setInterval(() => void refreshSharedStatus(), 30000);
@@ -129,7 +106,6 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['runtime-dot']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-dot']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-dot']} */ ;
-/** @type {__VLS_StyleScopedClasses['emergency-stop']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
@@ -257,23 +233,6 @@ const __VLS_16 = __VLS_15({
 }, ...__VLS_functionalComponentArgsRest(__VLS_15));
 (__VLS_ctx.runtimeCookies.validCount ?? "—");
 (__VLS_ctx.runtimeCookies.totalCount ?? "—");
-__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
-    ...{ onClick: (__VLS_ctx.emergencyDisable) },
-    ...{ class: "emergency-stop" },
-    type: "button",
-    disabled: (__VLS_ctx.busy || !__VLS_ctx.realExecutionAllowed),
-});
-/** @type {[typeof FolioIcon, ]} */ ;
-// @ts-ignore
-const __VLS_18 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "shield",
-    size: (15),
-}));
-const __VLS_19 = __VLS_18({
-    name: "shield",
-    size: (15),
-}, ...__VLS_functionalComponentArgsRest(__VLS_18));
-(__VLS_ctx.busy ? "正在关闭" : "紧急关闭真实执行");
 if (__VLS_ctx.cookieExpanded) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
         ...{ class: "profit-cookie-panel" },
@@ -282,17 +241,17 @@ if (__VLS_ctx.cookieExpanded) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    const __VLS_21 = {}.RouterLink;
+    const __VLS_18 = {}.RouterLink;
     /** @type {[typeof __VLS_components.RouterLink, typeof __VLS_components.RouterLink, ]} */ ;
     // @ts-ignore
-    const __VLS_22 = __VLS_asFunctionalComponent(__VLS_21, new __VLS_21({
+    const __VLS_19 = __VLS_asFunctionalComponent(__VLS_18, new __VLS_18({
         to: "/guadao/overview",
     }));
-    const __VLS_23 = __VLS_22({
+    const __VLS_20 = __VLS_19({
         to: "/guadao/overview",
-    }, ...__VLS_functionalComponentArgsRest(__VLS_22));
-    __VLS_24.slots.default;
-    var __VLS_24;
+    }, ...__VLS_functionalComponentArgsRest(__VLS_19));
+    __VLS_21.slots.default;
+    var __VLS_21;
     if (__VLS_ctx.runtimeCookies.accounts?.length) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
             ...{ class: "profit-cookie-grid" },
@@ -326,7 +285,7 @@ if (__VLS_ctx.error) {
 }
 if (__VLS_ctx.circuitVisible) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
-        ...{ class: (['listings-circuit-banner', { recovered: __VLS_ctx.circuitRecoveredRecently }]) },
+        ...{ class: "listings-circuit-banner" },
         'aria-live': "polite",
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
@@ -334,78 +293,59 @@ if (__VLS_ctx.circuitVisible) {
     });
     /** @type {[typeof FolioIcon, ]} */ ;
     // @ts-ignore
-    const __VLS_25 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-        name: (__VLS_ctx.circuitRecoveredRecently ? 'shield' : 'clock'),
+    const __VLS_22 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: "clock",
         size: (18),
     }));
-    const __VLS_26 = __VLS_25({
-        name: (__VLS_ctx.circuitRecoveredRecently ? 'shield' : 'clock'),
+    const __VLS_23 = __VLS_22({
+        name: "clock",
         size: (18),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_25));
+    }, ...__VLS_functionalComponentArgsRest(__VLS_22));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "circuit-main" },
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-    (__VLS_ctx.circuitRecoveredRecently ? "Steam listings 已恢复" : __VLS_ctx.listingsCircuit.status === "half_open" ? "Steam listings 等待恢复探测" : "Steam listings 查询冷却中");
-    if (!__VLS_ctx.circuitRecoveredRecently) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    }
-    else {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    }
-    if (!__VLS_ctx.circuitRecoveredRecently) {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.listingsCircuit.triggerAccountName || __VLS_ctx.listingsCircuit.triggerAccountId || "-");
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.listingsCircuit.consecutive429Count || 0);
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.circuitRemainingLabel);
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.localTime(__VLS_ctx.listingsCircuit.nextProbeAt || __VLS_ctx.listingsCircuit.cooldownUntil));
-    }
-    else {
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.localTime(__VLS_ctx.listingsCircuit.lastRecoveredAt));
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
-        __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
-        (__VLS_ctx.listingsCircuit.triggerMarketHashName || "-");
-    }
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dl, __VLS_intrinsicElements.dl)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.listingsCircuit.triggerAccountName || __VLS_ctx.listingsCircuit.triggerAccountId || "-");
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.listingsCircuit.consecutive429Count || 0);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.circuitRemainingLabel);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dt, __VLS_intrinsicElements.dt)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.dd, __VLS_intrinsicElements.dd)({});
+    (__VLS_ctx.localTime(__VLS_ctx.listingsCircuit.cooldownUntil));
 }
-const __VLS_28 = {}.RouterView;
+const __VLS_25 = {}.RouterView;
 /** @type {[typeof __VLS_components.RouterView, typeof __VLS_components.RouterView, ]} */ ;
 // @ts-ignore
-const __VLS_29 = __VLS_asFunctionalComponent(__VLS_28, new __VLS_28({}));
-const __VLS_30 = __VLS_29({}, ...__VLS_functionalComponentArgsRest(__VLS_29));
+const __VLS_26 = __VLS_asFunctionalComponent(__VLS_25, new __VLS_25({}));
+const __VLS_27 = __VLS_26({}, ...__VLS_functionalComponentArgsRest(__VLS_26));
 {
-    const { default: __VLS_thisSlot } = __VLS_31.slots;
+    const { default: __VLS_thisSlot } = __VLS_28.slots;
     const [{ Component }] = __VLS_getSlotParams(__VLS_thisSlot);
-    const __VLS_32 = {}.KeepAlive;
+    const __VLS_29 = {}.KeepAlive;
     /** @type {[typeof __VLS_components.KeepAlive, typeof __VLS_components.KeepAlive, ]} */ ;
     // @ts-ignore
-    const __VLS_33 = __VLS_asFunctionalComponent(__VLS_32, new __VLS_32({}));
-    const __VLS_34 = __VLS_33({}, ...__VLS_functionalComponentArgsRest(__VLS_33));
-    __VLS_35.slots.default;
-    const __VLS_36 = ((Component));
+    const __VLS_30 = __VLS_asFunctionalComponent(__VLS_29, new __VLS_29({}));
+    const __VLS_31 = __VLS_30({}, ...__VLS_functionalComponentArgsRest(__VLS_30));
+    __VLS_32.slots.default;
+    const __VLS_33 = ((Component));
     // @ts-ignore
-    const __VLS_37 = __VLS_asFunctionalComponent(__VLS_36, new __VLS_36({}));
-    const __VLS_38 = __VLS_37({}, ...__VLS_functionalComponentArgsRest(__VLS_37));
-    var __VLS_35;
-    __VLS_31.slots['' /* empty slot name completion */];
+    const __VLS_34 = __VLS_asFunctionalComponent(__VLS_33, new __VLS_33({}));
+    const __VLS_35 = __VLS_34({}, ...__VLS_functionalComponentArgsRest(__VLS_34));
+    var __VLS_32;
+    __VLS_28.slots['' /* empty slot name completion */];
 }
-var __VLS_31;
+var __VLS_28;
 /** @type {__VLS_StyleScopedClasses['profit-trade-workspace']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-workspace-bar']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-workspace-brand']} */ ;
@@ -413,10 +353,10 @@ var __VLS_31;
 /** @type {__VLS_StyleScopedClasses['profit-subnav']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-runtime-strip']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-cookie-button']} */ ;
-/** @type {__VLS_StyleScopedClasses['emergency-stop']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-layout-error']} */ ;
+/** @type {__VLS_StyleScopedClasses['listings-circuit-banner']} */ ;
 /** @type {__VLS_StyleScopedClasses['circuit-icon']} */ ;
 /** @type {__VLS_StyleScopedClasses['circuit-main']} */ ;
 var __VLS_dollars;
@@ -428,17 +368,14 @@ const __VLS_self = (await import('vue')).defineComponent({
             FolioIcon: FolioIcon,
             apiOnline: apiOnline,
             realExecutionAllowed: realExecutionAllowed,
-            busy: busy,
             error: error,
             listingsCircuit: listingsCircuit,
             runtimeCookies: runtimeCookies,
             profitRuntime: profitRuntime,
             cookieExpanded: cookieExpanded,
-            circuitRecoveredRecently: circuitRecoveredRecently,
             circuitVisible: circuitVisible,
             circuitRemainingLabel: circuitRemainingLabel,
             localTime: localTime,
-            emergencyDisable: emergencyDisable,
         };
     },
 });

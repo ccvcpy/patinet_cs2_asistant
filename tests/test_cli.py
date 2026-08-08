@@ -456,7 +456,7 @@ class PoolInventoryReportTestCase(unittest.TestCase):
                 ],
             },
             db=FakeCatalogDb(),
-            scope="case_only",
+            scope="crates_only",
             days=7,
             now=datetime(2026, 6, 4, 0, 0, tzinfo=timezone.utc),
         )

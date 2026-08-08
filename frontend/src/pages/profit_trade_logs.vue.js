@@ -25,6 +25,7 @@ const operation = ref("");
 const steamId = ref("");
 const tradeNo = ref(typeof route.query.tradeNo === "string" ? route.query.tradeNo : "");
 const requestId = ref("");
+const marketHashName = ref("");
 const keywordDraft = ref("");
 const keyword = ref("");
 const pageSize = 100;
@@ -74,7 +75,7 @@ function apiTime(value) {
 }
 function filters(includePaging = true) {
     const query = new URLSearchParams();
-    const values = { from: apiTime(from.value), to: apiTime(to.value), level: level.value, provider: provider.value, component: component.value, operation: operation.value, steamId: steamId.value, tradeNo: tradeNo.value, requestId: requestId.value, keyword: keyword.value };
+    const values = { from: apiTime(from.value), to: apiTime(to.value), level: level.value, provider: provider.value, component: component.value, operation: operation.value, steamId: steamId.value, tradeNo: tradeNo.value, requestId: requestId.value, marketHashName: marketHashName.value, keyword: keyword.value };
     Object.entries(values).forEach(([key, value]) => { if (value.trim())
         query.set(key, value.trim()); });
     if (includePaging)
@@ -134,6 +135,7 @@ function resetFilters() {
     steamId.value = "";
     tradeNo.value = "";
     requestId.value = "";
+    marketHashName.value = "";
     keywordDraft.value = "";
     keyword.value = "";
     queued.value = [];
@@ -434,6 +436,13 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements
     type: "text",
     placeholder: "PT-...",
 });
+__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
+    type: "search",
+    placeholder: "marketHashName",
+});
+(__VLS_ctx.marketHashName);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.input, __VLS_intrinsicElements.input)({
@@ -889,6 +898,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             steamId: steamId,
             tradeNo: tradeNo,
             requestId: requestId,
+            marketHashName: marketHashName,
             keywordDraft: keywordDraft,
             levels: levels,
             connectionLabel: connectionLabel,

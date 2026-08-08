@@ -86,7 +86,7 @@ onMounted(()=>{void refresh();startPolling()});onActivated(startPolling);onDeact
 <template>
   <main class="page issues-page">
     <header class="issues-heading"><div><p class="eyebrow">Guadao Operations</p><h1>异常与待处理</h1></div><RouterLink class="executor-state" to="/guadao/overview"><span></span>挂刀执行器 · {{runtimeText}} · 前往总览控制</RouterLink></header>
-    <div class="policy-banner"><FolioIcon name="success" :size="15" /><strong>C5 超过 24 小时未发货会自动判定补仓失败并创建替换补仓，不进入本页。</strong></div>
+    <div class="policy-banner"><FolioIcon name="success" :size="15" /><strong>C5 超过 12 小时会继续查询订单详情；只有 C5 明确返回发货失败，才会创建唯一替换补仓。</strong></div>
     <p v-if="error" class="api-error">异常 API 请求失败：{{ error }}</p>
     <p v-else-if="notice" class="review-notice">{{notice}}</p>
     <section class="issue-metrics"><article v-for="metric in metrics" :key="String(metric[0])"><span>{{ metric[0] }}</span><strong>{{ metric[1] }}</strong></article></section>

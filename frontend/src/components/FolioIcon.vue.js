@@ -135,6 +135,164 @@ else if (__VLS_ctx.name === 'edit') {
         d: "m13.5 6.5 4 4M12 20h8",
     });
 }
+else if (__VLS_ctx.name === 'calendar') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "3",
+        y: "5",
+        width: "18",
+        height: "16",
+        rx: "2",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M7 3v4M17 3v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01",
+    });
+}
+else if (__VLS_ctx.name === 'lock') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "5",
+        y: "10",
+        width: "14",
+        height: "11",
+        rx: "2",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M8 10V7a4 4 0 0 1 8 0v3M12 14v3",
+    });
+}
+else if (__VLS_ctx.name === 'rocket') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M14 5c2.7-2.7 5.2-2 5.2-2s.7 2.5-2 5.2l-5.4 5.4-3.4-3.4L14 5Z",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m13 12 1 5-3 3-2-5M10 11l-5-1-3 3 5 1M15.5 6.5h.01M5 19c1.3-2.7 3.3-2.7 4-2",
+    });
+}
+else if (__VLS_ctx.name === 'document') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M6 3h8l4 4v14H6zM14 3v5h4M9 12h6M9 16h6",
+    });
+}
+else if (__VLS_ctx.name === 'circle-dashed') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.circle)({
+        cx: "12",
+        cy: "12",
+        r: "8.5",
+        'stroke-dasharray': "2.2 2.4",
+    });
+}
+else if (__VLS_ctx.name === 'chevron-up') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m6 15 6-6 6 6",
+    });
+}
+else if (__VLS_ctx.name === 'chevron-down') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m6 9 6 6 6-6",
+    });
+}
+else if (__VLS_ctx.name === 'chevron-left') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m15 18-6-6 6-6",
+    });
+}
+else if (__VLS_ctx.name === 'chevron-right') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m9 18 6-6-6-6",
+    });
+}
+else if (__VLS_ctx.name === 'search') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.circle)({
+        cx: "11",
+        cy: "11",
+        r: "7",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m20 20-4-4",
+    });
+}
+else if (__VLS_ctx.name === 'download') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M12 3v12m0 0 5-5m-5 5-5-5M4 19v2h16v-2",
+    });
+}
+else if (__VLS_ctx.name === 'x') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m6 6 12 12M18 6 6 18",
+    });
+}
+else if (__VLS_ctx.name === 'info') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.circle)({
+        cx: "12",
+        cy: "12",
+        r: "9",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M12 11v5M12 8h.01",
+    });
+}
+else if (__VLS_ctx.name === 'crown') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m3 7 4.5 4L12 5l4.5 6L21 7l-2 11H5L3 7Z",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M5 18h14",
+    });
+}
+else if (__VLS_ctx.name === 'bell') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4",
+    });
+}
+else if (__VLS_ctx.name === 'menu') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M4 6h16M4 12h16M4 18h16",
+    });
+}
+else if (__VLS_ctx.name === 'grid') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "3",
+        y: "3",
+        width: "7",
+        height: "7",
+        rx: "1",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "14",
+        y: "3",
+        width: "7",
+        height: "7",
+        rx: "1",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "3",
+        y: "14",
+        width: "7",
+        height: "7",
+        rx: "1",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.rect)({
+        x: "14",
+        y: "14",
+        width: "7",
+        height: "7",
+        rx: "1",
+    });
+}
+else if (__VLS_ctx.name === 'user') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.circle)({
+        cx: "12",
+        cy: "8",
+        r: "3.5",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "M5 21a7 7 0 0 1 14 0",
+    });
+}
+else if (__VLS_ctx.name === 'sparkles') {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.path)({
+        d: "m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3ZM19 14l.7 2.3L22 17l-2.3.7L19 20l-.7-2.3L16 17l2.3-.7L19 14ZM5 13l.7 2.3L8 16l-2.3.7L5 19l-.7-2.3L2 16l2.3-.7L5 13Z",
+    });
+}
 else {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.circle)({
         cx: "12",

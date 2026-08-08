@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cs2_assistant.config import Settings
 from cs2_assistant.models import (
@@ -36,6 +36,7 @@ from cs2_assistant.services.market import (
     calculate_steam_after_tax,
     calculate_transfer_real_ratio,
 )
+from cs2_assistant.services.pricing import PricingDecision
 from cs2_assistant.services.t_yield_scan import (
     build_market_service,
     fetch_all_c5_inventories,
@@ -108,6 +109,13 @@ def scan_strategies(
     pool_market_hash_names: list[str] | None = None,
     inventory_payload: dict[str, Any] | None = None,
     weapon_case_market_hash_names: set[str] | None = None,
+    steam_request_source: str = "notify",
+    refresh_steam_accounts: bool = True,
+    steam_orderbook_max_workers: int = 4,
+    steam_orderbook_admission_timeout_seconds: float | None = None,
+    steam_orderbook_price_resolver: (
+        Callable[[str, dict[str, Any]], PricingDecision | None] | None
+    ) = None,
 ) -> StrategyScanReport:
     """Scan the inventory pool and evaluate strategies for each item type.
 
@@ -159,10 +167,21 @@ def scan_strategies(
             all_evaluated=[],
             total_pool_types=matched_inventory_type_count,
             missing_price_count=0,
+            item_outcomes=[],
         )
 
     # Fetch market prices using existing infrastructure
-    market_service = build_market_service(settings, include_c5_purchase_prices=False)
+    market_service = build_market_service(
+        settings,
+        include_c5_purchase_prices=False,
+        steam_request_source=steam_request_source,
+        refresh_steam_accounts=refresh_steam_accounts,
+        steam_orderbook_max_workers=steam_orderbook_max_workers,
+        steam_orderbook_admission_timeout_seconds=(
+            steam_orderbook_admission_timeout_seconds
+        ),
+        steam_orderbook_price_resolver=steam_orderbook_price_resolver,
+    )
     states = market_service.refresh_items(all_inventory_types)
     state_map = {state.market_hash_name: state for state in states}
 
@@ -171,12 +190,30 @@ def scan_strategies(
     hold_items: list[StrategyCandidate] = []
     all_evaluated: list[StrategyCandidate] = []
     missing_price_count = 0
+    item_outcomes: list[dict[str, Any]] = []
 
     for item_type in all_inventory_types:
         mhn = item_type["market_hash_name"]
         state = state_map.get(mhn)
+        outcome: dict[str, Any] = {
+            "name": str(item_type.get("name_cn") or mhn),
+            "marketHashName": mhn,
+            "status": None,
+            "reason": None,
+            "stage": None,
+            "c5RebuyPrice": None,
+            "steamListPrice": None,
+            "requestSent": None,
+        }
         if state is None:
-            missing_price_count += 1
+            outcome.update(
+                {
+                    "status": "market_state_missing",
+                    "reason": "行情服务没有返回该品类的状态记录",
+                    "stage": "market_state",
+                }
+            )
+            item_outcomes.append(outcome)
             continue
 
         # Determine rebuy_price (C5 price - what you'd pay to rebuy on C5)
@@ -186,20 +223,95 @@ def scan_strategies(
             rebuy_price = state.c5_sell_price
             rebuy_source = state.c5_price_source or "unknown"
         if rebuy_price is None:
-            missing_price_count += 1
+            c5_error = str(state.raw_json.get("c5_batch_error") or "").strip()
+            if c5_error:
+                outcome.update(
+                    {
+                        "status": "request_failed",
+                        "reason": f"C5 行情请求失败：{c5_error}",
+                        "stage": "c5_price",
+                        "requestSent": True,
+                    }
+                )
+            else:
+                missing_price_count += 1
+                outcome.update(
+                    {
+                        "status": "c5_price_missing",
+                        "reason": "C5 行情已读取，但没有可用补仓价",
+                        "stage": "c5_price",
+                        "requestSent": True,
+                    }
+                )
+            item_outcomes.append(outcome)
             continue
+        outcome["c5RebuyPrice"] = float(rebuy_price)
 
         # Determine steam_sell_price
         steam_sell_price = state.steam_sell_price
-        if not config.dry_run and state.steam_price_source != "steam_orderbook":
-            missing_price_count += 1
-            continue
         if steam_sell_price is None:
-            missing_price_count += 1
+            error_type = str(
+                state.raw_json.get("steam_orderbook_error_type") or ""
+            ).strip()
+            error = str(state.raw_json.get("steam_orderbook_error") or "").strip()
+            if error_type == "queue_timeout":
+                status = "queue_deferred"
+                reason = "Steam 队列等待超时，HTTP 请求尚未发送；顺延到下一轮"
+                request_sent = False
+            elif error_type == "empty_sell_orderbook":
+                status = "steam_price_missing"
+                reason = "Steam orderbook 请求成功，但公开卖盘为空"
+                request_sent = True
+                missing_price_count += 1
+            elif error_type:
+                status = "request_failed"
+                reason = f"Steam orderbook 请求失败：{error or error_type}"
+                request_sent = error_type != "queue_timeout"
+            else:
+                status = "steam_price_missing"
+                reason = "Steam orderbook 没有返回可用卖盘价"
+                request_sent = None
+                missing_price_count += 1
+            outcome.update(
+                {
+                    "status": status,
+                    "reason": reason,
+                    "stage": "steam_orderbook",
+                    "requestSent": request_sent,
+                }
+            )
+            item_outcomes.append(outcome)
             continue
+        if not config.dry_run and state.steam_price_source != "steam_orderbook":
+            outcome.update(
+                {
+                    "status": "steam_price_not_orderbook",
+                    "reason": (
+                        f"Steam 价格来源为 {state.steam_price_source or 'unknown'}，"
+                        "真实扫描拒绝使用"
+                    ),
+                    "stage": "steam_price_source",
+                    "requestSent": True,
+                }
+            )
+            item_outcomes.append(outcome)
+            continue
+        outcome["steamListPrice"] = float(steam_sell_price)
+        outcome["requestSent"] = True
 
         # Min price filter
         if rebuy_price < config.min_price:
+            outcome.update(
+                {
+                    "status": "below_min_price",
+                    "reason": (
+                        f"C5 补仓价 ¥{float(rebuy_price):.2f} "
+                        f"低于扫描下限 ¥{float(config.min_price):.2f}"
+                    ),
+                    "stage": "minimum_price_filter",
+                }
+            )
+            item_outcomes.append(outcome)
             continue
 
         # Calculate strategy metrics
@@ -207,7 +319,14 @@ def scan_strategies(
             steam_sell_price, steam_net_factor=config.steam_net_factor
         )
         if steam_after_tax is None:
-            missing_price_count += 1
+            outcome.update(
+                {
+                    "status": "calculation_failed",
+                    "reason": "Steam 税后到手价无法计算",
+                    "stage": "steam_after_tax",
+                }
+            )
+            item_outcomes.append(outcome)
             continue
 
         listing_ratio = calculate_listing_ratio(
@@ -216,6 +335,14 @@ def scan_strategies(
             steam_net_factor=config.steam_net_factor,
         )
         if listing_ratio is None:
+            outcome.update(
+                {
+                    "status": "calculation_failed",
+                    "reason": "挂刀比例无法计算",
+                    "stage": "listing_ratio",
+                }
+            )
+            item_outcomes.append(outcome)
             continue
 
         transfer_real_ratio = calculate_transfer_real_ratio(
@@ -224,6 +351,14 @@ def scan_strategies(
             balance_discount=config.balance_discount,
         )
         if transfer_real_ratio is None:
+            outcome.update(
+                {
+                    "status": "calculation_failed",
+                    "reason": "导余额收益比例无法计算",
+                    "stage": "transfer_ratio",
+                }
+            )
+            item_outcomes.append(outcome)
             continue
 
         item_is_weapon_case = (
@@ -266,6 +401,17 @@ def scan_strategies(
         )
 
         all_evaluated.append(candidate)
+        outcome.update(
+            {
+                "name": candidate.name,
+                "status": "evaluated",
+                "reason": "价格齐全，已完成策略评估",
+                "stage": "strategy_evaluation",
+                "listingRatio": round(float(candidate.listing_ratio), 6),
+                "listingRatioPct": round(float(candidate.listing_ratio_pct), 2),
+            }
+        )
+        item_outcomes.append(outcome)
         if STRATEGY_GUADAO in strategies:
             guadao_candidates.append(candidate)
         if STRATEGY_TRANSFER in strategies:
@@ -290,4 +436,5 @@ def scan_strategies(
         all_evaluated=all_evaluated,
         total_pool_types=matched_inventory_type_count,
         missing_price_count=missing_price_count,
+        item_outcomes=item_outcomes,
     )

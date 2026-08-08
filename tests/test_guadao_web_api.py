@@ -80,6 +80,8 @@ class FakeGuadaoLogger:
 class FakeRuntime:
     def __init__(self) -> None:
         self.operation_kwargs: dict | None = None
+        self.batch_refreeze_call: dict | None = None
+        self.batch_manual_complete_call: dict | None = None
         self.migration_confirmed = False
         self.wake_count = 0
 
@@ -113,9 +115,46 @@ class FakeRuntime:
     def wake(self) -> None:
         self.wake_count += 1
 
+    def stale_listing_recheck_now(self, *, confirmed: bool) -> dict:
+        if not confirmed:
+            raise RuntimeError("confirmation required")
+        return {
+            "ok": True,
+            "queued": True,
+            "maintenanceOnly": True,
+            "fullExecutorEnabled": False,
+            "taskKey": "stale_listing_recheck",
+        }
+
     def confirm_migration(self) -> dict:
         self.migration_confirmed = True
         return {"ok": True}
+
+    def batch_refreeze_guadao_rebuys(self, operation_ids, **kwargs) -> dict:
+        self.batch_refreeze_call = {
+            "operation_ids": operation_ids,
+            **kwargs,
+        }
+        return {
+            "ok": True,
+            "batchId": "GDRF-test",
+            "successCount": len(operation_ids),
+            "failedCount": 0,
+            "results": [],
+        }
+
+    def batch_complete_guadao_rebuys_manually(self, operation_ids, **kwargs) -> dict:
+        self.batch_manual_complete_call = {
+            "operation_ids": operation_ids,
+            **kwargs,
+        }
+        return {
+            "ok": True,
+            "batchId": "GDMC-test",
+            "successCount": len(operation_ids),
+            "failedCount": 0,
+            "results": [],
+        }
 
     def _public_guadao_log(self, event: dict) -> dict:
         return {
@@ -152,10 +191,48 @@ class FakeRuntime:
         ]
 
 
+class FakeCaseMonitor:
+    def __init__(self) -> None:
+        self.interval_minutes = 5
+        self.enabled = False
+        self.report_parameters: dict | None = None
+
+    def start(self) -> None:
+        return
+
+    def status(self) -> dict:
+        return {
+            "ok": True,
+            "runtime": {
+                "enabled": self.enabled,
+                "status": "idle" if self.enabled else "paused",
+                "intervalMinutes": self.interval_minutes,
+            },
+            "currentJob": None,
+        }
+
+    def start_monitor(self, interval_minutes: int) -> dict:
+        self.interval_minutes = int(interval_minutes)
+        self.enabled = True
+        return self.status()
+
+    def pause_monitor(self) -> dict:
+        self.enabled = False
+        return self.status()
+
+    def request_collect(self) -> dict:
+        return {"jobId": "collect-1", "jobType": "collect", "status": "queued"}
+
+    def request_report(self, parameters: dict) -> dict:
+        self.report_parameters = dict(parameters)
+        return {"jobId": "report-1", "jobType": "report", "status": "queued"}
+
+
 class GuadaoWebApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = Settings()
         self.runtime = FakeRuntime()
+        self.case_monitor = FakeCaseMonitor()
         self.guadao_logger = FakeGuadaoLogger()
 
     @staticmethod
@@ -164,7 +241,12 @@ class GuadaoWebApiTestCase(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    def _request_bytes(self, method: str, path: str) -> tuple[int, bytes]:
+    def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+    ) -> tuple[int, bytes]:
         port = self._free_port()
         errors: list[BaseException] = []
 
@@ -175,6 +257,7 @@ class GuadaoWebApiTestCase(unittest.TestCase):
                     host="127.0.0.1",
                     port=port,
                     runtime_controller=self.runtime,
+                    case_monitor_controller=self.case_monitor,
                 )
             except BaseException as exc:  # pragma: no cover
                 errors.append(exc)
@@ -187,7 +270,13 @@ class GuadaoWebApiTestCase(unittest.TestCase):
         ):
             thread = threading.Thread(target=run, daemon=True)
             thread.start()
-            request = Request(f"http://127.0.0.1:{port}{path}", method=method)
+            data = json.dumps(payload).encode("utf-8") if payload is not None else None
+            request = Request(
+                f"http://127.0.0.1:{port}{path}",
+                data=data,
+                headers={"Content-Type": "application/json"} if data is not None else {},
+                method=method,
+            )
             deadline = time.monotonic() + 3
             while True:
                 try:
@@ -208,14 +297,82 @@ class GuadaoWebApiTestCase(unittest.TestCase):
             raise errors[0]
         return status, body
 
-    def _request(self, method: str, path: str) -> tuple[int, dict]:
-        status, body = self._request_bytes(method, path)
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+    ) -> tuple[int, dict]:
+        status, body = self._request_bytes(method, path, payload)
         return status, json.loads(body.decode("utf-8"))
+
+    def test_steam_balances_returns_live_service_payload(self) -> None:
+        live_payload = {
+            "accounts": [
+                {
+                    "id": "account-1",
+                    "account": "live-account",
+                    "steamId": "76561190000000001",
+                    "realBalance": 12.34,
+                    "pendingBalance": 1.23,
+                    "totalBalance": 13.57,
+                    "currency": "CNY",
+                    "status": "ok",
+                    "error": None,
+                }
+            ],
+            "summary": {"accountCount": 1, "successfulCount": 1},
+        }
+        live_payload.update({"hasSnapshot": True, "updatedAt": "2026-07-18T08:00:00+00:00", "source": "cache"})
+        with patch.object(web_api, "load_steam_account_balances", return_value=live_payload):
+            status, payload = self._request("GET", "/api/steam-balances")
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("live-account", payload["accounts"][0]["account"])
+        self.assertEqual(12.34, payload["accounts"][0]["realBalance"])
+
+    def test_case_monitor_runtime_and_report_endpoints_use_injected_controller(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/case-monitor/start",
+            {"intervalMinutes": 15},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload["runtime"]["enabled"])
+        self.assertEqual(15, payload["runtime"]["intervalMinutes"])
+
+        status, payload = self._request(
+            "POST",
+            "/api/case-monitor/report",
+            {"hours": 168, "refreshLiquidity": False},
+        )
+        self.assertEqual(202, status)
+        self.assertEqual("report-1", payload["job"]["jobId"])
+        self.assertEqual(
+            {"hours": 168, "refreshLiquidity": False},
+            self.case_monitor.report_parameters,
+        )
+
+    def test_steam_balances_refresh_uses_live_service(self) -> None:
+        live_payload = {
+            "accounts": [],
+            "summary": {"accountCount": 0, "successfulCount": 0},
+            "hasSnapshot": True,
+            "updatedAt": "2026-07-18T08:00:00+00:00",
+            "source": "live",
+        }
+        with patch.object(web_api, "refresh_steam_account_balances", return_value=live_payload):
+            status, payload = self._request("POST", "/api/steam-balances/refresh", {})
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("live", payload["source"])
 
     def test_operations_forwards_pagination_and_filters(self) -> None:
         status, payload = self._request(
             "GET",
-            "/api/guadao/operations?page=3&pageSize=25&q=case&account=acc-1&status=listed",
+            "/api/guadao/operations?page=3&pageSize=25&q=case&account=acc-1&marketHashName=Kilowatt%20Case&status=listed",
         )
         self.assertEqual(200, status)
         self.assertEqual(3, payload["page"])
@@ -226,6 +383,7 @@ class GuadaoWebApiTestCase(unittest.TestCase):
                 "page_size": 25,
                 "keyword": "case",
                 "account_name": "acc-1",
+                "market_hash_name": "Kilowatt Case",
                 "status": "listed",
                 "start_at": None,
                 "end_at": None,
@@ -320,6 +478,88 @@ class GuadaoWebApiTestCase(unittest.TestCase):
         self.assertEqual(202, status)
         self.assertEqual("unified_runtime", payload["scope"])
         self.assertEqual(1, self.runtime.wake_count)
+
+    def test_stale_recheck_now_requires_explicit_maintenance_confirmation(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/guadao/runtime/stale-recheck-now",
+            {"confirm": "wrong"},
+        )
+        self.assertEqual(409, status)
+        self.assertFalse(payload["ok"])
+
+        status, payload = self._request(
+            "POST",
+            "/api/guadao/runtime/stale-recheck-now",
+            {"confirm": "stale_listing_recheck_only"},
+        )
+        self.assertEqual(202, status)
+        self.assertTrue(payload["maintenanceOnly"])
+        self.assertFalse(payload["fullExecutorEnabled"])
+
+    def test_batch_refreeze_endpoint_forwards_confirmation_and_idempotency_fields(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/guadao/operations/batch-refreeze-rebuy",
+            {
+                "operationIds": [101, 102],
+                "rebuyPrice": 7.23,
+                "executeNow": False,
+                "confirmed": True,
+                "requestId": "refreeze-api-request",
+                "reason": "temporary external price approval",
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("GDRF-test", payload["batchId"])
+        self.assertEqual(
+            {
+                "operation_ids": [101, 102],
+                "rebuy_price": 7.23,
+                "execute_now": False,
+                "confirmed": True,
+                "request_id": "refreeze-api-request",
+                "reason": "temporary external price approval",
+            },
+            self.runtime.batch_refreeze_call,
+        )
+
+    def test_batch_manual_complete_endpoint_forwards_external_purchase_fields(self) -> None:
+        status, payload = self._request(
+            "POST",
+            "/api/guadao/operations/batch-manual-complete",
+            {
+                "operationIds": [201],
+                "actualRebuyPrice": 6.95,
+                "source": "Buff",
+                "completedAt": "2026-07-17T12:34:56+08:00",
+                "memo": "manually bought outside C5",
+                "externalOrderRef": "BUFF-201",
+                "confirmed": True,
+                "requestId": "manual-api-request",
+                "reason": "C5 price was unsuitable",
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("GDMC-test", payload["batchId"])
+        self.assertEqual(
+            {
+                "operation_ids": [201],
+                "actual_rebuy_price": 6.95,
+                "source": "Buff",
+                "completed_at": "2026-07-17T12:34:56+08:00",
+                "memo": "manually bought outside C5",
+                "external_order_ref": "BUFF-201",
+                "confirmed": True,
+                "request_id": "manual-api-request",
+                "reason": "C5 price was unsuitable",
+            },
+            self.runtime.batch_manual_complete_call,
+        )
 
     def test_log_export_forwards_scheduler_and_independent_text_filters(self) -> None:
         status, body = self._request_bytes(

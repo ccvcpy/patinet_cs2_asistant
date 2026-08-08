@@ -1,0 +1,166 @@
+{
+  "generatedAt": "2026-07-22T09:06:15.351504+00:00",
+  "execute": false,
+  "aborted": false,
+  "trials": [
+    {
+      "trial": "control",
+      "action": "none",
+      "marketHashName": "XM1014 | Hieroglyph (Well-Worn)",
+      "assetId": "48137863919",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "xiaodigu11",
+        "buyerC": "ropzx55x",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "donkzymeng"
+      },
+      "price": {
+        "floor_cents": 35,
+        "previous_high_bid_cents": 30,
+        "a_bid_cents": 33,
+        "c_bid_cents": 34,
+        "seller_net_cents": 19,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 33,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": null,
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.12,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "insufficient_evidence",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": null,
+        "aMylistingsToOrderbookBid": null,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": []
+    },
+    {
+      "trial": "late_higher_buy_order",
+      "action": "createbuyorder",
+      "marketHashName": "Five-SeveN | Desert Seal (Field-Tested)",
+      "assetId": "52745245990",
+      "roles": {
+        "seller": "xiaodigu11",
+        "buyerA": "ropzx55x",
+        "buyerC": "x6l1cg3cy5o",
+        "observerD": "donkzymeng",
+        "observerE": "vnuzl692"
+      },
+      "price": {
+        "floor_cents": 42,
+        "previous_high_bid_cents": 37,
+        "a_bid_cents": 40,
+        "c_bid_cents": 41,
+        "seller_net_cents": 26,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 40,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": null,
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "ropzx55x": {
+          "balance": 117.21,
+          "delayedBalance": 5.98,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "insufficient_evidence",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": null,
+        "aMylistingsToOrderbookBid": null,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": []
+    },
+    {
+      "trial": "late_buylisting",
+      "action": "buylisting",
+      "marketHashName": "MAC-10 | Storm Camo (Factory New)",
+      "assetId": "48995006621",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "x6l1cg3cy5o",
+        "buyerC": "donkzymeng",
+        "observerD": "xiaodigu11",
+        "observerE": "ropzx55x"
+      },
+      "price": {
+        "floor_cents": 40,
+        "previous_high_bid_cents": 35,
+        "a_bid_cents": 38,
+        "c_bid_cents": 39,
+        "seller_net_cents": 24,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 38,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "aBuyOrderId": null,
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "x6l1cg3cy5o": {
+          "balance": 114.26,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "insufficient_evidence",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": null,
+        "aMylistingsToOrderbookBid": null,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": []
+    }
+  ]
+}

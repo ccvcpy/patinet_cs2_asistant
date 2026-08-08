@@ -190,6 +190,53 @@ class SteamRequestSchedulerTests(unittest.TestCase):
         self.assertEqual("running", active["status"])  # type: ignore[index]
         self.assertEqual("worker-a", active["lease_owner"])  # type: ignore[index]
 
+    def test_p1_default_queue_wait_survives_one_running_p0_login(self) -> None:
+        self.db.enqueue_steam_request(
+            "cookie-login",
+            source="cookie_refresh",
+            route="login",
+            priority=SteamRequestPriority.P0_SAFETY,
+        )
+        self.assertIsNotNone(
+            self.db.claim_steam_request("cookie-login", "login-worker", lease_seconds=30)
+        )
+        started_at = datetime.now(timezone.utc)
+        elapsed_seconds = 0.0
+
+        def now_provider() -> datetime:
+            return started_at + timedelta(seconds=elapsed_seconds)
+
+        def advance_clock(seconds: float) -> None:
+            nonlocal elapsed_seconds
+            elapsed_seconds += seconds
+            if elapsed_seconds >= 8.0:
+                self.db.complete_steam_request(
+                    "cookie-login",
+                    "login-worker",
+                    status="completed",
+                    http_status=200,
+                    now=now_provider().isoformat(),
+                )
+
+        scheduler = SteamRequestScheduler(
+            self.db,
+            now_provider=now_provider,
+            sleep=advance_clock,
+            quiet_window_seconds=0,
+            poll_seconds=1,
+        )
+
+        response = scheduler.execute(
+            lambda: FakeResponse(200),
+            source="profit_trade",
+            route="market/orderbook",
+            priority=SteamRequestPriority.P1_EXECUTION,
+            account_id="account-a",
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertGreaterEqual(elapsed_seconds, 8.0)
+
     def test_retry_after_route_cooldown_and_multi_account_global_circuit(self) -> None:
         scheduler = SteamRequestScheduler(self.db, quiet_window_seconds=0)
         combinations = (
@@ -537,6 +584,103 @@ class SteamRequestSchedulerTests(unittest.TestCase):
                 - datetime.fromisoformat(circuit["last_429_at"])
             ).total_seconds(),  # type: ignore[index]
         )
+
+    def test_closed_historical_global_circuit_does_not_reopen_for_one_route_429(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.db.upsert_steam_route_circuit(
+            GLOBAL_CIRCUIT_KEY,
+            scope="global",
+            state="closed",
+            first_429_at=now - timedelta(hours=3),
+            last_429_at=now - timedelta(hours=2),
+            cooldown_until=None,
+            next_probe_at=None,
+        )
+        scheduler = SteamRequestScheduler(
+            self.db,
+            now_provider=lambda: now,
+            quiet_window_seconds=0,
+        )
+
+        summary = scheduler.record_429(account_id="a", route="market/listings")
+
+        self.assertFalse(summary["globalCircuitOpened"])
+        global_circuit = self.db.get_steam_route_circuit(GLOBAL_CIRCUIT_KEY)
+        self.assertEqual("closed", global_circuit["state"])  # type: ignore[index]
+        route_circuit = self.db.get_steam_route_circuit(
+            "steam:account:a:route:market/listings"
+        )
+        self.assertEqual("open", route_circuit["state"])  # type: ignore[index]
+
+    def test_single_listings_429_only_blocks_listings_route(self) -> None:
+        scheduler = SteamRequestScheduler(self.db, quiet_window_seconds=0)
+
+        summary = scheduler.record_429(account_id="account-a", route="market/listings")
+
+        self.assertFalse(summary["globalCircuitOpened"])
+        global_circuit = self.db.get_steam_route_circuit(GLOBAL_CIRCUIT_KEY)
+        self.assertTrue(
+            global_circuit is None or global_circuit["state"] == "closed"  # type: ignore[index]
+        )
+        with self.assertRaises(SteamRequestTimeout):
+            scheduler.execute(
+                lambda: self.fail("cooled listings callback must not run"),
+                source="profit_trade",
+                route="market/listings/730/Glock-18%20%7C%20Candy%20Apple",
+                account_id="account-a",
+                priority=SteamRequestPriority.P1_EXECUTION,
+                timeout_seconds=0.01,
+            )
+
+        completed_routes: list[str] = []
+        for route, priority in (
+            ("market/orderbook", SteamRequestPriority.P2_SYNC),
+            ("market/createbuyorder", SteamRequestPriority.P1_EXECUTION),
+            ("market/mylistings", SteamRequestPriority.P2_SYNC),
+        ):
+            response = scheduler.execute(
+                lambda route=route: completed_routes.append(route) or FakeResponse(200),
+                source="profit_trade",
+                route=route,
+                account_id="account-a",
+                priority=priority,
+                timeout_seconds=1,
+            )
+            self.assertEqual(200, response.status_code)
+
+        self.assertEqual(
+            ["market/orderbook", "market/createbuyorder", "market/mylistings"],
+            completed_routes,
+        )
+
+    def test_listings_only_429s_across_accounts_never_open_global_circuit(self) -> None:
+        scheduler = SteamRequestScheduler(self.db, quiet_window_seconds=0)
+
+        for account_id in ("account-a", "account-b", "account-c"):
+            response = scheduler.execute(
+                lambda: FakeResponse(429),
+                source="profit_trade",
+                route="market/listings/730/Glock-18%20%7C%20Candy%20Apple",
+                account_id=account_id,
+                priority=SteamRequestPriority.P1_EXECUTION,
+                timeout_seconds=1,
+                quiet_before=False,
+            )
+            self.assertEqual(429, response.status_code)
+
+        global_circuit = self.db.get_steam_route_circuit(GLOBAL_CIRCUIT_KEY)
+        self.assertTrue(
+            global_circuit is None or global_circuit["state"] == "closed"  # type: ignore[index]
+        )
+        response = scheduler.execute(
+            lambda: FakeResponse(200),
+            source="profit_trade",
+            route="market/createbuyorder",
+            account_id="account-a",
+            priority=SteamRequestPriority.P1_EXECUTION,
+            timeout_seconds=1,
+        )
+        self.assertEqual(200, response.status_code)
 
     def test_scheduler_telemetry_is_metadata_only_and_redacted(self) -> None:
         events: list[dict[str, object]] = []

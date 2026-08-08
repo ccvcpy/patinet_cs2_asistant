@@ -1,0 +1,80 @@
+{
+  "generatedAt": "2026-07-22T11:42:27.173598+00:00",
+  "execute": true,
+  "aborted": true,
+  "globalErrors": [],
+  "trials": [
+    {
+      "trial": "late_buylisting",
+      "action": "buylisting",
+      "marketHashName": "XM1014 | Mockingbird (Battle-Scarred)",
+      "assetId": "48995006375",
+      "roles": {
+        "seller": "vnuzl692",
+        "buyerA": "xiaodigu11",
+        "buyerC": "donkzymeng",
+        "observerD": "x6l1cg3cy5o",
+        "observerE": "ropzx55x"
+      },
+      "price": {
+        "floor_cents": 65,
+        "previous_high_bid_cents": 47,
+        "a_bid_cents": 48,
+        "c_bid_cents": 49,
+        "seller_net_cents": 7,
+        "seller_fee_cents": 14,
+        "buyer_total_cents": 21,
+        "wallet_market_minimum_cents": 7,
+        "wallet_fee_minimum_cents": 7
+      },
+      "cActionPriceCents": 21,
+      "aBuyOrderId": "8576589347",
+      "cBuyOrderId": null,
+      "listingId": null,
+      "terminalBuyer": null,
+      "aReceipt": null,
+      "cReceipt": null,
+      "bSaleReceipt": null,
+      "walletsBefore": {
+        "xiaodigu11": {
+          "balance": 1238.05,
+          "delayedBalance": 27.54,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "donkzymeng": {
+          "balance": 92.56,
+          "delayedBalance": 0.0,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        },
+        "vnuzl692": {
+          "balance": 1124.17,
+          "delayedBalance": 0.07,
+          "currency": "CNY",
+          "currencyId": 23,
+          "marketMinimumCents": 7,
+          "feeMinimumCents": 7
+        }
+      },
+      "walletsAfter": {},
+      "assetVerification": {},
+      "classification": "evidence_conflict_or_request_failure",
+      "timingSeconds": {
+        "aOrderToOrderbookBid": 1.992,
+        "aMylistingsToOrderbookBid": 1.644,
+        "bSubmitToOfficialPurchase": null,
+        "firstCrossToTerminal": null,
+        "officialPurchaseToLastLowAsk": null,
+        "officialPurchaseToLastABid": null
+      },
+      "errors": [
+        "A stopped being the unique highest bid during baseline"
+      ]
+    }
+  ]
+}

@@ -543,6 +543,17 @@ class C5CaseSweeperTests(unittest.TestCase):
         results = self.service.search_items("Kilowatt Case")
         self.assertEqual("Kilowatt Case", results[0]["marketHashName"])
 
+    def test_catalog_search_page_exposes_continuation_without_duplicates(self) -> None:
+        first = self.service.search_items_page("", limit=1, offset=0)
+        second = self.service.search_items_page("", limit=1, offset=1)
+
+        self.assertTrue(first["pagination"]["hasMore"])
+        self.assertEqual(1, first["pagination"]["nextOffset"])
+        self.assertNotEqual(
+            first["items"][0]["marketHashName"],
+            second["items"][0]["marketHashName"],
+        )
+
     def test_receiving_accounts_expose_safe_identity_and_c5_binding(self) -> None:
         accounts = self.service.receiving_accounts(refresh=True)
         self.assertEqual(1, len(accounts))

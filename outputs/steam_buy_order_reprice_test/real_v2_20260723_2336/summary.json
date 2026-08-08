@@ -1,0 +1,110 @@
+{
+  "status": "completed",
+  "executed": true,
+  "account": "ropzx55x",
+  "marketHashName": "Glove Case",
+  "initialPriceCents": 21,
+  "higherPriceCents": 22,
+  "probeExplicitId": true,
+  "startedAt": "2026-07-23T15:36:50.000112+00:00",
+  "walletBefore": {
+    "balance": 195.37,
+    "delayedBalance": 0.0,
+    "currency": "CNY",
+    "currencyId": 23
+  },
+  "safety": {
+    "currencyId": 23,
+    "minSellCents": 12417,
+    "requiredGapMultiple": 10,
+    "maxPriceCents": 100,
+    "sellAsset": false,
+    "touchC5": false
+  },
+  "baselineOrders": [],
+  "initialOrder": {
+    "response": {
+      "kind": "success",
+      "httpStatus": 200,
+      "success": 1,
+      "message": "",
+      "buyOrderId": "8578627990",
+      "needConfirmation": false
+    },
+    "orders": [
+      {
+        "buyOrderId": "8578627990",
+        "marketHashName": "Glove Case",
+        "priceCents": 21,
+        "priceSource": "price",
+        "quantity": "1",
+        "quantityRemaining": "1"
+      }
+    ]
+  },
+  "ordinaryDuplicate": {
+    "response": {
+      "kind": "steam_error",
+      "httpStatus": null,
+      "success": 29,
+      "message": "You already have an active buy order for this item. You will need to either cancel that order, or wait for it to be fulfilled before you can place a new order.",
+      "buyOrderId": null,
+      "needConfirmation": false
+    },
+    "ordersAfter": [
+      {
+        "buyOrderId": "8578627990",
+        "marketHashName": "Glove Case",
+        "priceCents": 21,
+        "priceSource": "price",
+        "quantity": "1",
+        "quantityRemaining": "1"
+      }
+    ],
+    "classification": "original_order_unchanged"
+  },
+  "explicitIdProbe": {
+    "response": {
+      "kind": "raw_response",
+      "httpStatus": 200,
+      "success": 29,
+      "message": "You already have an active buy order for this item. You will need to either cancel that order, or wait for it to be fulfilled before you can place a new order.",
+      "buyOrderId": null,
+      "needConfirmation": false
+    },
+    "ordersAfter": [
+      {
+        "buyOrderId": "8578627990",
+        "marketHashName": "Glove Case",
+        "priceCents": 21,
+        "priceSource": "price",
+        "quantity": "1",
+        "quantityRemaining": "1"
+      }
+    ],
+    "classification": "original_order_unchanged"
+  },
+  "purchaseReceiptBeforeCleanup": null,
+  "conclusion": "no_in_place_reprice_behavior_observed",
+  "walletAfter": {
+    "balance": 195.37,
+    "delayedBalance": 0.0,
+    "currency": "CNY",
+    "currencyId": 23
+  },
+  "purchaseReceiptAfterCleanup": null,
+  "cleanup": {
+    "attempted": true,
+    "cancelledOrderIds": [
+      "8578627990"
+    ],
+    "remainingOrders": [],
+    "confirmedAbsent": true
+  },
+  "finishedAt": "2026-07-23T15:37:13.675286+00:00",
+  "observedExperimentOrderIds": [
+    "8578627990"
+  ],
+  "errors": [],
+  "cleanupErrors": []
+}

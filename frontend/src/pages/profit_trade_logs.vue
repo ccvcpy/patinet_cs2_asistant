@@ -45,7 +45,8 @@ const detailTab = ref("basic");
 const from = ref(""); const to = ref(""); const level = ref(""); const provider = ref("");
 const component = ref(""); const operation = ref(""); const steamId = ref("");
 const tradeNo = ref(typeof route.query.tradeNo === "string" ? route.query.tradeNo : "");
-const requestId = ref(""); const keywordDraft = ref(""); const keyword = ref("");
+const requestId = ref(""); const marketHashName = ref("");
+const keywordDraft = ref(""); const keyword = ref("");
 const pageSize = 100;
 let stream: EventSource | null = null;
 
@@ -87,7 +88,7 @@ function apiTime(value: string): string {
 }
 function filters(includePaging = true): URLSearchParams {
   const query = new URLSearchParams();
-  const values: Record<string,string> = { from:apiTime(from.value),to:apiTime(to.value),level:level.value,provider:provider.value,component:component.value,operation:operation.value,steamId:steamId.value,tradeNo:tradeNo.value,requestId:requestId.value,keyword:keyword.value };
+  const values: Record<string,string> = { from:apiTime(from.value),to:apiTime(to.value),level:level.value,provider:provider.value,component:component.value,operation:operation.value,steamId:steamId.value,tradeNo:tradeNo.value,requestId:requestId.value,marketHashName:marketHashName.value,keyword:keyword.value };
   Object.entries(values).forEach(([key,value]) => { if (value.trim()) query.set(key,value.trim()); });
   if (includePaging) query.set("pageSize", String(pageSize));
   return query;
@@ -115,7 +116,7 @@ async function load(reset = true): Promise<void> {
 }
 function apply(): void { keyword.value = keywordDraft.value.trim(); queued.value = []; void load(); connect(); }
 function resetFilters(): void {
-  from.value="";to.value="";level.value="";provider.value="";component.value="";operation.value="";steamId.value="";tradeNo.value="";requestId.value="";keywordDraft.value="";keyword.value="";queued.value=[];void load();connect();
+  from.value="";to.value="";level.value="";provider.value="";component.value="";operation.value="";steamId.value="";tradeNo.value="";requestId.value="";marketHashName.value="";keywordDraft.value="";keyword.value="";queued.value=[];void load();connect();
 }
 function onLog(event: MessageEvent<string>): void {
   try {
@@ -180,7 +181,7 @@ onUnmounted(() => { stream?.close(); stream=null; });
       <label><span>服务</span><select v-model="provider"><option value="">Steam / C5 / 本地</option><option value="steam">Steam</option><option value="c5">C5</option><option value="local">本地状态机</option></select></label>
       <label><span>组件</span><input v-model="component" type="text" placeholder="steam_market"></label><label><span>操作</span><input v-model="operation" type="text" placeholder="search_listings"></label>
       <label><span>Steam 账号</span><input v-model="steamId" type="text" placeholder="SteamId64"></label><label><span>交易号</span><input v-model="tradeNo" type="text" placeholder="PT-..."></label>
-      <label><span>request_id</span><input v-model="requestId" type="text" placeholder="req_..."></label><label class="keyword"><span>关键词</span><input v-model="keywordDraft" type="search" placeholder="摘要、异常、饰品名"></label>
+      <label><span>饰品名称</span><input v-model="marketHashName" type="search" placeholder="marketHashName"></label><label><span>request_id</span><input v-model="requestId" type="text" placeholder="req_..."></label><label class="keyword"><span>关键词</span><input v-model="keywordDraft" type="search" placeholder="摘要、异常、饰品名"></label>
       <button class="primary-button" type="submit">应用筛选</button><button class="secondary-button" type="button" @click="resetFilters">重置</button>
     </form>
 

@@ -27,7 +27,11 @@ class FakeC5Client:
 
     def quick_buy(self, **kwargs: object) -> dict[str, object]:
         self.quick_buy_calls.append(dict(kwargs))
-        return {"ok": True}
+        return {
+            "orderAssetId": "asset-order-1",
+            "orderId": "trade-order-1",
+            "payStatus": 1,
+        }
 
 
 class ExecuteRebuyTestCase(unittest.TestCase):
@@ -48,6 +52,7 @@ class ExecuteRebuyTestCase(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertFalse(result.skipped)
+        self.assertEqual("confirmed", result.submission_outcome)
         self.assertIsNotNone(result.submitted_at)
         self.assertEqual(1, len(client.quick_buy_calls))
 
@@ -207,6 +212,58 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         self.assertAlmostEqual(2.00, float(result.max_price), places=6)
         self.assertEqual([], client.quick_buy_calls)
 
+    def test_execute_rebuy_uses_exact_steam_net_amount_for_ratio_and_cap(self) -> None:
+        class ExactNetC5Client(FakeC5Client):
+            def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
+                return {market_hash_names[0]: {"price": 1.49}}
+
+        client = ExactNetC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.49,
+            expected_steam_list_price=3.00,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            guadao_max_listing_ratio=0.75,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+            steam_net_amount_override=2.00,
+        )
+
+        self.assertTrue(result.success)
+        self.assertAlmostEqual(1.49 / 2.00, float(result.listing_ratio_now), places=6)
+        self.assertAlmostEqual(2.00 * 0.75, float(result.max_price), places=6)
+        self.assertAlmostEqual(1.50, float(client.quick_buy_calls[0]["max_price"]), places=6)
+
+    def test_exact_steam_net_amount_guard_can_reject_when_legacy_estimate_would_pass(self) -> None:
+        class ExactNetC5Client(FakeC5Client):
+            def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
+                return {market_hash_names[0]: {"price": 1.50}}
+
+        client = ExactNetC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.50,
+            expected_steam_list_price=3.00,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            guadao_max_listing_ratio=0.70,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+            steam_net_amount_override=2.00,
+        )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.skipped)
+        self.assertEqual("ratio_no_longer_profitable", result.reason)
+        self.assertAlmostEqual(0.75, float(result.listing_ratio_now), places=6)
+        self.assertAlmostEqual(1.40, float(result.max_price), places=6)
+        self.assertEqual([], client.quick_buy_calls)
+
     def test_execute_rebuy_treats_c5_price_network_error_as_retryable(self) -> None:
         class NetworkErrorC5Client(FakeC5Client):
             def price_batch(self, market_hash_names: list[str], app_id: int = 730) -> dict[str, dict[str, float]]:
@@ -230,7 +287,7 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         self.assertEqual("c5_network_error", result.reason)
         self.assertEqual([], client.quick_buy_calls)
 
-    def test_execute_rebuy_treats_c5_buy_network_error_as_retryable(self) -> None:
+    def test_execute_rebuy_treats_c5_buy_network_error_as_submission_unconfirmed(self) -> None:
         class NetworkErrorC5Client(FakeC5Client):
             def quick_buy(self, **kwargs: object) -> dict[str, object]:
                 self.quick_buy_calls.append(dict(kwargs))
@@ -250,8 +307,131 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
-        self.assertTrue(result.skipped)
-        self.assertEqual("c5_network_error", result.reason)
+        self.assertFalse(result.skipped)
+        self.assertEqual("c5_submission_unconfirmed", result.reason)
+        self.assertEqual("unconfirmed", result.submission_outcome)
+        self.assertIsNotNone(result.out_trade_no)
+        self.assertIsNotNone(result.submitted_at)
+        self.assertIsInstance(result.payload, dict)
+        self.assertIn("connection reset", str(result.payload.get("error")))
+        self.assertEqual(1, len(client.quick_buy_calls))
+
+    def test_execute_rebuy_does_not_confirm_http_200_without_order_credentials(self) -> None:
+        class MissingOrderIdsC5Client(FakeC5Client):
+            def quick_buy(self, **kwargs: object) -> dict[str, object]:
+                self.quick_buy_calls.append(dict(kwargs))
+                return {
+                    "orderAssetId": None,
+                    "orderId": None,
+                    "payStatus": 2,
+                    "actualPay": None,
+                }
+
+        client = MissingOrderIdsC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.23,
+            expected_steam_list_price=2.12,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+        )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.skipped)
+        self.assertEqual("c5_submission_unconfirmed", result.reason)
+        self.assertEqual("unconfirmed", result.submission_outcome)
+        self.assertIsNotNone(result.out_trade_no)
+        self.assertIsNotNone(result.submitted_at)
+        self.assertEqual(2, result.payload["payStatus"])
+        self.assertEqual(1, len(client.quick_buy_calls))
+
+    def test_execute_rebuy_requires_both_order_ids(self) -> None:
+        incomplete_payloads = (
+            {"orderAssetId": "asset-order-1", "orderId": None, "payStatus": 1},
+            {"orderAssetId": None, "orderId": "trade-order-1", "payStatus": 1},
+        )
+
+        for payload in incomplete_payloads:
+            with self.subTest(payload=payload):
+                class IncompleteCredentialC5Client(FakeC5Client):
+                    def quick_buy(self, **kwargs: object) -> dict[str, object]:
+                        self.quick_buy_calls.append(dict(kwargs))
+                        return dict(payload)
+
+                result = execute_rebuy(
+                    client=IncompleteCredentialC5Client(),
+                    steam_client=None,
+                    market_hash_name="Kilowatt Case",
+                    expected_price=1.23,
+                    expected_steam_list_price=2.12,
+                    app_id=730,
+                    tolerance_pct=1.0,
+                    dry_run=False,
+                    trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+                )
+
+                self.assertFalse(result.success)
+                self.assertEqual("unconfirmed", result.submission_outcome)
+                self.assertEqual("c5_submission_unconfirmed", result.reason)
+
+    def test_execute_rebuy_recognizes_both_order_ids_even_when_pay_status_is_not_one(self) -> None:
+        class PayStatusPendingC5Client(FakeC5Client):
+            def quick_buy(self, **kwargs: object) -> dict[str, object]:
+                self.quick_buy_calls.append(dict(kwargs))
+                return {
+                    "orderAssetId": "asset-order-pending",
+                    "orderId": "trade-order-pending",
+                    "payStatus": 2,
+                }
+
+        client = PayStatusPendingC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.23,
+            expected_steam_list_price=2.12,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+        )
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.skipped)
+        self.assertEqual("ok", result.reason)
+        self.assertEqual("confirmed", result.submission_outcome)
+        self.assertEqual(2, result.payload["payStatus"])
+        self.assertEqual(1, len(client.quick_buy_calls))
+
+    def test_execute_rebuy_treats_unexpected_post_submit_exception_as_unconfirmed(self) -> None:
+        class UnexpectedFailureC5Client(FakeC5Client):
+            def quick_buy(self, **kwargs: object) -> dict[str, object]:
+                self.quick_buy_calls.append(dict(kwargs))
+                raise RuntimeError("response parser crashed")
+
+        client = UnexpectedFailureC5Client()
+        result = execute_rebuy(
+            client=client,
+            steam_client=None,
+            market_hash_name="Kilowatt Case",
+            expected_price=1.23,
+            expected_steam_list_price=2.12,
+            app_id=730,
+            tolerance_pct=1.0,
+            dry_run=False,
+            trade_url="https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc",
+        )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.skipped)
+        self.assertEqual("c5_submission_unconfirmed", result.reason)
+        self.assertEqual("unconfirmed", result.submission_outcome)
+        self.assertEqual("RuntimeError", result.payload["exceptionType"])
         self.assertEqual(1, len(client.quick_buy_calls))
 
     def test_execute_rebuy_treats_c5_1317_as_retryable_no_matching_listing(self) -> None:
@@ -278,6 +458,7 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.skipped)
         self.assertEqual("no_matching_listing", result.reason)
+        self.assertEqual("rejected", result.submission_outcome)
         self.assertIsInstance(result.payload, dict)
         self.assertEqual(1317, result.payload["errorCode"])
 
@@ -306,6 +487,7 @@ class ExecuteRebuyTestCase(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.skipped)
         self.assertEqual("no_matching_listing", result.reason)
+        self.assertEqual("rejected", result.submission_outcome)
         self.assertIsInstance(result.payload, dict)
         self.assertEqual(1014452, result.payload["errorCode"])
 
