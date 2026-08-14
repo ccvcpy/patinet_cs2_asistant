@@ -4,6 +4,7 @@ __pycache__/
 *.db
 data/
 logs/
+backups/
 profit-trade-api.*.log
 .venv/
 .codex_tmp/
