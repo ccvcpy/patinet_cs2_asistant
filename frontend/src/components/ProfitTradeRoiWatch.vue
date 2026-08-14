@@ -29,6 +29,7 @@ const props = withDefaults(defineProps<{
 });
 
 type InventoryFilter = "active" | "all" | "exited";
+type InventoryRoiSign = "all" | "positive" | "negative";
 type PoolState = {
   rows: ProfitTradeWatchItem[];
   total: number;
@@ -81,6 +82,7 @@ const selection = reactive<PoolState>({
 const inventoryKeywordDraft = ref("");
 const inventoryKeyword = ref("");
 const inventoryStatus = ref<InventoryFilter>("active");
+const inventoryRoiSign = ref<InventoryRoiSign>("all");
 const inventorySort = ref("roi_desc");
 const listingsCircuit = ref<ProfitTradeListingsCircuit>({ status: "closed", isBlocking: false });
 const listingsCooling = computed(() => listingsCircuit.value.status === "open");
@@ -278,6 +280,7 @@ async function loadInventory(): Promise<void> {
     pageSize: String(pageSize),
     active,
     sort: inventorySort.value,
+    roiSign: inventoryRoiSign.value,
   });
   if (inventoryKeyword.value) query.set("keyword", inventoryKeyword.value);
   try {
@@ -326,6 +329,13 @@ function loadAll(): void {
 
 function searchInventory(): void {
   inventoryKeyword.value = inventoryKeywordDraft.value.trim();
+  inventory.page = 1;
+  void loadInventory();
+}
+
+function setInventoryRoiSign(sign: InventoryRoiSign): void {
+  if (inventoryRoiSign.value === sign) return;
+  inventoryRoiSign.value = sign;
   inventory.page = 1;
   void loadInventory();
 }
@@ -714,6 +724,11 @@ onUnmounted(() => {
 
     <div class="dual-watch-layout">
       <section class="watch-pool inventory-pool" aria-labelledby="inventory-watch-title">
+        <div class="roi-sign-switch" role="group" aria-label="ROI 筛选">
+          <button type="button" :class="{ active: inventoryRoiSign === 'all' }" @click="setInventoryRoiSign('all')">全部</button>
+          <button type="button" :class="{ active: inventoryRoiSign === 'positive' }" @click="setInventoryRoiSign('positive')">ROI&gt;0</button>
+          <button type="button" :class="{ active: inventoryRoiSign === 'negative' }" @click="setInventoryRoiSign('negative')">ROI&lt;0</button>
+        </div>
         <header class="pool-header">
           <div><p class="eyebrow">库存做T观察池</p><h3 id="inventory-watch-title">已有可交易库存</h3><p>ROI 是主指标；满足条件的品类才可能进入真实执行链路。</p></div>
           <span>{{ inventoryItemCount }} 个品类</span>
@@ -817,4 +832,5 @@ onUnmounted(() => {
 .roi-watch{padding:18px;border-color:#dfe5df;box-shadow:0 8px 24px rgba(27,62,44,.045)}.watch-heading{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.watch-heading h2{margin:0;color:#17201c;font-size:19px}.watch-heading p:not(.eyebrow){margin:6px 0 0;color:#6f7872;font-size:12px}.refresh-all{display:inline-flex;align-items:center;justify-content:center;gap:5px;white-space:nowrap}.watch-summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:15px 0}.watch-summary>div{display:grid;gap:3px;padding:11px 12px;border:1px solid #e0e6e0;border-radius:9px;background:#fbfdfb}.watch-summary small,.watch-summary span{color:#728078;font-size:10px}.watch-summary strong{color:#246b4a;font-size:18px}.watch-running{display:flex;align-items:center;gap:8px;margin:12px 0;border:1px solid #b9d8c4;border-radius:8px;padding:9px 11px;color:#236a4c;background:#eef7f1}.watch-running>span{width:13px;height:13px;border:2px solid #bdd8c6;border-top-color:#236a4c;border-radius:50%;animation:watch-spin .8s linear infinite}.watch-running strong{font-size:11px}.watch-running small{color:#6f7872;font-size:10px}.manual-execution-message{margin:12px 0;border:1px solid #b9d8c4;border-radius:8px;padding:9px 11px;color:#236a4c;background:#eef7f1;font-size:11px;font-weight:700}@keyframes watch-spin{to{transform:rotate(360deg)}}.watch-circuit-note{margin:0 0 12px;padding:9px 11px;border:1px solid #dfc77e;border-radius:7px;color:#6b5b2c;background:#fff9e9;font-size:11px}.watch-circuit-note strong{color:#564718}.dual-watch-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start}.watch-pool{min-width:0;padding:14px;border:1px solid #e0e6e0;border-radius:10px;background:#f9fbf9}.selection-pool{border-color:#d0e3d5;background:#f8fbf8}.pool-header{display:flex;justify-content:space-between;gap:12px}.pool-header h3{margin:0;color:#1c2821;font-size:16px}.pool-header p:not(.eyebrow){margin:5px 0 0;color:#6c7871;font-size:11px;line-height:1.55}.pool-header>span{height:max-content;padding:4px 7px;border-radius:999px;color:#286548;background:#e7f3ea;font-size:10px;font-weight:700;white-space:nowrap}.inventory-toolbar{display:grid;grid-template-columns:minmax(170px,1fr) 120px 145px auto;gap:7px;align-items:end;margin:13px 0}.inventory-toolbar label{display:grid;gap:4px}.inventory-toolbar label span,.selection-toolbar>label{color:#68736d;font-size:10px;font-weight:650}.inventory-toolbar input,.inventory-toolbar select,.selection-search input{min-width:0;min-height:34px;border:1px solid #d6ddd6;border-radius:6px;padding:6px 8px;color:#17201c;background:#fff}.watch-error{margin:10px 0;padding:9px 11px;border:1px solid #e7b8b2;border-radius:7px;color:#8d3d34;background:#fff7f5;font-size:11px}.watch-empty{display:grid;place-items:center;min-height:110px;color:#77817b;border:1px dashed #d8ded8;border-radius:8px;background:#fff;font-size:11px;text-align:center;padding:10px}.pool-card-grid{display:grid;grid-template-columns:1fr;gap:10px}.selection-toolbar{display:grid;gap:6px;margin:13px 0}.selection-input-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:start}.selection-search{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px}.search-button{white-space:nowrap}.selection-suggestions{position:absolute;z-index:10;top:39px;left:0;right:0;max-height:250px;overflow:auto;border:1px solid #d8e1d8;border-radius:7px;background:#fff;box-shadow:0 9px 22px rgba(28,54,37,.13)}.selection-suggestions button{display:grid;width:100%;gap:2px;padding:8px 10px;border:0;border-bottom:1px solid #edf1ed;color:#243129;background:#fff;text-align:left}.selection-suggestions button:hover{background:#f2f8f3}.selection-suggestions small{overflow-wrap:anywhere;color:#76817b;font-size:9px}.selection-suggestions p{margin:0;padding:10px;color:#748078;font-size:10px}.primary-add-button{min-height:34px;border:1px solid #2d704e;border-radius:6px;padding:6px 10px;color:#fff;background:#28714d;font-size:11px;font-weight:700;white-space:nowrap}.primary-add-button:disabled{border-color:#c4d2c7;background:#b9c8bc;color:#f7faf7}.selected-item{color:#38644a;font-size:10px;overflow-wrap:anywhere}.selection-safety{margin:0;color:#557461;font-size:10px;font-weight:700}.pagination{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:13px;color:#6f7872;font-size:10px}.pagination>div{display:flex;gap:6px}.mini-action{border:1px solid #d6ded7;border-radius:6px;padding:5px 8px;color:#486258;background:#fff;font-size:10px}.mini-action:disabled{opacity:.45}.secondary-button{min-height:34px;border:1px solid #cbd8cd;border-radius:6px;padding:6px 9px;color:#2b6045;background:#fff;font-size:11px;font-weight:700}@media (max-width:1180px){.watch-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.dual-watch-layout{grid-template-columns:1fr}.pool-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (max-width:760px){.watch-heading{display:grid}.watch-summary{grid-template-columns:1fr}.inventory-toolbar{grid-template-columns:1fr 1fr}.inventory-toolbar label:first-child{grid-column:1/-1}.pool-card-grid{grid-template-columns:1fr}.selection-input-row{grid-template-columns:1fr}.selection-search{grid-template-columns:1fr}.search-button{width:100%}.pagination{align-items:flex-start;flex-direction:column}}
 .manual-execution-status{display:grid;gap:9px;margin:12px 0;padding:12px;border:1px solid #bfdac8;border-radius:9px;color:#254d37;background:#f2f8f4}.manual-execution-status>header,.manual-execution-status>footer{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.manual-execution-status>header>div{display:grid;gap:2px}.manual-execution-status>header small,.manual-execution-status>footer small{color:#6d7c72;font-size:9px;overflow-wrap:anywhere}.manual-execution-status>header strong{color:#1c3e2c;font-size:12px}.manual-execution-status>header>span{padding:3px 7px;border-radius:999px;color:#fff;background:#2b7550;font-size:9px;font-weight:750;white-space:nowrap}.manual-execution-status>p{margin:0;color:#365945;font-size:11px;line-height:1.55;overflow-wrap:anywhere}.manual-execution-status dl{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin:0}.manual-execution-status dl>div{display:grid;gap:2px;padding:7px 8px;border:1px solid rgba(52,105,75,.13);border-radius:6px;background:rgba(255,255,255,.72)}.manual-execution-status dt{color:#718078;font-size:8px}.manual-execution-status dd{margin:0;color:#254d37;font-size:11px;font-weight:750}.manual-execution-status>footer{align-items:center}.manual-execution-status>footer button{border:0;padding:3px 5px;color:#557264;background:transparent;font-size:9px}.manual-execution-status.is-pending,.manual-execution-status.is-retry{border-color:#dec986;background:#fff9e9}.manual-execution-status.is-pending>header>span,.manual-execution-status.is-retry>header>span{background:#8a7227}.manual-execution-status.is-failed,.manual-execution-status.is-cancelled{border-color:#e4b6af;background:#fff6f4}.manual-execution-status.is-failed>header>span,.manual-execution-status.is-cancelled>header>span{background:#a4493f}.batch-trades{display:grid;gap:5px;margin:0;padding:0;list-style:none}.batch-trades li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.72);font-size:9px}.batch-trades li>span{overflow-wrap:anywhere}.batch-trades li>small{grid-column:1/-1;color:#8a4b43;overflow-wrap:anywhere}.batch-next,.batch-refresh-error{font-size:9px!important}.batch-refresh-error{color:#963f35!important}@media (max-width:760px){.manual-execution-status dl{grid-template-columns:repeat(2,minmax(0,1fr))}.manual-execution-status>header,.manual-execution-status>footer{align-items:flex-start;flex-direction:column}}
 .selection-suggestions .catalog-load-more{display:block;color:#28714d;text-align:center;font-weight:750}.selection-suggestions .catalog-load-more:disabled{opacity:.55}
+.roi-sign-switch{display:inline-flex;gap:4px;margin:0 0 11px}.roi-sign-switch button{border:1px solid #d6ddd6;border-radius:6px;padding:5px 10px;color:#486258;background:#fff;font-size:11px;font-weight:650;cursor:pointer}.roi-sign-switch button.active{border-color:#28714d;color:#fff;background:#28714d}.roi-sign-switch button:focus-visible{outline:2px solid #28714d;outline-offset:1px}
 </style>

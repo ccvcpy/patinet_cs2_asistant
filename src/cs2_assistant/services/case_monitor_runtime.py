@@ -29,8 +29,8 @@ from cs2_assistant.utils import utc_now_iso
 CASE_MONITOR_RUNTIME_KEY = "case_monitor"
 CASE_MONITOR_INTERVALS = (5, 10, 15, 30)
 CASE_MONITOR_DEFAULT_INTERVAL = int(DEFAULT_COLLECTION_INTERVAL_MINUTES)
-CASE_MONITOR_COLLECT_WORKERS = 4
-CASE_MONITOR_LIQUIDITY_WORKERS = 4
+CASE_MONITOR_COLLECT_WORKERS = 8
+CASE_MONITOR_LIQUIDITY_WORKERS = 8
 CASE_MONITOR_EXPORT_KEYS = {
     "json": ("json", "application/json; charset=utf-8"),
     "summary_csv": ("summaryCsv", "text/csv; charset=utf-8"),
@@ -130,6 +130,21 @@ def public_case_monitor_job(row: Any) -> dict[str, Any] | None:
         "startedAt": row["started_at"],
         "finishedAt": row["finished_at"],
         "updatedAt": row["updated_at"],
+    }
+
+
+def _public_case_monitor_interruption(row: Any) -> dict[str, Any] | None:
+    job = public_case_monitor_job(row)
+    if job is None or job["status"] != "interrupted":
+        return None
+    return {
+        "jobId": job["jobId"],
+        "jobType": job["jobType"],
+        "progressCurrent": job["progressCurrent"],
+        "progressTotal": job["progressTotal"],
+        "savedCount": int(job["result"].get("savedCount") or 0),
+        "interruptedAt": job["finishedAt"],
+        "reason": job["error"] or job["message"],
     }
 
 
@@ -258,8 +273,14 @@ class CaseMonitorRuntimeController:
         try:
             db.initialize()
             row = ensure_case_monitor_runtime_state(db)
+            interrupted_job_id = str(row["current_job_id"] or "").strip()
             interrupted = db.interrupt_case_monitor_jobs("后端已重启，未完成的监控任务已中断")
             payload = _json_dict(row["payload_json"])
+            if interrupted_job_id:
+                interrupted_job = db.get_case_monitor_job(interrupted_job_id)
+                interruption = _public_case_monitor_interruption(interrupted_job)
+                if interruption is not None:
+                    payload["lastInterruption"] = interruption
             payload.update(
                 {
                     "message": "后端已重启，监控已暂停，请手动恢复",
@@ -421,6 +442,15 @@ class CaseMonitorRuntimeController:
             if current_job is None or str(current_job["status"]) not in {"queued", "running"}:
                 current_job = None
             latest_job = db.latest_case_monitor_job()
+            latest_interrupted = db.conn.execute(
+                """
+                SELECT *
+                FROM case_monitor_jobs
+                WHERE status = 'interrupted'
+                ORDER BY finished_at DESC, job_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             latest_report = db.conn.execute(
                 """
                 SELECT *
@@ -437,6 +467,18 @@ class CaseMonitorRuntimeController:
                 else 0
             )
             last_result = dict(payload.get("lastCollectionResult") or {})
+            last_interruption = payload.get("lastInterruption")
+            if not isinstance(last_interruption, dict):
+                candidate = _public_case_monitor_interruption(latest_interrupted)
+                interrupted_at = _parse_iso((candidate or {}).get("interruptedAt"))
+                last_collection_at = _parse_iso(row["last_collection_at"])
+                if candidate is not None and (
+                    last_collection_at is None
+                    or (interrupted_at is not None and interrupted_at > last_collection_at)
+                ):
+                    last_interruption = candidate
+                else:
+                    last_interruption = None
             return {
                 "ok": True,
                 "backend": {
@@ -458,6 +500,7 @@ class CaseMonitorRuntimeController:
                     "runningSeconds": running_seconds,
                     "restartRequiresManualResume": True,
                     "lastCollectionResult": last_result,
+                    "lastInterruption": last_interruption,
                 },
                 "currentJob": public_case_monitor_job(current_job),
                 "latestJob": public_case_monitor_job(latest_job),
@@ -622,25 +665,24 @@ class CaseMonitorRuntimeController:
             raise RuntimeError("没有可用的 Steam Cookie")
         c5_client = C5GameClient(self.settings.c5_api_key, self.settings.c5_base_url)
         progress_lock = threading.Lock()
-        last_saved = 0
+        saved_count = 0
 
         def on_progress(current: int, total: int, snapshot: Any) -> None:
-            nonlocal last_saved
+            nonlocal saved_count
             with progress_lock:
-                if current != total and current - last_saved < 5:
-                    return
-                last_saved = current
-            progress_db = Database(self.settings.db_path)
-            try:
-                progress_db.initialize()
-                progress_db.update_case_monitor_job_progress(
-                    job_id,
-                    current=current,
-                    total=total,
-                    message=f"正在采集 {current}/{total}",
-                )
-            finally:
-                progress_db.close()
+                progress_db = Database(self.settings.db_path)
+                try:
+                    progress_db.initialize()
+                    saved_count += save_case_ratio_snapshots(progress_db, [snapshot])
+                    progress_db.update_case_monitor_job_progress(
+                        job_id,
+                        current=current,
+                        total=total,
+                        message=f"正在采集 {current}/{total}，已保存 {saved_count}",
+                        partial_result={"savedCount": saved_count},
+                    )
+                finally:
+                    progress_db.close()
 
         snapshots = collect_case_ratio_snapshots(
             settings=self.settings,
@@ -651,12 +693,6 @@ class CaseMonitorRuntimeController:
             max_workers=CASE_MONITOR_COLLECT_WORKERS,
             progress_callback=on_progress,
         )
-        db = Database(self.settings.db_path)
-        try:
-            db.initialize()
-            saved_count = save_case_ratio_snapshots(db, snapshots)
-        finally:
-            db.close()
         counts = _status_counts(snapshots)
         return {
             "savedCount": saved_count,
@@ -791,6 +827,7 @@ class CaseMonitorRuntimeController:
             if error:
                 payload["message"] = f"{'采集' if job_type == 'collect' else '报告'}失败：{error}"
             elif job_type == "collect":
+                payload.pop("lastInterruption", None)
                 payload["lastCollectionResult"] = dict(result or {})
                 payload["message"] = (
                     f"采集完成：成功 {int((result or {}).get('okCount') or 0)}，"
@@ -837,4 +874,3 @@ class CaseMonitorRuntimeController:
         finally:
             db.close()
         self._wake.set()
-

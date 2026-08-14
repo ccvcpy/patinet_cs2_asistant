@@ -1311,9 +1311,14 @@ class SteamMarketClient:
         *,
         app_id: int,
         market_hash_name: str,
+        currency: int = 23,
+        country: str = "CN",
         execution_priority: bool = False,
         safety_terminal: bool = False,
         admission_timeout_seconds: float | None = None,
+        scheduler_parallel_group: str | None = None,
+        scheduler_parallel_limit: int = 1,
+        scheduler_account_exclusive: bool = False,
     ) -> dict[str, Any]:
         scheduler_options = (
             {"_scheduler_priority": 0}
@@ -1325,12 +1330,28 @@ class SteamMarketClient:
                 0.0,
                 float(admission_timeout_seconds),
             )
+        scheduler_metadata: dict[str, Any] = {"marketHashName": market_hash_name}
+        if scheduler_parallel_group:
+            scheduler_metadata.update(
+                {
+                    "schedulerParallelGroup": str(scheduler_parallel_group),
+                    "schedulerParallelLimit": min(
+                        8,
+                        max(1, int(scheduler_parallel_limit)),
+                    ),
+                    "schedulerAccountExclusive": bool(
+                        scheduler_account_exclusive
+                    ),
+                }
+            )
         response = self._request(
             "GET",
             "/market/orderbook",
             params={
                 "q": "Load",
                 "qp": json.dumps([app_id, market_hash_name], separators=(",", ":")),
+                "currency": int(currency),
+                "country": str(country or "CN"),
             },
             headers={
                 "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -1343,7 +1364,7 @@ class SteamMarketClient:
                     "AppleWebKit/537.36 Chrome/124 Safari/537.36"
                 ),
             },
-            _scheduler_metadata={"marketHashName": market_hash_name},
+            _scheduler_metadata=scheduler_metadata,
             **scheduler_options,
         )
         try:
@@ -1360,7 +1381,24 @@ class SteamMarketClient:
         app_id: int,
         market_hash_name: str,
         currency: int = 23,
+        scheduler_parallel_group: str | None = None,
+        scheduler_parallel_limit: int = 1,
+        scheduler_account_exclusive: bool = False,
     ) -> dict[str, Any]:
+        scheduler_metadata: dict[str, Any] = {"marketHashName": market_hash_name}
+        if scheduler_parallel_group:
+            scheduler_metadata.update(
+                {
+                    "schedulerParallelGroup": str(scheduler_parallel_group),
+                    "schedulerParallelLimit": min(
+                        8,
+                        max(1, int(scheduler_parallel_limit)),
+                    ),
+                    "schedulerAccountExclusive": bool(
+                        scheduler_account_exclusive
+                    ),
+                }
+            )
         response = self._request(
             "GET",
             "/market/pricehistory/",
@@ -1380,7 +1418,7 @@ class SteamMarketClient:
                     "AppleWebKit/537.36 Chrome/124 Safari/537.36"
                 ),
             },
-            _scheduler_metadata={"marketHashName": market_hash_name},
+            _scheduler_metadata=scheduler_metadata,
         )
         try:
             payload = response.json()

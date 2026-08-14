@@ -239,7 +239,6 @@ class StrategyConfig:
     def default_guadao_task_schedule() -> dict[str, Any]:
         return {
             "scanIntervalSeconds": 300.0,
-            "steamSyncIntervalSeconds": 120.0,
             # A Steam account sync may be promoted once it has waited this
             # long behind C5 rebuy work.  This is a start-lag budget, not an
             # additional polling interval.
@@ -258,7 +257,7 @@ class StrategyConfig:
                 {"untilSeconds": 600.0, "intervalSeconds": 60.0},
                 {"untilSeconds": 7200.0, "intervalSeconds": 300.0},
                 {"untilSeconds": 43200.0, "intervalSeconds": 900.0},
-                {"untilSeconds": 86400.0, "intervalSeconds": 1800.0},
+                {"untilSeconds": None, "intervalSeconds": 1800.0},
             ],
         }
 
@@ -319,6 +318,17 @@ class StrategyConfig:
         if rule is not None:
             return float(rule["maxListingRatio"])
         return float(self.guadao_max_listing_ratio)
+
+    def guadao_rebuy_reference_floor_for(self, market_hash_name: str) -> float | None:
+        """Return the per-item C5 price floor used only when opening new listings."""
+        rule = self.guadao_special_ratio_rule_for(market_hash_name)
+        if rule is None:
+            return None
+        try:
+            value = float(rule.get("rebuyReferenceFloor"))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     def to_dict(self) -> dict[str, Any]:
         return {

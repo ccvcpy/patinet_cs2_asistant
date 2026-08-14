@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -21,6 +21,7 @@ from cs2_assistant.services.guadao_case_monitor import (
     _parse_price_history_time,
     build_case_ratio_report,
     collect_case_ratio_snapshots,
+    enrich_case_ratio_report_with_steam_liquidity,
     list_case_monitor_targets,
 )
 from cs2_assistant.services.pricing import summarize_orderbook_prices
@@ -39,14 +40,17 @@ class FakeC5Client:
 class FakeSteamClient:
     account_id = "fake-steam"
 
-    def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
+    def order_book(self, *, app_id: int, market_hash_name: str, **kwargs) -> dict:
         return {
             "success": 1,
-            "rgCompactSellOrders": [
-                [9900, 10],
-                [10000, 10],
-                [10100, 10],
-            ],
+            "data": {
+                "eCurrency": 23,
+                "rgCompactSellOrders": [
+                    [9900, 10],
+                    [10000, 10],
+                    [10100, 10],
+                ],
+            },
         }
 
 
@@ -151,7 +155,7 @@ class GuadaoCaseMonitorCollectTestCase(unittest.TestCase):
         class CheapSteamClient:
             account_id = "fake-steam"
 
-            def order_book(self, *, app_id: int, market_hash_name: str) -> dict:
+            def order_book(self, *, app_id: int, market_hash_name: str, **kwargs) -> dict:
                 return {
                     "success": 1,
                     "data": {
@@ -186,6 +190,138 @@ class GuadaoCaseMonitorCollectTestCase(unittest.TestCase):
         self.assertEqual(0.89, round(snapshot.steam_wall_price or 0, 2))
         self.assertAlmostEqual(0.54 / (0.90 * 0.869), snapshot.listing_ratio or 0)
 
+    def test_collect_rotates_accounts_and_requests_eight_way_observation_group(self) -> None:
+        calls: list[tuple[str, str, dict]] = []
+
+        class CaptureSteamClient:
+            def __init__(self, account_id: str) -> None:
+                self.account_id = account_id
+
+            def order_book(self, *, app_id: int, market_hash_name: str, **kwargs) -> dict:
+                calls.append((self.account_id, market_hash_name, dict(kwargs)))
+                return {
+                    "success": 1,
+                    "data": {
+                        "eCurrency": 23,
+                        "rgCompactSellOrders": [[10000, 20]],
+                    },
+                }
+
+        class MultiC5Client:
+            def price_batch(self, market_hash_names, app_id=730):
+                return {name: {"price": 60.0, "count": 25} for name in market_hash_names}
+
+        targets = [CaseMonitorTarget(f"Case {index}", f"箱子 {index}") for index in range(4)]
+        clients = [CaptureSteamClient("account-a"), CaptureSteamClient("account-b")]
+        collect_case_ratio_snapshots(
+            settings=Settings(c5_api_key="c5-token"),
+            config=StrategyConfig(
+                steam_net_factor=0.869,
+                listing_wall_min_count=20,
+                listing_price_offset=0.01,
+                case_listing_price_offset=-0.01,
+            ),
+            targets=targets,
+            c5_client=MultiC5Client(),
+            steam_clients=clients,
+            max_workers=8,
+        )
+
+        by_name = {name: (account, options) for account, name, options in calls}
+        self.assertEqual("account-a", by_name["Case 0"][0])
+        self.assertEqual("account-b", by_name["Case 1"][0])
+        self.assertEqual("account-a", by_name["Case 2"][0])
+        self.assertEqual("account-b", by_name["Case 3"][0])
+        for _, options in by_name.values():
+            self.assertEqual("guadao_case_monitor", options["scheduler_parallel_group"])
+            self.assertEqual(8, options["scheduler_parallel_limit"])
+            self.assertTrue(options["scheduler_account_exclusive"])
+
+    def test_report_liquidity_reuses_saved_orderbook_and_only_requests_price_history(self) -> None:
+        class HistoryOnlySteamClient:
+            account_id = "account-a"
+
+            def __init__(self) -> None:
+                self.orderbook_calls = 0
+                self.history_calls: list[dict] = []
+
+            def order_book(self, **kwargs):
+                self.orderbook_calls += 1
+                raise AssertionError("report must reuse the saved orderbook snapshot")
+
+            def price_history(self, **kwargs):
+                self.history_calls.append(dict(kwargs))
+                observed_at = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+                    "%b %d %Y %H: +0"
+                )
+                return {
+                    "success": True,
+                    "prices": [[observed_at, 100.0, "12"]],
+                }
+
+        client = HistoryOnlySteamClient()
+        report = {
+            "items": [
+                {
+                    "marketHashName": "Kilowatt Case",
+                    "latestC5SellPrice": 60.0,
+                    "sellerFloorPrice": 99.0,
+                    "sellerWallPrice": 100.0,
+                    "sellerWallListPrice": 100.01,
+                    "buyerMaxPrice": 98.0,
+                    "recommendedMaxListingRatio": 0.7,
+                }
+            ]
+        }
+        enriched = enrich_case_ratio_report_with_steam_liquidity(
+            report,
+            settings=Settings(),
+            config=StrategyConfig(steam_net_factor=0.869),
+            steam_clients=[client],
+            max_workers=8,
+        )
+
+        self.assertEqual(0, client.orderbook_calls)
+        self.assertEqual(1, len(client.history_calls))
+        call = client.history_calls[0]
+        self.assertEqual("guadao_case_monitor", call["scheduler_parallel_group"])
+        self.assertEqual(8, call["scheduler_parallel_limit"])
+        self.assertTrue(call["scheduler_account_exclusive"])
+        self.assertEqual(12, enriched["items"][0]["steamVolume24h"])
+
+    def test_collect_rejects_non_cny_orderbook_and_falls_back_to_next_account(self) -> None:
+        class CurrencySteamClient:
+            def __init__(self, account_id: str, currency_id: int) -> None:
+                self.account_id = account_id
+                self.currency_id = currency_id
+
+            def order_book(self, **kwargs):
+                return {
+                    "success": 1,
+                    "data": {
+                        "eCurrency": self.currency_id,
+                        "rgCompactSellOrders": [[10000, 20]],
+                    },
+                }
+
+        snapshots = collect_case_ratio_snapshots(
+            settings=Settings(c5_api_key="c5-token"),
+            config=StrategyConfig(
+                steam_net_factor=0.869,
+                listing_wall_min_count=20,
+                case_listing_price_offset=-0.01,
+            ),
+            targets=[CaseMonitorTarget("Kilowatt Case", "千瓦武器箱")],
+            c5_client=FakeC5Client(),
+            steam_clients=[
+                CurrencySteamClient("sgd-account", 13),
+                CurrencySteamClient("cny-account", 23),
+            ],
+        )
+
+        self.assertEqual("ok", snapshots[0].status)
+        self.assertEqual("cny-account", snapshots[0].raw_json["steam"]["account"])
+        self.assertIn("currencyId=13", snapshots[0].raw_json["steamErrors"][0])
 
 class GuadaoCaseMonitorReportTestCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -286,6 +422,35 @@ class GuadaoCaseMonitorReportTestCase(unittest.TestCase):
         self.assertEqual(1, item["legacySteamMinorUnitCorrectedCount"])
         self.assertEqual(0.9, round(item["latestSteamListPrice"], 2))
         self.assertAlmostEqual(0.54 / (0.90 * 0.869), item["latestRatio"], places=4)
+
+    def test_report_excludes_historical_non_cny_rows_even_if_marked_ok(self) -> None:
+        self.db.save_guadao_case_ratio_snapshots(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "observed_at": "2026-08-13T00:00:00+00:00",
+                    "name_cn": "千瓦武器箱",
+                    "c5_sell_price": 0.97,
+                    "steam_list_price": 0.30,
+                    "steam_after_tax_price": 0.2607,
+                    "listing_ratio": 3.7208,
+                    "status": "ok",
+                    "raw_json": {
+                        "config": {"steamOrderbookPriceParserVersion": 2},
+                        "steam": {"orderbook": {"eCurrency": 13}},
+                    },
+                }
+            ]
+        )
+
+        report = build_case_ratio_report(
+            self.db,
+            start_utc="2026-08-12T00:00:00+00:00",
+            end_utc="2026-08-14T00:00:00+00:00",
+        )
+
+        self.assertEqual(0, report["itemCount"])
+        self.assertEqual({"currency_invalid": 1}, report["statusCounts"])
 
     def test_list_case_monitor_targets_uses_csgo_api_crates(self) -> None:
         self.db.upsert_items(

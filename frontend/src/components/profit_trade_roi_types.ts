@@ -6,6 +6,7 @@ export type ProfitTradeOrderbookLevel = {
 export type ProfitTradeSteamOrderbook = {
   observedAt?: string | null;
   currencyId?: number | null;
+  currencyValid?: boolean | null;
   sellerFloorPrice?: number | null;
   sellerFloorCount?: number | null;
   buyerMaxPrice?: number | null;
@@ -125,15 +126,26 @@ export type ProfitTradeLongBuyProposal = {
 export type ProfitTradeWatchPool = "inventory" | "selection";
 export type ProfitTradeHistoryRange = "7d" | "30d" | "90d" | "all";
 
+export type ProfitTradeRefreshStatus = {
+  status?: "failed" | string;
+  scanId?: string | null;
+  attemptedAt?: string | null;
+  reason?: string | null;
+  errorType?: string | null;
+  targetBalanceDiscount?: number | null;
+};
+
 export type ProfitTradeWatchItem = {
   scanId?: string | null;
   marketHashName: string;
   name?: string | null;
   active?: boolean;
   status?: string | null;
+  selectionStatus?: string | null;
   selectedAt?: string | null;
   nextScanAt?: string | null;
   lastError?: string | null;
+  latestRefresh?: ProfitTradeRefreshStatus | null;
 
   steamBuyPrice?: number | null;
   c5ListingPrice?: number | null;

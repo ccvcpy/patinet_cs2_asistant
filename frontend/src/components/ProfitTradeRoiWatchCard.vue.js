@@ -12,6 +12,22 @@ const hasSavedDepth = computed(() => {
     const snapshot = orderbook(props.row);
     return Boolean((snapshot.sellLevels?.length || 0) + (snapshot.buyLevels?.length || 0));
 });
+const selectionStatus = computed(() => props.row.selectionStatus || props.row.status || "");
+const currencyWarning = computed(() => {
+    if (!isSelection.value)
+        return null;
+    const snapshot = props.row.steamOrderbook;
+    const currencyId = Number(snapshot?.currencyId);
+    if (selectionStatus.value !== "currency_invalid"
+        && snapshot?.currencyValid !== false
+        && currencyId === 23)
+        return null;
+    const actual = Number.isFinite(currencyId) ? String(currencyId) : "未知";
+    return `Steam 实际币种 ${actual}，要求 CNY（23）；Steam 价格和 ROI 已停用，C5 行情仍可查看。`;
+});
+const refreshFailure = computed(() => (props.row.latestRefresh?.status === "failed"
+    ? props.row.latestRefresh
+    : null));
 const longBuyOrder = computed(() => props.row.longBuyOrder || null);
 const longBuyProposal = computed(() => props.row.longBuyProposal || null);
 const excludedOwnBuyPrices = computed(() => {
@@ -52,7 +68,27 @@ function time(value) {
         : parsed.toLocaleString("zh-CN", { hour12: false });
 }
 function orderbook(row) {
-    return row.steamOrderbook || {
+    const snapshot = row.steamOrderbook;
+    if (snapshot) {
+        const currencyId = Number(snapshot.currencyId);
+        if (snapshot.currencyValid === false || currencyId !== 23) {
+            return {
+                ...snapshot,
+                sellerFloorPrice: null,
+                sellerFloorCount: null,
+                buyerMaxPrice: null,
+                buyerMaxCount: null,
+                spreadAmount: null,
+                spreadPct: null,
+                sellOrderCountTotal: null,
+                buyOrderCountTotal: null,
+                sellLevels: [],
+                buyLevels: [],
+            };
+        }
+        return snapshot;
+    }
+    return {
         sellerFloorPrice: row.steamBuyPrice ?? null,
         sellLevels: [],
         buyLevels: [],
@@ -184,9 +220,14 @@ const c5RiskExplanation = computed(() => c5PurchaseGapExplanation(props.row));
 const generalReason = computed(() => {
     if (c5RiskExplanation.value)
         return "";
+    if (isSelection.value && props.row.lastError)
+        return props.row.lastError;
     return props.row.executionReason || props.row.riskReason || props.row.exitReason || props.row.lastError || "";
 });
 const displayedManualExecutionDisabledReason = computed(() => {
+    if (refreshFailure.value) {
+        return "本轮行情刷新失败，当前卡片是旧快照，不能据此执行。";
+    }
     const disabledReason = props.manualExecutionDisabledReason;
     if (!c5RiskExplanation.value)
         return disabledReason;
@@ -202,12 +243,13 @@ function stateLabel(row) {
         const labels = {
             pending_first_scan: "等待首次观察",
             observed: "已观察",
+            currency_invalid: "Steam 币种异常，暂不显示价格",
             price_unavailable: "暂时无价格",
             scan_failed: "读取失败",
             paused: "已暂停",
             removed: "已移出",
         };
-        return labels[row.status || ""] || "仅研究";
+        return labels[row.selectionStatus || row.status || ""] || "仅研究";
     }
     if (row.active === false)
         return "已退出观察池";
@@ -232,11 +274,12 @@ function stateLabel(row) {
 }
 function stateClass(row) {
     if (isSelection.value) {
-        if (["scan_failed", "price_unavailable"].includes(row.status || ""))
+        const status = row.selectionStatus || row.status || "";
+        if (["scan_failed", "price_unavailable", "currency_invalid"].includes(status))
             return "blocked";
-        if (["paused", "removed"].includes(row.status || ""))
+        if (["paused", "removed"].includes(status))
             return "exited";
-        if (row.status === "pending_first_scan")
+        if (status === "pending_first_scan")
             return "observe";
         return "ready";
     }
@@ -355,6 +398,8 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['long-buy-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-state']} */ ;
 /** @type {__VLS_StyleScopedClasses['manual-execute-action']} */ ;
+/** @type {__VLS_StyleScopedClasses['refresh-warning']} */ ;
+/** @type {__VLS_StyleScopedClasses['refresh-warning']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
@@ -378,6 +423,26 @@ if (__VLS_ctx.isSelection) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
         ...{ class: "research-note" },
     });
+}
+if (__VLS_ctx.currencyWarning) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "currency-warning" },
+        role: "alert",
+    });
+    (__VLS_ctx.currencyWarning);
+}
+if (__VLS_ctx.refreshFailure) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
+        ...{ class: "refresh-warning" },
+        role: "alert",
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    (__VLS_ctx.pct(__VLS_ctx.row.roiBasis ?? __VLS_ctx.row.balanceDiscount));
+    (__VLS_ctx.pct(__VLS_ctx.refreshFailure.targetBalanceDiscount));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    (__VLS_ctx.time(__VLS_ctx.refreshFailure.attemptedAt));
+    (__VLS_ctx.refreshFailure.reason || __VLS_ctx.refreshFailure.errorType || "行情读取失败");
 }
 else if (__VLS_ctx.listingsCooling && ['listings_cooldown', 'listings_probe_ready', 'executable', 'eligible'].includes(__VLS_ctx.row.executionStatus || '')) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
@@ -715,6 +780,8 @@ if (__VLS_ctx.depthOpen) {
 }
 /** @type {__VLS_StyleScopedClasses['card-head']} */ ;
 /** @type {__VLS_StyleScopedClasses['research-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['currency-warning']} */ ;
+/** @type {__VLS_StyleScopedClasses['refresh-warning']} */ ;
 /** @type {__VLS_StyleScopedClasses['card-cooldown']} */ ;
 /** @type {__VLS_StyleScopedClasses['price-line']} */ ;
 /** @type {__VLS_StyleScopedClasses['steam-highest-bid']} */ ;
@@ -754,6 +821,8 @@ const __VLS_self = (await import('vue')).defineComponent({
             depthOpen: depthOpen,
             isSelection: isSelection,
             hasSavedDepth: hasSavedDepth,
+            currencyWarning: currencyWarning,
+            refreshFailure: refreshFailure,
             longBuyOrder: longBuyOrder,
             longBuyProposal: longBuyProposal,
             excludedOwnBuyPrices: excludedOwnBuyPrices,

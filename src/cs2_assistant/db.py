@@ -2912,6 +2912,12 @@ class Database:
             "steamBuyPrice": row["steam_buy_price"],
             "steamOrderbook": steam_orderbook,
             "crossedListingProbe": crossed_listing_probe,
+            "latestRefresh": (
+                dict(raw_payload.get("latestRefresh") or {})
+                if isinstance(raw_payload, dict)
+                and isinstance(raw_payload.get("latestRefresh"), dict)
+                else None
+            ),
             "steamPriceSource": row["steam_price_source"] if "steam_price_source" in keys else None,
             "c5ListingPrice": row["c5_listing_price"],
             "c5PriceSource": row["c5_price_source"] if "c5_price_source" in keys else None,
@@ -3042,6 +3048,8 @@ class Database:
         observed_at: str | None = None,
         exit_reasons: dict[str, str] | None = None,
         exit_observations: dict[str, dict[str, Any]] | None = None,
+        preserve_market_hash_names: Iterable[str] | None = None,
+        preserve_refresh_failures: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         """Persist one successfully completed scan and retire stale watch rows.
 
@@ -3118,6 +3126,16 @@ class Database:
 
         exit_reasons = exit_reasons or {}
         exit_observations = exit_observations or {}
+        preserve_names = {
+            str(value or "").strip()
+            for value in (preserve_market_hash_names or ())
+            if str(value or "").strip()
+        }
+        refresh_failures = {
+            str(name or "").strip(): dict(failure)
+            for name, failure in (preserve_refresh_failures or {}).items()
+            if str(name or "").strip() and isinstance(failure, dict)
+        }
         inserted = 0
         updated = 0
         exited = 0
@@ -3348,6 +3366,44 @@ class Database:
             for watch_row in active_rows:
                 market_hash_name = str(watch_row["market_hash_name"])
                 if market_hash_name in active_names:
+                    continue
+                if market_hash_name in preserve_names:
+                    failure = refresh_failures.get(market_hash_name)
+                    if failure is not None:
+                        try:
+                            preserved_raw = json.loads(
+                                str(watch_row["raw_json"] or "{}")
+                            )
+                        except (TypeError, ValueError):
+                            preserved_raw = {}
+                        if not isinstance(preserved_raw, dict):
+                            preserved_raw = {}
+                        preserved_raw["latestRefresh"] = {
+                            "status": "failed",
+                            "scanId": scan_id,
+                            "attemptedAt": timestamp,
+                            "reason": str(
+                                failure.get("reason") or "行情读取失败"
+                            )[:1000],
+                            "errorType": str(
+                                failure.get("errorType") or "price_unavailable"
+                            )[:100],
+                            "targetBalanceDiscount": failure.get(
+                                "targetBalanceDiscount"
+                            ),
+                        }
+                        self.conn.execute(
+                            """
+                            UPDATE profit_trade_roi_watch
+                            SET updated_at = ?, raw_json = ?
+                            WHERE market_hash_name = ?
+                            """,
+                            (
+                                timestamp,
+                                json.dumps(preserved_raw, ensure_ascii=False),
+                                market_hash_name,
+                            ),
+                        )
                     continue
                 reason = str(
                     exit_reasons.get(market_hash_name)
@@ -4090,6 +4146,7 @@ class Database:
         active: bool | None = True,
         keyword: str | None = None,
         execution_status: str | None = None,
+        roi_sign: str | None = None,
         sort: str = "roi_desc",
         page: int = 1,
         page_size: int = 50,
@@ -4158,6 +4215,12 @@ class Database:
         if execution_status:
             where.append("execution_status = ?")
             params.append(execution_status)
+        if roi_sign == "positive":
+            where.append("expected_roi > 0")
+        elif roi_sign == "negative":
+            where.append("expected_roi < 0")
+        elif roi_sign not in (None, "", "all"):
+            raise ValueError("roiSign must be positive, negative, or all")
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
         total = int(
             self.conn.execute(
@@ -4881,6 +4944,7 @@ class Database:
         current: int,
         total: int,
         message: str | None = None,
+        partial_result: dict[str, Any] | None = None,
     ) -> None:
         with self.conn:
             self.conn.execute(
@@ -4889,6 +4953,7 @@ class Database:
                 SET progress_current = ?,
                     progress_total = ?,
                     message = COALESCE(?, message),
+                    result_json = COALESCE(?, result_json),
                     updated_at = ?
                 WHERE job_id = ? AND status = 'running'
                 """,
@@ -4896,6 +4961,7 @@ class Database:
                     max(0, int(current)),
                     max(0, int(total)),
                     str(message) if message else None,
+                    _json_object(partial_result) if partial_result is not None else None,
                     utc_now_iso(),
                     str(job_id or "").strip(),
                 ),
@@ -5058,6 +5124,15 @@ class Database:
             return raw_orderbook.get(raw_key) if raw_key else None
 
         crossed_value = value("steam_orderbook_crossed", "crossed")
+        currency_id = value("steam_currency_id", "currencyId")
+        try:
+            normalized_currency_id = int(currency_id) if currency_id is not None else None
+        except (TypeError, ValueError):
+            normalized_currency_id = None
+        currency_valid = (
+            raw_orderbook.get("currencyValid") is not False
+            and normalized_currency_id == 23
+        )
         expected_roi = value("expected_roi")
         try:
             expected_roi_pct = float(expected_roi) * 100.0 if expected_roi is not None else None
@@ -5098,18 +5173,19 @@ class Database:
             "steamBuyPrice": value("steam_buy_price"),
             "steamOrderbook": {
                 "observedAt": value("steam_orderbook_observed_at", "observedAt"),
-                "currencyId": value("steam_currency_id", "currencyId"),
-                "sellerFloorPrice": value("steam_buy_price", "sellerFloorPrice"),
-                "sellerFloorCount": value("steam_seller_floor_count", "sellerFloorCount"),
-                "buyerMaxPrice": value("steam_buyer_max_price", "buyerMaxPrice"),
-                "buyerMaxCount": value("steam_buyer_max_count", "buyerMaxCount"),
-                "spreadAmount": value("steam_spread_amount", "spreadAmount"),
-                "spreadPct": value("steam_spread_pct", "spreadPct"),
+                "currencyId": normalized_currency_id if normalized_currency_id is not None else currency_id,
+                "currencyValid": currency_valid,
+                "sellerFloorPrice": value("steam_buy_price", "sellerFloorPrice") if currency_valid else None,
+                "sellerFloorCount": value("steam_seller_floor_count", "sellerFloorCount") if currency_valid else None,
+                "buyerMaxPrice": value("steam_buyer_max_price", "buyerMaxPrice") if currency_valid else None,
+                "buyerMaxCount": value("steam_buyer_max_count", "buyerMaxCount") if currency_valid else None,
+                "spreadAmount": value("steam_spread_amount", "spreadAmount") if currency_valid else None,
+                "spreadPct": value("steam_spread_pct", "spreadPct") if currency_valid else None,
                 "crossed": bool(crossed_value) if crossed_value is not None else None,
-                "sellOrderCountTotal": raw_orderbook.get("sellOrderCountTotal"),
-                "buyOrderCountTotal": raw_orderbook.get("buyOrderCountTotal"),
-                "sellLevels": list(raw_orderbook.get("sellLevels") or []),
-                "buyLevels": list(raw_orderbook.get("buyLevels") or []),
+                "sellOrderCountTotal": raw_orderbook.get("sellOrderCountTotal") if currency_valid else None,
+                "buyOrderCountTotal": raw_orderbook.get("buyOrderCountTotal") if currency_valid else None,
+                "sellLevels": list(raw_orderbook.get("sellLevels") or []) if currency_valid else [],
+                "buyLevels": list(raw_orderbook.get("buyLevels") or []) if currency_valid else [],
             },
             "crossedListingProbe": crossed_listing_probe,
             "steamPriceSource": value("steam_price_source"),
@@ -6474,20 +6550,84 @@ class Database:
         *,
         lease_seconds: float,
         now_iso: str,
+        parallel_group: str | None = None,
+        parallel_limit: int = 1,
+        account_exclusive: bool = False,
     ) -> sqlite3.Row | None:
-        active = self.conn.execute(
+        active_rows = self.conn.execute(
             """
             SELECT * FROM steam_request_queue
             WHERE status = 'running' AND lease_expires_at > ?
-            ORDER BY id LIMIT 1
+            ORDER BY id
             """,
             (now_iso,),
-        ).fetchone()
-        if active is not None:
+        ).fetchall()
+        for active in active_rows:
             if active["request_id"] == request_id and active["lease_owner"] == worker_id:
                 return active
+
+        candidate = self.conn.execute(
+            """
+            SELECT * FROM steam_request_queue
+            WHERE request_id = ?
+              AND available_at <= ?
+              AND (
+                status = 'pending'
+                OR (status = 'running' AND lease_expires_at <= ?)
+              )
+            """,
+            (request_id, now_iso, now_iso),
+        ).fetchone()
+        if candidate is None:
             return None
-        head = self.conn.execute(
+
+        safe_group = str(parallel_group or "").strip()
+        safe_limit = min(8, max(1, int(parallel_limit)))
+
+        def row_policy(row: sqlite3.Row) -> tuple[str, int, bool]:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            group = str(payload.get("schedulerParallelGroup") or "").strip()
+            try:
+                limit = min(
+                    8,
+                    max(1, int(payload.get("schedulerParallelLimit") or 1)),
+                )
+            except (TypeError, ValueError, OverflowError):
+                limit = 1
+            return (
+                group,
+                limit,
+                bool(payload.get("schedulerAccountExclusive")),
+            )
+
+        active_accounts = {
+            str(row["account_id"] or "").strip()
+            for row in active_rows
+            if str(row["account_id"] or "").strip()
+        }
+        if active_rows:
+            if not safe_group or safe_limit <= 1 or len(active_rows) >= safe_limit:
+                return None
+            candidate_account = str(candidate["account_id"] or "").strip()
+            if account_exclusive and (
+                not candidate_account or candidate_account in active_accounts
+            ):
+                return None
+            for active in active_rows:
+                active_group, active_limit, active_account_exclusive = row_policy(active)
+                if (
+                    active_group != safe_group
+                    or active_limit <= len(active_rows)
+                    or active_account_exclusive != account_exclusive
+                ):
+                    return None
+
+        pending_rows = self.conn.execute(
             """
             SELECT * FROM steam_request_queue
             WHERE available_at <= ?
@@ -6496,11 +6636,28 @@ class Database:
                 OR (status = 'running' AND lease_expires_at <= ?)
               )
             ORDER BY priority ASC, available_at ASC, id ASC
-            LIMIT 1
             """,
             (now_iso, now_iso),
-        ).fetchone()
-        if head is None or str(head["request_id"]) != request_id:
+        ).fetchall()
+        claimable_head: sqlite3.Row | None = None
+        for pending in pending_rows:
+            if active_rows:
+                pending_group, _, pending_account_exclusive = row_policy(pending)
+                pending_account = str(pending["account_id"] or "").strip()
+                if int(pending["priority"]) < int(candidate["priority"]):
+                    return None
+                if (
+                    pending_group == safe_group
+                    and pending_account_exclusive == account_exclusive
+                    and account_exclusive
+                    and pending_account in active_accounts
+                ):
+                    # This older ticket cannot use its busy account lane yet;
+                    # let the next distinct-account ticket fill lane two.
+                    continue
+            claimable_head = pending
+            break
+        if claimable_head is None or str(claimable_head["request_id"]) != request_id:
             return None
         expires_at = _lease_expiry(now_iso, lease_seconds)
         self.conn.execute(
@@ -6521,6 +6678,9 @@ class Database:
         *,
         lease_seconds: float = 30,
         now: str | datetime | None = None,
+        parallel_group: str | None = None,
+        parallel_limit: int = 1,
+        account_exclusive: bool = False,
     ) -> sqlite3.Row | None:
         key = str(request_id or "").strip()
         owner = str(worker_id or "").strip()
@@ -6534,6 +6694,9 @@ class Database:
                 owner,
                 lease_seconds=lease_seconds,
                 now_iso=now_iso,
+                parallel_group=parallel_group,
+                parallel_limit=parallel_limit,
+                account_exclusive=account_exclusive,
             )
             self.conn.commit()
             return row

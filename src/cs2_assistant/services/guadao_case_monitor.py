@@ -476,9 +476,37 @@ def _fetch_steam_decision(
     for client in steam_clients:
         account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
         try:
-            payload = client.order_book(app_id=app_id, market_hash_name=market_hash_name)
+            payload = client.order_book(
+                app_id=app_id,
+                market_hash_name=market_hash_name,
+                scheduler_parallel_group="guadao_case_monitor",
+                scheduler_parallel_limit=8,
+                scheduler_account_exclusive=True,
+            )
         except Exception as exc:
             errors.append(f"{account_label}: {exc}")
+            continue
+        summary = summarize_orderbook_prices(
+            payload or {},
+            wall_min_count=wall_min_count,
+            price_offset=price_offset,
+            min_price=0.01,
+        )
+        summary_payload = summary.to_dict()
+        payload_data = (
+            payload.get("data")
+            if isinstance(payload, dict) and isinstance(payload.get("data"), dict)
+            else payload
+        )
+        currency_id = safe_int(
+            payload_data.get("eCurrency") or payload_data.get("currencyId")
+        ) if isinstance(payload_data, dict) else None
+        summary_payload["currencyId"] = currency_id
+        summary_payload["currencyValid"] = currency_id == 23
+        if currency_id != 23:
+            errors.append(
+                f"{account_label}: Steam orderbook currencyId={currency_id}; CNY currencyId=23 required"
+            )
             continue
         decision = choose_orderbook_price(
             payload or {},
@@ -489,12 +517,6 @@ def _fetch_steam_decision(
         if decision is None:
             errors.append(f"{account_label}: empty sell orderbook")
             continue
-        summary = summarize_orderbook_prices(
-            payload or {},
-            wall_min_count=wall_min_count,
-            price_offset=price_offset,
-            min_price=0.01,
-        )
         return (
             {
                 "payload": payload,
@@ -503,7 +525,7 @@ def _fetch_steam_decision(
                     "wallPrice": decision.wall_price,
                     "reason": decision.reason,
                 },
-                "summary": summary.to_dict(),
+                "summary": summary_payload,
                 "account": str(account_label),
             },
             errors,
@@ -532,7 +554,8 @@ def collect_case_ratio_snapshots(
     case_offset = config.case_listing_price_offset
     price_offset = case_offset if case_offset is not None else config.listing_price_offset
 
-    def build_snapshot(target: CaseMonitorTarget) -> CaseRatioSnapshot:
+    def build_snapshot(indexed_target: tuple[int, CaseMonitorTarget]) -> CaseRatioSnapshot:
+        target_index, target = indexed_target
         c5_payload = c5_prices.get(target.market_hash_name) or {}
         c5_sell_price = safe_float(c5_payload.get("price"))
         c5_sell_count = safe_int(c5_payload.get("count"))
@@ -563,8 +586,10 @@ def collect_case_ratio_snapshots(
                 raw_json=raw,
             )
 
+        primary_index = target_index % len(steam_clients)
+        ordered_clients = steam_clients[primary_index:] + steam_clients[:primary_index]
         steam_result, steam_errors = _fetch_steam_decision(
-            steam_clients,
+            ordered_clients,
             app_id=settings.app_id,
             market_hash_name=target.market_hash_name,
             wall_min_count=config.listing_wall_min_count,
@@ -624,9 +649,9 @@ def collect_case_ratio_snapshots(
     progress_current = 0
     progress_total = len(targets)
 
-    def tracked_snapshot(target: CaseMonitorTarget) -> CaseRatioSnapshot:
+    def tracked_snapshot(indexed_target: tuple[int, CaseMonitorTarget]) -> CaseRatioSnapshot:
         nonlocal progress_current
-        snapshot = build_snapshot(target)
+        snapshot = build_snapshot(indexed_target)
         if progress_callback is not None:
             with progress_lock:
                 progress_current += 1
@@ -635,10 +660,11 @@ def collect_case_ratio_snapshots(
         return snapshot
 
     workers = max(1, int(max_workers))
+    indexed_targets = list(enumerate(targets))
     if workers == 1:
-        return [tracked_snapshot(target) for target in targets]
+        return [tracked_snapshot(target) for target in indexed_targets]
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(tracked_snapshot, targets))
+        return list(executor.map(tracked_snapshot, indexed_targets))
 
 
 def save_case_ratio_snapshots(db: Database, snapshots: list[CaseRatioSnapshot]) -> int:
@@ -937,39 +963,31 @@ def enrich_case_ratio_report_with_steam_liquidity(
         report["steamLiquidityStatus"] = "skipped_no_candidates"
         return report
 
-    price_offset = (
-        config.case_listing_price_offset
-        if config.case_listing_price_offset is not None
-        else config.listing_price_offset
-    )
-
-    def fetch_liquidity(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def fetch_liquidity(indexed_item: tuple[int, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        item_index, item = indexed_item
         market_hash_name = str(item.get("marketHashName") or "")
         errors: list[str] = []
-        for client in steam_clients:
+        primary_index = item_index % len(steam_clients)
+        ordered_clients = steam_clients[primary_index:] + steam_clients[:primary_index]
+        for client in ordered_clients:
             try:
-                orderbook = client.order_book(app_id=settings.app_id, market_hash_name=market_hash_name)
                 history = client.price_history(
                     app_id=settings.app_id,
                     market_hash_name=market_hash_name,
                     currency=config.steam_currency,
+                    scheduler_parallel_group="guadao_case_monitor",
+                    scheduler_parallel_limit=8,
+                    scheduler_account_exclusive=True,
                 )
             except Exception as exc:
                 errors.append(str(exc))
                 continue
-            summary = summarize_orderbook_prices(
-                orderbook or {},
-                wall_min_count=config.listing_wall_min_count,
-                price_offset=price_offset,
-                min_price=0.01,
-            ).to_dict()
             liquidity = _parse_price_history_liquidity(history or {})
             reference = _select_report_reference(
-                summary,
+                item,
                 volume_24h=safe_int(liquidity.get("steamVolume24h")),
             )
             return market_hash_name, {
-                **summary,
                 **liquidity,
                 **reference,
                 "steamLiquidityError": None,
@@ -980,9 +998,9 @@ def enrich_case_ratio_report_with_steam_liquidity(
     progress_current = 0
     progress_total = len(candidates)
 
-    def tracked_liquidity(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def tracked_liquidity(indexed_item: tuple[int, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
         nonlocal progress_current
-        result = fetch_liquidity(item)
+        result = fetch_liquidity(indexed_item)
         if progress_callback is not None:
             with progress_lock:
                 progress_current += 1
@@ -991,11 +1009,12 @@ def enrich_case_ratio_report_with_steam_liquidity(
         return result
 
     workers = max(1, int(max_workers))
+    indexed_candidates = list(enumerate(candidates))
     if workers == 1:
-        results = [tracked_liquidity(item) for item in candidates]
+        results = [tracked_liquidity(item) for item in indexed_candidates]
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(tracked_liquidity, candidates))
+            results = list(executor.map(tracked_liquidity, indexed_candidates))
     by_name = {name: payload for name, payload in results}
 
     for item in items:
@@ -1104,6 +1123,13 @@ def _summarize_item_segments(
     dominant_buckets = sorted(bucket_rows, key=lambda row: (-float(row["durationSeconds"]), float(row["lower"])))[:5]
 
     latest_row = max(rows, key=lambda row: str(row.get("observed_at") or ""))
+    latest_raw = _raw_dict(latest_row.get("raw_json"))
+    latest_steam = latest_raw.get("steam") if isinstance(latest_raw.get("steam"), dict) else {}
+    latest_summary = (
+        latest_steam.get("summary")
+        if isinstance(latest_steam.get("summary"), dict)
+        else {}
+    )
     recommended_ratio = _ceil_ratio(p75 if p75 is not None else avg_ratio)
     conservative_ratio = _ceil_ratio(p50 if p50 is not None else avg_ratio)
     aggressive_ratio = _ceil_ratio(p90 if p90 is not None else avg_ratio)
@@ -1133,6 +1159,16 @@ def _summarize_item_segments(
         "latestC5SellPrice": latest_row.get("c5_sell_price"),
         "latestSteamListPrice": latest_row.get("steam_list_price"),
         "latestSteamAfterTaxPrice": latest_row.get("steam_after_tax_price"),
+        "sellerFloorPrice": latest_summary.get("sellerFloorPrice"),
+        "sellerFloorCount": latest_summary.get("sellerFloorCount"),
+        "sellerWallPrice": latest_summary.get("sellerWallPrice"),
+        "sellerWallListPrice": latest_summary.get("sellerWallListPrice"),
+        "buyerMaxPrice": latest_summary.get("buyerMaxPrice"),
+        "buyerMaxCount": latest_summary.get("buyerMaxCount"),
+        "spreadAmount": latest_summary.get("spreadAmount"),
+        "spreadRatio": latest_summary.get("spreadRatio"),
+        "wallToBuyerRatio": latest_summary.get("wallToBuyerRatio"),
+        "wallToFloorRatio": latest_summary.get("wallToFloorRatio"),
         "minRatio": round(min_ratio, 4),
         "minRatioDurationSeconds": round(min_duration, 2),
         "minRatioDurationMinutes": round(min_duration / 60.0, 2),
@@ -1203,11 +1239,23 @@ def build_case_ratio_report(
     for row in rows:
         payload = _correct_legacy_minor_unit_row(dict(row))
         status = str(payload.get("status") or "unknown")
+        raw_json = _raw_dict(payload.get("raw_json"))
+        raw_steam = raw_json.get("steam") if isinstance(raw_json.get("steam"), dict) else {}
+        raw_orderbook = (
+            raw_steam.get("orderbook")
+            if isinstance(raw_steam.get("orderbook"), dict)
+            else {}
+        )
+        raw_currency_id = safe_int(
+            raw_orderbook.get("eCurrency") or raw_orderbook.get("currencyId")
+        )
+        if status == "ok" and raw_currency_id is not None and raw_currency_id != 23:
+            status = "currency_invalid"
+            payload["status"] = status
         status_counts[status] = status_counts.get(status, 0) + 1
         if status != "ok" or payload.get("listing_ratio") is None:
             continue
         market_name = str(payload["market_hash_name"])
-        raw_json = _raw_dict(payload.get("raw_json"))
         raw_target = raw_json.get("target") if isinstance(raw_json.get("target"), dict) else {}
         type_info = type_lookup.get(market_name) or {}
         crate_type = str(

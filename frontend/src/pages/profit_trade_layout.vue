@@ -18,6 +18,11 @@ type RuntimeCookieAccount = {
   lastCheckedAt?: string | null;
   error?: string | null;
   nextRetryAt?: string | null;
+  currencyId?: number | null;
+  currency?: string | null;
+  currencyStatus?: "cny" | "non_cny" | "unknown" | string;
+  currencyCheckedAt?: string | null;
+  currencyError?: string | null;
 };
 type RuntimeCookies = {
   status?: string;
@@ -71,6 +76,16 @@ function localTime(value?: string | null): string {
   if (!value) return "-";
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
+}
+
+function cookieCurrencyLabel(account: RuntimeCookieAccount): string {
+  if (account.currencyStatus === "cny") {
+    return `${account.currency || "CNY"} · ID ${account.currencyId ?? 23}`;
+  }
+  if (account.currencyStatus === "non_cny") {
+    return `${account.currency || "非人民币"} · ID ${account.currencyId ?? "?"}`;
+  }
+  return "币种未知";
 }
 
 function handleDashboardStatus(event: Event): void {
@@ -173,7 +188,9 @@ onUnmounted(() => {
         <article v-for="account in runtimeCookies.accounts" :key="account.accountId || account.steamId">
           <div><strong>{{ account.accountName || account.name || "未命名账号" }}</strong><span>{{ account.steamId || "—" }}</span></div>
           <b :class="{ valid: account.valid }">{{ account.valid ? "有效" : account.error || account.status || "未知" }}</b>
-          <time>{{ localTime(account.lastCheckedAt) }}</time>
+          <small :class="['cookie-currency', account.currencyStatus === 'cny' ? 'currency-cny' : account.currencyStatus === 'non_cny' ? 'currency-invalid' : 'currency-unknown']">{{ cookieCurrencyLabel(account) }}</small>
+          <time>Cookie {{ localTime(account.lastCheckedAt) }} · 币种 {{ localTime(account.currencyCheckedAt) }}</time>
+          <em v-if="account.currencyError">币种检测失败：{{ account.currencyError }}</em>
         </article>
       </div>
       <p v-else>共享 Cookie API 暂未返回账号状态。</p>
@@ -214,6 +231,6 @@ onUnmounted(() => {
 .profit-subnav{display:flex;gap:4px;padding:3px;border-radius:9px;background:#edf1ec}.profit-subnav a{padding:7px 13px;border-radius:7px;color:#627068;text-decoration:none;font-size:13px;font-weight:650}.profit-subnav a.router-link-active{color:#174a36;background:#fff;box-shadow:0 1px 5px rgba(20,59,46,.09)}
 .profit-runtime-strip{display:flex;justify-content:flex-end;align-items:center;gap:8px;min-width:0}.runtime-dot{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border:1px solid #dfe5df;border-radius:999px;color:#66716b;background:#fff;font-size:11px;white-space:nowrap}.runtime-dot::before{content:"";width:6px;height:6px;border-radius:50%;background:#a3aaa6}.runtime-dot.online::before{background:#2f805b}.runtime-dot.offline::before,.runtime-dot.danger::before{background:#b64c42}.runtime-dot.safe::before{background:#2f805b}
 .profit-layout-error{width:min(1280px,calc(100vw - 40px));margin:10px auto 0;padding:8px 11px;border:1px solid #e4b4ae;border-radius:7px;color:#8c382f;background:#fff7f5;font-size:12px}
-.runtime-cookie-button{display:inline-flex;align-items:center;gap:5px;min-height:28px;border:1px solid #dce4de;border-radius:999px;padding:4px 8px;color:#335b48;background:#fff;font-size:10px;font-weight:700}.profit-cookie-panel{width:min(1280px,calc(100vw - 40px));margin:10px auto 0;border:1px solid var(--folio-line);border-radius:13px;padding:12px 14px;background:#fff;box-shadow:var(--folio-shadow)}.profit-cookie-panel header{display:flex;justify-content:space-between;align-items:center}.profit-cookie-panel header>div{display:grid;gap:2px}.profit-cookie-panel header span,.profit-cookie-panel>p{color:var(--folio-muted);font-size:9px}.profit-cookie-panel header a{color:var(--folio-green);font-size:9px;font-weight:700}.profit-cookie-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:9px}.profit-cookie-grid article{display:grid;grid-template-columns:1fr auto;gap:4px;border:1px solid var(--folio-line);border-radius:9px;padding:8px;background:var(--folio-surface-soft)}.profit-cookie-grid article>div{display:grid;gap:2px}.profit-cookie-grid strong{font-size:9px}.profit-cookie-grid span,.profit-cookie-grid time{color:var(--folio-muted);font-size:7px}.profit-cookie-grid b{color:var(--folio-amber);font-size:8px}.profit-cookie-grid b.valid{color:var(--folio-green)}.profit-cookie-grid time{grid-column:1/-1}
+.runtime-cookie-button{display:inline-flex;align-items:center;gap:5px;min-height:28px;border:1px solid #dce4de;border-radius:999px;padding:4px 8px;color:#335b48;background:#fff;font-size:10px;font-weight:700}.profit-cookie-panel{width:min(1280px,calc(100vw - 40px));margin:10px auto 0;border:1px solid var(--folio-line);border-radius:13px;padding:12px 14px;background:#fff;box-shadow:var(--folio-shadow)}.profit-cookie-panel header{display:flex;justify-content:space-between;align-items:center}.profit-cookie-panel header>div{display:grid;gap:2px}.profit-cookie-panel header span,.profit-cookie-panel>p{color:var(--folio-muted);font-size:9px}.profit-cookie-panel header a{color:var(--folio-green);font-size:9px;font-weight:700}.profit-cookie-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:9px}.profit-cookie-grid article{display:grid;grid-template-columns:1fr auto;gap:4px;border:1px solid var(--folio-line);border-radius:9px;padding:8px;background:var(--folio-surface-soft)}.profit-cookie-grid article>div{display:grid;gap:2px}.profit-cookie-grid strong{font-size:9px}.profit-cookie-grid span,.profit-cookie-grid time{color:var(--folio-muted);font-size:7px}.profit-cookie-grid b{color:var(--folio-amber);font-size:8px}.profit-cookie-grid b.valid{color:var(--folio-green)}.profit-cookie-grid .cookie-currency{grid-column:1/-1;font-size:8px;font-weight:700}.profit-cookie-grid .currency-cny{color:var(--folio-green)}.profit-cookie-grid .currency-invalid{color:#b64c42}.profit-cookie-grid .currency-unknown{color:var(--folio-muted)}.profit-cookie-grid time,.profit-cookie-grid em{grid-column:1/-1}.profit-cookie-grid time{font-style:normal}.profit-cookie-grid em{color:#b64c42;font-size:7px;font-style:normal}
 .listings-circuit-banner{width:min(1280px,calc(100vw - 40px));margin:12px auto 0;display:grid;grid-template-columns:auto minmax(280px,1fr) auto;gap:12px;align-items:center;padding:12px 14px;border:1px solid #dfc77e;border-radius:9px;color:#4f4524;background:#fff9e9;box-shadow:0 6px 18px rgba(79,69,36,.06)}.circuit-icon{display:grid;place-items:center;width:34px;height:34px;border-radius:8px;color:#7c6423;background:#f5e8b9}.circuit-main{display:grid;gap:3px}.circuit-main strong{font-size:13px}.circuit-main span{color:#746842;font-size:11px}.listings-circuit-banner dl{display:grid;grid-template-columns:repeat(4,auto);gap:8px 14px;margin:0}.listings-circuit-banner dl>div{display:grid}.listings-circuit-banner dt{color:#8a7d53;font-size:9px}.listings-circuit-banner dd{margin:2px 0 0;font-size:10px;font-weight:700;white-space:nowrap}.listings-circuit-banner.recovered{border-color:#b8d7c3;color:#205b42;background:#edf7f1}.listings-circuit-banner.recovered .circuit-icon{color:#236a4c;background:#dcefe3}.listings-circuit-banner.recovered .circuit-main span,.listings-circuit-banner.recovered dt{color:#61776b}
 </style>

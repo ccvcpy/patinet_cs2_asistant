@@ -135,6 +135,169 @@ class SteamRequestSchedulerTests(unittest.TestCase):
         self.assertEqual(1, max_active)
         self.assertCountEqual(["a", "b"], completed)
 
+    def test_profit_trade_orderbook_allows_two_distinct_account_callbacks(self) -> None:
+        scheduler = configure_shared_steam_scheduler(
+            self.db_path,
+            quiet_window_seconds=0,
+            poll_seconds=0.01,
+        )
+        lock = threading.Lock()
+        release = threading.Event()
+        both_started = threading.Event()
+        active_accounts: set[str] = set()
+        max_active = 0
+        errors: list[BaseException] = []
+
+        def run(account: str) -> None:
+            def callback() -> FakeResponse:
+                nonlocal max_active
+                with lock:
+                    active_accounts.add(account)
+                    max_active = max(max_active, len(active_accounts))
+                    if len(active_accounts) == 2:
+                        both_started.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("test did not release concurrent orderbooks")
+                with lock:
+                    active_accounts.remove(account)
+                return FakeResponse(200)
+
+            try:
+                scheduler.call(
+                    method="GET",
+                    url="https://steamcommunity.com/market/orderbook",
+                    callback=callback,
+                    account=account,
+                    source="profit_trade",
+                    priority=SteamRequestPriority.P3_OBSERVATION,
+                    timeout_seconds=2,
+                    metadata={
+                        "schedulerParallelGroup": "profit_trade_orderbook",
+                        "schedulerParallelLimit": 2,
+                        "schedulerAccountExclusive": True,
+                    },
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=(account,))
+            for account in ("account-a", "account-b")
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(both_started.wait(timeout=1))
+        finally:
+            release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual([], errors)
+        self.assertEqual(2, max_active)
+
+    def test_monitor_observations_allow_five_distinct_account_callbacks(self) -> None:
+        scheduler = configure_shared_steam_scheduler(
+            self.db_path,
+            quiet_window_seconds=0,
+            poll_seconds=0.01,
+        )
+        lock = threading.Lock()
+        release = threading.Event()
+        all_started = threading.Event()
+        active_accounts: set[str] = set()
+        max_active = 0
+        errors: list[BaseException] = []
+
+        def run(account: str) -> None:
+            def callback() -> FakeResponse:
+                nonlocal max_active
+                with lock:
+                    active_accounts.add(account)
+                    max_active = max(max_active, len(active_accounts))
+                    if len(active_accounts) == 5:
+                        all_started.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("test did not release concurrent observations")
+                with lock:
+                    active_accounts.remove(account)
+                return FakeResponse(200)
+
+            try:
+                scheduler.call(
+                    method="GET",
+                    url="https://steamcommunity.com/market/orderbook",
+                    callback=callback,
+                    account=account,
+                    source="guadao_monitor",
+                    priority=SteamRequestPriority.P3_OBSERVATION,
+                    timeout_seconds=2,
+                    metadata={
+                        "schedulerParallelGroup": "guadao_case_monitor",
+                        "schedulerParallelLimit": 8,
+                        "schedulerAccountExclusive": True,
+                    },
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(f"account-{index}",)) for index in range(5)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(all_started.wait(timeout=1))
+        finally:
+            release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual([], errors)
+        self.assertEqual(5, max_active)
+
+    def test_profit_trade_orderbook_keeps_one_callback_per_account(self) -> None:
+        scheduler = configure_shared_steam_scheduler(
+            self.db_path,
+            quiet_window_seconds=0,
+            poll_seconds=0.01,
+        )
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def run() -> None:
+            def callback() -> FakeResponse:
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with lock:
+                    active -= 1
+                return FakeResponse(200)
+
+            scheduler.call(
+                method="GET",
+                url="https://steamcommunity.com/market/orderbook",
+                callback=callback,
+                account="account-a",
+                source="profit_trade",
+                priority=SteamRequestPriority.P3_OBSERVATION,
+                timeout_seconds=2,
+                metadata={
+                    "schedulerParallelGroup": "profit_trade_orderbook",
+                    "schedulerParallelLimit": 2,
+                    "schedulerAccountExclusive": True,
+                },
+            )
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(1, max_active)
+
     def test_priority_queue_position_and_high_priority_claim(self) -> None:
         self.db.enqueue_steam_request(
             "low",
@@ -537,6 +700,60 @@ class SteamRequestSchedulerTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("cancelled", self.db.get_steam_request("orphan-pending")["status"])  # type: ignore[index]
         self.assertEqual("cancelled", self.db.get_steam_request("orphan-running")["status"])  # type: ignore[index]
+
+    def test_recent_orphaned_pending_ticket_is_cleaned_quickly(self) -> None:
+        old = datetime.now(timezone.utc) - timedelta(seconds=60)
+        self.db.enqueue_steam_request(
+            "orphan-pending-recent",
+            source="dead-process",
+            route="market/removelisting",
+            priority=0,
+        )
+        self.db.conn.execute(
+            "UPDATE steam_request_queue SET updated_at = ? WHERE request_id = ?",
+            (old.isoformat(), "orphan-pending-recent"),
+        )
+        self.db.conn.commit()
+
+        scheduler = configure_shared_steam_scheduler(
+            self.db_path,
+            quiet_window_seconds=0,
+        )
+        response = scheduler.execute(
+            lambda: FakeResponse(200),
+            source="guadao",
+            route="market/removelisting/9",
+            priority=SteamRequestPriority.P0_SAFETY,
+            timeout_seconds=1,
+        )
+
+        self.assertEqual(200, response.status_code)
+        row = self.db.get_steam_request("orphan-pending-recent")
+        self.assertEqual("cancelled", row["status"])  # type: ignore[index]
+        self.assertEqual("orphaned_pending_request", row["last_error"])  # type: ignore[index]
+
+    def test_enqueued_ticket_records_creator_worker(self) -> None:
+        captured: dict[str, object] = {}
+        original_enqueue = self.db.enqueue_steam_request
+
+        def spy(request_id: str, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return original_enqueue(request_id, **kwargs)
+
+        self.db.enqueue_steam_request = spy  # type: ignore[method-assign]
+        scheduler = SteamRequestScheduler(self.db, quiet_window_seconds=0)
+        response = scheduler.execute(
+            lambda: FakeResponse(200),
+            source="guadao",
+            route="market/removelisting/9",
+            priority=SteamRequestPriority.P0_SAFETY,
+            timeout_seconds=5,
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = captured["payload"]
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(scheduler.worker_id, payload.get("schedulerCreatorWorkerId"))
 
     def test_execution_guard_rejects_after_permit_before_callback(self) -> None:
         scheduler = SteamRequestScheduler(self.db, quiet_window_seconds=0)

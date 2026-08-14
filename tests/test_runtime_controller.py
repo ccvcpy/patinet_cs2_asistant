@@ -817,6 +817,150 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self.assertEqual(confirm["next_attempt_at"], by_id[pending_id]["nextAttemptAt"])
         self.assertEqual(evidence["next_attempt_at"], by_id[listed_id]["nextAttemptAt"])
 
+    def test_seed_tasks_does_not_create_periodic_steam_sync_without_operation_timer(self) -> None:
+        account = self.accounts[0]
+        db = self._open_db()
+        try:
+            with patch(
+                "cs2_assistant.services.runtime_controller.load_strategy_config",
+                return_value=StrategyConfig(),
+            ):
+                self.controller._seed_tasks(db)
+
+            self.assertIsNone(db.get_scheduled_task(f"steam-sync:{account.id}"))
+        finally:
+            db.close()
+
+    def test_seed_tasks_schedules_account_sync_at_earliest_operation_timer(self) -> None:
+        account = self.accounts[0]
+        created_at = datetime.now(timezone.utc).replace(microsecond=0)
+        config = StrategyConfig(
+            guadao_task_schedule={
+                "actionConfirmationDelaysSeconds": [8.0, 15.0, 30.0],
+                "saleEvidenceDelaysSeconds": [0.0, 60.0, 120.0, 300.0],
+            }
+        )
+        db = self._open_db()
+        try:
+            op_id = db.add_pool_operation(
+                market_hash_name="Dynamic Sync Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-dynamic-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": account.id,
+                        "steamId64": account.steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(op_id, status="listing_pending")
+            db.conn.execute(
+                "UPDATE pool_operations SET created_at = ? WHERE id = ?",
+                (created_at.isoformat(), op_id),
+            )
+            db.conn.commit()
+
+            with patch(
+                "cs2_assistant.services.runtime_controller.load_strategy_config",
+                return_value=config,
+            ):
+                self.controller._seed_tasks(db)
+
+            marker = db.get_scheduled_task(f"listing-confirm:{op_id}")
+            sync = db.get_scheduled_task(f"steam-sync:{account.id}")
+            self.assertIsNotNone(marker)
+            self.assertIsNotNone(sync)
+            assert marker is not None and sync is not None
+            self.assertEqual(marker["next_attempt_at"], sync["next_attempt_at"])
+            self.assertEqual(
+                created_at + timedelta(seconds=8),
+                datetime.fromisoformat(str(sync["next_attempt_at"])),
+            )
+        finally:
+            db.close()
+
+    def test_completed_account_sync_reprojects_to_next_operation_timer(self) -> None:
+        account = self.accounts[0]
+        config = StrategyConfig(
+            guadao_task_schedule={
+                "saleEvidenceDelaysSeconds": [0.0, 60.0, 120.0, 300.0],
+            }
+        )
+        db = self._open_db()
+        try:
+            op_id = db.add_pool_operation(
+                market_hash_name="Reprojected Sync Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-reprojected-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": account.id,
+                        "steamId64": account.steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(op_id, status="listed")
+            due_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            db.upsert_scheduled_task(
+                f"sale-evidence:{op_id}",
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STEAM_SALE_EVIDENCE,
+                next_attempt_at=due_at,
+                account_id=account.id,
+                operation_id=op_id,
+                payload={"tierIndex": 0},
+                status="waiting",
+                priority=2,
+            )
+            db.upsert_scheduled_task(
+                f"steam-sync:{account.id}",
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STEAM_ACCOUNT_SYNC,
+                next_attempt_at=due_at,
+                account_id=account.id,
+                status="running",
+                priority=2,
+            )
+            db.conn.execute(
+                "UPDATE scheduled_tasks SET lease_owner = ?, lease_expires_at = ? WHERE task_key = ?",
+                (
+                    self.controller.worker_id,
+                    (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(),
+                    f"steam-sync:{account.id}",
+                ),
+            )
+            db.conn.commit()
+            task = dict(db.get_scheduled_task(f"steam-sync:{account.id}"))
+            task["_dueOperationTasks"] = [
+                dict(db.get_scheduled_task(f"sale-evidence:{op_id}"))
+            ]
+        finally:
+            db.close()
+
+        before = datetime.now(timezone.utc)
+        with patch(
+            "cs2_assistant.services.runtime_controller.load_strategy_config",
+            return_value=config,
+        ):
+            self.controller._reschedule_after_task(task, result={"ok": True})
+
+        db = self._open_db()
+        try:
+            marker = db.get_scheduled_task(f"sale-evidence:{op_id}")
+            sync = db.get_scheduled_task(f"steam-sync:{account.id}")
+            self.assertIsNotNone(marker)
+            self.assertIsNotNone(sync)
+            assert marker is not None and sync is not None
+            self.assertEqual(marker["next_attempt_at"], sync["next_attempt_at"])
+            self.assertGreaterEqual(
+                datetime.fromisoformat(str(sync["next_attempt_at"])),
+                before + timedelta(seconds=59),
+            )
+        finally:
+            db.close()
+
     def test_successful_account_sync_advances_only_due_operation_timer_tier(self) -> None:
         account = self.accounts[0]
         config = StrategyConfig(
@@ -1996,6 +2140,45 @@ class RuntimeControllerTestCase(unittest.TestCase):
         )
         self.assertNotIn("scanRound", dashboard["recentTaskRuns"][0]["result"])
 
+    def test_dashboard_exposes_live_guadao_scan_progress_until_round_finishes(self) -> None:
+        self._confirm_migration()
+        self._mark_all_cookies_valid()
+        self._set_runtime(RUNTIME_GUADAO, enabled=True, runtime_status="running")
+        started_at = "2026-08-12T19:14:16+00:00"
+        db = self._open_db()
+        try:
+            runtime = db.get_executor_runtime_state(RUNTIME_GUADAO)
+            payload = json.loads(runtime["payload_json"] or "{}")
+            payload["activeScan"] = {
+                "status": "running",
+                "startedAt": started_at,
+                "evaluatedCount": 13,
+                "listedCount": 4,
+                "currentStep": "继续逐笔上架/确认",
+            }
+            db.upsert_executor_runtime_state(
+                RUNTIME_GUADAO,
+                enabled=True,
+                runtime_status="running",
+                migration_hold=False,
+                heartbeat_at=utc_now_iso(),
+                payload=payload,
+            )
+            db.conn.execute(
+                "UPDATE scheduled_tasks SET status = 'running' WHERE task_key = ?",
+                (TASK_GUADAO_SCAN,),
+            )
+            db.conn.commit()
+        finally:
+            db.close()
+
+        current_scan = self.controller.dashboard()["currentScan"]
+        self.assertEqual("running", current_scan["status"])
+        self.assertEqual(started_at, current_scan["startedAt"])
+        self.assertEqual(13, current_scan["evaluatedCount"])
+        self.assertEqual(4, current_scan["listedCount"])
+        self.assertEqual("继续逐笔上架/确认", current_scan["currentStep"])
+
     def test_dashboard_always_exposes_stale_listing_recheck_task(self) -> None:
         """The global hourly maintenance task must not be hidden by old queue rows."""
 
@@ -2031,6 +2214,30 @@ class RuntimeControllerTestCase(unittest.TestCase):
         sync_key = f"steam-sync:{self.accounts[0].id}"
         db = self._open_db()
         try:
+            operation_id = db.add_pool_operation(
+                market_hash_name="Fair Sync Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-fair-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": self.accounts[0].id,
+                        "steamId64": self.accounts[0].steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(operation_id, status="listed")
+            db.upsert_scheduled_task(
+                f"sale-evidence:{operation_id}",
+                source=RUNTIME_GUADAO,
+                task_type=TASK_STEAM_SALE_EVIDENCE,
+                next_attempt_at=overdue_at,
+                account_id=self.accounts[0].id,
+                operation_id=operation_id,
+                payload={"tierIndex": 0},
+                status="waiting",
+                priority=2,
+            )
             db.upsert_scheduled_task(
                 sync_key,
                 source=RUNTIME_GUADAO,
@@ -2465,6 +2672,7 @@ class RuntimeControllerTestCase(unittest.TestCase):
                 ),
             )
             db.update_pool_operation(sell_id, status="listed")
+            self.controller._seed_tasks(db)
         finally:
             db.close()
         self._move_all_tasks_to_future(except_key=sync_key)
@@ -2579,6 +2787,53 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self.assertEqual(["unknown"] * len(self.accounts), [str(row["status"]) for row in rows])
         self.assertTrue(all(str(row["batch_id"]) == result["batchId"] for row in rows))
 
+    def test_successful_cookie_refresh_records_wallet_currency_in_public_snapshot(self) -> None:
+        account = self.accounts[0]
+        db = self._open_db()
+        try:
+            db.upsert_steam_cookie_health(
+                account.id,
+                account_name=account.name,
+                steam_id=account.steam_id64,
+                status="unknown",
+                batch_id="currency-probe-batch",
+            )
+            row = db.get_steam_cookie_health(account.id)
+            self.assertIsNotNone(row)
+            with (
+                patch(
+                    "cs2_assistant.services.runtime_controller.try_steam_auto_relogin",
+                    return_value=(True, "auto_ok", account),
+                ),
+                patch.object(
+                    self.controller,
+                    "_probe_cookie_currency",
+                    return_value={
+                        "currencyId": 23,
+                        "currency": "CNY",
+                        "currencyStatus": "cny",
+                        "currencyCheckedAt": "2026-08-08T14:30:00+00:00",
+                        "currencyError": None,
+                    },
+                ),
+            ):
+                self.controller._refresh_cookie_account(
+                    db,
+                    account,
+                    row,
+                    batch_id="currency-probe-batch",
+                )
+            snapshot = self.controller._cookie_gate_snapshot(db)
+        finally:
+            db.close()
+
+        public = next(item for item in snapshot["accounts"] if item["accountId"] == account.id)
+        self.assertEqual(23, public["currencyId"])
+        self.assertEqual("CNY", public["currency"])
+        self.assertEqual("cny", public["currencyStatus"])
+        self.assertEqual("2026-08-08T14:30:00+00:00", public["currencyCheckedAt"])
+        self.assertIsNone(public["currencyError"])
+
     def test_runtime_cookie_loss_pauses_only_the_failed_account(self) -> None:
         """After startup, 4/5 must be degraded running, not a global startup gate."""
 
@@ -2597,6 +2852,34 @@ class RuntimeControllerTestCase(unittest.TestCase):
                 last_error="401",
                 next_retry_at=(datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(),
             )
+            failed_sell_id = db.add_pool_operation(
+                market_hash_name="Failed Cookie Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-failed-cookie-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": failed.id,
+                        "steamId64": failed.steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(failed_sell_id, status="listed")
+            valid = self.accounts[0]
+            valid_sell_id = db.add_pool_operation(
+                market_hash_name="Valid Cookie Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-valid-cookie-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": valid.id,
+                        "steamId64": valid.steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(valid_sell_id, status="listed")
+            self.controller._seed_tasks(db)
             snapshot = self.controller._cookie_gate_tick(db)
             runtime = db.get_executor_runtime_state(RUNTIME_GUADAO)
         finally:
@@ -2650,7 +2933,6 @@ class RuntimeControllerTestCase(unittest.TestCase):
         finally:
             db.close()
 
-        valid = self.accounts[0]
         valid_sync_key = f"steam-sync:{valid.id}"
         self._move_all_tasks_to_future(except_key=valid_sync_key)
         db = self._open_db()
@@ -2921,9 +3203,32 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self._mark_all_cookies_valid()
         self._set_runtime(RUNTIME_GUADAO, enabled=True, runtime_status="running")
         account_sync_key = f"steam-sync:{self.accounts[0].id}"
+        db = self._open_db()
+        try:
+            sell_id = db.add_pool_operation(
+                market_hash_name="Kilowatt Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-same-tick-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": self.accounts[0].id,
+                        "steamId64": self.accounts[0].steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(sell_id, status="listed")
+            self.controller._seed_tasks(db)
+        finally:
+            db.close()
         self._move_all_tasks_to_future(except_key=account_sync_key)
         db = self._open_db()
         try:
+            db.reschedule_scheduled_task(
+                f"sale-evidence:{sell_id}",
+                next_attempt_at=utc_now_iso(),
+                status="waiting",
+            )
             db.reschedule_scheduled_task(account_sync_key, next_attempt_at=utc_now_iso())
         finally:
             db.close()
@@ -3016,7 +3321,6 @@ class RuntimeControllerTestCase(unittest.TestCase):
                     "specialRules": [],
                     "timePolicy": {
                         "scanMinutes": 6,
-                        "steamSyncSeconds": 150,
                         "steamSyncMaxStartLagSeconds": 75,
                         "staleListedCheckHours": 24,
                         "actionConfirmSeconds": [10, 20, 40],
@@ -3040,7 +3344,7 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self.assertFalse(settings["global"]["autoListing"])
         self.assertTrue(settings["global"]["autoRebuy"])
         self.assertEqual(6, settings["timePolicy"]["scanMinutes"])
-        self.assertEqual(150, settings["timePolicy"]["steamSyncSeconds"])
+        self.assertNotIn("steamSyncSeconds", settings["timePolicy"])
         self.assertEqual(75, settings["timePolicy"]["steamSyncMaxStartLagSeconds"])
         self.assertEqual(24, settings["timePolicy"]["staleListedCheckHours"])
         self.assertEqual([1, 3, 10], settings["timePolicy"]["rebuyMinutes"])
@@ -3098,6 +3402,7 @@ class RuntimeControllerTestCase(unittest.TestCase):
                     "marketHashName": market_hash_name,
                     "displayName": "梦魇武器箱",
                     "maxRatioPct": 76,
+                    "rebuyReferenceFloor": 7.60,
                     "enabled": True,
                     "version": 1,
                 }
@@ -3132,6 +3437,7 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self.assertEqual(1, len(rules))
         self.assertEqual(market_hash_name, rules[0]["marketHashName"])
         self.assertAlmostEqual(76.0, rules[0]["maxRatioPct"])
+        self.assertAlmostEqual(7.60, rules[0]["rebuyReferenceFloor"])
         edited_rule = edited["settings"]["specialRules"][0]
         self.assertAlmostEqual(77.0, edited_rule["maxRatioPct"])
         self.assertIsNone(edited_rule["currentRatioPct"])
@@ -3142,6 +3448,10 @@ class RuntimeControllerTestCase(unittest.TestCase):
         self.assertAlmostEqual(
             0.77,
             holder["config"].guadao_special_ratio_rules[0]["maxListingRatio"],
+        )
+        self.assertAlmostEqual(
+            7.60,
+            holder["config"].guadao_special_ratio_rules[0]["rebuyReferenceFloor"],
         )
 
         observed_at = "2026-07-16T15:00:00+00:00"
@@ -3898,6 +4208,19 @@ class RuntimeControllerTestCase(unittest.TestCase):
                 ),
             )
             db.update_pool_operation(delivery_id, status="delivery_pending")
+            sell_id = db.add_pool_operation(
+                market_hash_name="Scheduler Down Listed Case",
+                strategy="guadao",
+                operation_type=OP_SELL_STEAM,
+                asset_id="asset-scheduler-down-sync",
+                note=json.dumps(
+                    {
+                        "steamAccountId": self.accounts[0].id,
+                        "steamId64": self.accounts[0].steam_id64,
+                    }
+                ),
+            )
+            db.update_pool_operation(sell_id, status="listed")
             self.controller._seed_tasks(db)
         finally:
             db.close()
@@ -4080,25 +4403,9 @@ class RuntimeControllerTestCase(unittest.TestCase):
                 self.controller._notify_new_guadao_issues(db)
                 self.controller._notify_new_guadao_issues(db)
 
-                timeout_id = db.add_pool_operation(
-                    market_hash_name="Dreams & Nightmares Case",
-                    strategy="guadao",
-                    operation_type=OP_REBUY_C5,
-                    expected_price=7.0,
-                    note=json.dumps(
-                        {
-                            "c5OrderFailedCode": "delivery_timeout_24h",
-                            "c5OrderId": "C5-TIMEOUT-NOTIFY",
-                            "replacementRebuyOperationId": 999,
-                        }
-                    ),
-                )
-                db.update_pool_operation(timeout_id, status=C5_DELIVERY_FAILED)
-                self.controller._notify_c5_delivery_timeouts(db)
-                self.controller._notify_c5_delivery_timeouts(db)
             finally:
                 db.close()
-            self.assertEqual(7, len(sent))  # S3 issue + C5 timeout
+            self.assertEqual(6, len(sent))  # S3 issue
 
             # A new controller instance reads the same persistent dedupe map.
             restarted = UnifiedRuntimeController(self.settings, poll_seconds=0.2)
@@ -4108,15 +4415,14 @@ class RuntimeControllerTestCase(unittest.TestCase):
             db = self._open_db()
             try:
                 restarted._notify_new_guadao_issues(db)
-                restarted._notify_c5_delivery_timeouts(db)
                 runtime = db.get_executor_runtime_state(RUNTIME_GUADAO)
                 notification_events = json.loads(runtime["payload_json"])[
                     "notificationEvents"
                 ]
             finally:
                 db.close()
-            self.assertEqual(7, len(sent))
-            self.assertEqual(7, len(notification_events))
+            self.assertEqual(6, len(sent))
+            self.assertEqual(6, len(notification_events))
 
     def test_stale_listing_result_notification_is_aggregated_and_deduplicated(self) -> None:
         self.settings.serverchan_sendkey = "test-only-sendkey"
@@ -4409,6 +4715,52 @@ class RuntimeControllerTestCase(unittest.TestCase):
             },
             {row["operationId"]: row["code"] for row in result["results"]},
         )
+
+    def test_batch_refreeze_allows_explicit_batch_rejection_without_order_ids(self) -> None:
+        sell_id, rebuy_id, _ = self._create_sold_pending_rebuy(
+            market_hash_name="Dreams & Nightmares Case",
+            suffix="batch-rejected",
+        )
+        db = self._open_db()
+        try:
+            row = db.conn.execute(
+                "SELECT note FROM pool_operations WHERE id = ?", (rebuy_id,)
+            ).fetchone()
+            note = json.loads(row["note"])
+            note.update(
+                {
+                    "c5OutTradeNo": "OUT-REJECTED",
+                    "c5BatchSubmissionState": "rejected",
+                    "c5ErrorPayload": {"outTradeNo": "OUT-REJECTED"},
+                }
+            )
+            db.update_pool_operation(rebuy_id, note=json.dumps(note))
+        finally:
+            db.close()
+
+        result = self.controller.batch_refreeze_guadao_rebuys(
+            [sell_id],
+            rebuy_price=7.82,
+            execute_now=False,
+            confirmed=True,
+            request_id="batch-rejected-refreeze",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["successCount"])
+        self.assertEqual("rebuy_refrozen", result["results"][0]["code"])
+        db = self._open_db()
+        try:
+            rebuy = db.conn.execute(
+                "SELECT expected_price, note FROM pool_operations WHERE id = ?",
+                (rebuy_id,),
+            ).fetchone()
+            self.assertAlmostEqual(7.82, float(rebuy["expected_price"]), places=6)
+            updated_note = json.loads(rebuy["note"])
+            self.assertEqual("rejected", updated_note["c5BatchSubmissionState"])
+            self.assertEqual("OUT-REJECTED", updated_note["c5OutTradeNo"])
+        finally:
+            db.close()
 
     def test_batch_manual_complete_validates_time_and_terminal_sibling_states(self) -> None:
         market_hash_name = "Fracture Case"

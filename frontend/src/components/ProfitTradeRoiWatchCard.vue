@@ -30,6 +30,24 @@ const hasSavedDepth = computed(() => {
   const snapshot = orderbook(props.row);
   return Boolean((snapshot.sellLevels?.length || 0) + (snapshot.buyLevels?.length || 0));
 });
+const selectionStatus = computed(() => props.row.selectionStatus || props.row.status || "");
+const currencyWarning = computed(() => {
+  if (!isSelection.value) return null;
+  const snapshot = props.row.steamOrderbook;
+  const currencyId = Number(snapshot?.currencyId);
+  if (
+    selectionStatus.value !== "currency_invalid"
+    && snapshot?.currencyValid !== false
+    && currencyId === 23
+  ) return null;
+  const actual = Number.isFinite(currencyId) ? String(currencyId) : "未知";
+  return `Steam 实际币种 ${actual}，要求 CNY（23）；Steam 价格和 ROI 已停用，C5 行情仍可查看。`;
+});
+const refreshFailure = computed(() => (
+  props.row.latestRefresh?.status === "failed"
+    ? props.row.latestRefresh
+    : null
+));
 const longBuyOrder = computed(() => props.row.longBuyOrder || null);
 const longBuyProposal = computed(() => props.row.longBuyProposal || null);
 const excludedOwnBuyPrices = computed(() => {
@@ -85,7 +103,27 @@ function time(value?: string | null): string {
 }
 
 function orderbook(row: ProfitTradeWatchItem): ProfitTradeSteamOrderbook {
-  return row.steamOrderbook || {
+  const snapshot = row.steamOrderbook;
+  if (snapshot) {
+    const currencyId = Number(snapshot.currencyId);
+    if (snapshot.currencyValid === false || currencyId !== 23) {
+      return {
+        ...snapshot,
+        sellerFloorPrice: null,
+        sellerFloorCount: null,
+        buyerMaxPrice: null,
+        buyerMaxCount: null,
+        spreadAmount: null,
+        spreadPct: null,
+        sellOrderCountTotal: null,
+        buyOrderCountTotal: null,
+        sellLevels: [],
+        buyLevels: [],
+      };
+    }
+    return snapshot;
+  }
+  return {
     sellerFloorPrice: row.steamBuyPrice ?? null,
     sellLevels: [],
     buyLevels: [],
@@ -215,9 +253,13 @@ function c5PurchaseGapExplanation(row: ProfitTradeWatchItem): C5PurchaseGapExpla
 const c5RiskExplanation = computed(() => c5PurchaseGapExplanation(props.row));
 const generalReason = computed(() => {
   if (c5RiskExplanation.value) return "";
+  if (isSelection.value && props.row.lastError) return props.row.lastError;
   return props.row.executionReason || props.row.riskReason || props.row.exitReason || props.row.lastError || "";
 });
 const displayedManualExecutionDisabledReason = computed(() => {
+  if (refreshFailure.value) {
+    return "本轮行情刷新失败，当前卡片是旧快照，不能据此执行。";
+  }
   const disabledReason = props.manualExecutionDisabledReason;
   if (!c5RiskExplanation.value) return disabledReason;
   if (
@@ -234,12 +276,13 @@ function stateLabel(row: ProfitTradeWatchItem): string {
     const labels: Record<string, string> = {
       pending_first_scan: "等待首次观察",
       observed: "已观察",
+      currency_invalid: "Steam 币种异常，暂不显示价格",
       price_unavailable: "暂时无价格",
       scan_failed: "读取失败",
       paused: "已暂停",
       removed: "已移出",
     };
-    return labels[row.status || ""] || "仅研究";
+    return labels[row.selectionStatus || row.status || ""] || "仅研究";
   }
   if (row.active === false) return "已退出观察池";
   if (
@@ -265,9 +308,10 @@ function stateLabel(row: ProfitTradeWatchItem): string {
 
 function stateClass(row: ProfitTradeWatchItem): string {
   if (isSelection.value) {
-    if (["scan_failed", "price_unavailable"].includes(row.status || "")) return "blocked";
-    if (["paused", "removed"].includes(row.status || "")) return "exited";
-    if (row.status === "pending_first_scan") return "observe";
+    const status = row.selectionStatus || row.status || "";
+    if (["scan_failed", "price_unavailable", "currency_invalid"].includes(status)) return "blocked";
+    if (["paused", "removed"].includes(status)) return "exited";
+    if (status === "pending_first_scan") return "observe";
     return "ready";
   }
   if (row.active === false) return "exited";
@@ -320,6 +364,18 @@ function tradeStateLabel(status?: string | null): string {
     </div>
 
     <p v-if="isSelection" class="research-note">仅研究 · 不要求库存 · 不创建流水</p>
+    <p v-if="currencyWarning" class="currency-warning" role="alert">{{ currencyWarning }}</p>
+    <p v-if="refreshFailure" class="refresh-warning" role="alert">
+      <strong>本轮刷新失败，当前展示旧行情和旧 ROI 参数。</strong>
+      <span>
+        旧 ROI 基底 {{ pct(row.roiBasis ?? row.balanceDiscount) }}；
+        本轮目标 ROI 基底 {{ pct(refreshFailure.targetBalanceDiscount) }}。
+      </span>
+      <small>
+        尝试时间 {{ time(refreshFailure.attemptedAt) }}；
+        原因 {{ refreshFailure.reason || refreshFailure.errorType || "行情读取失败" }}
+      </small>
+    </p>
     <p
       v-else-if="listingsCooling && ['listings_cooldown', 'listings_probe_ready', 'executable', 'eligible'].includes(row.executionStatus || '')"
       class="card-cooldown"
@@ -533,5 +589,6 @@ function tradeStateLabel(status?: string | null): string {
 </template>
 
 <style scoped>
-.watch-card{display:grid;gap:11px;padding:13px;border:1px solid #e0e5df;border-radius:9px;background:#fff}.selection-card{border-color:#d8e8dc;background:linear-gradient(180deg,#fff 0,#fbfdfb 100%)}.card-head{display:flex;justify-content:space-between;gap:12px}.card-head>div{display:grid;min-width:0}.card-head strong,.card-head small{overflow-wrap:anywhere}.card-head small{color:#7a837e}.watch-state{height:max-content;padding:4px 7px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap}.watch-state.ready{color:#1d6748;background:#e6f4eb}.watch-state.observe{color:#6d5a25;background:#faf3d9}.watch-state.blocked{color:#913b31;background:#fbe9e6}.watch-state.exited{color:#68716c;background:#edf0ed}.watch-state.cooldown{color:#6d5720;background:#f8edc8}.research-note,.card-cooldown{margin:0;padding:7px 9px;border-left:3px solid #88b89a;color:#38664a;background:#eff8f1;font-size:10px}.card-cooldown{border-color:#cba545;color:#665731;background:#fff8e7}.price-line{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:7px;align-items:center;padding:9px;border-radius:7px;background:#f7f9f6}.price-line i{color:#98a19b;font-style:normal}.price-line dl,.watch-metrics dl{margin:0}.price-line dt,.watch-metrics dt{color:#77817b;font-size:10px}.price-line dd{margin:2px 0 0;font-size:13px;font-weight:700}.steam-highest-bid{display:block;margin-top:4px;color:#68736d;font-size:9px;font-weight:600}.crossed-badge{display:inline-block;margin-top:4px;padding:2px 5px;border-radius:999px;color:#765a18;background:#faefc9;font-size:8px;font-weight:700}.listing-probe{display:grid;gap:2px;margin-top:5px;padding:5px 7px;border-left:2px solid #c9a548;border-radius:4px;color:#65552c;background:#fff8e6;font-size:8px;line-height:1.35}.listing-probe strong{font-size:8px}.listing-probe.matched{border-left-color:#4f9870;color:#315f45;background:#edf7f0}.listing-probe.mismatch{border-left-color:#d1874d;color:#744f2e;background:#fff4e9}.roi-summary{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.roi-summary>div{display:grid;gap:2px;padding:9px 10px;border-radius:8px;background:#f0f7f3}.roi-summary small,.roi-summary span{color:#6f7f75;font-size:10px}.roi-summary strong{color:#1f704d;font-size:19px;line-height:1.05}.buy-reference{background:#f7f8f5 !important}.buy-reference strong{color:#496858;font-size:14px}.reference-hint{margin:-5px 0 0;color:#756127;font-size:10px}.long-buy-retained{margin:-4px 0 0;padding:6px 8px;border-left:3px solid #8d7350;color:#6c573c;background:#faf4e9;font-size:9px}.long-buy-panel{display:grid;gap:8px;padding:10px;border:1px solid #bcd8c7;border-radius:9px;background:#f1f8f3}.long-buy-panel.is-proposal{border-style:dashed;border-color:#b8cbbc;background:#f8fbf8}.long-buy-panel.is-pending{border-color:#d8c47c;background:#fff9e9}.long-buy-panel.is-uncertain{border-color:#e2a79e;background:#fff3f1}.long-buy-panel>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.long-buy-panel>header>div{display:grid;gap:2px}.long-buy-panel>header small{color:#6e7c73;font-size:8px}.long-buy-panel>header strong{color:#235e43;font-size:12px}.long-buy-panel>header>span{padding:3px 6px;border-radius:999px;color:#285f45;background:#dfeee4;font-size:9px;font-weight:750;white-space:nowrap}.long-buy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.long-buy-grid dl{display:grid;gap:2px;margin:0;padding:7px;border:1px solid rgba(40,96,68,.12);border-radius:6px;background:rgba(255,255,255,.72)}.long-buy-grid dt,.long-buy-grid small{color:#718078;font-size:8px}.long-buy-grid dd{margin:0;color:#234c37;font-size:11px;font-weight:750}.long-buy-meta{display:flex;flex-wrap:wrap;gap:4px 10px;margin:0;color:#68766e;font-size:8px;overflow-wrap:anywhere}.own-price-exclusion,.long-buy-decision,.long-buy-warning,.long-buy-observe-note{margin:0;font-size:9px;line-height:1.45}.own-price-exclusion{color:#2d6749;font-weight:700}.long-buy-decision{color:#4a6253}.long-buy-warning{padding:5px 7px;border-left:2px solid #c78754;color:#704f31;background:#fff7ec}.long-buy-observe-note{color:#6b765f}.watch-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.watch-metrics dd{margin:2px 0 0;font-size:11px;font-weight:650;overflow-wrap:anywhere}.reason{margin:0;padding:7px 9px;border-left:3px solid #d4b05b;color:#665731;background:#fbf7e9;font-size:11px}.c5-risk-reason{display:grid;gap:3px;margin:0;padding:8px 10px;border-left:3px solid #c96551;color:#784337;background:#fdf0ed;font-size:11px}.c5-risk-reason strong{color:#973f30;font-size:11px}.c5-risk-reason span{font-weight:700}.c5-risk-reason small{color:#76534b;font-size:10px}.linked-trade{border:1px solid #c9dfd1;border-radius:9px;padding:9px 10px;display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f0f7f3}.linked-trade>span{display:grid;gap:2px}.linked-trade>span:last-child{text-align:right}.linked-trade small{color:#718078;font-size:9px}.linked-trade strong,.linked-trade b{color:#236a4c;font-size:11px}.linked-trade b{font-weight:700}.card-actions{display:flex;flex-wrap:wrap;align-items:center;gap:11px}.link-action{justify-self:start;border:0;padding:0;color:#236a4c;background:transparent;font-size:11px;font-weight:700;text-align:left}.remove-action{color:#7a5148}.manual-execute-action{margin-left:auto;border:1px solid #28714d;border-radius:6px;padding:6px 12px;color:#fff;background:#28714d;font-size:11px;font-weight:750;box-shadow:0 3px 8px rgba(35,106,76,.12)}.manual-execute-action:hover:not(:disabled){background:#1f6544}.manual-execute-action:disabled{cursor:not-allowed;border-color:#c7d2ca;color:#f5f7f5;background:#b7c5ba;box-shadow:none}.depth-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding-top:2px}.depth-panel>div{padding:8px;border:1px solid #e1e6e1;border-radius:6px;background:#f8faf8}.depth-panel>div>strong{font-size:10px}.depth-panel p{display:grid;grid-template-columns:18px 1fr auto;gap:6px;margin:5px 0 0;color:#47534d;font-size:9px}.depth-panel p span,.depth-panel p small{color:#78827c}.depth-panel p b{text-align:right}.depth-empty{grid-column:1/-1;display:block !important;margin:0 !important;padding:8px;border:1px dashed #d8ded8;border-radius:6px;color:#748078 !important;font-size:10px !important}.depth-empty::first-line{color:#748078}@media (max-width:560px){.price-line{grid-template-columns:1fr;gap:6px}.price-line i{display:none}.watch-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.depth-panel{grid-template-columns:1fr}.roi-summary{grid-template-columns:1fr}.long-buy-grid{grid-template-columns:1fr}.long-buy-panel>header{display:grid}.long-buy-panel>header>span{width:max-content}.watch-state{white-space:normal;text-align:right}.manual-execute-action{width:100%;margin-left:0}}
+.watch-card{display:grid;gap:11px;padding:13px;border:1px solid #e0e5df;border-radius:9px;background:#fff}.selection-card{border-color:#d8e8dc;background:linear-gradient(180deg,#fff 0,#fbfdfb 100%)}.card-head{display:flex;justify-content:space-between;gap:12px}.card-head>div{display:grid;min-width:0}.card-head strong,.card-head small{overflow-wrap:anywhere}.card-head small{color:#7a837e}.watch-state{height:max-content;padding:4px 7px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap}.watch-state.ready{color:#1d6748;background:#e6f4eb}.watch-state.observe{color:#6d5a25;background:#faf3d9}.watch-state.blocked{color:#913b31;background:#fbe9e6}.watch-state.exited{color:#68716c;background:#edf0ed}.watch-state.cooldown{color:#6d5720;background:#f8edc8}.research-note,.card-cooldown{margin:0;padding:7px 9px;border-left:3px solid #88b89a;color:#38664a;background:#eff8f1;font-size:10px}.currency-warning{margin:0;padding:8px 10px;border-left:3px solid #c96551;color:#7b3e34;background:#fdf0ed;font-size:10px;font-weight:700}.card-cooldown{border-color:#cba545;color:#665731;background:#fff8e7}.price-line{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:7px;align-items:center;padding:9px;border-radius:7px;background:#f7f9f6}.price-line i{color:#98a19b;font-style:normal}.price-line dl,.watch-metrics dl{margin:0}.price-line dt,.watch-metrics dt{color:#77817b;font-size:10px}.price-line dd{margin:2px 0 0;font-size:13px;font-weight:700}.steam-highest-bid{display:block;margin-top:4px;color:#68736d;font-size:9px;font-weight:600}.crossed-badge{display:inline-block;margin-top:4px;padding:2px 5px;border-radius:999px;color:#765a18;background:#faefc9;font-size:8px;font-weight:700}.listing-probe{display:grid;gap:2px;margin-top:5px;padding:5px 7px;border-left:2px solid #c9a548;border-radius:4px;color:#65552c;background:#fff8e6;font-size:8px;line-height:1.35}.listing-probe strong{font-size:8px}.listing-probe.matched{border-left-color:#4f9870;color:#315f45;background:#edf7f0}.listing-probe.mismatch{border-left-color:#d1874d;color:#744f2e;background:#fff4e9}.roi-summary{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}.roi-summary>div{display:grid;gap:2px;padding:9px 10px;border-radius:8px;background:#f0f7f3}.roi-summary small,.roi-summary span{color:#6f7f75;font-size:10px}.roi-summary strong{color:#1f704d;font-size:19px;line-height:1.05}.buy-reference{background:#f7f8f5 !important}.buy-reference strong{color:#496858;font-size:14px}.reference-hint{margin:-5px 0 0;color:#756127;font-size:10px}.long-buy-retained{margin:-4px 0 0;padding:6px 8px;border-left:3px solid #8d7350;color:#6c573c;background:#faf4e9;font-size:9px}.long-buy-panel{display:grid;gap:8px;padding:10px;border:1px solid #bcd8c7;border-radius:9px;background:#f1f8f3}.long-buy-panel.is-proposal{border-style:dashed;border-color:#b8cbbc;background:#f8fbf8}.long-buy-panel.is-pending{border-color:#d8c47c;background:#fff9e9}.long-buy-panel.is-uncertain{border-color:#e2a79e;background:#fff3f1}.long-buy-panel>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.long-buy-panel>header>div{display:grid;gap:2px}.long-buy-panel>header small{color:#6e7c73;font-size:8px}.long-buy-panel>header strong{color:#235e43;font-size:12px}.long-buy-panel>header>span{padding:3px 6px;border-radius:999px;color:#285f45;background:#dfeee4;font-size:9px;font-weight:750;white-space:nowrap}.long-buy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.long-buy-grid dl{display:grid;gap:2px;margin:0;padding:7px;border:1px solid rgba(40,96,68,.12);border-radius:6px;background:rgba(255,255,255,.72)}.long-buy-grid dt,.long-buy-grid small{color:#718078;font-size:8px}.long-buy-grid dd{margin:0;color:#234c37;font-size:11px;font-weight:750}.long-buy-meta{display:flex;flex-wrap:wrap;gap:4px 10px;margin:0;color:#68766e;font-size:8px;overflow-wrap:anywhere}.own-price-exclusion,.long-buy-decision,.long-buy-warning,.long-buy-observe-note{margin:0;font-size:9px;line-height:1.45}.own-price-exclusion{color:#2d6749;font-weight:700}.long-buy-decision{color:#4a6253}.long-buy-warning{padding:5px 7px;border-left:2px solid #c78754;color:#704f31;background:#fff7ec}.long-buy-observe-note{color:#6b765f}.watch-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.watch-metrics dd{margin:2px 0 0;font-size:11px;font-weight:650;overflow-wrap:anywhere}.reason{margin:0;padding:7px 9px;border-left:3px solid #d4b05b;color:#665731;background:#fbf7e9;font-size:11px}.c5-risk-reason{display:grid;gap:3px;margin:0;padding:8px 10px;border-left:3px solid #c96551;color:#784337;background:#fdf0ed;font-size:11px}.c5-risk-reason strong{color:#973f30;font-size:11px}.c5-risk-reason span{font-weight:700}.c5-risk-reason small{color:#76534b;font-size:10px}.linked-trade{border:1px solid #c9dfd1;border-radius:9px;padding:9px 10px;display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f0f7f3}.linked-trade>span{display:grid;gap:2px}.linked-trade>span:last-child{text-align:right}.linked-trade small{color:#718078;font-size:9px}.linked-trade strong,.linked-trade b{color:#236a4c;font-size:11px}.linked-trade b{font-weight:700}.card-actions{display:flex;flex-wrap:wrap;align-items:center;gap:11px}.link-action{justify-self:start;border:0;padding:0;color:#236a4c;background:transparent;font-size:11px;font-weight:700;text-align:left}.remove-action{color:#7a5148}.manual-execute-action{margin-left:auto;border:1px solid #28714d;border-radius:6px;padding:6px 12px;color:#fff;background:#28714d;font-size:11px;font-weight:750;box-shadow:0 3px 8px rgba(35,106,76,.12)}.manual-execute-action:hover:not(:disabled){background:#1f6544}.manual-execute-action:disabled{cursor:not-allowed;border-color:#c7d2ca;color:#f5f7f5;background:#b7c5ba;box-shadow:none}.depth-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding-top:2px}.depth-panel>div{padding:8px;border:1px solid #e1e6e1;border-radius:6px;background:#f8faf8}.depth-panel>div>strong{font-size:10px}.depth-panel p{display:grid;grid-template-columns:18px 1fr auto;gap:6px;margin:5px 0 0;color:#47534d;font-size:9px}.depth-panel p span,.depth-panel p small{color:#78827c}.depth-panel p b{text-align:right}.depth-empty{grid-column:1/-1;display:block !important;margin:0 !important;padding:8px;border:1px dashed #d8ded8;border-radius:6px;color:#748078 !important;font-size:10px !important}.depth-empty::first-line{color:#748078}@media (max-width:560px){.price-line{grid-template-columns:1fr;gap:6px}.price-line i{display:none}.watch-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.depth-panel{grid-template-columns:1fr}.roi-summary{grid-template-columns:1fr}.long-buy-grid{grid-template-columns:1fr}.long-buy-panel>header{display:grid}.long-buy-panel>header>span{width:max-content}.watch-state{white-space:normal;text-align:right}.manual-execute-action{width:100%;margin-left:0}}
+.refresh-warning{display:grid;gap:3px;margin:0;padding:8px 10px;border-left:3px solid #c58b2f;color:#6b531f;background:#fff8e8;font-size:10px}.refresh-warning strong{font-size:11px}.refresh-warning small{color:#806d43}
 </style>

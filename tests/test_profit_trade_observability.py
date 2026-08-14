@@ -227,6 +227,147 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
         db.initialize()
         return db
 
+    def test_roi_watch_positive_and_negative_sign_filter(self) -> None:
+        db = self._open_db()
+        try:
+            with db.conn:
+                for name, roi in (
+                    ("Positive | Item", 0.08),
+                    ("Negative | Item", -0.03),
+                    ("Zero | Item", 0.0),
+                ):
+                    db.conn.execute(
+                        """
+                        INSERT INTO profit_trade_roi_watch (
+                            market_hash_name,
+                            name_cn,
+                            active,
+                            expected_roi,
+                            execution_status,
+                            first_seen_at,
+                            last_observed_at,
+                            updated_at,
+                            raw_json
+                        ) VALUES (?, ?, 1, ?, 'observe_only', ?, ?, ?, '{}')
+                        """,
+                        (
+                            name,
+                            name,
+                            roi,
+                            "2026-07-13T00:00:00+00:00",
+                            "2026-07-13T00:00:00+00:00",
+                            "2026-07-13T00:00:00+00:00",
+                        ),
+                    )
+        finally:
+            db.close()
+
+        positive = build_profit_trade_roi_watch_payload(
+            self.settings,
+            roi_sign="positive",
+        )
+        self.assertEqual(1, positive["total"])
+        self.assertGreater(positive["items"][0]["expectedRoi"], 0)
+
+        negative = build_profit_trade_roi_watch_payload(
+            self.settings,
+            roi_sign="negative",
+        )
+        self.assertEqual(1, negative["total"])
+        self.assertLess(negative["items"][0]["expectedRoi"], 0)
+
+        all_rows = build_profit_trade_roi_watch_payload(self.settings)
+        self.assertEqual(3, all_rows["total"])
+
+        with self.assertRaisesRegex(ValueError, "roiSign"):
+            build_profit_trade_roi_watch_payload(self.settings, roi_sign="zero")
+
+    def test_unavailable_market_snapshot_preserves_existing_roi_watch(self) -> None:
+        db = self._open_db()
+        try:
+            row = {
+                "market_hash_name": MARKET_HASH_NAME,
+                "name_cn": "fixture",
+                "steam_buy_price": 100.0,
+                "c5_listing_price": 75.0,
+                "c5_expected_net_price": 74.25,
+                "balance_discount": 0.69,
+                "expected_profit": 5.25,
+                "expected_roi": 0.0525,
+                "inventory_count": 1,
+                "tradable_count": 1,
+                "risk_status": "passed",
+                "execution_status": "observe_only",
+                "raw": {
+                    "steamOrderbook": {
+                        "currencyId": 23,
+                        "currencyValid": True,
+                        "sellerFloorPrice": 100.0,
+                    }
+                },
+            }
+            db.record_profit_trade_roi_scan([row], scan_id="PTSCAN-valid-1")
+            db.record_profit_trade_roi_scan(
+                [],
+                scan_id="PTSCAN-currency-failed",
+                preserve_market_hash_names=[MARKET_HASH_NAME],
+                preserve_refresh_failures={
+                    MARKET_HASH_NAME: {
+                        "reason": "Steam request timed out in queue",
+                        "errorType": "queue_timeout",
+                        "targetBalanceDiscount": 0.65,
+                    }
+                },
+            )
+        finally:
+            db.close()
+
+        watch = build_profit_trade_roi_watch_payload(self.settings)
+        self.assertEqual(1, watch["total"])
+        self.assertTrue(watch["items"][0]["active"])
+        self.assertEqual(0.69, watch["items"][0]["balanceDiscount"])
+        self.assertEqual("failed", watch["items"][0]["latestRefresh"]["status"])
+        self.assertEqual(
+            0.65,
+            watch["items"][0]["latestRefresh"]["targetBalanceDiscount"],
+        )
+        self.assertEqual(
+            "queue_timeout",
+            watch["items"][0]["latestRefresh"]["errorType"],
+        )
+
+    def test_valid_snapshot_reenters_roi_watch_after_real_exit(self) -> None:
+        db = self._open_db()
+        try:
+            row = {
+                "market_hash_name": MARKET_HASH_NAME,
+                "name_cn": "fixture",
+                "steam_buy_price": 100.0,
+                "c5_listing_price": 75.0,
+                "c5_expected_net_price": 74.25,
+                "balance_discount": 0.69,
+                "expected_profit": 5.25,
+                "expected_roi": 0.0525,
+                "inventory_count": 1,
+                "tradable_count": 1,
+                "risk_status": "passed",
+                "execution_status": "observe_only",
+                "raw": {"steamOrderbook": {"currencyId": 23, "currencyValid": True}},
+            }
+            db.record_profit_trade_roi_scan([row], scan_id="PTSCAN-valid-1")
+            db.record_profit_trade_roi_scan(
+                [],
+                scan_id="PTSCAN-real-exit",
+                exit_reasons={MARKET_HASH_NAME: "ROI is not positive"},
+            )
+            db.record_profit_trade_roi_scan([row], scan_id="PTSCAN-valid-2")
+        finally:
+            db.close()
+
+        watch = build_profit_trade_roi_watch_payload(self.settings)
+        self.assertEqual(1, watch["total"])
+        self.assertTrue(watch["items"][0]["active"])
+
     def test_positive_roi_below_minimum_is_watched_but_never_executable(self) -> None:
         report = scan_profit_trade_opportunities(
             self.settings,
@@ -448,16 +589,16 @@ class ProfitTradeObservabilityTestCase(unittest.TestCase):
         self.assertEqual(0.69, valid["roiBasis"])
         self.assertEqual("crossed_possible_stale", by_name[names["crossed"]]["buyOrderReferenceStatus"])
         self.assertEqual("missing_buy_book", by_name[names["missing"]]["buyOrderReferenceStatus"])
-        self.assertEqual("currency_invalid", by_name[names["currency"]]["buyOrderReferenceStatus"])
+        self.assertNotIn(names["currency"], by_name)
 
         # page_size=1 proves headline amounts come from all active inventory
         # rows, not the current page.  One valid reference is the only one
         # eligible for the diagnostic total; crossed/missing/currency rows are
-        # visible but deliberately excluded.
+        # but deliberately excluded, and the currency row is not active at all.
         summary = payload["summary"]
-        self.assertEqual(4, summary["activeItemCount"])
-        self.assertEqual(4, summary["tradableQuantity"])
-        self.assertAlmostEqual(4 * 5.0025, summary["currentExpectedProfitTotal"])
+        self.assertEqual(3, summary["activeItemCount"])
+        self.assertEqual(3, summary["tradableQuantity"])
+        self.assertAlmostEqual(3 * 5.0025, summary["currentExpectedProfitTotal"])
         self.assertAlmostEqual(
             round(first_c5_expected_net - (90.0 * 0.69), 2),
             summary["buyOrderReferenceProfitTotal"],

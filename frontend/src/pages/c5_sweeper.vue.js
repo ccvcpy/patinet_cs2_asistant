@@ -198,6 +198,7 @@ const priceSafe = computed(() => {
     const live = displayRound.value?.lastPrice;
     return live != null && live <= Number(maxPrice.value);
 });
+const unresolvedCount = computed(() => (displayRound.value?.submissions || []).reduce((sum, row) => sum + (row.unresolvedProductIds?.length || 0), 0));
 function markDirty() {
     formDirty.value = true;
 }
@@ -279,6 +280,15 @@ async function refreshRound() {
     const id = dashboard.value?.round?.id;
     if (id)
         await postAction("/api/c5-sweeper/refresh", { roundId: id }, "价格与交付状态已刷新，没有发起购买");
+}
+async function confirmNotBought() {
+    const id = displayRound.value?.id;
+    if (!id || unresolvedCount.value <= 0)
+        return;
+    const confirmed = window.confirm(`确认这 ${unresolvedCount.value} 件商品在 C5 未生成订单、未扣款？确认后本轮会自动继续扫货。`);
+    if (!confirmed)
+        return;
+    await postAction("/api/c5-sweeper/confirm-not-bought", { roundId: id }, "已确认未成交，本轮自动继续");
 }
 function statusText(status) {
     return {
@@ -1454,6 +1464,12 @@ if (__VLS_ctx.actionError) {
     });
     (__VLS_ctx.actionError);
 }
+if (__VLS_ctx.displayRound?.workerError) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "alert error" },
+    });
+    (__VLS_ctx.displayRound.workerError);
+}
 if (__VLS_ctx.actionMessage) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "alert notice" },
@@ -1903,6 +1919,15 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElement
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "runtime-actions" },
 });
+if (__VLS_ctx.currentStatus === 'paused' && __VLS_ctx.displayRound?.stopReason === 'buy_uncertain' && __VLS_ctx.unresolvedCount > 0) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.confirmNotBought) },
+        ...{ class: "dark" },
+        type: "button",
+        disabled: (__VLS_ctx.busy),
+    });
+    (__VLS_ctx.unresolvedCount);
+}
 if (__VLS_ctx.currentStatus === 'running') {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
         ...{ onClick: (__VLS_ctx.pauseRound) },
@@ -2176,6 +2201,8 @@ if (__VLS_ctx.confirmationOpen) {
 /** @type {__VLS_StyleScopedClasses['alert']} */ ;
 /** @type {__VLS_StyleScopedClasses['error']} */ ;
 /** @type {__VLS_StyleScopedClasses['alert']} */ ;
+/** @type {__VLS_StyleScopedClasses['error']} */ ;
+/** @type {__VLS_StyleScopedClasses['alert']} */ ;
 /** @type {__VLS_StyleScopedClasses['notice']} */ ;
 /** @type {__VLS_StyleScopedClasses['metrics']} */ ;
 /** @type {__VLS_StyleScopedClasses['metric-label']} */ ;
@@ -2221,6 +2248,7 @@ if (__VLS_ctx.confirmationOpen) {
 /** @type {__VLS_StyleScopedClasses['runtime-message']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-meta']} */ ;
 /** @type {__VLS_StyleScopedClasses['runtime-actions']} */ ;
+/** @type {__VLS_StyleScopedClasses['dark']} */ ;
 /** @type {__VLS_StyleScopedClasses['dark']} */ ;
 /** @type {__VLS_StyleScopedClasses['outline-red']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary']} */ ;
@@ -2292,6 +2320,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             formTargetCost: formTargetCost,
             countdown: countdown,
             priceSafe: priceSafe,
+            unresolvedCount: unresolvedCount,
             markDirty: markDirty,
             resetNewRound: resetNewRound,
             saveRound: saveRound,
@@ -2300,6 +2329,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             pauseRound: pauseRound,
             stopRound: stopRound,
             refreshRound: refreshRound,
+            confirmNotBought: confirmNotBought,
             statusText: statusText,
             stopReasonText: stopReasonText,
             orderStatus: orderStatus,

@@ -115,6 +115,64 @@ class PricingTestCase(unittest.TestCase):
                 debug=True,
             )
 
+    def test_orderbook_snapshot_reads_currency_from_double_nested_data(self) -> None:
+        # Steam /market/orderbook returns {"data":{"data":{"eCurrency":23,
+        # "rgCompactSellOrders":[...]}}} on production.  The currency field
+        # lives in the innermost data object and must not be lost.
+        snapshot = build_orderbook_snapshot(
+            {
+                "data": {
+                    "data": {
+                        "eCurrency": 23,
+                        "cSellOrders": 12,
+                        "cBuyOrders": 9,
+                        "rgCompactSellOrders": [19499, 2, 19600, 1],
+                        "rgCompactBuyOrders": [19300, 3],
+                    }
+                }
+            },
+            observed_at="2026-08-14T06:10:00+00:00",
+            expected_currency=23,
+        )
+        self.assertEqual(23, snapshot["currencyId"])
+        self.assertTrue(snapshot["currencyValid"])
+        self.assertAlmostEqual(194.99, snapshot["sellerFloorPrice"])
+        self.assertEqual(12, snapshot["sellOrderCountTotal"])
+
+    def test_orderbook_snapshot_fails_closed_when_currency_field_missing(self) -> None:
+        snapshot = build_orderbook_snapshot(
+            {
+                "data": {
+                    "data": {
+                        "rgCompactSellOrders": [19499, 2],
+                        "rgCompactBuyOrders": [19300, 3],
+                    }
+                }
+            },
+            observed_at="2026-08-14T06:10:00+00:00",
+            expected_currency=23,
+        )
+        self.assertFalse(snapshot["currencyValid"])
+        self.assertIsNone(snapshot["currencyId"])
+
+    def test_orderbook_snapshot_double_nested_usd_marks_invalid(self) -> None:
+        snapshot = build_orderbook_snapshot(
+            {
+                "data": {
+                    "data": {
+                        "eCurrency": 1,
+                        "rgCompactSellOrders": [3675, 2],
+                        "rgCompactBuyOrders": [3600, 1],
+                    }
+                }
+            },
+            observed_at="2026-08-14T06:10:00+00:00",
+            expected_currency=23,
+        )
+        self.assertEqual(1, snapshot["currencyId"])
+        self.assertFalse(snapshot["currencyValid"])
+
+
     def test_fetch_listing_price_accepts_matching_orderbook_currency(self) -> None:
         client = FakeSteamMarketClient(
             {

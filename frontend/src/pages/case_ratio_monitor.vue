@@ -306,6 +306,23 @@ const missingCount = computed(() =>
   Number(lastCollection.value.missingC5Count || 0) +
   Number(lastCollection.value.missingSteamCount || 0),
 );
+const lastInterruption = computed(() => runtime.value?.runtime.lastInterruption || null);
+
+function formatBeijingDateTime(value: string | null | undefined): string {
+  if (!value) return "时间未知";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(parsed);
+}
 
 function openDetail(item: CaseRatioItem): void {
   selectedName.value = item.marketHashName;
@@ -388,6 +405,15 @@ onBeforeUnmount(() => {
         </CaseMonitorButton>
       </div>
     </header>
+
+    <CaseMonitorFeedback v-if="lastInterruption" tone="error">
+      监控曾被后端重启中断：北京时间 {{ formatBeijingDateTime(lastInterruption.interruptedAt) }}，
+      已完成 {{ lastInterruption.progressCurrent }}/{{ lastInterruption.progressTotal }}，
+      <template v-if="lastInterruption.savedCount > 0">
+        已保存 {{ lastInterruption.savedCount }} 条快照，可用于生成报告。
+      </template>
+      <template v-else>本轮数据未保存。</template>
+    </CaseMonitorFeedback>
 
     <section class="case-monitor-controls" aria-label="监控与报告控制">
       <div class="case-control-group">

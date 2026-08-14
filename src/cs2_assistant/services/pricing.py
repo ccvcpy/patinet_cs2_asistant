@@ -146,6 +146,12 @@ def _extract_orderbook_buy_rows(payload: dict[str, Any]) -> list[list[Any]]:
 
 def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
     data = payload.get("data")
+    # Steam /market/orderbook can wrap the real payload one or two levels
+    # deep: {"data": {...}} or {"data": {"data": {"eCurrency": ...}}}.
+    # Currency and counts live in the innermost object, so recurse until the
+    # nested dict stops containing another "data" dict.
+    while isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
     return data if isinstance(data, dict) else payload
 
 
@@ -288,7 +294,7 @@ def build_orderbook_snapshot(
     return {
         "observedAt": timestamp,
         "currencyId": currency_id,
-        "currencyValid": currency_id is None or currency_id == int(expected_currency),
+        "currencyValid": currency_id == int(expected_currency),
         "sellerFloorPrice": float(seller_floor) if seller_floor is not None else None,
         "sellerFloorCount": summary.seller_floor_count,
         "buyerMaxPrice": float(buyer_max) if buyer_max is not None else None,
@@ -400,7 +406,7 @@ def fetch_listing_price(
 
     data = _payload_data(orderbook or {})
     actual_currency = safe_int(data.get("eCurrency"))
-    if actual_currency is not None and actual_currency != int(currency):
+    if actual_currency != int(currency):
         if debug:
             raise SteamMarketError(
                 f"Steam orderbook currency mismatch: expected={currency} actual={actual_currency}"

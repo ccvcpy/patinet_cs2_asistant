@@ -18,6 +18,7 @@ const selection = reactive({
 const inventoryKeywordDraft = ref("");
 const inventoryKeyword = ref("");
 const inventoryStatus = ref("active");
+const inventoryRoiSign = ref("all");
 const inventorySort = ref("roi_desc");
 const listingsCircuit = ref({ status: "closed", isBlocking: false });
 const listingsCooling = computed(() => listingsCircuit.value.status === "open");
@@ -192,6 +193,7 @@ async function loadInventory() {
         pageSize: String(pageSize),
         active,
         sort: inventorySort.value,
+        roiSign: inventoryRoiSign.value,
     });
     if (inventoryKeyword.value)
         query.set("keyword", inventoryKeyword.value);
@@ -250,6 +252,13 @@ function loadAll() {
 }
 function searchInventory() {
     inventoryKeyword.value = inventoryKeywordDraft.value.trim();
+    inventory.page = 1;
+    void loadInventory();
+}
+function setInventoryRoiSign(sign) {
+    if (inventoryRoiSign.value === sign)
+        return;
+    inventoryRoiSign.value = sign;
     inventory.page = 1;
     void loadInventory();
 }
@@ -650,6 +659,9 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['selection-suggestions']} */ ;
 /** @type {__VLS_StyleScopedClasses['selection-suggestions']} */ ;
 /** @type {__VLS_StyleScopedClasses['catalog-load-more']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-sign-switch']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-sign-switch']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-sign-switch']} */ ;
 // CSS variable injection 
 // CSS variable injection end 
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
@@ -823,6 +835,32 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "watch-pool inventory-pool" },
     'aria-labelledby': "inventory-watch-title",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+    ...{ class: "roi-sign-switch" },
+    role: "group",
+    'aria-label': "ROI 筛选",
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setInventoryRoiSign('all');
+        } },
+    type: "button",
+    ...{ class: ({ active: __VLS_ctx.inventoryRoiSign === 'all' }) },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setInventoryRoiSign('positive');
+        } },
+    type: "button",
+    ...{ class: ({ active: __VLS_ctx.inventoryRoiSign === 'positive' }) },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.setInventoryRoiSign('negative');
+        } },
+    type: "button",
+    ...{ class: ({ active: __VLS_ctx.inventoryRoiSign === 'negative' }) },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({
     ...{ class: "pool-header" },
@@ -1247,6 +1285,7 @@ var __VLS_30;
 /** @type {__VLS_StyleScopedClasses['dual-watch-layout']} */ ;
 /** @type {__VLS_StyleScopedClasses['watch-pool']} */ ;
 /** @type {__VLS_StyleScopedClasses['inventory-pool']} */ ;
+/** @type {__VLS_StyleScopedClasses['roi-sign-switch']} */ ;
 /** @type {__VLS_StyleScopedClasses['pool-header']} */ ;
 /** @type {__VLS_StyleScopedClasses['eyebrow']} */ ;
 /** @type {__VLS_StyleScopedClasses['inventory-toolbar']} */ ;
@@ -1292,6 +1331,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             selection: selection,
             inventoryKeywordDraft: inventoryKeywordDraft,
             inventoryStatus: inventoryStatus,
+            inventoryRoiSign: inventoryRoiSign,
             inventorySort: inventorySort,
             listingsCircuit: listingsCircuit,
             listingsCooling: listingsCooling,
@@ -1326,6 +1366,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             dismissManualExecutionStatus: dismissManualExecutionStatus,
             loadAll: loadAll,
             searchInventory: searchInventory,
+            setInventoryRoiSign: setInventoryRoiSign,
             turnInventory: turnInventory,
             turnSelection: turnSelection,
             manualExecutionMaxQuantity: manualExecutionMaxQuantity,

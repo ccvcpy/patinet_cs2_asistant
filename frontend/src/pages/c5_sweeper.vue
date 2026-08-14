@@ -43,7 +43,9 @@ interface SweeperRound {
   lastRunAt?: string | null;
   lastPrice?: number | null;
   lastMessage: string;
+  workerError?: string | null;
   attemptCount: number;
+  submissions?: SweeperSubmission[];
   receivingAccountId?: string | null;
   receivingAccountName?: string | null;
   receivingSteamId?: string | null;
@@ -70,6 +72,14 @@ interface RoundSummary {
   receivingAccountId?: string | null;
   receivingAccountName?: string | null;
   receivingSteamId?: string | null;
+}
+
+interface SweeperSubmission {
+  id: string;
+  status: "submitting" | "uncertain" | "resolved" | "reconciled";
+  products: { productId: string; buyPrice: number; outTradeNo: string }[];
+  unresolvedProductIds?: string[];
+  notBoughtProducts?: { productId: string; confirmedAt: string; reason?: string }[];
 }
 
 interface SweeperOrder {
@@ -304,6 +314,12 @@ const priceSafe = computed(() => {
   const live = displayRound.value?.lastPrice;
   return live != null && live <= Number(maxPrice.value);
 });
+const unresolvedCount = computed(() =>
+  (displayRound.value?.submissions || []).reduce(
+    (sum, row) => sum + (row.unresolvedProductIds?.length || 0),
+    0,
+  ),
+);
 
 function markDirty() {
   formDirty.value = true;
@@ -390,6 +406,16 @@ async function refreshRound() {
   if (id) await postAction("/api/c5-sweeper/refresh", { roundId: id }, "价格与交付状态已刷新，没有发起购买");
 }
 
+async function confirmNotBought() {
+  const id = displayRound.value?.id;
+  if (!id || unresolvedCount.value <= 0) return;
+  const confirmed = window.confirm(
+    `确认这 ${unresolvedCount.value} 件商品在 C5 未生成订单、未扣款？确认后本轮会自动继续扫货。`,
+  );
+  if (!confirmed) return;
+  await postAction("/api/c5-sweeper/confirm-not-bought", { roundId: id }, "已确认未成交，本轮自动继续");
+}
+
 function statusText(status?: RoundStatus | "empty") {
   return ({
     empty: "等待新建轮次",
@@ -471,6 +497,7 @@ onBeforeUnmount(() => {
 
     <div v-if="apiError" class="alert error">API 未连接：{{ apiError }}。请启动 8765 后端。</div>
     <div v-if="actionError" class="alert error">{{ actionError }}</div>
+    <div v-if="displayRound?.workerError" class="alert error">调度循环异常：{{ displayRound.workerError }}（已保留运行状态，下一轮会自动重试）</div>
     <div v-if="actionMessage" class="alert notice">{{ actionMessage }}</div>
 
     <section class="metrics">
@@ -572,6 +599,7 @@ onBeforeUnmount(() => {
         <p class="runtime-message">{{ displayRound?.lastMessage || "保存轮次后才会读取行情；打开页面不会自动购买。" }}</p>
         <div class="runtime-meta"><span>接收账号<strong>{{ displayRound?.receivingAccountName || selectedReceivingAccount?.name || "未选择" }}</strong><small>{{ maskSteamId(displayRound?.receivingSteamId || selectedReceivingAccount?.steamId) }}</small></span><span>上次轮询<strong>{{ dateTime(displayRound?.lastRunAt) }}</strong></span><span>下一轮时间<strong>{{ dateTime(displayRound?.nextRunAt) }}</strong></span><span>结束原因<strong>{{ stopReasonText(displayRound?.stopReason) }}</strong></span></div>
         <div class="runtime-actions">
+          <button v-if="currentStatus === 'paused' && displayRound?.stopReason === 'buy_uncertain' && unresolvedCount > 0" class="dark" type="button" :disabled="busy" @click="confirmNotBought">确认未成交并继续（{{ unresolvedCount }}）</button>
           <button v-if="currentStatus === 'running'" class="dark" type="button" :disabled="busy" @click="pauseRound">Ⅱ 暂停本轮</button>
           <button v-if="dashboard?.round" class="outline-red" type="button" :disabled="busy || ['completed','stopped'].includes(currentStatus)" @click="stopRound">□ 停止本轮</button>
           <button v-if="dashboard?.round" class="secondary" type="button" :disabled="busy" @click="refreshRound">只刷新，不购买</button>

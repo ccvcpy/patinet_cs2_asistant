@@ -115,8 +115,8 @@ TASK_PUBLIC_LABELS = {
     TASK_GUADAO_SCAN: "挂刀候选完整扫描",
     TASK_STEAM_ACCOUNT_SYNC: "Steam 账号状态同步",
     TASK_STEAM_LISTING_CONFIRM: "Steam 挂单确认",
-    TASK_STEAM_SALE_EVIDENCE: "Steam 卖出证据复核",
-    TASK_REBUY_ATTEMPT: "C5 补仓价格复查",
+    TASK_STEAM_SALE_EVIDENCE: "挂单消失后确认是否卖出",
+    TASK_REBUY_ATTEMPT: "C5 补仓价格不合适时再查",
     TASK_REBUY_BATCH: "C5 同品类批量补仓",
     TASK_C5_DELIVERY_CONFIRM: "C5 已购买待收货确认",
     TASK_C5_ORDER_RECONCILE: "C5 补仓证据复核",
@@ -599,6 +599,33 @@ class UnifiedRuntimeController:
             db.close()
         self.wake()
         return {"ok": bool(changed), "taskKey": TASK_GUADAO_SCAN}
+
+    def _update_guadao_scan_progress(self, changes: dict[str, Any]) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            state = db.get_executor_runtime_state(RUNTIME_GUADAO)
+            if state is None:
+                return
+            payload = _runtime_payload(state)
+            current = payload.get("activeScan")
+            progress = dict(current) if isinstance(current, dict) else {}
+            progress.setdefault("status", "running")
+            progress.setdefault("startedAt", utc_now_iso())
+            progress.update(changes)
+            progress["updatedAt"] = utc_now_iso()
+            payload["activeScan"] = progress
+            db.upsert_executor_runtime_state(
+                RUNTIME_GUADAO,
+                enabled=bool(state["enabled"]),
+                runtime_status=str(state["runtime_status"]),
+                migration_hold=bool(state["migration_hold"]),
+                gate_reason=state["gate_reason"],
+                heartbeat_at=utc_now_iso(),
+                payload=payload,
+            )
+        finally:
+            db.close()
 
     @staticmethod
     def _active_stale_maintenance_authorization(
@@ -1965,28 +1992,6 @@ class UnifiedRuntimeController:
                 ),
             )
 
-    def _notify_c5_delivery_timeouts(self, db: Database) -> None:
-        rows = db.list_pool_operations_by_type_and_statuses(
-            OP_REBUY_C5,
-            statuses=[C5_DELIVERY_FAILED],
-            limit=5000,
-        )
-        for row in rows:
-            note = _read_note(row["note"])
-            if str(note.get("c5OrderFailedCode") or "") != "delivery_timeout_24h":
-                continue
-            self._send_runtime_notification_once(
-                db,
-                event_key=f"c5-delivery-timeout:{int(row['id'])}",
-                title="[挂刀补仓] C5 24小时未发货，已自动失败",
-                body=(
-                    f"物品: {row['market_hash_name']}\n原补仓流水: GD-{int(row['id'])}\n"
-                    f"C5订单: {note.get('c5OrderId') or note.get('c5TradeOrderId') or '-'}\n"
-                    f"替换补仓流水: {note.get('replacementRebuyOperationId') or '-'}\n"
-                    "处理: 原单已判定补仓失败，替换补仓继续遵守原价格上限和冻结比例。"
-                ),
-            )
-
     def _guadao_scan_starvation_guard_seconds(
         self,
         db: Database,
@@ -2127,7 +2132,6 @@ class UnifiedRuntimeController:
             try:
                 db.initialize()
                 self._notify_new_guadao_issues(db)
-                self._notify_c5_delivery_timeouts(db)
             finally:
                 db.close()
             return {
@@ -2205,6 +2209,7 @@ class UnifiedRuntimeController:
         for account in accounts:
             row = rows.get(account.id)
             status = str(row["status"] if row is not None else "unknown")
+            health_payload = _json_dict(row["payload_json"]) if row is not None else {}
             if status == "valid":
                 valid_count += 1
             public_accounts.append(
@@ -2223,6 +2228,13 @@ class UnifiedRuntimeController:
                     "error": row["last_error"] if row is not None else None,
                     "nextRetryAt": row["next_retry_at"] if row is not None else None,
                     "batchId": row["batch_id"] if row is not None else None,
+                    "currencyId": safe_int(health_payload.get("currencyId")),
+                    "currency": health_payload.get("currency"),
+                    "currencyStatus": str(
+                        health_payload.get("currencyStatus") or "unknown"
+                    ),
+                    "currencyCheckedAt": health_payload.get("currencyCheckedAt"),
+                    "currencyError": health_payload.get("currencyError"),
                 }
             )
         total = len(account_by_id)
@@ -2284,6 +2296,46 @@ class UnifiedRuntimeController:
                 snapshot["status"] = "degraded"
         return snapshot
 
+    def _probe_cookie_currency(self, account: Account) -> dict[str, Any]:
+        """Read wallet currency once after relogin without triggering another relogin."""
+
+        checked_at = utc_now_iso()
+        try:
+            from cs2_assistant.clients.steam_market import SteamMarketClient
+
+            client = SteamMarketClient(
+                cookies=account.cookies,
+                steam_id64=account.steam_id64,
+                identity_secret=account.identity_secret,
+                device_id=account.device_id,
+                account_id=account.id,
+                base_url=self.settings.steam_market_base_url,
+                request_source="guadao",
+                allow_account_relogin=False,
+            )
+            wallet = client.wallet_balance()
+            currency_id = safe_int(wallet.get("currency_id"))
+            currency = str(wallet.get("currency") or "").strip() or None
+            return {
+                "currencyId": currency_id,
+                "currency": currency,
+                "currencyStatus": (
+                    "cny" if currency_id == 23
+                    else "non_cny" if currency_id is not None
+                    else "unknown"
+                ),
+                "currencyCheckedAt": checked_at,
+                "currencyError": None,
+            }
+        except Exception as exc:
+            return {
+                "currencyId": None,
+                "currency": None,
+                "currencyStatus": "unknown",
+                "currencyCheckedAt": checked_at,
+                "currencyError": str(exc)[:240],
+            }
+
     def _refresh_cookie_account(
         self,
         db: Database,
@@ -2325,6 +2377,7 @@ class UnifiedRuntimeController:
         except Exception as exc:
             ok, status, updated = False, str(exc), None
         if ok and updated is not None and updated.cookies:
+            currency_probe = self._probe_cookie_currency(updated)
             db.upsert_steam_cookie_health(
                 account.id,
                 status="valid",
@@ -2333,7 +2386,24 @@ class UnifiedRuntimeController:
                 batch_id=batch_id,
                 failure_count=0,
                 last_validated_at=utc_now_iso(),
-                payload={"message": "Steam Cookie 已刷新并通过市场门禁"},
+                payload={
+                    "message": "Steam Cookie 已刷新并通过市场门禁",
+                    **currency_probe,
+                },
+            )
+            currency_id = currency_probe.get("currencyId")
+            self._emit_guadao_runtime_event(
+                operation="cookie_refresh_completed",
+                message=(
+                    f"Steam Cookie 刷新完成：{updated.name or account.name}，"
+                    f"币种 {currency_probe.get('currency') or '未知'} "
+                    f"(currencyId={currency_id if currency_id is not None else 'unknown'})"
+                ),
+                level="INFO" if currency_id == 23 else "WARNING",
+                accountId=updated.id,
+                accountName=updated.name or account.name,
+                batchId=batch_id,
+                **currency_probe,
             )
             if failure_count > 0:
                 self._send_runtime_notification_once(
@@ -2361,6 +2431,17 @@ class UnifiedRuntimeController:
             last_error=normalized,
             next_retry_at=_iso_after(delay),
             payload={"retryDelaySeconds": delay},
+        )
+        self._emit_guadao_runtime_event(
+            operation="cookie_refresh_failed",
+            message=f"Steam Cookie 刷新失败：{account.name}，{normalized}",
+            level="ERROR",
+            accountId=account.id,
+            accountName=account.name,
+            batchId=batch_id,
+            status=health_status,
+            error=normalized,
+            retryDelaySeconds=delay,
         )
         self._send_runtime_notification_once(
             db,
@@ -2605,29 +2686,78 @@ class UnifiedRuntimeController:
                 status="waiting",
             )
 
-        for account in self._accounts():
-            markers = [
-                row
-                for task_type in (TASK_STEAM_LISTING_CONFIRM, TASK_STEAM_SALE_EVIDENCE)
-                for row in db.list_scheduled_tasks(
-                    source=RUNTIME_GUADAO,
-                    task_type=task_type,
-                    status="waiting",
-                    account_id=account.id,
-                    limit=5000,
-                )
-            ]
-            if not markers:
-                continue
-            earliest = min(str(row["next_attempt_at"]) for row in markers)
-            sync_key = f"steam-sync:{account.id}"
-            sync_task = db.get_scheduled_task(sync_key)
-            if (
-                sync_task is not None
-                and str(sync_task["status"] or "") in {"pending", "retry"}
-                and earliest < str(sync_task["next_attempt_at"] or "")
-            ):
-                db.reschedule_scheduled_task(sync_key, next_attempt_at=earliest)
+        accounts = list(self._accounts())
+        account_ids = {account.id for account in accounts}
+        for account in accounts:
+            self._project_steam_account_sync_task(db, account.id)
+        for sync_task in db.list_scheduled_tasks(
+            source=RUNTIME_GUADAO,
+            task_type=TASK_STEAM_ACCOUNT_SYNC,
+            limit=5000,
+        ):
+            account_id = str(sync_task["account_id"] or "")
+            if account_id not in account_ids and str(sync_task["status"] or "") != "running":
+                db.delete_scheduled_task(str(sync_task["task_key"]))
+
+    def _steam_operation_markers(self, db: Database, account_id: str) -> list[Any]:
+        return [
+            row
+            for task_type in (TASK_STEAM_LISTING_CONFIRM, TASK_STEAM_SALE_EVIDENCE)
+            for row in db.list_scheduled_tasks(
+                source=RUNTIME_GUADAO,
+                task_type=task_type,
+                status="waiting",
+                account_id=account_id,
+                limit=5000,
+            )
+        ]
+
+    def _project_steam_account_sync_task(
+        self,
+        db: Database,
+        account_id: str,
+    ) -> str | None:
+        """Project one account carrier from its earliest operation timer.
+
+        Listing confirmation and sale-evidence rows own the business clocks.
+        The account sync is only their coalesced execution carrier; it must not
+        acquire a second, periodic clock of its own.
+        """
+
+        sync_key = f"steam-sync:{account_id}"
+        current = db.get_scheduled_task(sync_key)
+        markers = self._steam_operation_markers(db, account_id)
+        if not markers:
+            if current is not None and str(current["status"] or "") != "running":
+                db.delete_scheduled_task(sync_key)
+            return None
+
+        earliest = min(str(row["next_attempt_at"]) for row in markers)
+        if current is not None and str(current["status"] or "") == "running":
+            return earliest
+
+        current_payload = _task_payload(current) if current is not None else {}
+        current_error = str(current["last_error"] or "") if current is not None else ""
+        manual_wakeup = bool(current_payload.get("manualSafeReviewIssueId"))
+        cookie_backoff = current_error == "account_cookie_not_valid"
+        if manual_wakeup and str(current["next_attempt_at"] or "") < earliest:
+            next_attempt_at = str(current["next_attempt_at"])
+        elif cookie_backoff and str(current["next_attempt_at"] or "") > earliest:
+            next_attempt_at = str(current["next_attempt_at"])
+        else:
+            next_attempt_at = earliest
+        db.upsert_scheduled_task(
+            sync_key,
+            source=RUNTIME_GUADAO,
+            task_type=TASK_STEAM_ACCOUNT_SYNC,
+            next_attempt_at=next_attempt_at,
+            account_id=account_id,
+            payload=current_payload,
+            status="pending",
+            priority=0 if manual_wakeup else 2,
+            last_error=current_error or None,
+        )
+        return earliest
 
     def _seed_read_only_auxiliary_tasks(self, db: Database, *, now: str) -> None:
         """Recover isolated research/audit jobs after a backend restart."""
@@ -2829,16 +2959,6 @@ class UnifiedRuntimeController:
                     (now, TASK_STALE_LISTING_RECHECK),
                 )
                 db.conn.commit()
-        for account in self._accounts():
-            self._ensure_task(
-                db,
-                f"steam-sync:{account.id}",
-                source=RUNTIME_GUADAO,
-                task_type=TASK_STEAM_ACCOUNT_SYNC,
-                next_attempt_at=now,
-                account_id=account.id,
-                priority=2,
-            )
         self._ensure_task(
             db,
             TASK_PROFIT_CYCLE,
@@ -3247,11 +3367,10 @@ class UnifiedRuntimeController:
                     )
                     return
                 if not enabled and not self._has_guadao_account_closure_work(db, account_id):
-                    schedule = load_strategy_config(self.settings).effective_guadao_task_schedule()
-                    db.reschedule_scheduled_task(
+                    db.complete_scheduled_task(
                         task_key,
-                        next_attempt_at=_iso_after(float(schedule["steamSyncIntervalSeconds"])),
                         worker_id=self.worker_id,
+                        status="completed",
                         error="executor_disabled_no_account_work",
                     )
                     return
@@ -3274,6 +3393,17 @@ class UnifiedRuntimeController:
             )
             lease_thread.start()
         try:
+            if task_type == TASK_GUADAO_SCAN:
+                self._update_guadao_scan_progress(
+                    {
+                        "status": "running",
+                        "startedAt": utc_now_iso(),
+                        "evaluatedCount": 0,
+                        "candidateCount": 0,
+                        "listedCount": 0,
+                        "currentStep": "正在启动完整扫描",
+                    }
+                )
             result = self._dispatch_task(dispatch_task, enabled=enabled)
         except Exception as exc:
             if source == RUNTIME_GUADAO:
@@ -3407,6 +3537,8 @@ class UnifiedRuntimeController:
             self.settings,
             new_action_guard=action_guard,
         )
+        if task_type == TASK_GUADAO_SCAN:
+            engine._scan_progress_callback = self._update_guadao_scan_progress
         try:
             if task_type == TASK_GUADAO_SCAN:
                 result = engine.run_guadao_scan_task()
@@ -3635,7 +3767,14 @@ class UnifiedRuntimeController:
             if task_type == TASK_GUADAO_SCAN:
                 next_seconds = float(schedule["scanIntervalSeconds"])
             elif task_type == TASK_STEAM_ACCOUNT_SYNC:
-                next_seconds = float(schedule["steamSyncIntervalSeconds"])
+                account_id = str(task.get("account_id") or "")
+                next_attempt_override = (
+                    self._project_steam_account_sync_task(db, account_id)
+                    if account_id
+                    else None
+                )
+                terminal = next_attempt_override is None
+                next_seconds = None
             elif task_type == TASK_PROFIT_CYCLE:
                 next_seconds = PROFIT_TRADE_CYCLE_INTERVAL_SECONDS
             elif task_type == TASK_STALE_LISTING_RECHECK:
@@ -4078,6 +4217,7 @@ class UnifiedRuntimeController:
                             scan_rounds.insert(0, scan_round)
                             runtime_payload["recentScanRounds"] = scan_rounds[:12]
                     if task_type == TASK_GUADAO_SCAN:
+                        runtime_payload.pop("activeScan", None)
                         runtime_payload["nextScanAt"] = next_attempt_at
                     db.upsert_executor_runtime_state(
                         str(task["source"]),
@@ -4366,6 +4506,7 @@ class UnifiedRuntimeController:
                     "marketHashName": market_hash_name,
                     "displayName": rule.get("nameCn"),
                     "maxRatioPct": float(rule.get("maxListingRatio") or 0) * 100.0,
+                    "rebuyReferenceFloor": safe_float(rule.get("rebuyReferenceFloor")),
                     "enabled": bool(rule.get("enabled", True)),
                     **self._latest_case_ratio_snapshot(db, market_hash_name),
                     }
@@ -4375,6 +4516,14 @@ class UnifiedRuntimeController:
                 guadao_runtime.get("payload", {})
                 if isinstance(guadao_runtime.get("payload"), dict)
                 else {}
+            )
+            scan_task_row = db.get_scheduled_task(TASK_GUADAO_SCAN)
+            current_scan = (
+                dict(guadao_runtime_payload.get("activeScan") or {})
+                if scan_task_row is not None
+                and str(scan_task_row["status"] or "") == "running"
+                and isinstance(guadao_runtime_payload.get("activeScan"), dict)
+                else None
             )
             return {
                 "generatedAt": utc_now_iso(),
@@ -4399,6 +4548,7 @@ class UnifiedRuntimeController:
                 "recentTaskRuns": list(
                     guadao_runtime_payload.get("recentTaskRuns") or []
                 ),
+                "currentScan": current_scan,
                 "scanRounds": list(
                     guadao_runtime_payload.get("recentScanRounds") or []
                 ),
@@ -4861,6 +5011,18 @@ class UnifiedRuntimeController:
 
     @staticmethod
     def _rebuy_has_remote_order_evidence(note: dict[str, Any]) -> bool:
+        # batch_buy returns an explicit failedList for requests that were
+        # rejected before an order was created.  Keep the outTradeNo for
+        # audit/idempotency, but do not mistake that failed request id for a
+        # remote C5 order.  Any actual order id still wins and blocks manual
+        # refreezing until its terminal state is reconciled.
+        if (
+            str(note.get("c5BatchSubmissionState") or "").strip().lower()
+            == "rejected"
+            and not str(note.get("c5OrderId") or "").strip()
+            and not str(note.get("c5TradeOrderId") or "").strip()
+        ):
+            return False
         return any(
             note.get(key) not in (None, "", False)
             for key in (
@@ -5749,7 +5911,6 @@ class UnifiedRuntimeController:
             ),
             ("c5OrderCheckedAt", "C5 发货状态复查"),
             ("c5DeliveryOverdueAt", "C5 已超过12小时，继续查询订单详情"),
-            ("c5DeliveryTimedOutAt", "历史记录：C5 24小时未发货，自动失败"),
         ):
             value = rebuy_note.get(key) or note.get(key)
             if value:
@@ -6267,6 +6428,7 @@ class UnifiedRuntimeController:
                     "marketHashName": market_hash_name,
                     "displayName": rule.get("nameCn"),
                     "maxRatioPct": float(rule.get("maxListingRatio") or 0) * 100.0,
+                    "rebuyReferenceFloor": safe_float(rule.get("rebuyReferenceFloor")),
                     "enabled": bool(rule.get("enabled", True)),
                     "version": int(rule.get("version") or 1),
                     "updatedAt": rule_updated_at(str(market_hash_name or "")),
@@ -6288,7 +6450,6 @@ class UnifiedRuntimeController:
                 "specialRules": special_rules,
                 "timePolicy": {
                     "scanMinutes": float(schedule.get("scanIntervalSeconds") or 300.0) / 60.0,
-                    "steamSyncSeconds": float(schedule.get("steamSyncIntervalSeconds") or 120.0),
                     "steamSyncMaxStartLagSeconds": float(
                         schedule.get("steamSyncMaxStartLagSeconds") or 60.0
                     ),
@@ -6382,6 +6543,7 @@ class UnifiedRuntimeController:
                         "marketHashName": rule.get("marketHashName"),
                         "nameCn": rule.get("displayName"),
                         "maxListingRatio": float(rule.get("maxRatioPct")) / 100.0,
+                        "rebuyReferenceFloor": rule.get("rebuyReferenceFloor"),
                         "enabled": bool(rule.get("enabled", True)),
                     }
                     for rule in nested_rules
@@ -6400,7 +6562,6 @@ class UnifiedRuntimeController:
                 payload["taskSchedule"] = {
                     **current_schedule,
                     "scanIntervalSeconds": float(nested_time.get("scanMinutes")) * 60.0,
-                    "steamSyncIntervalSeconds": float(nested_time.get("steamSyncSeconds")),
                     "steamSyncMaxStartLagSeconds": float(
                         nested_time.get(
                             "steamSyncMaxStartLagSeconds",
@@ -6462,7 +6623,7 @@ class UnifiedRuntimeController:
             if "staleListedMaxRatioTolerancePct" in payload:
                 value = float(payload["staleListedMaxRatioTolerancePct"])
                 if value < 0 or value > 20:
-                    raise ValueError("老挂单比例容忍必须在 0 到 20 个百分点之间")
+                    raise ValueError("老挂单比例最多可放宽 0 到 20 个百分点")
                 config.stale_listed_max_ratio_tolerance_pct = value
             if "specialCaseRatioRules" in payload:
                 config.guadao_special_ratio_rules = self._validate_special_ratio_rules(
@@ -6471,7 +6632,9 @@ class UnifiedRuntimeController:
                     confirm_high=bool(payload.get("confirmHighRatio")),
                 )
             if "taskSchedule" in payload:
-                config.guadao_task_schedule = self._validate_task_schedule(payload["taskSchedule"])
+                validated_schedule = self._validate_task_schedule(payload["taskSchedule"])
+                config.guadao_task_schedule = validated_schedule
+                payload["taskSchedule"] = validated_schedule
             save_strategy_config(self.settings, config)
             new_dict = config.to_dict()
             db = Database(self.settings.db_path)
@@ -6526,6 +6689,12 @@ class UnifiedRuntimeController:
                 ratio = float(raw.get("maxListingRatio"))
                 if ratio <= 0 or ratio > 0.80:
                     raise ValueError("特殊箱子比例必须大于 0 且不超过 80%")
+                raw_floor = raw.get("rebuyReferenceFloor")
+                rebuy_reference_floor = None
+                if raw_floor not in (None, ""):
+                    rebuy_reference_floor = round(float(raw_floor), 2)
+                    if rebuy_reference_floor <= 0:
+                        raise ValueError("特殊箱子开单参考价下限必须大于 0")
                 if ratio > 0.75 and not confirm_high:
                     raise ValueError("超过 75% 的特殊比例需要二次确认")
                 enabled = bool(raw.get("enabled", True))
@@ -6536,6 +6705,8 @@ class UnifiedRuntimeController:
                 else:
                     changed = (
                         abs(float(existing.get("maxListingRatio") or 0) - ratio) > 1e-12
+                        or safe_float(existing.get("rebuyReferenceFloor"))
+                        != rebuy_reference_floor
                         or bool(existing.get("enabled", True)) != enabled
                     )
                     version = max(1, int(existing.get("version") or 1)) + (1 if changed else 0)
@@ -6550,6 +6721,7 @@ class UnifiedRuntimeController:
                         "marketHashName": market_hash_name,
                         "nameCn": str(raw.get("nameCn") or item["name_cn"] or ""),
                         "maxListingRatio": ratio,
+                        "rebuyReferenceFloor": rebuy_reference_floor,
                         "enabled": enabled,
                     }
                 )
@@ -6562,20 +6734,21 @@ class UnifiedRuntimeController:
             raise ValueError("taskSchedule 必须是对象")
         defaults = StrategyConfig.default_guadao_task_schedule()
         result = {**defaults, **raw}
+        # Account synchronisation is projected from operation timers. Drop
+        # the retired periodic interval when old clients or configs send it.
+        result.pop("steamSyncIntervalSeconds", None)
         if float(result["scanIntervalSeconds"]) < 60:
             raise ValueError("完整扫描间隔不得低于 1 分钟")
-        if float(result["steamSyncIntervalSeconds"]) < 30:
-            raise ValueError("普通 Steam 同步间隔不得低于 30 秒")
         if float(result["steamSyncMaxStartLagSeconds"]) < 1:
             raise ValueError("Steam 同步最长开始等待不得低于 1 秒")
         if float(result["staleListedCheckIntervalSeconds"]) < 3600:
-            raise ValueError("老挂单候选扫描间隔不得低于 1 小时")
+            raise ValueError("查找超过 48 小时挂单的间隔不得低于 1 小时")
         action = [float(value) for value in result.get("actionConfirmationDelaysSeconds") or []]
         if not action or min(action) < 2 or action != sorted(action):
             raise ValueError("动作确认间隔不得低于 2 秒且必须非递减")
         sale = [float(value) for value in result.get("saleEvidenceDelaysSeconds") or []]
         if not sale or min(sale) < 0 or sale != sorted(sale):
-            raise ValueError("卖出证据复核间隔不得为负数且必须非递减")
+            raise ValueError("挂单消失后的卖出检查间隔不能为负数，并且必须从短到长排列")
         for key in ("rebuyRetryTiers", "deliveryConfirmationTiers"):
             previous = 0.0
             tiers = result.get(key)
@@ -6589,7 +6762,6 @@ class UnifiedRuntimeController:
                     raise ValueError("C5 复查间隔不得低于 30 秒且必须非递减")
                 previous = interval
         result["scanIntervalSeconds"] = float(result["scanIntervalSeconds"])
-        result["steamSyncIntervalSeconds"] = float(result["steamSyncIntervalSeconds"])
         result["steamSyncMaxStartLagSeconds"] = float(result["steamSyncMaxStartLagSeconds"])
         result["staleListedCheckIntervalSeconds"] = float(
             result["staleListedCheckIntervalSeconds"]

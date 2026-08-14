@@ -44,6 +44,76 @@ class FakeThirdPartyMarketService:
 
 
 class StrategyClassificationTestCase(unittest.TestCase):
+    def test_special_case_rebuy_reference_floor_only_changes_matching_item(self) -> None:
+        class FloorMarketService:
+            def refresh_items(self, items: list[dict]) -> list[MarketState]:
+                return [
+                    MarketState(
+                        market_hash_name=str(item["market_hash_name"]),
+                        name_cn=str(item["market_hash_name"]),
+                        steam_sell_price=12.0,
+                        steam_price_source="steam_orderbook",
+                    )
+                    for item in items
+                ]
+
+        config = StrategyConfig(
+            dry_run=False,
+            min_price=1.0,
+            guadao_max_listing_ratio=0.80,
+            transfer_min_real_ratio=9999,
+            guadao_special_ratio_rules=[
+                {
+                    "marketHashName": "Dreams & Nightmares Case",
+                    "maxListingRatio": 0.80,
+                    "rebuyReferenceFloor": 7.60,
+                    "enabled": True,
+                }
+            ],
+        )
+        inventory_payload = {
+            "source": "live",
+            "list": [
+                {
+                    "assetId": "dreams-asset",
+                    "marketHashName": "Dreams & Nightmares Case",
+                    "ifTradable": True,
+                    "price": 7.00,
+                },
+                {
+                    "assetId": "revolution-asset",
+                    "marketHashName": "Revolution Case",
+                    "ifTradable": True,
+                    "price": 7.00,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "cs2_assistant.services.strategy.build_market_service",
+            return_value=FloorMarketService(),
+        ):
+            report = scan_strategies(
+                Settings(
+                    db_path=Path(temp_dir) / "assistant.db",
+                    c5_api_key="test-c5-key",
+                    steamdt_api_key="test-steamdt-key",
+                ),
+                config,
+                inventory_payload=inventory_payload,
+            )
+
+        candidates = {row.market_hash_name: row for row in report.all_evaluated}
+        self.assertEqual(7.60, candidates["Dreams & Nightmares Case"].rebuy_price)
+        self.assertTrue(
+            candidates["Dreams & Nightmares Case"].rebuy_price_source.endswith(
+                "_special_floor"
+            )
+        )
+        self.assertEqual(7.00, candidates["Revolution Case"].rebuy_price)
+        outcomes = {row["marketHashName"]: row for row in report.item_outcomes}
+        self.assertEqual(7.00, outcomes["Dreams & Nightmares Case"]["c5ObservedRebuyPrice"])
+        self.assertEqual(7.60, outcomes["Dreams & Nightmares Case"]["c5RebuyReferenceFloor"])
+
     def test_scan_report_preserves_every_non_evaluated_item_reason(self) -> None:
         class OutcomeMarketService:
             def refresh_items(self, items: list[dict]) -> list[MarketState]:

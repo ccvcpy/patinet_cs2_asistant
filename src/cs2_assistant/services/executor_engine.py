@@ -572,6 +572,7 @@ class ExecutionEngine:
         dry_run_override: bool | None = None,
         force_refresh_override: bool | None = None,
         new_action_guard: Callable[[], bool] | None = None,
+        scan_progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.settings = settings
         self.config = config or load_strategy_config(settings)
@@ -647,8 +648,25 @@ class ExecutionEngine:
         self._stop_requested = False
         self._stop_reason: str | None = None
         self._new_action_guard = new_action_guard
+        self._scan_progress_callback = scan_progress_callback
+        self._scan_progress: dict[str, Any] = {}
         self._case_open_guadao_limit_notified = False
         self._process_session_id = EXECUTION_PROCESS_SESSION_ID
+
+    def _report_scan_progress(self, **changes: Any) -> None:
+        progress = getattr(self, "_scan_progress", None)
+        if not isinstance(progress, dict):
+            progress = {}
+            self._scan_progress = progress
+        progress.update(changes)
+        callback = getattr(self, "_scan_progress_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(dict(progress))
+        except Exception:
+            # Dashboard progress must never interrupt a real trading action.
+            return
         self._rebuy_wait_started_at: dict[int, datetime] = {}
         self._recent_rebuy_delivery_failures_checked = False
         self._listing_account_next_attempt_at: dict[str, float] = {}
@@ -2594,6 +2612,9 @@ class ExecutionEngine:
             "guadaoRatioRuleSource": "special_case" if special_rule else "global",
             "guadaoRatioRuleId": special_rule.get("ruleId") if special_rule else None,
             "guadaoRatioRuleVersion": special_rule.get("version") if special_rule else None,
+            "rebuyReferenceFloorAtOpen": (
+                safe_float(special_rule.get("rebuyReferenceFloor")) if special_rule else None
+            ),
         }
         if listing_ratio is None or listing_ratio <= 0:
             return {
@@ -2757,6 +2778,7 @@ class ExecutionEngine:
         picked_asset_ids: set[str] = set()
         selected_steam_id64: str | None = None
         selected_account: Account | None = None
+        submitted_confirmation_op_ids: set[int] = set()
         defer_logged_asset_ids: set[str] = set()
         # 本轮内 (market_hash_name, reason) 维度的去重，避免同饰品在同一轮里重复推送跳过通知
         self._notified_listing_skips_cycle: set[tuple[str, str]] = set()
@@ -2885,6 +2907,10 @@ class ExecutionEngine:
                             )
                         if status_after != POOL_STATUS_HOLDING:
                             list_count += 1
+                            self._report_scan_progress(
+                                listedCount=list_count,
+                                currentStep="继续逐笔上架/确认",
+                            )
                             wait_before_next_listing = True
                         continue
                     if str(asset_id) not in defer_logged_asset_ids:
@@ -2904,6 +2930,10 @@ class ExecutionEngine:
                         f"price={decision.list_price:.2f}"
                     )
                     list_count += 1
+                    self._report_scan_progress(
+                        listedCount=list_count,
+                        currentStep="继续逐笔上架/确认",
+                    )
                     continue
 
                 try:
@@ -2952,6 +2982,10 @@ class ExecutionEngine:
                             )
                         if status_after != POOL_STATUS_HOLDING:
                             list_count += 1
+                            self._report_scan_progress(
+                                listedCount=list_count,
+                                currentStep="继续逐笔上架/确认",
+                            )
                             wait_before_next_listing = True
                         continue
                     if _is_transient_listing_error(exc):
@@ -3000,19 +3034,28 @@ class ExecutionEngine:
                     )
                     continue
                 listing_id = str(payload.get("listingid") or "")
-                confirmation_note: dict[str, Any] = {
-                    "needsConfirmation": True,
-                    "confirmationStatus": "pending",
-                }
-                status_after = POOL_STATUS_LISTED
                 pending_count_before = self._pending_confirmation_count
-                confirmation_note, status_after = self._handle_listing_confirmation(
-                    market_hash_name=candidate.market_hash_name,
-                    asset_id=asset_id,
-                    listing_id=listing_id,
+                if self._listing_confirmation_credentials_available(
                     client=client,
                     account=selected_account,
-                )
+                ):
+                    submitted_at = utc_now_iso()
+                    confirmation_note = {
+                        "needsConfirmation": True,
+                        "confirmationStatus": "sellitem_submitted_waiting_batch_confirmation",
+                        "listingPendingAt": submitted_at,
+                    }
+                    if listing_id:
+                        confirmation_note["listingId"] = listing_id
+                    status_after = POOL_STATUS_LISTING_PENDING
+                else:
+                    confirmation_note, status_after = self._handle_listing_confirmation(
+                        market_hash_name=candidate.market_hash_name,
+                        asset_id=asset_id,
+                        listing_id=listing_id,
+                        client=client,
+                        account=selected_account,
+                    )
 
                 if status_after == POOL_STATUS_LISTED:
                     op_status = "listed"
@@ -3051,6 +3094,12 @@ class ExecutionEngine:
                 )
                 self.db.update_pool_operation(op_id, status=op_status)
                 self.db.set_asset_status(asset_id, asset_status)
+                if (
+                    op_status == POOL_STATUS_LISTING_PENDING
+                    and confirmation_note.get("confirmationStatus")
+                    == "sellitem_submitted_waiting_batch_confirmation"
+                ):
+                    submitted_confirmation_op_ids.add(int(op_id))
                 if op_status == "canceled":
                     if not self._has_other_open_guadao_operation(candidate.market_hash_name, exclude_op_id=op_id):
                         self.db.set_pool_status(candidate.market_hash_name, POOL_STATUS_HOLDING)
@@ -3085,7 +3134,12 @@ class ExecutionEngine:
                         },
                     )
                 immediate_sold = False
-                if op_status == POOL_STATUS_LISTING_PENDING and client is not None:
+                if (
+                    op_status == POOL_STATUS_LISTING_PENDING
+                    and client is not None
+                    and confirmation_note.get("confirmationStatus")
+                    != "sellitem_submitted_waiting_batch_confirmation"
+                ):
                     immediate_sold = self._mark_pending_sell_operation_sold_if_receipted(
                         op_id=op_id,
                         note=note_dict,
@@ -3098,6 +3152,19 @@ class ExecutionEngine:
                         status_map[candidate.market_hash_name] = POOL_STATUS_PENDING_REBUY
                 if immediate_sold:
                     pass
+                elif (
+                    confirmation_note.get("confirmationStatus")
+                    == "sellitem_submitted_waiting_batch_confirmation"
+                ):
+                    print(
+                        f"[上架已提交] {candidate.market_hash_name} | "
+                        f"账号={selected_account.name if selected_account else selected_steam_id64} | "
+                        f"asset={asset_id} | "
+                        f"预计挂刀比例 {decision.listing_ratio * 100:.2f}% | "
+                        f"Steam挂价 CNY {decision.list_price:.2f} | "
+                        f"预计到手 CNY {decision.list_price * self.config.steam_net_factor:.2f} | "
+                        "等待本轮统一 Steam Guard 确认"
+                    )
                 elif status_after == POOL_STATUS_LISTED:
                     print(
                         f"[上架] {candidate.market_hash_name} | "
@@ -3121,7 +3188,41 @@ class ExecutionEngine:
                     )
                 if status_after != POOL_STATUS_HOLDING:
                     list_count += 1
+                    self._report_scan_progress(
+                        listedCount=list_count,
+                        currentStep="继续逐笔上架/确认",
+                    )
                     wait_before_next_listing = True
+
+        if submitted_confirmation_op_ids:
+            self._report_scan_progress(currentStep="正在统一确认本轮 Steam 挂单")
+            confirmation_result = self.run_guadao_account_sync_task(
+                selected_account.id if selected_account is not None else None,
+                confirmation_operation_ids=submitted_confirmation_op_ids,
+                sale_operation_ids=set(),
+            )
+            if not confirmation_result.get("confirmationError"):
+                placeholders = ",".join("?" for _ in submitted_confirmation_op_ids)
+                unresolved_row = self.db.conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM pool_operations
+                    WHERE id IN ({placeholders}) AND status = ?
+                    """,
+                    (
+                        *sorted(submitted_confirmation_op_ids),
+                        POOL_STATUS_LISTING_PENDING,
+                    ),
+                ).fetchone()
+                self._pending_confirmation_count += int(
+                    unresolved_row["count"] if unresolved_row is not None else 0
+                )
+            if not confirmation_result.get("ok", True):
+                print(
+                    "[上架待后续确认] 本轮 Steam 挂单已逐笔提交并安全落库；"
+                    f"统一确认暂未完成，将由账号定时检查继续处理 | 原因: "
+                    f"{confirmation_result.get('error') or 'Steam 状态暂不可读'}"
+                )
 
         return list_count
 
@@ -3956,10 +4057,15 @@ class ExecutionEngine:
     def _case_capacity_max_observation_gap_seconds(self) -> float:
         schedule = self.config.effective_guadao_task_schedule()
         scan_seconds = max(1.0, safe_float(schedule.get("scanIntervalSeconds")) or 300.0)
-        sync_seconds = max(1.0, safe_float(schedule.get("steamSyncIntervalSeconds")) or 120.0)
-        # A normal scan/sync may drift slightly while another due task owns the
-        # worker. More than 2.5 normal intervals is no longer continuous proof.
-        return max(60.0, max(scan_seconds, sync_seconds) * 2.5)
+        sale_evidence_delays = [
+            max(1.0, safe_float(value) or 0.0)
+            for value in schedule.get("saleEvidenceDelaysSeconds") or []
+        ]
+        evidence_seconds = max(sale_evidence_delays or [60.0])
+        # Account sync is event-driven by operation evidence timers.  A normal
+        # scan/evidence round may drift slightly while another due task owns
+        # the worker; a larger gap is no longer continuous proof.
+        return max(60.0, max(scan_seconds, evidence_seconds) * 2.5)
 
     def _observe_case_listing_capacity(
         self,
@@ -5277,6 +5383,28 @@ class ExecutionEngine:
             updated += 1
         return updated
 
+    def _listing_confirmation_credentials_available(
+        self,
+        *,
+        client: SteamMarketClient | None,
+        account: Account | None,
+    ) -> bool:
+        active_client = client or self.steam_client
+        allow_global_credentials = active_client is self.steam_client and (
+            account is None
+            or (self.account is not None and account.id == self.account.id)
+        )
+        identity_secret = getattr(active_client, "identity_secret", None) or (
+            account.identity_secret if account else None
+        )
+        device_id = getattr(active_client, "device_id", None) or (
+            account.device_id if account else None
+        )
+        if allow_global_credentials:
+            identity_secret = identity_secret or self._effective_steam_identity_secret()
+            device_id = device_id or self._effective_steam_device_id()
+        return bool(identity_secret and device_id)
+
     def _handle_listing_confirmation(
         self,
         *,
@@ -5459,6 +5587,32 @@ class ExecutionEngine:
                     f"- 状态: 待 Steam Guard 确认\n"
                     f"- 原因: {reason}\n\n"
                     "请运行: `python main.py steam confirm`"
+                ),
+            )
+        except Exception as exc:
+            print(f"  ServerChan 推送失败: {exc}")
+
+    def _notify_listing_confirmation_batch_required(
+        self,
+        operations: list[Any],
+        *,
+        reason: str,
+    ) -> None:
+        operation_ids = [int(op["id"]) for op in operations]
+        print(
+            f"[提醒] 本轮 {len(operation_ids)} 笔 Steam 挂单统一确认失败，"
+            f"已保持待确认并等待账号定时检查重试 | 原因: {reason}"
+        )
+        if not self.serverchan:
+            return
+        try:
+            self.serverchan.send(
+                f"[steam confirm] {len(operation_ids)} 笔挂单待确认",
+                (
+                    f"本轮 {len(operation_ids)} 笔 Steam 挂单统一确认失败。\n\n"
+                    f"- 流水 ID: {', '.join(str(value) for value in operation_ids)}\n"
+                    f"- 原因: {reason}\n\n"
+                    "流水已安全保持为待确认；程序会通过账号定时检查继续核验。"
                 ),
             )
         except Exception as exc:
@@ -9087,10 +9241,18 @@ class ExecutionEngine:
     def run_guadao_scan_task(self) -> dict[str, Any]:
         """Run only the new-candidate branch; existing-state work has its own tasks."""
 
+        self._report_scan_progress(
+            status="running",
+            evaluatedCount=0,
+            candidateCount=0,
+            listedCount=0,
+            currentStep="正在同步可交易库存",
+        )
         self._pending_confirmation_count = 0
         self._market_pending_cleanup_failed_count = 0
         self._steam_market_validated_accounts = set()
         self._sync_assets()
+        self._report_scan_progress(currentStep="正在读取候选行情")
         pool_names = self.db.get_pool_market_hash_names()
         if not pool_names:
             return {"ok": True, "listed": 0, "evaluated": 0, "reason": "empty_pool"}
@@ -9114,6 +9276,11 @@ class ExecutionEngine:
             ),
             steam_orderbook_price_resolver=self._guadao_scan_orderbook_price,
         )
+        self._report_scan_progress(
+            evaluatedCount=len(getattr(report, "all_evaluated", []) or []),
+            candidateCount=len(getattr(report, "guadao_candidates", []) or []),
+            currentStep="候选行情已读取，正在准备上架",
+        )
         status_map = self.db.get_pool_status_map()
         blocked_by_open_cycle = self._has_open_guadao_cycle(status_map)
         inventory_infos = {
@@ -9122,7 +9289,12 @@ class ExecutionEngine:
         }
         listed = 0
         if not blocked_by_open_cycle:
+            self._report_scan_progress(currentStep="继续逐笔上架/确认")
             listed = self._execute_guadao_listings(report, status_map)
+        self._report_scan_progress(
+            listedCount=listed,
+            currentStep="正在整理本轮扫描结果",
+        )
         self._release_full_case_listing_capacity()
         candidate_names = {
             candidate.market_hash_name
@@ -9411,7 +9583,15 @@ class ExecutionEngine:
             if pending_listing_id:
                 note["listingId"] = pending_listing_id
                 note["marketPendingListingId"] = pending_listing_id
-            note["confirmationStatus"] = "market_pending_visible"
+            previous_confirmation_status = str(
+                note.get("confirmationStatus") or ""
+            )
+            if previous_confirmation_status not in {
+                "confirm_sent_waiting_active_listing",
+                "failed",
+                "not_found",
+            }:
+                note["confirmationStatus"] = "market_pending_visible"
             note["marketPendingVerifiedAt"] = observed_at
             note["listingPendingAt"] = note.get("listingPendingAt") or observed_at
             self.db.update_pool_operation(
@@ -9511,9 +9691,24 @@ class ExecutionEngine:
             note = _read_note(op["note"])
             note["confirmationRetryAt"] = attempted_at
             if error:
+                note["confirmationStatus"] = "failed"
+                note["confirmationMessage"] = error
                 note["confirmationRetryStatus"] = "failed"
                 note["confirmationRetryMessage"] = error
             else:
+                if (confirmed_count or 0) > 0:
+                    note["confirmationStatus"] = (
+                        "confirm_sent_waiting_active_listing"
+                    )
+                    note["confirmationSentAt"] = attempted_at
+                    note["listingPendingAt"] = (
+                        note.get("listingPendingAt") or attempted_at
+                    )
+                else:
+                    note["confirmationStatus"] = "not_found"
+                    note["confirmationMessage"] = (
+                        "no matching Steam Guard confirmation found for this batch"
+                    )
                 note["confirmationRetryStatus"] = (
                     "confirmed_waiting_active_listing"
                     if (confirmed_count or 0) > 0
@@ -9522,6 +9717,14 @@ class ExecutionEngine:
                 note["confirmationRetryCount"] = confirmed_count
             self.db.update_pool_operation(op["id"], note=_build_note(note))
         self.db.conn.commit()
+        if error:
+            self._pending_confirmation_count += len(targets)
+            self._notify_listing_confirmation_batch_required(targets, reason=error)
+        elif (confirmed_count or 0) <= 0:
+            self._notify_listing_confirmation_batch_required(
+                targets,
+                reason="no matching Steam Guard confirmation found",
+            )
         return attempted_ids, error
 
     def run_guadao_account_sync_task(
@@ -9615,6 +9818,13 @@ class ExecutionEngine:
                 confirmation_operation_ids=confirmation_operation_ids,
             )
         )
+        if attempted_confirmation_ids:
+            due_operations = [
+                refreshed
+                for operation_id in [int(op["id"]) for op in due_operations]
+                if (refreshed := self._get_pool_operation_by_id(operation_id))
+                is not None
+            ]
 
         confirmed = initial_confirmed
         if attempted_confirmation_ids and not confirmation_error:

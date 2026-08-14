@@ -34,6 +34,15 @@ function localTime(value) {
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
 }
+function cookieCurrencyLabel(account) {
+    if (account.currencyStatus === "cny") {
+        return `${account.currency || "CNY"} · ID ${account.currencyId ?? 23}`;
+    }
+    if (account.currencyStatus === "non_cny") {
+        return `${account.currency || "非人民币"} · ID ${account.currencyId ?? "?"}`;
+    }
+    return "币种未知";
+}
 function handleDashboardStatus(event) {
     const detail = event.detail;
     if (typeof detail?.allowRealExecution === "boolean") {
@@ -111,6 +120,13 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-panel']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
 /** @type {__VLS_StyleScopedClasses['profit-cookie-grid']} */ ;
@@ -269,8 +285,17 @@ if (__VLS_ctx.cookieExpanded) {
                 ...{ class: ({ valid: account.valid }) },
             });
             (account.valid ? "有效" : account.error || account.status || "未知");
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({
+                ...{ class: (['cookie-currency', account.currencyStatus === 'cny' ? 'currency-cny' : account.currencyStatus === 'non_cny' ? 'currency-invalid' : 'currency-unknown']) },
+            });
+            (__VLS_ctx.cookieCurrencyLabel(account));
             __VLS_asFunctionalElement(__VLS_intrinsicElements.time, __VLS_intrinsicElements.time)({});
             (__VLS_ctx.localTime(account.lastCheckedAt));
+            (__VLS_ctx.localTime(account.currencyCheckedAt));
+            if (account.currencyError) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
+                (account.currencyError);
+            }
         }
     }
     else {
@@ -376,6 +401,7 @@ const __VLS_self = (await import('vue')).defineComponent({
             circuitVisible: circuitVisible,
             circuitRemainingLabel: circuitRemainingLabel,
             localTime: localTime,
+            cookieCurrencyLabel: cookieCurrencyLabel,
         };
     },
 });

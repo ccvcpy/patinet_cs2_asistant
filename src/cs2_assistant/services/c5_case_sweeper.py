@@ -4,6 +4,8 @@ import json
 import math
 import os
 import re
+import sys
+import time
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,6 +23,15 @@ DEFAULT_DISPLAY_NAME = "千瓦武器箱"
 DEFAULT_INTERVAL_SECONDS = 60
 C5_MARKET_SEARCH_MAX_PAGE_SIZE = 50
 C5_MARKET_LIST_MAX_PAGES_PER_CYCLE = 5
+# A product missing from the remote order list must stay unresolved across
+# this many consecutive reconciliation passes before it is treated as not
+# bought and the round auto-resumes. This protects against transient C5
+# order-list lag right after a timed-out batch request.
+AUTO_CONFIRM_NOT_BOUGHT_PASSES = 3
+# When confirming "not bought", additionally scan this many order-history
+# pages (100 rows each) so a genuinely created order beyond the quick recent
+# window is not misclassified as absent.
+DEEP_VERIFY_MAX_PAGE = 30
 STATE_VERSION = 3
 # Keep the existing filename so an already-created v2 task can be migrated in place.
 DEFAULT_STATE_PATH = Path(
@@ -158,6 +169,7 @@ class C5CaseSweeper:
         self._next_idle_audit_at = self._now()
         self._receiving_accounts_cache: tuple[datetime, list[dict[str, Any]]] | None = None
         self._state = self._load_state()
+        self._last_worker_error: str | None = None
         restarted = False
         for round_data in self._state["rounds"]:
             if round_data.get("status") == "running":
@@ -167,6 +179,7 @@ class C5CaseSweeper:
                 restarted = True
         if restarted:
             self._save_locked()
+        self._cleanup_temp_files(max_age_seconds=300.0)
         self._thread: threading.Thread | None = None
         if start_worker:
             self._thread = threading.Thread(target=self._worker, name="c5-case-sweeper", daemon=True)
@@ -262,11 +275,54 @@ class C5CaseSweeper:
             state["currentRoundId"] = clean_rounds[-1]["id"] if clean_rounds else None
         return state
 
+    def _cleanup_temp_files(
+        self,
+        *,
+        keep: Path | None = None,
+        max_age_seconds: float | None = None,
+    ) -> None:
+        """Remove leftover JSON temp files from interrupted state saves.
+
+        Each save uses a unique temp name and cleans up after success, so a
+        failed replace can never block or poison the next save.
+        """
+        try:
+            patterns = [f"{self.state_path.name}.*.tmp", f"{self.state_path.name}.tmp"]
+            for pattern in patterns:
+                for candidate in self.state_path.parent.glob(pattern):
+                    try:
+                        if keep is not None and candidate.resolve() == keep.resolve():
+                            continue
+                        if (
+                            max_age_seconds is not None
+                            and time.time() - candidate.stat().st_mtime <= max_age_seconds
+                        ):
+                            continue
+                        candidate.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
     def _save_locked(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.state_path)
+        payload = json.dumps(self._state, ensure_ascii=False, indent=2)
+        temporary = self.state_path.with_name(f"{self.state_path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        last_error: OSError | None = None
+        for attempt in range(5):
+            try:
+                temporary.replace(self.state_path)
+                self._cleanup_temp_files(keep=temporary)
+                return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(min(0.1 * (2 ** attempt), 1.0))
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise last_error or RuntimeError("failed to persist sweeper state")
 
     def _round_locked(self, round_id: str | None = None, *, required: bool = True) -> dict[str, Any] | None:
         target_id = round_id or self._state.get("currentRoundId")
@@ -783,6 +839,65 @@ class C5CaseSweeper:
             for row in remote_rows
             if str(row.get("productId") or "")
         }
+        deep_candidates: list[str] = []
+        with self._lock:
+            for round_id, snapshot in uncertain:
+                round_data = self._round_locked(round_id, required=False)
+                if round_data is None:
+                    continue
+                submission = next(
+                    (
+                        row
+                        for row in round_data.get("submissions", [])
+                        if row.get("id") == snapshot.get("id")
+                    ),
+                    None,
+                )
+                if submission is None:
+                    continue
+                confirmed_not_bought = {
+                    str(row.get("productId") or "")
+                    for row in submission.get("notBoughtProducts", [])
+                    if str(row.get("productId") or "")
+                }
+                absent_checks = submission.get("absentChecks") or {}
+                for requested in submission.get("products", []):
+                    product_id = str(requested.get("productId") or "")
+                    if (
+                        not product_id
+                        or product_id in remote_by_product
+                        or product_id in confirmed_not_bought
+                    ):
+                        continue
+                    streak = int(absent_checks.get(product_id) or 0) + 1
+                    if streak >= AUTO_CONFIRM_NOT_BOUGHT_PASSES:
+                        deep_candidates.append(product_id)
+        if deep_candidates:
+            deep_wanted = set(deep_candidates)
+            for page_num in range(6, DEEP_VERIFY_MAX_PAGE + 1):
+                try:
+                    payload = self.client.buyer_order_status(
+                        page_num=page_num,
+                        page_size=100,
+                        status=None,
+                    )
+                except Exception:
+                    break
+                rows = payload.get("list") if isinstance(payload, dict) else None
+                if not isinstance(rows, list):
+                    break
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    product_id = str(row.get("productId") or "")
+                    if product_id in deep_wanted:
+                        remote_by_product[product_id] = row
+                        deep_wanted.discard(product_id)
+                if not deep_wanted:
+                    break
+                pages = _safe_int(payload.get("pages")) if isinstance(payload, dict) else None
+                if pages is not None and page_num >= pages:
+                    break
         with self._lock:
             for round_id, snapshot in uncertain:
                 round_data = self._round_locked(round_id, required=False)
@@ -805,12 +920,26 @@ class C5CaseSweeper:
                 }
                 matched_now = 0
                 unresolved: list[str] = []
+                confirmed_not_bought = {
+                    str(row.get("productId") or "")
+                    for row in submission.get("notBoughtProducts", [])
+                    if str(row.get("productId") or "")
+                }
+                absent_checks = submission.setdefault("absentChecks", {})
+                auto_not_bought_now: list[str] = []
                 for requested in submission.get("products", []):
                     product_id = str(requested.get("productId") or "")
                     remote = remote_by_product.get(product_id)
                     if remote is None:
+                        if product_id in confirmed_not_bought:
+                            continue
+                        absent_checks[product_id] = int(absent_checks.get(product_id) or 0) + 1
+                        if absent_checks[product_id] >= AUTO_CONFIRM_NOT_BOUGHT_PASSES:
+                            auto_not_bought_now.append(product_id)
+                            continue
                         unresolved.append(product_id)
                         continue
+                    absent_checks.pop(product_id, None)
                     remote_steam_id = str(remote.get("receiveSteamId") or "")
                     expected_steam_id = str(submission.get("receivingSteamId") or "")
                     if expected_steam_id and remote_steam_id and remote_steam_id != expected_steam_id:
@@ -856,8 +985,22 @@ class C5CaseSweeper:
                     })
                     if status != "pending":
                         order["finishedAt"] = _iso(self._now())
+                confirmed_at = _iso(self._now())
+                not_bought_rows = submission.setdefault("notBoughtProducts", [])
+                for product_id in auto_not_bought_now:
+                    not_bought_rows.append({
+                        "productId": product_id,
+                        "confirmedAt": confirmed_at,
+                        "reason": f"自动确认未成交：连续 {AUTO_CONFIRM_NOT_BOUGHT_PASSES} 次未在 C5 远端订单查到",
+                        "autoConfirmed": True,
+                    })
+                    absent_checks.pop(product_id, None)
                 submission["lastCheckedAt"] = _iso(self._now())
-                submission["matchedCount"] = len(submission.get("products", [])) - len(unresolved)
+                submission["matchedCount"] = sum(
+                    1
+                    for requested in submission.get("products", [])
+                    if str(requested.get("productId") or "") in existing_by_product
+                )
                 submission["unresolvedProductIds"] = unresolved
                 submission.pop("lastCheckError", None)
                 if not unresolved:
@@ -866,12 +1009,107 @@ class C5CaseSweeper:
                 else:
                     submission["status"] = "uncertain"
                 if matched_now:
+                    if not unresolved:
+                        self._event_locked(
+                            round_data,
+                            "buy_reconciled",
+                            f"C5 超时购买对账补回 {matched_now} 件；本轮已全部对账完成。",
+                        )
+                    else:
+                        self._event_locked(
+                            round_data,
+                            "buy_reconciled",
+                            f"C5 超时购买对账补回 {matched_now} 件；仍有 {len(unresolved)} 件未确认，本轮继续保持暂停。",
+                        )
+                if auto_not_bought_now:
                     self._event_locked(
                         round_data,
-                        "buy_reconciled",
-                        f"C5 超时购买对账补回 {matched_now} 件；本轮继续保持暂停，需人工确认后再继续。",
+                        "auto_not_bought",
+                        f"自动确认 {len(auto_not_bought_now)} 件未成交（连续 {AUTO_CONFIRM_NOT_BOUGHT_PASSES} 次未在 C5 远端订单查到），未扣款。",
                     )
+            for round_id, _snapshot in uncertain:
+                round_data = self._round_locked(round_id, required=False)
+                if round_data is not None:
+                    self._maybe_auto_resume_after_reconcile(round_data)
             self._save_locked()
+
+    def _maybe_auto_resume_after_reconcile(self, round_data: dict[str, Any]) -> None:
+        """Resume a round paused by an uncertain batch once every batch is accounted for.
+
+        Only auto-resumes when the pause was caused by ``buy_uncertain`` and no
+        submission is still uncertain. The next worker tick still enforces the
+        price, budget, and target guards before buying anything.
+        """
+        if round_data.get("status") != "paused":
+            return
+        if round_data.get("stopReason") != "buy_uncertain":
+            return
+        if any(
+            submission.get("status") in {"submitting", "uncertain"}
+            for submission in round_data.get("submissions", [])
+        ):
+            return
+        round_data["status"] = "running"
+        round_data["stopReason"] = None
+        round_data["nextRunAt"] = _iso(self._now())
+        round_data["updatedAt"] = _iso(self._now())
+        self._event_locked(
+            round_data,
+            "auto_resumed",
+            "本轮超时批次已全部对账完成，自动继续扫货。",
+        )
+        self._wake.set()
+
+    def confirm_unresolved_not_bought(
+        self,
+        *,
+        round_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """人工确认：远端订单里查不到的商品确实未成交、未扣款。
+
+        只允许在本轮因购买结果不确定（``buy_uncertain``）暂停时调用；确认后
+        解除不确定状态并自动继续本轮，不会发起任何购买请求。
+        """
+        with self._lock:
+            round_data = self._round_locked(round_id)
+            if round_data.get("status") != "paused" or round_data.get("stopReason") != "buy_uncertain":
+                raise ValueError("当前轮次不在“购买结果不确定”暂停状态，无需人工确认")
+            confirmed_total = 0
+            for submission in round_data.get("submissions", []):
+                if submission.get("status") != "uncertain":
+                    continue
+                unresolved = [str(pid) for pid in submission.get("unresolvedProductIds", [])]
+                if not unresolved:
+                    continue
+                not_bought = submission.setdefault("notBoughtProducts", [])
+                existing_ids = {str(row.get("productId") or "") for row in not_bought}
+                confirmed_at = _iso(self._now())
+                for product_id in unresolved:
+                    if product_id in existing_ids:
+                        continue
+                    not_bought.append({
+                        "productId": product_id,
+                        "confirmedAt": confirmed_at,
+                        "reason": str(reason or "").strip() or "人工确认远端订单未成交、未扣款",
+                    })
+                    existing_ids.add(product_id)
+                    submission.get("absentChecks", {}).pop(product_id, None)
+                    confirmed_total += 1
+                submission["unresolvedProductIds"] = []
+                submission["status"] = "reconciled"
+                submission["reconciledAt"] = confirmed_at
+                submission["notBoughtConfirmedAt"] = confirmed_at
+            if not confirmed_total:
+                raise ValueError("没有需要人工确认的未成交商品")
+            self._event_locked(
+                round_data,
+                "manual_not_bought",
+                f"人工确认 {confirmed_total} 件未成交且未扣款，已解除不确定状态，本轮自动继续。",
+            )
+            self._maybe_auto_resume_after_reconcile(round_data)
+            self._save_locked()
+        return self.dashboard(round_data["id"])
 
     def _audit_all_pending(self) -> None:
         self._reconcile_uncertain_submissions()
@@ -1278,6 +1516,7 @@ class C5CaseSweeper:
                     "apiOnline": True,
                     "realExecutionRunning": real_running,
                     "round": None,
+                    "workerError": self._last_worker_error,
                     "counts": {"accepted": 0, "delivered": 0, "pending": 0, "failed": 0},
                     "money": {
                         "budget": 0.0,
@@ -1297,6 +1536,7 @@ class C5CaseSweeper:
                     "recentItems": recent_items,
                 }
             snapshot = json.loads(json.dumps(round_data, ensure_ascii=False))
+            snapshot["workerError"] = self._last_worker_error
             counts = self._counts(round_data)
             money = self._money(round_data)
         orders = snapshot.pop("orders", [])
@@ -1305,6 +1545,7 @@ class C5CaseSweeper:
             "apiOnline": True,
             "realExecutionRunning": real_running,
             "round": snapshot,
+            "workerError": self._last_worker_error,
             "counts": counts,
             "money": money,
             "orders": list(reversed(orders[-100:])),
@@ -1330,15 +1571,7 @@ class C5CaseSweeper:
             now = self._now()
             if running_round is not None:
                 if next_run is None or next_run <= now:
-                    self.run_cycle(allow_buy=True, round_id=running_round["id"])
-                    with self._lock:
-                        current = self._round_locked(running_round["id"], required=False)
-                        if current is not None and current.get("status") == "running":
-                            current["nextRunAt"] = _iso(
-                                self._now() + timedelta(seconds=DEFAULT_INTERVAL_SECONDS)
-                            )
-                            current["updatedAt"] = _iso(self._now())
-                            self._save_locked()
+                    self._run_due_round(running_round["id"])
                     continue
                 timeout = min(5.0, max(0.1, (next_run - now).total_seconds()))
                 self._wake.wait(timeout)
@@ -1348,12 +1581,56 @@ class C5CaseSweeper:
                 if self._cycle_lock.acquire(blocking=False):
                     try:
                         self._audit_all_pending()
+                    except Exception as exc:
+                        self._record_worker_error(f"pending audit failed: {type(exc).__name__}: {exc}")
                     finally:
                         self._cycle_lock.release()
                 self._next_idle_audit_at = self._now() + timedelta(seconds=DEFAULT_INTERVAL_SECONDS)
                 continue
             self._wake.wait(5.0)
             self._wake.clear()
+
+    def _record_worker_error(self, message: str) -> None:
+        self._last_worker_error = message
+        try:
+            print(f"[c5-case-sweeper] {message}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+    def _run_due_round(self, round_id: str) -> None:
+        """Run one due cycle without ever killing the worker thread.
+
+        Any exception (network, transient file lock, unexpected bug) is
+        recorded, the round stays running, and the next tick retries instead
+        of silently stopping the scheduler forever.
+        """
+        try:
+            self.run_cycle(allow_buy=True, round_id=round_id)
+        except Exception as exc:
+            self._record_worker_error(f"run_cycle failed: {type(exc).__name__}: {exc}")
+            with self._lock:
+                current = self._round_locked(round_id, required=False)
+                if current is not None and current.get("status") == "running":
+                    current["nextRunAt"] = _iso(
+                        self._now() + timedelta(seconds=DEFAULT_INTERVAL_SECONDS)
+                    )
+                    current["updatedAt"] = _iso(self._now())
+            return
+        with self._lock:
+            current = self._round_locked(round_id, required=False)
+            if current is not None and current.get("status") == "running":
+                current["nextRunAt"] = _iso(
+                    self._now() + timedelta(seconds=DEFAULT_INTERVAL_SECONDS)
+                )
+                current["updatedAt"] = _iso(self._now())
+                try:
+                    self._save_locked()
+                except Exception as exc:
+                    # The in-memory schedule still advances so the next tick
+                    # retries; the persisted file keeps the last safe snapshot.
+                    self._record_worker_error(f"persist state failed: {type(exc).__name__}: {exc}")
+                    return
+        self._last_worker_error = None
 
     def close(self) -> None:
         self._shutdown.set()

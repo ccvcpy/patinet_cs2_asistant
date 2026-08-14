@@ -273,6 +273,24 @@ const averageCoverage = computed(() => {
 const lastCollection = computed(() => runtime.value?.runtime.lastCollectionResult || {});
 const missingCount = computed(() => Number(lastCollection.value.missingC5Count || 0) +
     Number(lastCollection.value.missingSteamCount || 0));
+const lastInterruption = computed(() => runtime.value?.runtime.lastInterruption || null);
+function formatBeijingDateTime(value) {
+    if (!value)
+        return "时间未知";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime()))
+        return "时间未知";
+    return new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    }).format(parsed);
+}
 function openDetail(item) {
     selectedName.value = item.marketHashName;
     drawerItem.value = item;
@@ -442,6 +460,26 @@ const __VLS_23 = {
 __VLS_19.slots.default;
 (__VLS_ctx.runtime?.runtime.enabled ? "暂停监控" : "开始监控");
 var __VLS_19;
+if (__VLS_ctx.lastInterruption) {
+    /** @type {[typeof CaseMonitorFeedback, typeof CaseMonitorFeedback, ]} */ ;
+    // @ts-ignore
+    const __VLS_24 = __VLS_asFunctionalComponent(CaseMonitorFeedback, new CaseMonitorFeedback({
+        tone: "error",
+    }));
+    const __VLS_25 = __VLS_24({
+        tone: "error",
+    }, ...__VLS_functionalComponentArgsRest(__VLS_24));
+    __VLS_26.slots.default;
+    (__VLS_ctx.formatBeijingDateTime(__VLS_ctx.lastInterruption.interruptedAt));
+    (__VLS_ctx.lastInterruption.progressCurrent);
+    (__VLS_ctx.lastInterruption.progressTotal);
+    if (__VLS_ctx.lastInterruption.savedCount > 0) {
+        (__VLS_ctx.lastInterruption.savedCount);
+    }
+    else {
+    }
+    var __VLS_26;
+}
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "case-monitor-controls" },
     'aria-label': "监控与报告控制",
@@ -454,14 +492,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof CaseMonitorIntervalPicker, ]} */ ;
 // @ts-ignore
-const __VLS_24 = __VLS_asFunctionalComponent(CaseMonitorIntervalPicker, new CaseMonitorIntervalPicker({
+const __VLS_27 = __VLS_asFunctionalComponent(CaseMonitorIntervalPicker, new CaseMonitorIntervalPicker({
     modelValue: (__VLS_ctx.intervalMinutes),
     disabled: (Boolean(__VLS_ctx.runtime?.runtime.enabled || __VLS_ctx.busy)),
 }));
-const __VLS_25 = __VLS_24({
+const __VLS_28 = __VLS_27({
     modelValue: (__VLS_ctx.intervalMinutes),
     disabled: (Boolean(__VLS_ctx.runtime?.runtime.enabled || __VLS_ctx.busy)),
-}, ...__VLS_functionalComponentArgsRest(__VLS_24));
+}, ...__VLS_functionalComponentArgsRest(__VLS_27));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span)({
     ...{ class: "case-control-divider" },
 });
@@ -473,28 +511,28 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof CaseMonitorSegmented, ]} */ ;
 // @ts-ignore
-const __VLS_27 = __VLS_asFunctionalComponent(CaseMonitorSegmented, new CaseMonitorSegmented({
+const __VLS_30 = __VLS_asFunctionalComponent(CaseMonitorSegmented, new CaseMonitorSegmented({
     modelValue: (__VLS_ctx.reportWindow),
     options: (__VLS_ctx.reportWindows),
     disabled: (__VLS_ctx.busy),
-}));
-const __VLS_28 = __VLS_27({
-    modelValue: (__VLS_ctx.reportWindow),
-    options: (__VLS_ctx.reportWindows),
-    disabled: (__VLS_ctx.busy),
-}, ...__VLS_functionalComponentArgsRest(__VLS_27));
-/** @type {[typeof FolioIcon, ]} */ ;
-// @ts-ignore
-const __VLS_30 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-    name: "calendar",
-    size: (14),
-    ...{ class: "case-custom-calendar" },
 }));
 const __VLS_31 = __VLS_30({
+    modelValue: (__VLS_ctx.reportWindow),
+    options: (__VLS_ctx.reportWindows),
+    disabled: (__VLS_ctx.busy),
+}, ...__VLS_functionalComponentArgsRest(__VLS_30));
+/** @type {[typeof FolioIcon, ]} */ ;
+// @ts-ignore
+const __VLS_33 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
     name: "calendar",
     size: (14),
     ...{ class: "case-custom-calendar" },
-}, ...__VLS_functionalComponentArgsRest(__VLS_30));
+}));
+const __VLS_34 = __VLS_33({
+    name: "calendar",
+    size: (14),
+    ...{ class: "case-custom-calendar" },
+}, ...__VLS_functionalComponentArgsRest(__VLS_33));
 if (__VLS_ctx.reportWindow === 'custom') {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "case-custom-range" },
@@ -522,14 +560,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof CaseMonitorToggle, ]} */ ;
 // @ts-ignore
-const __VLS_33 = __VLS_asFunctionalComponent(CaseMonitorToggle, new CaseMonitorToggle({
+const __VLS_36 = __VLS_asFunctionalComponent(CaseMonitorToggle, new CaseMonitorToggle({
     modelValue: (__VLS_ctx.refreshLiquidity),
     disabled: (__VLS_ctx.busy),
 }));
-const __VLS_34 = __VLS_33({
+const __VLS_37 = __VLS_36({
     modelValue: (__VLS_ctx.refreshLiquidity),
     disabled: (__VLS_ctx.busy),
-}, ...__VLS_functionalComponentArgsRest(__VLS_33));
+}, ...__VLS_functionalComponentArgsRest(__VLS_36));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span)({
     ...{ class: "case-control-divider" },
 });
@@ -579,14 +617,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof FolioIcon, ]} */ ;
 // @ts-ignore
-const __VLS_36 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+const __VLS_39 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
     name: "shield",
     size: (31),
 }));
-const __VLS_37 = __VLS_36({
+const __VLS_40 = __VLS_39({
     name: "shield",
     size: (31),
-}, ...__VLS_functionalComponentArgsRest(__VLS_36));
+}, ...__VLS_functionalComponentArgsRest(__VLS_39));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -599,14 +637,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof FolioIcon, ]} */ ;
 // @ts-ignore
-const __VLS_39 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+const __VLS_42 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
     name: "case",
     size: (31),
 }));
-const __VLS_40 = __VLS_39({
+const __VLS_43 = __VLS_42({
     name: "case",
     size: (31),
-}, ...__VLS_functionalComponentArgsRest(__VLS_39));
+}, ...__VLS_functionalComponentArgsRest(__VLS_42));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({
@@ -621,14 +659,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof FolioIcon, ]} */ ;
 // @ts-ignore
-const __VLS_42 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+const __VLS_45 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
     name: "report",
     size: (31),
 }));
-const __VLS_43 = __VLS_42({
+const __VLS_46 = __VLS_45({
     name: "report",
     size: (31),
-}, ...__VLS_functionalComponentArgsRest(__VLS_42));
+}, ...__VLS_functionalComponentArgsRest(__VLS_45));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({
@@ -643,14 +681,14 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
 });
 /** @type {[typeof FolioIcon, ]} */ ;
 // @ts-ignore
-const __VLS_45 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+const __VLS_48 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
     name: "clock",
     size: (31),
 }));
-const __VLS_46 = __VLS_45({
+const __VLS_49 = __VLS_48({
     name: "clock",
     size: (31),
-}, ...__VLS_functionalComponentArgsRest(__VLS_45));
+}, ...__VLS_functionalComponentArgsRest(__VLS_48));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
 __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
@@ -663,31 +701,31 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.d
 });
 /** @type {[typeof CaseMonitorCategoryTabs, ]} */ ;
 // @ts-ignore
-const __VLS_48 = __VLS_asFunctionalComponent(CaseMonitorCategoryTabs, new CaseMonitorCategoryTabs({
+const __VLS_51 = __VLS_asFunctionalComponent(CaseMonitorCategoryTabs, new CaseMonitorCategoryTabs({
     ...{ 'onUpdate:modelValue': {} },
     modelValue: (__VLS_ctx.typeFilter),
     options: (__VLS_ctx.categoryOptions),
 }));
-const __VLS_49 = __VLS_48({
+const __VLS_52 = __VLS_51({
     ...{ 'onUpdate:modelValue': {} },
     modelValue: (__VLS_ctx.typeFilter),
     options: (__VLS_ctx.categoryOptions),
-}, ...__VLS_functionalComponentArgsRest(__VLS_48));
-let __VLS_51;
-let __VLS_52;
-let __VLS_53;
-const __VLS_54 = {
+}, ...__VLS_functionalComponentArgsRest(__VLS_51));
+let __VLS_54;
+let __VLS_55;
+let __VLS_56;
+const __VLS_57 = {
     'onUpdate:modelValue': (__VLS_ctx.chooseCategory)
 };
-var __VLS_50;
+var __VLS_53;
 /** @type {[typeof CaseMonitorSearch, ]} */ ;
 // @ts-ignore
-const __VLS_55 = __VLS_asFunctionalComponent(CaseMonitorSearch, new CaseMonitorSearch({
+const __VLS_58 = __VLS_asFunctionalComponent(CaseMonitorSearch, new CaseMonitorSearch({
     modelValue: (__VLS_ctx.keyword),
 }));
-const __VLS_56 = __VLS_55({
+const __VLS_59 = __VLS_58({
     modelValue: (__VLS_ctx.keyword),
-}, ...__VLS_functionalComponentArgsRest(__VLS_55));
+}, ...__VLS_functionalComponentArgsRest(__VLS_58));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
 if (__VLS_ctx.loading) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
@@ -709,20 +747,6 @@ else {
         'aria-hidden': "true",
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
-        ...{ class: "cm-recommendation-header__info" },
-    });
-    /** @type {[typeof FolioIcon, ]} */ ;
-    // @ts-ignore
-    const __VLS_58 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
-        name: "info",
-        size: (12),
-    }));
-    const __VLS_59 = __VLS_58({
-        name: "info",
-        size: (12),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_58));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
         ...{ class: "cm-recommendation-header__info" },
@@ -752,29 +776,43 @@ else {
         size: (12),
     }, ...__VLS_functionalComponentArgsRest(__VLS_64));
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+        ...{ class: "cm-recommendation-header__info" },
+    });
+    /** @type {[typeof FolioIcon, ]} */ ;
+    // @ts-ignore
+    const __VLS_67 = __VLS_asFunctionalComponent(FolioIcon, new FolioIcon({
+        name: "info",
+        size: (12),
+    }));
+    const __VLS_68 = __VLS_67({
+        name: "info",
+        size: (12),
+    }, ...__VLS_functionalComponentArgsRest(__VLS_67));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
     for (const [item, index] of __VLS_getVForSourceType((__VLS_ctx.pagedItems))) {
         /** @type {[typeof CaseMonitorRecommendationRow, ]} */ ;
         // @ts-ignore
-        const __VLS_67 = __VLS_asFunctionalComponent(CaseMonitorRecommendationRow, new CaseMonitorRecommendationRow({
+        const __VLS_70 = __VLS_asFunctionalComponent(CaseMonitorRecommendationRow, new CaseMonitorRecommendationRow({
             ...{ 'onClick': {} },
             key: (item.marketHashName),
             item: (item),
             rank: ((__VLS_ctx.currentPage - 1) * __VLS_ctx.pageSize + index + 1),
             selected: (__VLS_ctx.selectedName === item.marketHashName),
         }));
-        const __VLS_68 = __VLS_67({
+        const __VLS_71 = __VLS_70({
             ...{ 'onClick': {} },
             key: (item.marketHashName),
             item: (item),
             rank: ((__VLS_ctx.currentPage - 1) * __VLS_ctx.pageSize + index + 1),
             selected: (__VLS_ctx.selectedName === item.marketHashName),
-        }, ...__VLS_functionalComponentArgsRest(__VLS_67));
-        let __VLS_70;
-        let __VLS_71;
-        let __VLS_72;
-        const __VLS_73 = {
+        }, ...__VLS_functionalComponentArgsRest(__VLS_70));
+        let __VLS_73;
+        let __VLS_74;
+        let __VLS_75;
+        const __VLS_76 = {
             onClick: (...[$event]) => {
                 if (!!(__VLS_ctx.loading))
                     return;
@@ -783,7 +821,7 @@ else {
                 __VLS_ctx.openDetail(item);
             }
         };
-        var __VLS_69;
+        var __VLS_72;
     }
     if (!__VLS_ctx.pagedItems.length) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
@@ -792,22 +830,22 @@ else {
     }
     /** @type {[typeof CaseMonitorPagination, ]} */ ;
     // @ts-ignore
-    const __VLS_74 = __VLS_asFunctionalComponent(CaseMonitorPagination, new CaseMonitorPagination({
+    const __VLS_77 = __VLS_asFunctionalComponent(CaseMonitorPagination, new CaseMonitorPagination({
         ...{ 'onUpdate:pageSize': {} },
         modelValue: (__VLS_ctx.currentPage),
         totalItems: (__VLS_ctx.rankedItems.length),
         pageSize: (__VLS_ctx.pageSize),
     }));
-    const __VLS_75 = __VLS_74({
+    const __VLS_78 = __VLS_77({
         ...{ 'onUpdate:pageSize': {} },
         modelValue: (__VLS_ctx.currentPage),
         totalItems: (__VLS_ctx.rankedItems.length),
         pageSize: (__VLS_ctx.pageSize),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_74));
-    let __VLS_77;
-    let __VLS_78;
-    let __VLS_79;
-    const __VLS_80 = {
+    }, ...__VLS_functionalComponentArgsRest(__VLS_77));
+    let __VLS_80;
+    let __VLS_81;
+    let __VLS_82;
+    const __VLS_83 = {
         'onUpdate:pageSize': (...[$event]) => {
             if (!!(__VLS_ctx.loading))
                 return;
@@ -816,36 +854,36 @@ else {
             __VLS_ctx.pageSize = $event;
         }
     };
-    var __VLS_76;
+    var __VLS_79;
 }
 if (__VLS_ctx.notice) {
     /** @type {[typeof CaseMonitorFeedback, typeof CaseMonitorFeedback, ]} */ ;
     // @ts-ignore
-    const __VLS_81 = __VLS_asFunctionalComponent(CaseMonitorFeedback, new CaseMonitorFeedback({
+    const __VLS_84 = __VLS_asFunctionalComponent(CaseMonitorFeedback, new CaseMonitorFeedback({
         ...{ 'onClose': {} },
         ...{ class: "case-monitor-toast" },
         tone: (__VLS_ctx.notice.tone),
     }));
-    const __VLS_82 = __VLS_81({
+    const __VLS_85 = __VLS_84({
         ...{ 'onClose': {} },
         ...{ class: "case-monitor-toast" },
         tone: (__VLS_ctx.notice.tone),
-    }, ...__VLS_functionalComponentArgsRest(__VLS_81));
-    let __VLS_84;
-    let __VLS_85;
-    let __VLS_86;
-    const __VLS_87 = {
+    }, ...__VLS_functionalComponentArgsRest(__VLS_84));
+    let __VLS_87;
+    let __VLS_88;
+    let __VLS_89;
+    const __VLS_90 = {
         onClose: (...[$event]) => {
             if (!(__VLS_ctx.notice))
                 return;
             __VLS_ctx.notice = null;
         }
     };
-    __VLS_83.slots.default;
+    __VLS_86.slots.default;
     (__VLS_ctx.notice.message);
     if (__VLS_ctx.notice.showExports) {
         {
-            const { actions: __VLS_thisSlot } = __VLS_83.slots;
+            const { actions: __VLS_thisSlot } = __VLS_86.slots;
             __VLS_asFunctionalElement(__VLS_intrinsicElements.a, __VLS_intrinsicElements.a)({
                 href: (__VLS_ctx.exportUrl('summary_csv')),
             });
@@ -857,29 +895,29 @@ if (__VLS_ctx.notice) {
             });
         }
     }
-    var __VLS_83;
+    var __VLS_86;
 }
 /** @type {[typeof CaseMonitorDetailDrawer, ]} */ ;
 // @ts-ignore
-const __VLS_88 = __VLS_asFunctionalComponent(CaseMonitorDetailDrawer, new CaseMonitorDetailDrawer({
+const __VLS_91 = __VLS_asFunctionalComponent(CaseMonitorDetailDrawer, new CaseMonitorDetailDrawer({
     ...{ 'onClose': {} },
     open: (Boolean(__VLS_ctx.drawerItem)),
     item: (__VLS_ctx.drawerItem),
 }));
-const __VLS_89 = __VLS_88({
+const __VLS_92 = __VLS_91({
     ...{ 'onClose': {} },
     open: (Boolean(__VLS_ctx.drawerItem)),
     item: (__VLS_ctx.drawerItem),
-}, ...__VLS_functionalComponentArgsRest(__VLS_88));
-let __VLS_91;
-let __VLS_92;
-let __VLS_93;
-const __VLS_94 = {
+}, ...__VLS_functionalComponentArgsRest(__VLS_91));
+let __VLS_94;
+let __VLS_95;
+let __VLS_96;
+const __VLS_97 = {
     onClose: (...[$event]) => {
         __VLS_ctx.drawerItem = null;
     }
 };
-var __VLS_90;
+var __VLS_93;
 /** @type {__VLS_StyleScopedClasses['cm-surface']} */ ;
 /** @type {__VLS_StyleScopedClasses['case-monitor-page']} */ ;
 /** @type {__VLS_StyleScopedClasses['case-monitor-header']} */ ;
@@ -979,6 +1017,8 @@ const __VLS_self = (await import('vue')).defineComponent({
             validSnapshots: validSnapshots,
             averageCoverage: averageCoverage,
             lastCollection: lastCollection,
+            lastInterruption: lastInterruption,
+            formatBeijingDateTime: formatBeijingDateTime,
             openDetail: openDetail,
             chooseCategory: chooseCategory,
             exportUrl: exportUrl,

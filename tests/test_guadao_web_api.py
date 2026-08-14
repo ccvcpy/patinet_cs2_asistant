@@ -28,11 +28,26 @@ class OneRequestServer(HTTPServer):
 
 
 class FakeSweeper:
+    confirm_calls: list[dict] = []
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
     def close(self) -> None:
         return
+
+    def confirm_unresolved_not_bought(
+        self,
+        *,
+        round_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict:
+        FakeSweeper.confirm_calls.append({"roundId": round_id, "reason": reason})
+        return {
+            "apiOnline": True,
+            "realExecutionRunning": True,
+            "round": {"id": round_id or "round-1", "status": "running", "stopReason": None},
+        }
 
 
 class FakeProfitLogger:
@@ -331,6 +346,22 @@ class GuadaoWebApiTestCase(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual("live-account", payload["accounts"][0]["account"])
         self.assertEqual(12.34, payload["accounts"][0]["realBalance"])
+
+    def test_c5_sweeper_confirm_not_bought_endpoint_forwards_round(self) -> None:
+        FakeSweeper.confirm_calls.clear()
+        status, payload = self._request(
+            "POST",
+            "/api/c5-sweeper/confirm-not-bought",
+            {"roundId": "round-9", "reason": "人工核对"},
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("round-9", payload["dashboard"]["round"]["id"])
+        self.assertEqual(
+            [{"roundId": "round-9", "reason": "人工核对"}],
+            FakeSweeper.confirm_calls,
+        )
 
     def test_case_monitor_runtime_and_report_endpoints_use_injected_controller(self) -> None:
         status, payload = self._request(

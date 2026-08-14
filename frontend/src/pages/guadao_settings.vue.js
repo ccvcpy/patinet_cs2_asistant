@@ -25,15 +25,16 @@ const validation = computed(() => { const s = settings.value; if (!s)
         errors.push(`${rule.marketHashName} 的专用上限必须大于 0`);
     if (rule.maxRatioPct > 80)
         errors.push(`${rule.marketHashName} 的专用上限不能超过 80%`);
+    if (rule.rebuyReferenceFloor != null && !(rule.rebuyReferenceFloor > 0))
+        errors.push(`${rule.marketHashName} 的开单参考价下限必须大于 0`);
 } if (s.timePolicy.scanMinutes < 1)
-    errors.push("完整扫描不得低于 1 分钟"); if (s.timePolicy.steamSyncSeconds < 30)
-    errors.push("普通 Steam 同步不得低于 30 秒"); if (s.timePolicy.steamSyncMaxStartLagSeconds < 1)
-    errors.push("Steam 同步最长等待不得低于 1 秒"); if (s.timePolicy.staleListedCheckHours < 1)
-    errors.push("老挂单候选扫描不得低于 1 小时"); if (s.timePolicy.actionConfirmSeconds.some(v => v < 2))
-    errors.push("动作确认不得低于 2 秒"); if (s.timePolicy.soldEvidenceMinutes.some(v => v < 0))
-    errors.push("卖出证据复核间隔不能为负数"); if (s.timePolicy.rebuyMinutes.some(v => v < .5) || s.timePolicy.deliveryMinutes.some(v => v < .5))
-    errors.push("C5 复查不得低于 30 秒"); const sequences = [s.timePolicy.actionConfirmSeconds, s.timePolicy.soldEvidenceMinutes, s.timePolicy.rebuyMinutes, s.timePolicy.deliveryMinutes]; if (sequences.some(values => values.some((value, index) => index > 0 && value < values[index - 1])))
-    errors.push("多段退避时间必须非递减"); return errors; });
+    errors.push("新机会扫描间隔不得低于 1 分钟"); if (s.timePolicy.steamSyncMaxStartLagSeconds < 1)
+    errors.push("Steam 检查到期后的最多延迟不得低于 1 秒"); if (s.timePolicy.staleListedCheckHours < 1)
+    errors.push("超过 48 小时挂单的查找间隔不得低于 1 小时"); if (s.timePolicy.actionConfirmSeconds.some(v => v < 2))
+    errors.push("上架后确认间隔不得低于 2 秒"); if (s.timePolicy.soldEvidenceMinutes.some(v => v < 0))
+    errors.push("在售挂单与卖出证据复查间隔不能为负数"); if (s.timePolicy.rebuyMinutes.some(v => v < .5) || s.timePolicy.deliveryMinutes.some(v => v < .5))
+    errors.push("C5 检查间隔不得低于 30 秒"); const sequences = [s.timePolicy.actionConfirmSeconds, s.timePolicy.soldEvidenceMinutes, s.timePolicy.rebuyMinutes, s.timePolicy.deliveryMinutes]; if (sequences.some(values => values.some((value, index) => index > 0 && value < values[index - 1])))
+    errors.push("同一组检查间隔必须从短到长排列"); return errors; });
 function numeric(value, fallback = 0) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
 function durationLabel(seconds) { if (seconds == null)
     return "—"; if (seconds % 3600 === 0)
@@ -41,7 +42,7 @@ function durationLabel(seconds) { if (seconds == null)
     return `${seconds / 60} 分钟`; return `${seconds} 秒`; }
 function auditText(value) { if (value == null)
     return "—"; const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 120 ? `${text.slice(0, 117)}…` : text; }
-function adaptSettings(raw) { const task = (raw.taskSchedule && typeof raw.taskSchedule === "object" ? raw.taskSchedule : {}); const nestedGlobal = (raw.global && typeof raw.global === "object" ? raw.global : {}); const rules = (Array.isArray(raw.specialRules) ? raw.specialRules : Array.isArray(raw.specialCaseRatioRules) ? raw.specialCaseRatioRules : []); const audit = (Array.isArray(raw.audit) ? raw.audit : []); const tierMinutes = (key) => (Array.isArray(task[key]) ? task[key] : []).map(tier => numeric(tier.intervalSeconds) / 60); return { runtime: (raw.runtime || undefined), global: { maxListingRatioPct: nestedGlobal.maxListingRatioPct == null ? numeric(raw.guadaoMaxListingRatio) * 100 : numeric(nestedGlobal.maxListingRatioPct), steamNetFactorPct: nestedGlobal.steamNetFactorPct == null ? (raw.steamNetFactor == null ? null : numeric(raw.steamNetFactor) * 100) : numeric(nestedGlobal.steamNetFactorPct), maxNewListingsPerCycle: nestedGlobal.maxNewListingsPerCycle == null ? (raw.maxNewListingsPerCycle == null ? null : numeric(raw.maxNewListingsPerCycle)) : numeric(nestedGlobal.maxNewListingsPerCycle), caseMaxOpenCount: nestedGlobal.caseMaxOpenCount == null ? (raw.caseMaxOpenCount == null ? null : numeric(raw.caseMaxOpenCount)) : numeric(nestedGlobal.caseMaxOpenCount), autoListing: nestedGlobal.autoListing == null ? Boolean(raw.autoListEnabled) : Boolean(nestedGlobal.autoListing), autoRebuy: nestedGlobal.autoRebuy == null ? Boolean(raw.autoRebuyEnabled) : Boolean(nestedGlobal.autoRebuy), lastModifiedAt: String(nestedGlobal.lastModifiedAt || "") || null }, specialRules: rules.map(rule => ({ id: String(rule.id || rule.ruleId || ""), marketHashName: String(rule.marketHashName || ""), displayName: String(rule.displayName || rule.nameCn || "") || null, maxRatioPct: rule.maxRatioPct == null ? numeric(rule.maxListingRatio) * 100 : numeric(rule.maxRatioPct), currentRatioPct: rule.currentRatioPct == null ? null : numeric(rule.currentRatioPct), currentRatioObservedAt: String(rule.currentRatioObservedAt || "") || null, enabled: rule.enabled !== false, version: numeric(rule.version, 1), updatedAt: String(rule.updatedAt || "") || null })), timePolicy: { scanMinutes: numeric(task.scanIntervalSeconds) / 60, steamSyncSeconds: numeric(task.steamSyncIntervalSeconds), steamSyncMaxStartLagSeconds: numeric(task.steamSyncMaxStartLagSeconds, 60), staleListedCheckHours: numeric(task.staleListedCheckIntervalSeconds, 86400) / 3600, actionConfirmSeconds: (Array.isArray(task.actionConfirmationDelaysSeconds) ? task.actionConfirmationDelaysSeconds : []).map(value => numeric(value)), soldEvidenceMinutes: (Array.isArray(task.saleEvidenceDelaysSeconds) ? task.saleEvidenceDelaysSeconds : []).map(value => numeric(value) / 60), rebuyMinutes: tierMinutes("rebuyRetryTiers"), deliveryMinutes: tierMinutes("deliveryConfirmationTiers"), staleListedRecheckHours: raw.staleListedRecheckHours == null ? null : numeric(raw.staleListedRecheckHours), staleListedMaxRatioTolerancePct: raw.staleListedMaxRatioTolerancePct == null ? null : numeric(raw.staleListedMaxRatioTolerancePct) }, rawTaskSchedule: JSON.parse(JSON.stringify(task)), steamScheduler: (raw.steamScheduler || undefined), audit: audit.map(row => ({ id: String(row.id || ""), at: String(row.createdAt || row.at || ""), actor: String(row.actor || ""), summary: String(row.reason || row.summary || ""), changes: row.diff ? JSON.stringify(row.diff) : String(row.changes || ""), oldValue: row.oldValue, newValue: row.newValue, diff: row.diff })) }; }
+function adaptSettings(raw) { const task = (raw.taskSchedule && typeof raw.taskSchedule === "object" ? raw.taskSchedule : {}); const nestedGlobal = (raw.global && typeof raw.global === "object" ? raw.global : {}); const rules = (Array.isArray(raw.specialRules) ? raw.specialRules : Array.isArray(raw.specialCaseRatioRules) ? raw.specialCaseRatioRules : []); const audit = (Array.isArray(raw.audit) ? raw.audit : []); const tierMinutes = (key) => (Array.isArray(task[key]) ? task[key] : []).map(tier => numeric(tier.intervalSeconds) / 60); return { runtime: (raw.runtime || undefined), global: { maxListingRatioPct: nestedGlobal.maxListingRatioPct == null ? numeric(raw.guadaoMaxListingRatio) * 100 : numeric(nestedGlobal.maxListingRatioPct), steamNetFactorPct: nestedGlobal.steamNetFactorPct == null ? (raw.steamNetFactor == null ? null : numeric(raw.steamNetFactor) * 100) : numeric(nestedGlobal.steamNetFactorPct), maxNewListingsPerCycle: nestedGlobal.maxNewListingsPerCycle == null ? (raw.maxNewListingsPerCycle == null ? null : numeric(raw.maxNewListingsPerCycle)) : numeric(nestedGlobal.maxNewListingsPerCycle), caseMaxOpenCount: nestedGlobal.caseMaxOpenCount == null ? (raw.caseMaxOpenCount == null ? null : numeric(raw.caseMaxOpenCount)) : numeric(nestedGlobal.caseMaxOpenCount), autoListing: nestedGlobal.autoListing == null ? Boolean(raw.autoListEnabled) : Boolean(nestedGlobal.autoListing), autoRebuy: nestedGlobal.autoRebuy == null ? Boolean(raw.autoRebuyEnabled) : Boolean(nestedGlobal.autoRebuy), lastModifiedAt: String(nestedGlobal.lastModifiedAt || "") || null }, specialRules: rules.map(rule => ({ id: String(rule.id || rule.ruleId || ""), marketHashName: String(rule.marketHashName || ""), displayName: String(rule.displayName || rule.nameCn || "") || null, maxRatioPct: rule.maxRatioPct == null ? numeric(rule.maxListingRatio) * 100 : numeric(rule.maxRatioPct), rebuyReferenceFloor: rule.rebuyReferenceFloor == null ? null : numeric(rule.rebuyReferenceFloor), currentRatioPct: rule.currentRatioPct == null ? null : numeric(rule.currentRatioPct), currentRatioObservedAt: String(rule.currentRatioObservedAt || "") || null, enabled: rule.enabled !== false, version: numeric(rule.version, 1), updatedAt: String(rule.updatedAt || "") || null })), timePolicy: { scanMinutes: numeric(task.scanIntervalSeconds) / 60, steamSyncSeconds: numeric(task.steamSyncIntervalSeconds), steamSyncMaxStartLagSeconds: numeric(task.steamSyncMaxStartLagSeconds, 60), staleListedCheckHours: numeric(task.staleListedCheckIntervalSeconds, 86400) / 3600, actionConfirmSeconds: (Array.isArray(task.actionConfirmationDelaysSeconds) ? task.actionConfirmationDelaysSeconds : []).map(value => numeric(value)), soldEvidenceMinutes: (Array.isArray(task.saleEvidenceDelaysSeconds) ? task.saleEvidenceDelaysSeconds : []).map(value => numeric(value) / 60), rebuyMinutes: tierMinutes("rebuyRetryTiers"), deliveryMinutes: tierMinutes("deliveryConfirmationTiers"), staleListedRecheckHours: raw.staleListedRecheckHours == null ? null : numeric(raw.staleListedRecheckHours), staleListedMaxRatioTolerancePct: raw.staleListedMaxRatioTolerancePct == null ? null : numeric(raw.staleListedMaxRatioTolerancePct) }, rawTaskSchedule: JSON.parse(JSON.stringify(task)), steamScheduler: (raw.steamScheduler || undefined), audit: audit.map(row => ({ id: String(row.id || ""), at: String(row.createdAt || row.at || ""), actor: String(row.actor || ""), summary: String(row.reason || row.summary || ""), changes: row.diff ? JSON.stringify(row.diff) : String(row.changes || ""), oldValue: row.oldValue, newValue: row.newValue, diff: row.diff })) }; }
 async function load() { loading.value = true; try {
     const response = await fetch("/api/guadao/settings", { cache: "no-store" });
     if (!response.ok)
@@ -58,7 +59,7 @@ finally {
 } }
 function changed() { dirty.value = true; notice.value = ""; }
 async function save() { if (!settings.value || validation.value.length)
-    return; const current = settings.value; const rawTask = { ...current.rawTaskSchedule, scanIntervalSeconds: current.timePolicy.scanMinutes * 60, steamSyncIntervalSeconds: current.timePolicy.steamSyncSeconds, steamSyncMaxStartLagSeconds: current.timePolicy.steamSyncMaxStartLagSeconds, staleListedCheckIntervalSeconds: current.timePolicy.staleListedCheckHours * 3600, actionConfirmationDelaysSeconds: current.timePolicy.actionConfirmSeconds, saleEvidenceDelaysSeconds: current.timePolicy.soldEvidenceMinutes.map(value => value * 60) }; const rebuyRaw = (Array.isArray(rawTask.rebuyRetryTiers) ? rawTask.rebuyRetryTiers : []); const deliveryRaw = (Array.isArray(rawTask.deliveryConfirmationTiers) ? rawTask.deliveryConfirmationTiers : []); rawTask.rebuyRetryTiers = current.timePolicy.rebuyMinutes.map((value, index) => ({ ...rebuyRaw[index], intervalSeconds: value * 60 })); rawTask.deliveryConfirmationTiers = current.timePolicy.deliveryMinutes.map((value, index) => ({ ...deliveryRaw[index], intervalSeconds: value * 60 })); const body = { guadaoMaxListingRatio: current.global.maxListingRatioPct / 100, autoListEnabled: current.global.autoListing, autoRebuyEnabled: current.global.autoRebuy, maxListPerCycle: current.global.maxNewListingsPerCycle, caseMaxOpenGuadaoCount: current.global.caseMaxOpenCount, staleListedRecheckHours: current.timePolicy.staleListedRecheckHours, staleListedMaxRatioTolerancePct: current.timePolicy.staleListedMaxRatioTolerancePct, specialCaseRatioRules: current.specialRules.map(rule => ({ ruleId: rule.id, version: rule.version, marketHashName: rule.marketHashName, nameCn: rule.displayName, maxListingRatio: rule.maxRatioPct / 100, enabled: rule.enabled })), taskSchedule: rawTask, confirmHighRatio: ratioWarning.value }; saving.value = true; try {
+    return; const current = settings.value; const rawTask = { ...current.rawTaskSchedule, scanIntervalSeconds: current.timePolicy.scanMinutes * 60, steamSyncIntervalSeconds: current.timePolicy.steamSyncSeconds, steamSyncMaxStartLagSeconds: current.timePolicy.steamSyncMaxStartLagSeconds, staleListedCheckIntervalSeconds: current.timePolicy.staleListedCheckHours * 3600, actionConfirmationDelaysSeconds: current.timePolicy.actionConfirmSeconds, saleEvidenceDelaysSeconds: current.timePolicy.soldEvidenceMinutes.map(value => value * 60) }; const rebuyRaw = (Array.isArray(rawTask.rebuyRetryTiers) ? rawTask.rebuyRetryTiers : []); const deliveryRaw = (Array.isArray(rawTask.deliveryConfirmationTiers) ? rawTask.deliveryConfirmationTiers : []); rawTask.rebuyRetryTiers = current.timePolicy.rebuyMinutes.map((value, index) => ({ ...rebuyRaw[index], intervalSeconds: value * 60 })); rawTask.deliveryConfirmationTiers = current.timePolicy.deliveryMinutes.map((value, index) => ({ ...deliveryRaw[index], intervalSeconds: value * 60 })); const body = { guadaoMaxListingRatio: current.global.maxListingRatioPct / 100, autoListEnabled: current.global.autoListing, autoRebuyEnabled: current.global.autoRebuy, maxListPerCycle: current.global.maxNewListingsPerCycle, caseMaxOpenGuadaoCount: current.global.caseMaxOpenCount, staleListedRecheckHours: current.timePolicy.staleListedRecheckHours, staleListedMaxRatioTolerancePct: current.timePolicy.staleListedMaxRatioTolerancePct, specialCaseRatioRules: current.specialRules.map(rule => ({ ruleId: rule.id, version: rule.version, marketHashName: rule.marketHashName, nameCn: rule.displayName, maxListingRatio: rule.maxRatioPct / 100, rebuyReferenceFloor: rule.rebuyReferenceFloor, enabled: rule.enabled })), taskSchedule: rawTask, confirmHighRatio: ratioWarning.value }; saving.value = true; try {
     const response = await fetch("/api/guadao/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!response.ok)
         throw new Error(await responseError(response));
@@ -115,7 +116,7 @@ function addRule(item) { if (!settings.value)
     suggestions.value = [];
     searchHasMore.value = false;
     return;
-} settings.value.specialRules.push({ marketHashName: item.marketHashName, displayName: item.displayName || item.nameCn || item.name || null, maxRatioPct: settings.value.global.maxListingRatioPct, enabled: true }); search.value = ""; suggestions.value = []; searchHasMore.value = false; changed(); }
+} settings.value.specialRules.push({ marketHashName: item.marketHashName, displayName: item.displayName || item.nameCn || item.name || null, maxRatioPct: settings.value.global.maxListingRatioPct, rebuyReferenceFloor: null, enabled: true }); search.value = ""; suggestions.value = []; searchHasMore.value = false; changed(); }
 function removeRule(index) { settings.value?.specialRules.splice(index, 1); changed(); }
 onMounted(load);
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
@@ -203,6 +204,21 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
 /** @type {__VLS_StyleScopedClasses['multi']} */ ;
 /** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['settings-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['special-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['field-grid']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['rule-row']} */ ;
+/** @type {__VLS_StyleScopedClasses['item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['item-search']} */ ;
+/** @type {__VLS_StyleScopedClasses['rule-note']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['multi']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['multi']} */ ;
+/** @type {__VLS_StyleScopedClasses['policy-form']} */ ;
+/** @type {__VLS_StyleScopedClasses['multi']} */ ;
 /** @type {__VLS_StyleScopedClasses['policy-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['delivery-boundary-note']} */ ;
 /** @type {__VLS_StyleScopedClasses['delivery-boundary-note']} */ ;
@@ -312,6 +328,8 @@ if (__VLS_ctx.settings) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.em, __VLS_intrinsicElements.em)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.br, __VLS_intrinsicElements.br)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
         ...{ onInput: (__VLS_ctx.changed) },
         type: "number",
@@ -456,6 +474,7 @@ if (__VLS_ctx.settings) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
         for (const [rule, index] of __VLS_getVForSourceType((__VLS_ctx.settings.specialRules))) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
                 key: (rule.id || rule.marketHashName),
@@ -490,6 +509,15 @@ if (__VLS_ctx.settings) {
                 step: "0.01",
             });
             (rule.maxRatioPct);
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
+                ...{ onInput: (__VLS_ctx.changed) },
+                type: "number",
+                min: "0.01",
+                step: "0.01",
+                placeholder: "不设置",
+            });
+            (rule.rebuyReferenceFloor);
             __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
             __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
             (rule.currentRatioPct == null ? "—" : `${rule.currentRatioPct.toFixed(2)}%`);
@@ -554,16 +582,6 @@ if (__VLS_ctx.settings) {
         type: "number",
     });
     (__VLS_ctx.settings.timePolicy.scanMinutes);
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
-    __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
-        ...{ onInput: (__VLS_ctx.changed) },
-        min: "30",
-        type: "number",
-    });
-    (__VLS_ctx.settings.timePolicy.steamSyncSeconds);
     __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});

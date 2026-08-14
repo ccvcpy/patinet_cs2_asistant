@@ -41,6 +41,39 @@ class _FakeResponse:
 
 
 class SteamMarketClientTests(unittest.TestCase):
+    def test_price_history_forwards_monitor_parallel_metadata(self) -> None:
+        scheduled: list[dict[str, object]] = []
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                scheduled.append(dict(kwargs))
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            account_id="account-a",
+            request_source="guadao_monitor",
+        )
+        client._session.request = lambda **kwargs: _FakeResponse(  # type: ignore[method-assign]
+            {"success": True, "prices": []}
+        )
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.price_history(
+                app_id=730,
+                market_hash_name="Kilowatt Case",
+                scheduler_parallel_group="guadao_case_monitor",
+                scheduler_parallel_limit=8,
+                scheduler_account_exclusive=True,
+            )
+
+        metadata = scheduled[0]["metadata"]
+        self.assertEqual("guadao_case_monitor", metadata["schedulerParallelGroup"])
+        self.assertEqual(8, metadata["schedulerParallelLimit"])
+        self.assertTrue(metadata["schedulerAccountExclusive"])
     def test_safety_terminal_reads_are_scheduled_as_p0(self) -> None:
         scheduled: list[dict[str, object]] = []
 
@@ -350,6 +383,33 @@ class SteamMarketClientTests(unittest.TestCase):
         self.assertIsInstance(metadata, dict)
         self.assertEqual("Kilowatt Case", metadata["marketHashName"])  # type: ignore[index]
         self.assertEqual(90.0, scheduled[0]["timeout_seconds"])
+
+    def test_order_book_pins_cny_request_currency(self) -> None:
+        captured: dict[str, object] = {}
+
+        class CaptureScheduler:
+            def call(self, **kwargs: object) -> _FakeResponse:
+                return kwargs["callback"]()  # type: ignore[operator]
+
+        client = SteamMarketClient(
+            cookies="sessionid=session-1; steamLoginSecure=76561198000000000%7C%7Ctoken",
+            steam_id64="76561198000000000",
+            request_source="profit_trade",
+        )
+
+        def fake_request(**kwargs: object) -> _FakeResponse:
+            captured.update(kwargs)
+            return _FakeResponse({"success": True, "eCurrency": 23, "rgCompactSellOrders": []})
+
+        client._session.request = fake_request  # type: ignore[method-assign]
+        with patch(
+            "cs2_assistant.services.steam_request_scheduler.get_shared_steam_scheduler",
+            return_value=CaptureScheduler(),
+        ):
+            client.order_book(app_id=730, market_hash_name="Kilowatt Case")
+
+        self.assertEqual(23, captured["params"]["currency"])  # type: ignore[index]
+        self.assertEqual("CN", captured["params"]["country"])  # type: ignore[index]
 
     def test_get_transport_retry_count_remains_three_with_telemetry(self) -> None:
         events: list[dict[str, object]] = []

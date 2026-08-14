@@ -947,11 +947,15 @@ def run_profit_trade_api_server(
                     }:
                         raise ValueError("active must be true, false, or all")
                     active = None if active_text in {"all", "include"} else active_text not in {"0", "false", "no"}
+                    roi_sign = _query_value(query, "roiSign", "all").lower()
+                    if roi_sign not in {"all", "positive", "negative"}:
+                        raise ValueError("roiSign must be all, positive, or negative")
                     payload = build_profit_trade_roi_watch_payload(
                         settings,
                         active=active,
                         keyword=_query_value(query, "keyword") or None,
                         execution_status=_query_value(query, "status") or None,
+                        roi_sign=None if roi_sign == "all" else roi_sign,
                         sort=_query_value(query, "sort", "roi_desc"),
                         page=_query_int(query, "page", 1),
                         page_size=_query_int(query, "pageSize", 50, maximum=200),
@@ -1620,6 +1624,18 @@ def run_profit_trade_api_server(
                     result = c5_sweeper.run_cycle(
                         allow_buy=False,
                         round_id=str(body.get("roundId") or "").strip() or None,
+                    )
+                except Exception as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "dashboard": result})
+                return
+            if path == "/api/c5-sweeper/confirm-not-bought":
+                body = self._read_json_body()
+                try:
+                    result = c5_sweeper.confirm_unresolved_not_bought(
+                        round_id=str(body.get("roundId") or "").strip() or None,
+                        reason=str(body.get("reason") or "").strip() or None,
                     )
                 except Exception as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})

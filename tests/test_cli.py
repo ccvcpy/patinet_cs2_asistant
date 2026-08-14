@@ -752,7 +752,7 @@ class StrategyConfigCompatTestCase(unittest.TestCase):
         self.assertEqual(80, config.profit_trade_min_item_value)
         self.assertEqual(0, config.max_transfer_buy_per_cycle)
         self.assertNotIn("listingCheckIntervalMinutes", config.to_dict()["common"])
-        self.assertEqual(120.0, config.effective_guadao_task_schedule()["steamSyncIntervalSeconds"])
+        self.assertNotIn("steamSyncIntervalSeconds", config.effective_guadao_task_schedule())
 
 
 class GuadaoDiscountReportTestCase(unittest.TestCase):

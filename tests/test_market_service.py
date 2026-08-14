@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -111,7 +113,7 @@ class FakeC5Client:
 
 
 class FakeSteamMarketClient:
-    def __init__(self, *, fail: bool = False, currency: int | None = None, price: int = 22200) -> None:
+    def __init__(self, *, fail: bool = False, currency: int | None = 23, price: int = 22200) -> None:
         self.fail = fail
         self.currency = currency
         self.price = price
@@ -155,7 +157,90 @@ class FakeC5PriceBatchFailureClient:
         raise RuntimeError("c5 purchase unavailable")
 
 
+class ConcurrentOrderbookClient:
+    def __init__(self, account_id: str, tracker: dict[str, object]) -> None:
+        self.account_id = account_id
+        self.tracker = tracker
+        self.calls: list[tuple[str, str | None, int | None, bool | None]] = []
+
+    def order_book(
+        self,
+        *,
+        app_id: int,
+        market_hash_name: str,
+        scheduler_parallel_group: str | None = None,
+        scheduler_parallel_limit: int | None = None,
+        scheduler_account_exclusive: bool | None = None,
+    ) -> dict:
+        self.calls.append(
+            (
+                market_hash_name,
+                scheduler_parallel_group,
+                scheduler_parallel_limit,
+                scheduler_account_exclusive,
+            )
+        )
+        lock = self.tracker["lock"]
+        assert isinstance(lock, type(threading.Lock()))
+        with lock:
+            active = self.tracker.setdefault("active", {})
+            assert isinstance(active, dict)
+            active[self.account_id] = int(active.get(self.account_id, 0)) + 1
+            self.tracker["max_global"] = max(
+                int(self.tracker.get("max_global", 0)),
+                sum(int(value) for value in active.values()),
+            )
+            self.tracker["max_account"] = max(
+                int(self.tracker.get("max_account", 0)),
+                int(active[self.account_id]),
+            )
+        time.sleep(0.04)
+        with lock:
+            active = self.tracker["active"]
+            assert isinstance(active, dict)
+            active[self.account_id] = int(active[self.account_id]) - 1
+        return {
+            "success": 1,
+            "eCurrency": 23,
+            "rgCompactSellOrders": [[100, 1]],
+        }
+
+
 class MarketServiceTestCase(unittest.TestCase):
+    def test_profit_trade_orderbooks_use_two_account_lanes_without_account_overlap(self) -> None:
+        tracker: dict[str, object] = {"lock": threading.Lock()}
+        clients = [
+            ConcurrentOrderbookClient("account-a", tracker),
+            ConcurrentOrderbookClient("account-b", tracker),
+        ]
+        service = MarketService(
+            steam_market_clients=clients,
+            include_c5_purchase_prices=False,
+            fallback_max_workers=2,
+            steam_orderbook_parallel_group="profit_trade_orderbook",
+            steam_orderbook_parallel_limit=2,
+            steam_orderbook_account_exclusive=True,
+        )
+
+        states = service.refresh_items(
+            [{"market_hash_name": f"Item {index}"} for index in range(6)]
+        )
+
+        self.assertEqual(6, len(states))
+        self.assertEqual(2, tracker.get("max_global"))
+        self.assertEqual(1, tracker.get("max_account"))
+        self.assertEqual(3, len(clients[0].calls))
+        self.assertEqual(3, len(clients[1].calls))
+        self.assertTrue(
+            all(
+                group == "profit_trade_orderbook"
+                and limit == 2
+                and account_exclusive is True
+                for client in clients
+                for _, group, limit, account_exclusive in client.calls
+            )
+        )
+
     def test_guadao_batch_uses_one_orderbook_snapshot_with_custom_wall_pricing(self) -> None:
         steam = RecordingBatchSteamMarketClient()
         service = MarketService(
@@ -273,6 +358,35 @@ class MarketServiceTestCase(unittest.TestCase):
         self.assertEqual("steam_orderbook", state.steam_price_source)
         self.assertEqual(99.0, state.c5_sell_price)
         self.assertEqual("c5_batch", state.c5_price_source)
+
+    def test_steam_orderbook_without_currency_never_becomes_orderbook_price(self) -> None:
+        """A missing eCurrency field must fail closed, not act like CNY.
+
+        Steam can return a USD-denominated orderbook (e.g. 3675 = $36.75) and
+        omit/ignore the requested currency marker.  Treating that number as
+        CNY caused fake 200%+ Profit Trade ROIs.  The third-party fallback may
+        fill the price, but it must never be labelled as steam_orderbook.
+        """
+
+        service = MarketService(
+            steamdt_client=FakeSteamDTClient(),
+            csqaq_client=FakeCSQAQClient(),
+            c5_client=FakeC5Client(),
+            steam_market_client=FakeSteamMarketClient(currency=None),
+        )
+
+        states = service.refresh_items(
+            [
+                {
+                    "market_hash_name": "Kilowatt Case",
+                    "name_cn": "Kilowatt Case",
+                    "c5_item_id": "case-1",
+                }
+            ]
+        )
+
+        state = states[0]
+        self.assertNotEqual("steam_orderbook", state.steam_price_source)
 
     def test_steam_orderbook_tries_all_configured_clients(self) -> None:
         service = MarketService(

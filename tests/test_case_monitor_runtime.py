@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cs2_assistant.config import Settings
 from cs2_assistant.db import Database
@@ -11,6 +13,7 @@ from cs2_assistant.services.case_monitor_runtime import (
     CaseMonitorRuntimeController,
     ensure_case_monitor_runtime_state,
 )
+from cs2_assistant.services.guadao_case_monitor import CaseMonitorTarget, CaseRatioSnapshot
 
 
 class CaseMonitorRuntimeTestCase(unittest.TestCase):
@@ -46,6 +49,14 @@ class CaseMonitorRuntimeTestCase(unittest.TestCase):
             self.assertIsNotNone(job)
             self.assertIsNone(busy)
             job_id = str(job["job_id"])
+            claimed = db.claim_next_case_monitor_job()
+            self.assertEqual(job_id, claimed["job_id"])
+            db.update_case_monitor_job_progress(
+                job_id,
+                current=275,
+                total=543,
+                message="正在采集 275/543",
+            )
         finally:
             db.close()
 
@@ -57,6 +68,12 @@ class CaseMonitorRuntimeTestCase(unittest.TestCase):
             self.assertEqual("paused", status["runtime"]["status"])
             self.assertEqual(15, status["runtime"]["intervalMinutes"])
             self.assertIsNone(status["currentJob"])
+            interruption = status["runtime"]["lastInterruption"]
+            self.assertEqual(job_id, interruption["jobId"])
+            self.assertEqual(275, interruption["progressCurrent"])
+            self.assertEqual(543, interruption["progressTotal"])
+            self.assertEqual(0, interruption["savedCount"])
+            self.assertIsNotNone(interruption["interruptedAt"])
         finally:
             controller.stop()
 
@@ -65,6 +82,76 @@ class CaseMonitorRuntimeTestCase(unittest.TestCase):
             db.initialize()
             persisted = db.get_case_monitor_job(job_id)
             self.assertEqual("interrupted", persisted["status"])
+        finally:
+            db.close()
+
+    def test_collect_persists_each_completed_snapshot_before_full_cycle_finishes(self) -> None:
+        settings = Settings(
+            db_path=self.settings.db_path,
+            c5_api_key="c5-token",
+        )
+        controller = CaseMonitorRuntimeController(settings)
+        db = Database(settings.db_path)
+        try:
+            db.initialize()
+            job, busy = db.create_case_monitor_job_if_idle(
+                job_type="collect",
+                trigger_source="manual",
+                parameters={"allCrateTypes": True},
+                start_immediately=True,
+            )
+            self.assertIsNotNone(job)
+            self.assertIsNone(busy)
+            job_id = str(job["job_id"])
+        finally:
+            db.close()
+
+        targets = [
+            CaseMonitorTarget("Kilowatt Case", "千瓦武器箱"),
+            CaseMonitorTarget("Revolution Case", "变革武器箱"),
+            CaseMonitorTarget("Recoil Case", "反冲武器箱"),
+        ]
+
+        def interrupted_collect(**kwargs):
+            callback = kwargs["progress_callback"]
+            for index, target in enumerate(targets[:2], start=1):
+                callback(
+                    index,
+                    len(targets),
+                    CaseRatioSnapshot(
+                        market_hash_name=target.market_hash_name,
+                        name_cn=target.name_cn,
+                        observed_at="2026-08-13T00:00:00+00:00",
+                        c5_sell_price=1.0,
+                        status="missing_steam",
+                    ),
+                )
+            raise RuntimeError("simulated backend interruption")
+
+        with (
+            patch(
+                "cs2_assistant.services.case_monitor_runtime.list_case_monitor_targets",
+                return_value=targets,
+            ),
+            patch(
+                "cs2_assistant.services.case_monitor_runtime.build_steam_clients_for_monitor",
+                return_value=[object()],
+            ),
+            patch(
+                "cs2_assistant.services.case_monitor_runtime.collect_case_ratio_snapshots",
+                side_effect=interrupted_collect,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated backend interruption"):
+                controller._run_collect_job(job_id)
+
+        db = Database(settings.db_path)
+        try:
+            db.initialize()
+            self.assertEqual(2, db.latest_guadao_case_ratio_snapshot_count())
+            persisted = db.get_case_monitor_job(job_id)
+            result = json.loads(str(persisted["result_json"] or "{}"))
+            self.assertEqual(2, result["savedCount"])
         finally:
             db.close()
 

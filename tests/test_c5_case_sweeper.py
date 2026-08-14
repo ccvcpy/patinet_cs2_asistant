@@ -351,8 +351,101 @@ class C5CaseSweeperTests(unittest.TestCase):
         self.assertEqual("reconciled", reconciled["round"]["submissions"][0]["status"])
         self.assertEqual(1, reconciled["counts"]["delivered"])
         self.assertEqual("remote-order-1", reconciled["orders"][0]["orderAssetId"])
-        self.assertEqual("paused", reconciled["round"]["status"])
+        self.assertEqual("running", reconciled["round"]["status"])
         self.assertEqual(1, batch_buy.call_count)
+
+    def test_partial_reconcile_keeps_paused_until_manual_confirm(self) -> None:
+        self.client.listings = [
+            {"productId": "product-1", "price": 1.00, "delivery": 2},
+            {"productId": "product-absent", "price": 1.10, "delivery": 2},
+        ]
+        with patch.object(
+            self.client,
+            "batch_buy",
+            side_effect=RuntimeError("504 Gateway Time-out"),
+        ):
+            round_id = self._start(max_price=1.10, budget=10.0, target=5)
+            timed_out = self.service.run_cycle(round_id=round_id)
+
+        self.assertEqual("paused", timed_out["round"]["status"])
+        self.assertEqual(2, len(timed_out["round"]["submissions"][0]["products"]))
+
+        self.client.buyer_orders = [{
+            "orderId": "remote-order-1",
+            "productId": "product-1",
+            "price": 1.00,
+            "status": 10,
+            "statusName": "success",
+            "receiveSteamId": "76561197960265729",
+            "createTime": 1783831070,
+        }]
+        partial = self.service.run_cycle(allow_buy=False, round_id=round_id)
+        self.assertEqual("paused", partial["round"]["status"])
+        self.assertEqual("uncertain", partial["round"]["submissions"][0]["status"])
+        self.assertEqual(["product-absent"], partial["round"]["submissions"][0]["unresolvedProductIds"])
+        self.assertEqual(1, partial["round"]["submissions"][0]["matchedCount"])
+
+        resumed = self.service.confirm_unresolved_not_bought(round_id=round_id)
+        self.assertEqual("running", resumed["round"]["status"])
+        self.assertIsNone(resumed["round"]["stopReason"])
+        submission = resumed["round"]["submissions"][0]
+        self.assertEqual("reconciled", submission["status"])
+        self.assertEqual([], submission["unresolvedProductIds"])
+        self.assertEqual(1, len(submission["notBoughtProducts"]))
+        self.assertEqual("product-absent", submission["notBoughtProducts"][0]["productId"])
+        self.assertEqual(
+            1,
+            len([event for event in resumed["events"] if event["status"] == "manual_not_bought"]),
+        )
+
+    def test_manual_confirm_rejected_when_round_not_uncertain(self) -> None:
+        round_id = self._start()
+        with self.assertRaisesRegex(ValueError, "购买结果不确定"):
+            self.service.confirm_unresolved_not_bought(round_id=round_id)
+
+    def test_absent_product_auto_confirms_not_bought_and_resumes(self) -> None:
+        self.client.listings = [
+            {"productId": "product-1", "price": 1.00, "delivery": 2},
+            {"productId": "product-absent", "price": 1.10, "delivery": 2},
+        ]
+        with patch.object(
+            self.client,
+            "batch_buy",
+            side_effect=RuntimeError("504 Gateway Time-out"),
+        ):
+            round_id = self._start(max_price=1.10, budget=10.0, target=5)
+            self.service.run_cycle(round_id=round_id)
+
+        self.client.buyer_orders = [{
+            "orderId": "remote-order-1",
+            "productId": "product-1",
+            "price": 1.00,
+            "status": 10,
+            "statusName": "success",
+            "receiveSteamId": "76561197960265729",
+            "createTime": 1783831070,
+        }]
+
+        first = self.service.run_cycle(allow_buy=False, round_id=round_id)
+        self.assertEqual("paused", first["round"]["status"])
+        self.assertEqual(["product-absent"], first["round"]["submissions"][0]["unresolvedProductIds"])
+
+        second = self.service.run_cycle(allow_buy=False, round_id=round_id)
+        self.assertEqual("paused", second["round"]["status"])
+        self.assertEqual(["product-absent"], second["round"]["submissions"][0]["unresolvedProductIds"])
+
+        third = self.service.run_cycle(allow_buy=False, round_id=round_id)
+        self.assertEqual("running", third["round"]["status"])
+        submission = third["round"]["submissions"][0]
+        self.assertEqual("reconciled", submission["status"])
+        self.assertEqual([], submission["unresolvedProductIds"])
+        self.assertEqual(1, len(submission["notBoughtProducts"]))
+        self.assertEqual("product-absent", submission["notBoughtProducts"][0]["productId"])
+        self.assertTrue(submission["notBoughtProducts"][0].get("autoConfirmed"))
+        self.assertEqual(
+            1,
+            len([event for event in third["events"] if event["status"] == "auto_not_bought"]),
+        )
 
     def test_price_above_limit_waits_without_buying_or_spamming_events(self) -> None:
         self.client.price = 1.11
@@ -574,6 +667,57 @@ class C5CaseSweeperTests(unittest.TestCase):
         raw = self.state_path.read_text(encoding="utf-8")
         self.assertNotIn("test-key", raw)
         json.loads(raw)
+
+    def test_save_locked_recovers_after_transient_replace_failure(self) -> None:
+        self._create()
+        original_replace = Path.replace
+        calls = {"count": 0}
+
+        def flaky_replace(path: Path, target: Path) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PermissionError(13, "sharing violation", str(target))
+            return original_replace(path, target)
+
+        with patch.object(Path, "replace", flaky_replace):
+            self.service._save_locked()
+
+        self.assertEqual(2, calls["count"])
+        self.assertTrue(self.state_path.exists())
+        json.loads(self.state_path.read_text(encoding="utf-8"))
+        leftovers = list(self.state_path.parent.glob(f"{self.state_path.name}.*.tmp"))
+        self.assertEqual([], leftovers)
+
+    def test_worker_survives_cycle_exception_and_keeps_running(self) -> None:
+        round_id = self._start()
+        with patch.object(
+            self.service,
+            "run_cycle",
+            side_effect=RuntimeError("temporary failure"),
+        ):
+            self.service._run_due_round(round_id)
+
+        dashboard = self.service.dashboard(round_id)
+        self.assertEqual("running", dashboard["round"]["status"])
+        self.assertIsNotNone(dashboard["round"]["nextRunAt"])
+        self.assertIn("temporary failure", dashboard["workerError"] or "")
+
+    def test_worker_records_persist_failure_and_keeps_round_running(self) -> None:
+        round_id = self._start()
+        with patch.object(
+            self.service,
+            "run_cycle",
+            return_value=self.service.dashboard(round_id),
+        ), patch.object(
+            self.service,
+            "_save_locked",
+            side_effect=PermissionError(13, "locked"),
+        ):
+            self.service._run_due_round(round_id)
+
+        dashboard = self.service.dashboard(round_id)
+        self.assertEqual("running", dashboard["round"]["status"])
+        self.assertIn("persist state failed", dashboard["workerError"] or "")
 
 
 if __name__ == "__main__":

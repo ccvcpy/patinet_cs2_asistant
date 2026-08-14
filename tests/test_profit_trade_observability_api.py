@@ -405,6 +405,27 @@ class ProfitTradeObservabilityApiTestCase(unittest.TestCase):
         self.assertEqual(0.0, payload["summary"]["buyOrderReferenceProfitTotal"])
         self.assertEqual(1, payload["summary"]["longBuyActiveOrders"])
 
+        positive_status, positive_payload = self._request(
+            "GET",
+            "/api/profit-trade/roi-watch?active=true&roiSign=positive&page=1&pageSize=12",
+        )
+        self.assertEqual(200, positive_status)
+        self.assertEqual(1, positive_payload["total"])
+
+        negative_status, negative_payload = self._request(
+            "GET",
+            "/api/profit-trade/roi-watch?active=true&roiSign=negative&page=1&pageSize=12",
+        )
+        self.assertEqual(200, negative_status)
+        self.assertEqual(0, negative_payload["total"])
+
+        invalid_status, invalid_payload = self._request(
+            "GET",
+            "/api/profit-trade/roi-watch?active=true&roiSign=zero",
+        )
+        self.assertEqual(400, invalid_status)
+        self.assertIn("roiSign", invalid_payload["error"])
+
         dashboard_status, dashboard = self._request(
             "GET",
             "/api/profit-trade/dashboard",

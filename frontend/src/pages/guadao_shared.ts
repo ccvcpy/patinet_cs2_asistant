@@ -28,6 +28,11 @@ export type CookieAccount = {
   lastValidatedAt?: string | null;
   batchId?: string | null;
   nextRetryAt?: string | null;
+  currencyId?: number | null;
+  currency?: string | null;
+  currencyStatus?: "cny" | "non_cny" | "unknown" | string;
+  currencyCheckedAt?: string | null;
+  currencyError?: string | null;
 };
 
 export type CookieGate = {

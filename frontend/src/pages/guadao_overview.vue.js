@@ -256,6 +256,10 @@ let __VLS_directives;
 /** @type {__VLS_StyleScopedClasses['upcoming-tasks']} */ ;
 /** @type {__VLS_StyleScopedClasses['upcoming-tasks']} */ ;
 /** @type {__VLS_StyleScopedClasses['task-list']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-rounds']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
@@ -520,6 +524,7 @@ if (__VLS_ctx.cookieExpanded) {
         __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
         __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
         __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
+        __VLS_asFunctionalElement(__VLS_intrinsicElements.th, __VLS_intrinsicElements.th)({});
         __VLS_asFunctionalElement(__VLS_intrinsicElements.tbody, __VLS_intrinsicElements.tbody)({});
         for (const [account] of __VLS_getVForSourceType((__VLS_ctx.cookieAccounts))) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.tr, __VLS_intrinsicElements.tr)({
@@ -537,11 +542,20 @@ if (__VLS_ctx.cookieExpanded) {
             });
             (account.valid ? "有效" : account.status || "未知");
             __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
+                ...{ class: (['pill', account.currencyStatus === 'cny' ? 'success' : account.currencyStatus === 'non_cny' ? 'warning' : 'neutral']) },
+            });
+            (account.currencyStatus === 'cny' ? `${account.currency || 'CNY'} · ID ${account.currencyId ?? 23}` : account.currencyStatus === 'non_cny' ? `${account.currency || '非人民币'} · ID ${account.currencyId ?? '?'}` : '未知');
+            if (account.currencyCheckedAt) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+                (__VLS_ctx.formatLocal(account.currencyCheckedAt));
+            }
+            __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
             (__VLS_ctx.formatLocal(account.lastCheckedAt));
             __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({
-                ...{ class: ({ 'danger-text': account.error }) },
+                ...{ class: ({ 'danger-text': account.error || account.currencyError }) },
             });
-            (account.error || account.lastResult || "—");
+            (account.error || account.currencyError || account.lastResult || "—");
             __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
             (account.failureCount || 0);
             __VLS_asFunctionalElement(__VLS_intrinsicElements.td, __VLS_intrinsicElements.td)({});
@@ -661,6 +675,38 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.
     ...{ class: "panel-count" },
 });
 (__VLS_ctx.dashboard?.scanRounds?.length || 0);
+if (__VLS_ctx.dashboard?.currentScan) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.article, __VLS_intrinsicElements.article)({
+        ...{ class: "current-scan-card" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "current-scan-title" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.strong, __VLS_intrinsicElements.strong)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    (__VLS_ctx.formatLocal(__VLS_ctx.dashboard.currentScan.startedAt));
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    (__VLS_ctx.dashboard.currentScan.evaluatedCount || 0);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    (__VLS_ctx.dashboard.currentScan.candidateCount || 0);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    (__VLS_ctx.dashboard.currentScan.listedCount || 0);
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
+        ...{ class: "current-scan-step" },
+    });
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.b, __VLS_intrinsicElements.b)({});
+    (__VLS_ctx.dashboard.currentScan.currentStep || "正在处理");
+}
 if (__VLS_ctx.dashboard?.scanRounds?.length) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "scan-rounds" },
@@ -1117,6 +1163,9 @@ if (__VLS_ctx.confirmAction) {
 /** @type {__VLS_StyleScopedClasses['scan-panel']} */ ;
 /** @type {__VLS_StyleScopedClasses['section-title']} */ ;
 /** @type {__VLS_StyleScopedClasses['panel-count']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-card']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-title']} */ ;
+/** @type {__VLS_StyleScopedClasses['current-scan-step']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-rounds']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-round-summary']} */ ;
 /** @type {__VLS_StyleScopedClasses['scan-detail']} */ ;

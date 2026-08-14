@@ -3562,14 +3562,17 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             db.close()
 
     def test_market_service_build_reuses_saved_cookies_without_proactive_validation(self) -> None:
-        account = Account(
-            id="saved-cookie-account",
-            name="saved-cookie-account",
-            username="username",
-            password="password",
-            steam_id64="steam-a",
-            cookies="sessionid=x; steamLoginSecure=y",
-        )
+        accounts = [
+            Account(
+                id=f"saved-cookie-account-{index}",
+                name=f"saved-cookie-account-{index}",
+                username=f"username-{index}",
+                password="password",
+                steam_id64=f"steam-{index}",
+                cookies=f"sessionid={index}; steamLoginSecure={index}",
+            )
+            for index in range(2)
+        ]
         original_store = profit_trade_module.AccountStore
         original_client = profit_trade_module.SteamMarketClient
 
@@ -3578,7 +3581,7 @@ class ProfitTradeScanTestCase(unittest.TestCase):
                 pass
 
             def list_accounts(self) -> list[Account]:
-                return [account]
+                return accounts
 
         class SavedCookieClient:
             def __init__(self, **kwargs: object) -> None:
@@ -3597,11 +3600,19 @@ class ProfitTradeScanTestCase(unittest.TestCase):
             profit_trade_module.AccountStore = original_store
             profit_trade_module.SteamMarketClient = original_client
 
-        self.assertEqual(1, len(service.steam_market_clients))
+        self.assertEqual(2, len(service.steam_market_clients))
         self.assertEqual(
-            "saved-cookie-account",
+            "saved-cookie-account-0",
             service.steam_market_clients[0].kwargs["account_id"],
         )
+        self.assertEqual(
+            "saved-cookie-account-1",
+            service.steam_market_clients[1].kwargs["account_id"],
+        )
+        self.assertEqual(2, service.fallback_max_workers)
+        self.assertEqual("profit_trade_orderbook", service.steam_orderbook_parallel_group)
+        self.assertEqual(2, service.steam_orderbook_parallel_limit)
+        self.assertTrue(service.steam_orderbook_account_exclusive)
 
     def test_run_once_retries_pre_buy_queue_timeout_once_and_continues_purchase(self) -> None:
         trade_id = self._create_locked_trade()
@@ -5576,6 +5587,44 @@ class ProfitTradeManualRecordTestCase(unittest.TestCase):
         self.assertEqual(1, dashboard["summary"]["completedCount"])
         self.assertAlmostEqual(6.0, dashboard["summary"]["realizedProfit"])
         self.assertAlmostEqual(0.0, dashboard["summary"]["dailySteamSpent"])
+
+    def test_daily_spend_excludes_unverified_cancelled_buy_attempts(self) -> None:
+        db = Database(self.settings.db_path)
+        try:
+            db.initialize()
+            db.add_profit_trade(
+                trade_no="PT-unverified-cancelled",
+                market_hash_name="Sawed-Off | Wasteland Princess (Field-Tested)",
+                status="cancelled",
+                step_key="steam_bought",
+                steam_buy_price=289.34,
+                note=profit_trade_module._build_note(
+                    {
+                        "steamBuyUnverifiedAt": "2026-07-14T01:00:00+00:00",
+                        "steamBuyOrderCancellationConfirmedAt": "2026-07-14T01:01:00+00:00",
+                        "walletDelta": 0.0,
+                    }
+                ),
+            )
+            db.add_profit_trade(
+                trade_no="PT-verified-success",
+                market_hash_name="Sticker | Test",
+                status="c5_listed",
+                step_key="c5_listed",
+                steam_buy_price=41.94,
+                note=profit_trade_module._build_note(
+                    {"steamBuySucceededAt": "2026-07-14T02:00:00+00:00"}
+                ),
+            )
+
+            spent = profit_trade_module._profit_trade_daily_steam_spent(
+                db,
+                now=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+            )
+        finally:
+            db.close()
+
+        self.assertAlmostEqual(41.94, spent)
 
     def test_update_completed_auto_record_preserves_original_times_and_writes_audit(self) -> None:
         db = Database(self.settings.db_path)

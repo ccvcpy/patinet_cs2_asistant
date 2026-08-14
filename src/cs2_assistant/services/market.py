@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import Any, Callable
 
 from cs2_assistant.clients import C5GameClient, CSQAQClient, SteamDTClient, SteamMarketClient
@@ -126,6 +127,9 @@ class MarketService:
         include_c5_purchase_prices: bool = True,
         fallback_max_workers: int = 4,
         steam_orderbook_admission_timeout_seconds: float | None = None,
+        steam_orderbook_parallel_group: str | None = None,
+        steam_orderbook_parallel_limit: int = 1,
+        steam_orderbook_account_exclusive: bool = False,
         steam_orderbook_price_resolver: (
             Callable[[str, dict[str, Any]], PricingDecision | None] | None
         ) = None,
@@ -144,6 +148,16 @@ class MarketService:
             None
             if steam_orderbook_admission_timeout_seconds is None
             else max(0.0, float(steam_orderbook_admission_timeout_seconds))
+        )
+        self.steam_orderbook_parallel_group = str(
+            steam_orderbook_parallel_group or ""
+        ).strip() or None
+        self.steam_orderbook_parallel_limit = min(
+            2,
+            max(1, int(steam_orderbook_parallel_limit)),
+        )
+        self.steam_orderbook_account_exclusive = bool(
+            steam_orderbook_account_exclusive
         )
         self.steam_orderbook_price_resolver = steam_orderbook_price_resolver
 
@@ -247,10 +261,19 @@ class MarketService:
     ) -> None:
         def load_one(
             market_hash_name: str,
+            preferred_client_index: int | None = None,
         ) -> tuple[str, dict[str, Any] | None, list[str], int | None, str | None]:
             errors: list[str] = []
             error_type: str | None = None
-            for client_index, client in enumerate(self.steam_market_clients):
+            client_indexes = list(range(len(self.steam_market_clients)))
+            if preferred_client_index is not None and client_indexes:
+                preferred = preferred_client_index % len(client_indexes)
+                client_indexes = [
+                    *client_indexes[preferred:],
+                    *client_indexes[:preferred],
+                ]
+            for client_index in client_indexes:
+                client = self.steam_market_clients[client_index]
                 account_label = getattr(client, "account_id", None) or getattr(client, "steam_id64", None) or "steam"
                 try:
                     orderbook_kwargs: dict[str, Any] = {
@@ -261,7 +284,16 @@ class MarketService:
                         orderbook_kwargs["admission_timeout_seconds"] = (
                             self.steam_orderbook_admission_timeout_seconds
                         )
-                    payload = client.order_book(**orderbook_kwargs)
+                    if self.steam_orderbook_parallel_group is not None:
+                        orderbook_kwargs.update(
+                            {
+                                "scheduler_parallel_group": self.steam_orderbook_parallel_group,
+                                "scheduler_parallel_limit": self.steam_orderbook_parallel_limit,
+                                "scheduler_account_exclusive": self.steam_orderbook_account_exclusive,
+                            }
+                        )
+                    with client_locks[client_index]:
+                        payload = client.order_book(**orderbook_kwargs)
                 except Exception as exc:
                     errors.append(f"{account_label}: {exc}")
                     if isinstance(exc, SteamRequestTimeout):
@@ -275,10 +307,10 @@ class MarketService:
                     continue
                 data = _payload_data(payload or {})
                 currency = safe_int(data.get("eCurrency"))
-                if currency is not None and currency != int(self.steam_currency):
+                if currency != int(self.steam_currency):
                     errors.append(
                         f"{account_label}: orderbook currency mismatch "
-                        f"expected={self.steam_currency} actual={currency}"
+                        f"expected={self.steam_currency} actual={currency!r}"
                     )
                     error_type = "currency_mismatch"
                     continue
@@ -336,13 +368,31 @@ class MarketService:
             if on_state_ready is not None:
                 on_state_ready(state)
 
+        client_locks = [threading.Lock() for _ in self.steam_market_clients]
         max_workers = min(self.fallback_max_workers, len(market_hash_names))
+        if self.steam_orderbook_parallel_group is not None:
+            max_workers = min(
+                max_workers,
+                self.steam_orderbook_parallel_limit,
+                len(self.steam_market_clients),
+            )
         if max_workers <= 1:
             for market_hash_name in market_hash_names:
                 apply_result(load_one(market_hash_name))
             return
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(load_one, market_hash_name) for market_hash_name in market_hash_names]
+            futures = [
+                executor.submit(
+                    load_one,
+                    market_hash_name,
+                    (
+                        index % len(self.steam_market_clients)
+                        if self.steam_orderbook_parallel_group is not None
+                        else None
+                    ),
+                )
+                for index, market_hash_name in enumerate(market_hash_names)
+            ]
             for future in as_completed(futures):
                 apply_result(future.result())
 

@@ -132,6 +132,15 @@ export type CaseMonitorStatus = {
       missingSteamCount?: number;
       statusCounts?: Record<string, number>;
     };
+    lastInterruption: {
+      jobId: string;
+      jobType: "collect" | "report";
+      progressCurrent: number;
+      progressTotal: number;
+      savedCount: number;
+      interruptedAt: string | null;
+      reason: string | null;
+    } | null;
   };
   currentJob: CaseMonitorJob | null;
   latestJob: CaseMonitorJob | null;

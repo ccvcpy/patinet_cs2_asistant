@@ -88,6 +88,7 @@ class FakeSteamClient:
         return {
             "success": 1,
             "data": {
+                "eCurrency": 23,
                 "rgCompactSellOrders": [
                     2500, 20,
                 ],
@@ -2119,6 +2120,82 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("asset-kilowatt", self.engine.steam_client.sell_calls[0]["asset_id"])
         self.assertEqual("asset-old", self.engine.steam_client.sell_calls[1]["asset_id"])
 
+    def test_guadao_scan_defers_same_account_confirmations_to_one_batched_sync(self) -> None:
+        self.engine.config.dry_run = False
+        self.engine.config.force_refresh_before_execution = False
+        self.engine.config.max_list_per_cycle = 2
+        self.engine.settings.steam_identity_secret = "secret"
+        self.engine.settings.steam_device_id = "device"
+        self.db.upsert_inventory_assets(
+            [
+                {
+                    "assetId": "asset-new",
+                    "marketHashName": "Revolution Case",
+                    "steamId": self.engine.steam_client.steam_id64,
+                    "ifTradable": True,
+                    "tradableTime": None,
+                    "token": "token-new",
+                    "styleToken": "style-new",
+                    "price": 20.0,
+                }
+            ]
+        )
+        self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
+            list_price=25.0,
+            listing_ratio=0.62,
+            transfer_real_ratio=0.07,
+            pricing=None,
+        )
+
+        def submit_listing(**kwargs: object) -> dict[str, object]:
+            asset_id = str(kwargs["asset_id"])
+            listing_id = f"listing-{asset_id}"
+            self.engine.steam_client.sell_calls.append(dict(kwargs))
+            self.engine.steam_client.pending_listing_assets[asset_id] = listing_id
+            return {"listingid": listing_id}
+
+        def confirm_batch(
+            *,
+            asset_ids: object,
+            listing_ids: object | None = None,
+            pending_listings: object | None = None,
+        ) -> int:
+            assets = [str(value) for value in asset_ids]
+            self.engine.steam_client.confirm_calls += 1
+            self.engine.steam_client.confirm_asset_calls.append(
+                {"asset_ids": assets, "listing_ids": listing_ids}
+            )
+            for asset_id in assets:
+                listing_id = self.engine.steam_client.pending_listing_assets.pop(asset_id)
+                self.engine.steam_client.active_listing_assets[asset_id] = listing_id
+            return len(assets)
+
+        self.engine._sell_item_with_retry = submit_listing  # type: ignore[method-assign]
+        self.engine.steam_client.confirm_listing_assets = confirm_batch  # type: ignore[method-assign]
+        report = type(
+            "Report",
+            (),
+            {"guadao_candidates": [build_guadao_candidate()]},
+        )()
+
+        listed = self.engine._execute_guadao_listings(
+            report,
+            {"Revolution Case": POOL_STATUS_HOLDING},
+        )
+
+        self.assertEqual(2, listed)
+        self.assertEqual(2, len(self.engine.steam_client.sell_calls))
+        self.assertEqual(1, self.engine.steam_client.confirm_calls)
+        self.assertEqual(
+            {"asset-new", "asset-old"},
+            set(self.engine.steam_client.confirm_asset_calls[0]["asset_ids"]),
+        )
+        statuses = {
+            str(row["status"])
+            for row in self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)
+        }
+        self.assertEqual({"listed"}, statuses)
+
     def test_guadao_listing_uses_recent_sell_speed_as_tie_breaker(self) -> None:
         self.engine.config.dry_run = False
         self.engine.config.force_refresh_before_execution = False
@@ -2303,6 +2380,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
                 "ruleId": "special-revolution",
                 "marketHashName": "Revolution Case",
                 "maxListingRatio": 0.75,
+                "rebuyReferenceFloor": 7.60,
                 "version": 3,
                 "enabled": True,
             }
@@ -2326,6 +2404,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("special_case", note["guadaoRatioRuleSource"])
         self.assertEqual("special-revolution", note["guadaoRatioRuleId"])
         self.assertEqual(3, note["guadaoRatioRuleVersion"])
+        self.assertEqual(7.60, note["rebuyReferenceFloorAtOpen"])
         self.assertAlmostEqual(0.75, float(note["guadaoMaxListingRatioAtOpen"]), places=6)
         self.assertAlmostEqual(0.75, float(note["maxRebuyRatioAtOpen"]), places=6)
 
@@ -5637,6 +5716,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.engine.settings.steam_identity_secret = "secret"
         self.engine.settings.steam_device_id = "device"
         self.engine.steam_client.confirm_should_fail = True
+        self.engine.steam_client.pending_listing_assets["asset-old"] = "listing-1"
         self.engine.serverchan = FakeServerChan()
         self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
             list_price=25.0,
@@ -5679,13 +5759,10 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.assertEqual("Revolution Case", pool_row["market_hash_name"])
         sell_op = self.db.list_pool_operations_by_type(OP_SELL_STEAM, limit=10)[0]
         self.assertEqual("listed", sell_op["status"])
-        self.assertIn('"confirmationStatus": "confirmed"', sell_op["note"])
+        self.assertIn('"confirmationStatus": "confirmed_late"', sell_op["note"])
         self.assertIn('"activeVerifiedAt":', sell_op["note"])
-        self.assertEqual(1, self.engine.steam_client.confirm_calls)
-        self.assertEqual(
-            [{"asset_ids": ["asset-old"], "listing_ids": ["listing-1"]}],
-            self.engine.steam_client.confirm_asset_calls,
-        )
+        self.assertEqual(0, self.engine.steam_client.confirm_calls)
+        self.assertEqual([], self.engine.steam_client.confirm_asset_calls)
         self.assertEqual(0, self.engine._pending_confirmation_count)
 
     def test_listing_auto_confirm_waits_until_listing_is_active(self) -> None:
@@ -5700,6 +5777,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
             pricing=None,
         )
         report = type("Report", (), {"guadao_candidates": [build_guadao_candidate()]})()
+        self.engine.steam_client.pending_listing_assets["asset-old"] = "listing-1"
 
         listed = self.engine._execute_guadao_listings(report, {"Revolution Case": POOL_STATUS_HOLDING})
 
@@ -5723,6 +5801,7 @@ class ExecutorEngineTransferTestCase(unittest.TestCase):
         self.engine.settings.steam_identity_secret = "secret"
         self.engine.settings.steam_device_id = "device"
         self.engine.steam_client.confirm_result = 0
+        self.engine.steam_client.pending_listing_assets["asset-old"] = "listing-1"
         self.engine.serverchan = FakeServerChan()
         self.engine._decide_listing = lambda candidate: ListingDecision(  # type: ignore[method-assign]
             list_price=25.0,

@@ -245,6 +245,13 @@ def scan_strategies(
                 )
             item_outcomes.append(outcome)
             continue
+        observed_rebuy_price = float(rebuy_price)
+        rebuy_reference_floor = config.guadao_rebuy_reference_floor_for(mhn)
+        if rebuy_reference_floor is not None and observed_rebuy_price < rebuy_reference_floor:
+            rebuy_price = float(rebuy_reference_floor)
+            rebuy_source = f"{rebuy_source or 'unknown'}_special_floor"
+            outcome["c5ObservedRebuyPrice"] = observed_rebuy_price
+            outcome["c5RebuyReferenceFloor"] = float(rebuy_reference_floor)
         outcome["c5RebuyPrice"] = float(rebuy_price)
 
         # Determine steam_sell_price

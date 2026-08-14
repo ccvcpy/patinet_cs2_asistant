@@ -22,9 +22,10 @@ GLOBAL_CIRCUIT_KEY = "steam:global"
 QUIET_WINDOW_CIRCUIT_KEY = "steam:quiet:profit_search_listings"
 DEFAULT_ACCOUNT_ROUTE_COOLDOWN_SECONDS = 120.0
 DEFAULT_GLOBAL_COOLDOWN_SECONDS = 600.0
-DEFAULT_ADMISSION_TIMEOUT_SECONDS = 5.0
+DEFAULT_ADMISSION_TIMEOUT_SECONDS = 15.0
 DEFAULT_CRITICAL_ADMISSION_TIMEOUT_SECONDS = 30.0
-ORPHAN_PENDING_STALE_SECONDS = 300.0
+MAX_PARALLEL_OBSERVATION_REQUESTS = 8
+ORPHAN_PENDING_STALE_SECONDS = 30.0
 ORPHAN_RUNNING_GRACE_SECONDS = 5.0
 DEGRADED_GLOBAL_PROBE_SECONDS = 1_800.0
 GLOBAL_DEGRADED_AFTER_SECONDS = 3_600.0
@@ -488,7 +489,6 @@ class SteamRequestScheduler:
     ) -> Iterator[SteamRequestPermit[Any]]:
         safe_priority = SteamRequestPriority(int(priority))
         safe_route = normalize_steam_route(route)
-        deadline = None
         admission_timeout = (
             (
                 DEFAULT_CRITICAL_ADMISSION_TIMEOUT_SECONDS
@@ -498,12 +498,15 @@ class SteamRequestScheduler:
             if timeout_seconds is None
             else max(0.0, float(timeout_seconds))
         )
-        deadline = self._now() + timedelta(seconds=admission_timeout)
+        admission_deadline = self._now() + timedelta(seconds=admission_timeout)
         should_quiet = quiet_before
         if should_quiet is None:
             should_quiet = str(source) == "profit_trade" and safe_route == "market/listings"
         if should_quiet and self.quiet_window_seconds > 0:
-            self._prepare_quiet_window(self.quiet_window_seconds, deadline=deadline)
+            self._prepare_quiet_window(
+                self.quiet_window_seconds,
+                deadline=admission_deadline,
+            )
 
         # The first pass prevents a blocked request from entering the queue,
         # but deliberately does not reserve a half-open probe while the ticket
@@ -513,7 +516,7 @@ class SteamRequestScheduler:
             priority=safe_priority,
             account_id=account_id,
             route=safe_route,
-            deadline=deadline,
+            deadline=admission_deadline,
             source=str(source or "unknown"),
             bounded_retry=bool(bounded_retry),
             claim_probes=False,
@@ -523,6 +526,11 @@ class SteamRequestScheduler:
         safe_metadata = redact_sensitive_data(dict(metadata or {}))
         if isinstance(safe_metadata, dict) and bounded_retry:
             safe_metadata["boundedRetry"] = True
+        if isinstance(safe_metadata, dict):
+            # The creator worker is written onto the ticket so that an
+            # abandoned pending row (e.g. after a process restart) can be
+            # identified and its orphan cleanup confirmed in diagnostics.
+            safe_metadata["schedulerCreatorWorkerId"] = self.worker_id
         self.store.enqueue_steam_request(
             request_id=request_id,
             source=str(source or "unknown"),
@@ -534,6 +542,10 @@ class SteamRequestScheduler:
             payload=safe_metadata,
             available_at=_iso(self._now()),
         )
+        # Queue time starts when the ticket actually exists. Circuit admission
+        # and a listings quiet window must not silently consume the queue's
+        # entire timeout before the request can even be claimed.
+        queue_deadline = self._now() + timedelta(seconds=admission_timeout)
         position = self.queue_position(request_id)
         self._emit(
             source=source,
@@ -550,7 +562,7 @@ class SteamRequestScheduler:
         try:
             claimed, probe_keys, request_id = self._wait_and_claim(
                 request_id,
-                deadline=deadline,
+                deadline=queue_deadline,
                 priority=safe_priority,
                 account_id=account_id,
                 route=safe_route,
@@ -804,11 +816,28 @@ class SteamRequestScheduler:
                 bounded_retry=bounded_retry,
                 claim_probes=True,
             )
+            try:
+                requested_parallel_limit = int(
+                    payload.get("schedulerParallelLimit") or 1
+                )
+            except (TypeError, ValueError, OverflowError):
+                requested_parallel_limit = 1
             claimed = self.store.claim_steam_request(
                 current_request_id,
                 self.worker_id,
                 lease_seconds=self.lease_seconds,
                 now=_iso(self._now()),
+                parallel_group=(
+                    str(payload.get("schedulerParallelGroup") or "").strip()
+                    or None
+                ),
+                parallel_limit=min(
+                    MAX_PARALLEL_OBSERVATION_REQUESTS,
+                    max(1, requested_parallel_limit),
+                ),
+                account_exclusive=bool(
+                    payload.get("schedulerAccountExclusive")
+                ),
             )
             if claimed:
                 try:

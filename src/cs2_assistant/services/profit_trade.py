@@ -227,10 +227,10 @@ def _build_profit_trade_market_service(
         if account.cookies:
             usable_accounts.append(account)
 
-    steam_market_client: SteamMarketClient | None = None
+    steam_market_clients: list[SteamMarketClient] = []
     for account in usable_accounts:
         try:
-            steam_market_client = SteamMarketClient(
+            steam_market_clients.append(SteamMarketClient(
                 cookies=account.cookies,
                 steam_id64=account.steam_id64,
                 identity_secret=account.identity_secret,
@@ -240,13 +240,12 @@ def _build_profit_trade_market_service(
                 telemetry_callback=callback,
                 request_source="profit_trade",
                 **({"allow_account_relogin": False} if not allow_relogin else {}),
-            )
-            break
+            ))
         except Exception:
             continue
-    if steam_market_client is None and settings.steam_cookies:
+    if not steam_market_clients and settings.steam_cookies:
         try:
-            steam_market_client = SteamMarketClient(
+            steam_market_clients.append(SteamMarketClient(
                 cookies=settings.steam_cookies,
                 identity_secret=settings.steam_identity_secret,
                 device_id=settings.steam_device_id,
@@ -254,7 +253,7 @@ def _build_profit_trade_market_service(
                 telemetry_callback=callback,
                 request_source="profit_trade",
                 **({"allow_account_relogin": False} if not allow_relogin else {}),
-            )
+            ))
         except Exception:
             pass
 
@@ -264,9 +263,13 @@ def _build_profit_trade_market_service(
         c5_client=_build_profit_trade_c5_client(settings, **context)
         if settings.c5_api_key
         else None,
-        steam_market_client=steam_market_client,
+        steam_market_clients=steam_market_clients,
         app_id=settings.app_id,
         include_c5_purchase_prices=False,
+        fallback_max_workers=2,
+        steam_orderbook_parallel_group="profit_trade_orderbook",
+        steam_orderbook_parallel_limit=2,
+        steam_orderbook_account_exclusive=True,
     )
 
 @dataclass(slots=True)
@@ -3339,7 +3342,21 @@ def _profit_trade_daily_steam_spent(db: Database, *, now: datetime | None = None
         note = _read_note(row["note"])
         if str(note.get("recordOrigin") or "") == "manual_backfill":
             continue
-        bought_at_value, _ = _profit_trade_steam_bought_at(note)
+        # `steamBuyUnverifiedAt` only means that a request may have reached
+        # Steam.  It is deliberately accepted by the general presentation
+        # helper, but it is not evidence that wallet funds were spent.
+        bought_at_value = next(
+            (
+                str(note.get(key) or "").strip()
+                for key in (
+                    "manualSteamBoughtAtOverride",
+                    "steamBuySucceededAt",
+                    "steamBuyRecoveredAt",
+                )
+                if str(note.get(key) or "").strip()
+            ),
+            None,
+        )
         bought_at = _parse_iso(bought_at_value)
         if bought_at is None:
             continue
@@ -3823,12 +3840,20 @@ def _watch_eligible_market_hash_names(
 
 
 def _state_price_is_usable_for_profit_trade(state: MarketState) -> bool:
-    return (
+    if not (
         state.steam_sell_price is not None
         and state.steam_price_source == "steam_orderbook"
         and state.c5_sell_price is not None
         and state.c5_price_source == "c5_batch"
-    )
+    ):
+        return False
+    raw = state.raw_json if isinstance(state.raw_json, dict) else {}
+    snapshot = raw.get("steam_orderbook_snapshot")
+    if isinstance(snapshot, dict):
+        currency_id = safe_int(snapshot.get("currencyId"))
+        if snapshot.get("currencyValid") is False or currency_id != 23:
+            return False
+    return True
 
 
 def _build_market_evaluation(
@@ -5226,6 +5251,8 @@ def scan_profit_trade_opportunities(
         watch_observations: list[dict[str, Any]] = []
         watch_exit_reasons: dict[str, str] = {}
         watch_exit_observations: dict[str, dict[str, Any]] = {}
+        watch_preserve_names: set[str] = set()
+        watch_refresh_failures: dict[str, dict[str, Any]] = {}
         missing_price_count = 0
         skipped_count = 0
         for item_type in inventory_types:
@@ -5233,7 +5260,34 @@ def scan_profit_trade_opportunities(
             state = state_map.get(market_hash_name)
             if state is None or not _state_price_is_usable_for_profit_trade(state):
                 missing_price_count += 1
+                watch_preserve_names.add(market_hash_name)
                 watch_exit_reasons[market_hash_name] = "Steam orderbook or C5 batch price is unavailable"
+                state_raw = state.raw_json if state is not None else {}
+                steam_error = str(
+                    state_raw.get("steam_orderbook_error") or ""
+                ).strip()
+                steam_error_type = str(
+                    state_raw.get("steam_orderbook_error_type") or ""
+                ).strip()
+                c5_error = str(state_raw.get("c5_batch_error") or "").strip()
+                watch_refresh_failures[market_hash_name] = {
+                    "reason": (
+                        steam_error
+                        or c5_error
+                        or watch_exit_reasons[market_hash_name]
+                    ),
+                    "errorType": (
+                        steam_error_type
+                        or (
+                            "c5_price_unavailable"
+                            if c5_error
+                            else "price_unavailable"
+                        )
+                    ),
+                    "targetBalanceDiscount": float(
+                        config.profit_trade_balance_discount
+                    ),
+                }
                 unavailable_snapshot = (
                     state.raw_json.get("steam_orderbook_snapshot")
                     if state is not None
@@ -5273,6 +5327,7 @@ def scan_profit_trade_opportunities(
             )
             if evaluation is None:
                 skipped_count += 1
+                watch_preserve_names.add(market_hash_name)
                 watch_exit_reasons[market_hash_name] = "price or minimum-item-value evaluation is not usable"
                 skipped_snapshot = (
                     state.raw_json.get("steam_orderbook_snapshot")
@@ -5534,6 +5589,8 @@ def scan_profit_trade_opportunities(
             observed_at=scan_observed_at,
             exit_reasons=watch_exit_reasons,
             exit_observations=watch_exit_observations,
+            preserve_market_hash_names=watch_preserve_names,
+            preserve_refresh_failures=watch_refresh_failures,
         )
         notes.append(
             "ROI watch updated: "
@@ -5552,6 +5609,7 @@ def scan_profit_trade_opportunities(
                 "opportunity_count": len(opportunities),
                 "missing_price_count": missing_price_count,
                 "skipped_count": skipped_count,
+                "roi_watch_preserved_unavailable_count": len(watch_preserve_names),
                 "roi_watch": watch_result,
             },
         )
@@ -14232,6 +14290,7 @@ def build_profit_trade_roi_watch_payload(
     active: bool | None = True,
     keyword: str | None = None,
     execution_status: str | None = None,
+    roi_sign: str | None = None,
     sort: str = "roi_desc",
     page: int = 1,
     page_size: int = 50,
@@ -14243,6 +14302,7 @@ def build_profit_trade_roi_watch_payload(
             active=active,
             keyword=keyword,
             execution_status=execution_status,
+            roi_sign=roi_sign,
             sort=sort,
             page=page,
             page_size=page_size,
@@ -15081,7 +15141,7 @@ def _selection_watch_observation(
     currency_id = safe_int(snapshot.get("currencyId")) if snapshot else None
     currency_valid = (
         snapshot.get("currencyValid") is not False
-        and (currency_id is None or int(currency_id) == 23)
+        and currency_id == 23
     )
     c5_listing_price = safe_float(state.c5_sell_price) if state is not None else None
     if c5_listing_price is not None and c5_listing_price <= 0:
@@ -15151,6 +15211,22 @@ def _selection_watch_observation(
         last_error = " | ".join(reasons) or None
 
     snapshot_payload = dict(snapshot)
+    if not currency_valid:
+        # Keep the returned currency id for diagnosis, but never expose prices
+        # or depth from a non-CNY response as if they were CNY values.
+        for key in (
+            "sellerFloorPrice",
+            "sellerFloorCount",
+            "buyerMaxPrice",
+            "buyerMaxCount",
+            "spreadAmount",
+            "spreadPct",
+            "sellOrderCountTotal",
+            "buyOrderCountTotal",
+        ):
+            snapshot_payload[key] = None
+        snapshot_payload["sellLevels"] = []
+        snapshot_payload["buyLevels"] = []
     crossed_listing_probe = (
         dict(raw_state.get("crossed_listing_probe") or {})
         if isinstance(raw_state.get("crossed_listing_probe"), dict)
