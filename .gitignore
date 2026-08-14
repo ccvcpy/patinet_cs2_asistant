@@ -6,6 +6,11 @@ data/
 logs/
 profit-trade-api.*.log
 .venv/
+.codex_tmp/
+pytest-run-*/
+.pytest_tmp/
+frontend/vite-preview-*.log
+outputs/_steam_mybuyorders.html
 
 .claude/
 config/accounts.json
